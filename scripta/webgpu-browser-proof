@@ -250,6 +250,30 @@ require(color_targets[0] == "bgra8unorm", "graphics: color target must be bgra8u
 graphics_wgsl = graphics_wgsl_path.read_text()
 require("@vertex" in graphics_wgsl, "graphics.wgsl must contain @vertex entrypoint")
 require("@fragment" in graphics_wgsl, "graphics.wgsl must contain @fragment entrypoint")
+# Visual-law body contract (reflection-driven MVP + vertex color; not black-stub).
+require(
+    "@group(0) @binding(0) var<storage, read> transform: array<f32>;" in graphics_wgsl,
+    "graphics.wgsl must load transform storage at group 0 binding 0",
+)
+require(
+    "view_proj * model * vec4<f32>(input.position, 1.0)" in graphics_wgsl
+    or "view_proj * model * vec4<f32>(input.position,1.0)" in graphics_wgsl,
+    "graphics.wgsl vertex body must apply view_proj * model to position",
+)
+require(
+    "vec4<f32>(input.color, 1.0)" in graphics_wgsl
+    or "vec4<f32>(input.color,1.0)" in graphics_wgsl,
+    "graphics.wgsl fragment body must output interpolated vertex color",
+)
+require(
+    "out.color = vec4<f32>(0.0, 0.0, 0.0, 1.0)" not in graphics_wgsl
+    and "out.color = vec4<f32>(0.0,0.0,0.0,1.0)" not in graphics_wgsl,
+    "graphics.wgsl must not emit constant black fragment stub",
+)
+require(
+    "out.position = vec4<f32>(input.position, 1.0)" not in graphics_wgsl,
+    "graphics.wgsl must not use identity position when transform resource is bound",
+)
 
 draw = json.loads(draw_path.read_text())
 require(draw.get("index_format") == "uint32", "draw.json: index_format must be uint32")
