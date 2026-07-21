@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Faber WebGPU Host</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js",
+          "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="shell">
+      <section id="scene" class="scene" aria-label="WebGPU result scene"></section>
+      <aside class="panel" aria-label="Kernel result">
+        <h1>Faber WebGPU Host</h1>
+        <dl class="metrics">
+          <div>
+            <dt>Kernel</dt>
+            <dd id="kernel-name">--</dd>
+          </div>
+          <div>
+            <dt>Input</dt>
+            <dd id="input-value">--</dd>
+          </div>
+          <div>
+            <dt>Output</dt>
+            <dd id="output-value">--</dd>
+          </div>
+          <div>
+            <dt>Status</dt>
+            <dd id="status-value" data-state="pending">Loading</dd>
+          </div>
+        </dl>
+      </aside>
+    </main>
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

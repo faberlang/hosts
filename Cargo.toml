@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "macos-arm64",
+]
+resolver = "2"
+
+# Non-Cargo host products live beside members (e.g. webgpu-browser/).
+# Each platform/runtime host is one product directory under this repo.

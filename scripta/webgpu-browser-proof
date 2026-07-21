@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Generate and serve the browser WebGPU host proof artifacts.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOST="$ROOT/webgpu-browser"
+# Radix is the sibling compiler; emit uses its workspace.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+RADIX_ROOT="$(cd "$ROOT/../radix" && pwd)"
+FIXTURE="$HOST/fixtures/add-one.fab"
+PUBLIC="$HOST/public"
+GENERATED="$PUBLIC/generated"
+PORT="${WEBGPU_BROWSER_PROOF_PORT:-8787}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: ./scripta/webgpu-browser-proof <generate|check|serve>
+
+Commands:
+  generate  Regenerate WGSL and reflection JSON proof artifacts.
+  check     Generate temp artifacts, compare checked-in artifacts, and validate.
+  serve     Regenerate artifacts, then serve webgpu-browser/public.
+USAGE
+}
+
+generate_into() {
+  local output_dir="$1"
+  mkdir -p "$output_dir"
+
+  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
+    emit -t wgsl-text "$FIXTURE" \
+    -o "$output_dir/kernel.wgsl"
+  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
+    emit --reflection -t wgsl-text "$FIXTURE" \
+    -o "$output_dir/reflection.json"
+}
+
+generate() {
+  generate_into "$GENERATED"
+
+  printf 'generated %s\n' "$GENERATED/kernel.wgsl"
+  printf 'generated %s\n' "$GENERATED/reflection.json"
+}
+
+compare_generated_artifacts() {
+  local fresh="$1"
+  local drift=0
+
+  for artifact in kernel.wgsl reflection.json; do
+    if ! cmp -s "$fresh/$artifact" "$GENERATED/$artifact"; then
+      printf 'webgpu-browser-proof check failed: checked-in generated artifact is stale: %s\n' \
+        "$GENERATED/$artifact" >&2
+      drift=1
+    fi
+  done
+
+  if [[ "$drift" -ne 0 ]]; then
+    printf 'run ./scripta/webgpu-browser-proof generate and commit the updated artifacts\n' >&2
+    exit 1
+  fi
+}
+
+check_contract() {
+  local fresh
+  fresh="$(mktemp -d "${TMPDIR:-/tmp}/faber-webgpu-proof.XXXXXX")"
+  trap "rm -rf '$fresh'" EXIT
+
+  generate_into "$fresh"
+  compare_generated_artifacts "$fresh"
+
+  python3 - "$HOST" "$fresh" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+host = Path(sys.argv[1])
+generated = Path(sys.argv[2])
+public = host / "public"
+reflection_path = generated / "reflection.json"
+kernel_path = generated / "kernel.wgsl"
+index_path = public / "index.html"
+app_path = public / "src" / "app.js"
+runtime_path = public / "src" / "webgpu-runtime.js"
+manifest_path = public / "faber-webgpu-product.json"
+
+def fail(message):
+    raise SystemExit(f"webgpu-browser-proof check failed: {message}")
+
+def require(condition, message):
+    if not condition:
+        fail(message)
+
+reflection = json.loads(reflection_path.read_text())
+require(reflection.get("schema_version") == 1, "schema_version must be 1")
+require(reflection.get("target") == "wgsl-text", "target must be wgsl-text")
+kernels = reflection.get("kernels")
+require(isinstance(kernels, list) and len(kernels) == 1, "expected one reflected kernel")
+kernel = kernels[0]
+require(kernel.get("entry_name") == "add_one", "entry_name must be add_one")
+require(kernel.get("shader_stage") == "compute", "shader_stage must be compute")
+
+launch = kernel.get("launch") or {}
+adapter = launch.get("webgpu_adapter") or {}
+dispatch = adapter.get("dispatch_workgroups") or {}
+require(dispatch == {"x": 1, "y": 1, "z": 1}, "dispatch_workgroups must be 1,1,1")
+
+layouts = adapter.get("bind_group_layout_descriptors")
+groups = adapter.get("bind_group_descriptors")
+require(isinstance(layouts, list) and len(layouts) == 1, "expected one bind group layout descriptor")
+require(isinstance(groups, list) and len(groups) == 1, "expected one bind group descriptor")
+
+entries = groups[0].get("entries")
+require(isinstance(entries, list) and len(entries) == 2, "expected two bind group entries")
+roles = [entry.get("role") for entry in entries]
+require(roles == ["input", "output"], "expected input/output bind group roles")
+require(entries[0].get("buffer_type") == "read-only-storage", "input must be read-only-storage")
+require(entries[1].get("buffer_type") == "storage", "output must be storage")
+require(all(entry.get("buffer_byte_len") == 4 for entry in entries), "each buffer must be 4 bytes")
+require(all(entry.get("has_dynamic_offset") is False for entry in entries), "dynamic offsets must be false")
+
+kernel_wgsl = kernel_path.read_text()
+require("@compute" in kernel_wgsl, "kernel.wgsl must contain a compute entrypoint")
+require("@group(0) @binding(0)" in kernel_wgsl, "kernel.wgsl must contain binding 0")
+require("@group(0) @binding(1)" in kernel_wgsl, "kernel.wgsl must contain binding 1")
+
+index = index_path.read_text()
+app = app_path.read_text()
+runtime = runtime_path.read_text()
+require("three.webgpu.js" in index, "index.html must pin the three.js WebGPU build")
+require("window.faberWebGpuProof" in app, "app.js must expose browser proof state")
+require("EXPECTED_VALUE = 42.0" in app, "app.js must assert the expected readback value")
+require("proofFailure" in app, "app.js must map failures into structured proof state")
+require('kind: "ok"' in app, "app.js success state must set kind ok")
+require("dispatchWorkgroups" in runtime, "runtime must dispatch from reflection counts")
+require("createBindGroupLayout" in runtime, "runtime must create bind group layouts")
+require("createBindGroup" in runtime, "runtime must create bind groups")
+require("copyBufferToBuffer" in runtime, "runtime must copy output for readback")
+require('"webgpu"' in runtime, "runtime must tag unavailable WebGPU as kind webgpu")
+
+kernel_js = (public / "src" / "faber-kernel.js").read_text()
+require("artifact-fetch" in kernel_js, "faber-kernel must tag fetch failures as artifact-fetch")
+require('kind = "reflection"' in kernel_js, "faber-kernel must default contract errors to kind reflection")
+boundary_check = public / "src" / "product-boundary-check.mjs"
+require(boundary_check.is_file(), "product-boundary-check.mjs must exist for focused admission")
+
+manifest = json.loads(manifest_path.read_text())
+require(manifest.get("schema_version") == 1, "product manifest schema_version must be 1")
+require(manifest.get("kind") == "faber-webgpu-browser-product", "product manifest kind is invalid")
+require(manifest.get("entrypoint") == "./index.html", "product manifest entrypoint must be index.html")
+artifacts = manifest.get("artifacts") or {}
+require(artifacts == {"wgsl": "./generated/kernel.wgsl", "reflection": "./generated/reflection.json"}, "product manifest artifacts are invalid")
+admission = manifest.get("admission") or {}
+require(admission.get("fixture") == "../fixtures/add-one.fab", "product manifest fixture is invalid")
+require(admission.get("expected_value") == 42.0, "product manifest expected value is invalid")
+require(admission.get("state_path") == "window.faberWebGpuProof", "product manifest state path is invalid")
+success = manifest.get("success") or {}
+require(success == {"ok": True, "value": 42.0}, "product manifest success contract is invalid")
+unsupported = manifest.get("unsupported") or {}
+require(unsupported.get("webgpu") == "kind=webgpu clear error state", "product manifest WebGPU failure policy is invalid")
+require(unsupported.get("reflection") == "kind=reflection FaberKernelContractError", "product manifest reflection failure policy is invalid")
+require(unsupported.get("artifact_fetch") == "kind=artifact-fetch FaberKernelContractError", "product manifest artifact-fetch policy is invalid")
+inspection = manifest.get("inspection") or {}
+require(inspection.get("static_check") == "./scripta/webgpu-browser-proof check", "product manifest static_check path is invalid")
+require(inspection.get("product_boundary_check") == "./public/src/product-boundary-check.mjs", "product manifest product_boundary_check path is invalid")
+require(inspection.get("manual_browser") == "http://127.0.0.1:8787/", "product manifest manual_browser URL is invalid")
+require(
+    inspection.get("manual_assertion")
+    == "window.faberWebGpuProof.ok === true && window.faberWebGpuProof.value === 42",
+    "product manifest manual_assertion is invalid",
+)
+
+print("webgpu-browser-proof static contract check passed")
+print("manual browser URL: http://127.0.0.1:8787/")
+print("manual browser assertion: window.faberWebGpuProof.ok === true && window.faberWebGpuProof.value === 42")
+PY
+
+  run_product_boundary_check
+}
+
+run_product_boundary_check() {
+  if ! command -v node >/dev/null 2>&1; then
+    printf 'webgpu-browser-proof check failed: node is required for product-boundary-check.mjs\n' >&2
+    exit 1
+  fi
+
+  node "$PUBLIC/src/product-boundary-check.mjs"
+}
+
+serve() {
+  generate
+  printf 'serving %s at http://127.0.0.1:%s/\n' "$PUBLIC" "$PORT"
+  python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$PUBLIC"
+}
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 2
+fi
+
+case "$1" in
+  generate)
+    generate
+    ;;
+  check)
+    check_contract
+    ;;
+  serve)
+    serve
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

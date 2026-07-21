@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "kind": "faber-webgpu-browser-product",
+  "entrypoint": "./index.html",
+  "serve": "./scripta/webgpu-browser-proof serve",
+  "artifacts": {
+    "wgsl": "./generated/kernel.wgsl",
+    "reflection": "./generated/reflection.json"
+  },
+  "admission": {
+    "fixture": "../fixtures/add-one.fab",
+    "input_value": 41.0,
+    "expected_value": 42.0,
+    "state_path": "window.faberWebGpuProof"
+  },
+  "success": {
+    "ok": true,
+    "value": 42.0
+  },
+  "unsupported": {
+    "artifact_fetch": "kind=artifact-fetch FaberKernelContractError",
+    "reflection": "kind=reflection FaberKernelContractError",
+    "webgpu": "kind=webgpu clear error state"
+  },
+  "inspection": {
+    "static_check": "./scripta/webgpu-browser-proof check",
+    "product_boundary_check": "./public/src/product-boundary-check.mjs",
+    "manual_browser": "http://127.0.0.1:8787/",
+    "manual_assertion": "window.faberWebGpuProof.ok === true && window.faberWebGpuProof.value === 42",
+    "static_evidence_note": "check + product-boundary-check are non-GPU evidence; exact 42.0 readback requires a WebGPU-capable browser"
+  }
+}
