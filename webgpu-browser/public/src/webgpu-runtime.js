@@ -829,6 +829,8 @@ export function createChunkGraphicsResources(device, descriptor, basePayloads, c
     pipeline,
     bindGroups,
     depthTexture,
+    /** Draw index format for per-chunk indexCount (not byteLength heuristics). */
+    indexFormat: descriptor.draw.indexFormat,
     /** @type {Map<number, object>} */
     chunks: new Map(),
     /** @type {Array<object>} */
@@ -969,6 +971,10 @@ export function applyChunkResourceReplace(device, resources, transition) {
  * After work that referenced retired buffers has been submitted, wait for
  * queue completion and destroy pending retired buffers.
  * Must not be called as a frame-count guess — only with real completion.
+ *
+ * Snapshot/splice pendingRetire *before* awaiting onSubmittedWorkDone.
+ * Destroy only that snapshot after completion. Groups retired during the
+ * wait stay in pendingRetire for a later completion that covers them.
  */
 export async function destroyRetiredChunkResources(device, resources) {
   expectChunkResources(resources);
@@ -985,10 +991,13 @@ export async function destroyRetiredChunkResources(device, resources) {
     );
   }
 
+  // Take ownership of currently pending groups before waiting. Concurrent
+  // retires during the await must not be destroyed under this completion.
+  const groups = resources.pendingRetire.splice(0, resources.pendingRetire.length);
+
   await done.call(device.queue);
 
   let destroyedBuffers = 0;
-  const groups = resources.pendingRetire.splice(0, resources.pendingRetire.length);
   for (const group of groups) {
     for (const buffer of group.buffers) {
       if (buffer && typeof buffer.destroy === "function" && !buffer.__faberDestroyed) {
@@ -1231,8 +1240,19 @@ function createChunkGpuEntry(device, resources, logicalId, generation, mesh) {
   const colorBuffer = createMappedBuffer(device, mesh.colors, BUFFER_USAGE.vertex());
   const indexBuffer = createMappedBuffer(device, mesh.indices, BUFFER_USAGE.index());
 
-  // Prefer uint32 when byte length is a multiple of 4; else uint16.
-  const indexByteSize = mesh.indices.byteLength % 4 === 0 ? 4 : 2;
+  // Match createIndexBuffer: indexCount from descriptor draw indexFormat.
+  const indexFormat = resources.indexFormat;
+  const indexByteSize = indexFormat === "uint16" ? 2 : 4;
+  if (mesh.indices.byteLength % indexByteSize !== 0) {
+    positionBuffer.destroy();
+    colorBuffer.destroy();
+    indexBuffer.destroy();
+    throw new FaberKernelContractError(
+      "transition.payload.indices",
+      `index byte length ${mesh.indices.byteLength} is not a multiple of ${indexByteSize} for ${indexFormat}`,
+      "product",
+    );
+  }
   const indexCount = Math.floor(mesh.indices.byteLength / indexByteSize);
   if (indexCount === 0) {
     positionBuffer.destroy();
@@ -1240,7 +1260,7 @@ function createChunkGpuEntry(device, resources, logicalId, generation, mesh) {
     indexBuffer.destroy();
     throw new FaberKernelContractError(
       "transition.payload.indices",
-      "index data produced zero indices",
+      `index data too short for ${indexFormat} format`,
       "product",
     );
   }
@@ -1257,6 +1277,7 @@ function createChunkGpuEntry(device, resources, logicalId, generation, mesh) {
     ]),
     indexBuffer,
     indexCount,
+    indexFormat,
     buffers: [positionBuffer, colorBuffer, indexBuffer],
   };
 }

@@ -743,9 +743,103 @@ async function main() {
     require(result.destroyed_groups === 0 && result.destroyed_buffers === 0, "empty destroy no-op");
   }
 
+  // ── Concurrent retire during onSubmittedWorkDone is not destroyed ──────
+  // Snapshot-before-await: groups retired while waiting stay pending.
+  {
+    const device = createFakeDevice();
+    const context = createFakeCanvasContext();
+    const resources = createChunkGraphicsResources(
+      device,
+      descriptor,
+      { storageData: { transform } },
+      context,
+    );
+
+    applyChunkResourceReplace(device, resources, {
+      logical_id: 0,
+      generation: 0,
+      payload: meshPayload(0),
+    });
+    applyChunkResourceReplace(device, resources, {
+      logical_id: 1,
+      generation: 0,
+      payload: meshPayload(2),
+    });
+
+    // Retire chunk 0 → pending group A
+    applyChunkResourceReplace(device, resources, {
+      logical_id: 0,
+      generation: 1,
+      payload: meshPayloadAlt(0),
+    });
+    const groupA = resources.pendingRetire[0].buffers.slice();
+    require(resources.pendingRetire.length === 1, "one pending before destroy");
+
+    // During the completion wait, retire chunk 1 → group B must survive this destroy.
+    // One-shot inject so a later destroy uses the normal completion path.
+    const origDone = device.queue.onSubmittedWorkDone.bind(device.queue);
+    let injected = false;
+    device.queue.onSubmittedWorkDone = async function () {
+      if (!injected) {
+        injected = true;
+        applyChunkResourceReplace(device, resources, {
+          logical_id: 1,
+          generation: 1,
+          payload: meshPayloadAlt(2),
+        });
+        require(resources.pendingRetire.length === 1, "only concurrent group in pending during await");
+      }
+      return origDone();
+    };
+
+    runChunkGraphicsFrame(device, context, resources, descriptor, { submittedFrameCount: 0 });
+    const destroyResult = await destroyRetiredChunkResources(device, resources);
+
+    require(destroyResult.destroyed_groups === 1, "only pre-await group destroyed");
+    require(destroyResult.destroyed_buffers === 3, "only three buffers from snapshot");
+    require(groupA.every((b) => b.__faberDestroyed), "snapshot group A destroyed");
+    require(resources.pendingRetire.length === 1, "concurrent group B still pending");
+    require(
+      resources.pendingRetire[0].buffers.every((b) => !b.__faberDestroyed),
+      "group B buffers not destroyed under earlier completion",
+    );
+    require(chunkResourceCounters(resources).destroyed === 3, "destroyed counter is 3 not 6");
+
+    // Restore normal completion; later wait covers group B.
+    device.queue.onSubmittedWorkDone = origDone;
+    runChunkGraphicsFrame(device, context, resources, descriptor, { submittedFrameCount: 1 });
+    const second = await destroyRetiredChunkResources(device, resources);
+    require(second.destroyed_groups === 1 && second.destroyed_buffers === 3, "second destroy covers B");
+    require(resources.pendingRetire.length === 0, "pending empty after second destroy");
+    require(chunkResourceCounters(resources).destroyed === 6, "both groups destroyed over two waits");
+  }
+
+  // ── indexCount follows resources.indexFormat (not byteLength%4) ────────
+  {
+    const device = createFakeDevice();
+    const context = createFakeCanvasContext();
+    const resources = createChunkGraphicsResources(
+      device,
+      descriptor,
+      { storageData: { transform } },
+      context,
+    );
+    require(resources.indexFormat === "uint32", "session stores draw indexFormat");
+
+    // 6 uint32 indices → 24 bytes (also %4===0 under the old heuristic).
+    const created = applyChunkResourceReplace(device, resources, {
+      logical_id: 0,
+      generation: 0,
+      payload: meshPayload(0),
+    });
+    require(created.index_count === 6, "uint32 indexCount is 6");
+    require(resources.chunks.get(0).indexCount === 6, "entry indexCount is 6");
+    require(resources.chunks.get(0).indexFormat === "uint32", "entry records indexFormat");
+  }
+
   console.log("chunk-resource-lifecycle-check passed");
   console.log("path: per-chunk-multi-draw");
-  console.log("covered: create, replace create-before-retire, remove, multi-draw, counters, invalid transitions, queue completion gate, unaffected identity");
+  console.log("covered: create, replace create-before-retire, remove, multi-draw, counters, invalid transitions, queue completion gate, unaffected identity, concurrent retire-during-await, indexFormat-driven indexCount");
 }
 
 main().catch((error) => {
