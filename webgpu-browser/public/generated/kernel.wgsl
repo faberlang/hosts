@@ -6,6 +6,9 @@
 @compute @workgroup_size(1, 1, 1)
 fn add_one(@builtin(global_invocation_id) id: vec3<u32>) {
   let i: u32 = id.x;
+  if (i >= 1u) {
+    return;
+  }
   let x: f32 = x_in[i];
   output[i] = (x + 1.0);
 }

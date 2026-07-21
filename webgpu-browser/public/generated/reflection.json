@@ -4,6 +4,10 @@
   "kernels": [
     {
       "function": 0,
+      "provenance": {
+        "kind": "mir-function",
+        "function": 0
+      },
       "entry_name": "add_one",
       "shader_stage": "compute",
       "resources": [
@@ -41,6 +45,8 @@
           "source_local": null
         }
       ],
+      "vertex_input_count": 0,
+      "vertex_inputs": [],
       "builtin_inputs": [],
       "called_builtins": [],
       "launch": {
@@ -365,6 +371,10 @@
               ]
             }
           ],
+          "vertex_buffer_layout_descriptor_count": 0,
+          "vertex_buffer_layout_descriptor_indexes": [],
+          "vertex_buffer_layout_descriptor_index_count": 0,
+          "vertex_buffer_layout_descriptors": [],
           "dispatch_workgroup_dimension_count": 3,
           "dispatch_workgroups": {
             "x": 1,

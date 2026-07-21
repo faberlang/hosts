@@ -3,8 +3,17 @@ import {
   FaberKernelContractError,
   fetchFaberKernelArtifacts,
   loadFaberKernel,
+  loadFaberGraphicsPipeline,
 } from "./faber-kernel.js";
-import { acquireWebGpuDevice, createWebGpuResources, runKernel } from "./webgpu-runtime.js";
+import {
+  acquireWebGpuDevice,
+  createWebGpuResources,
+  runKernel,
+  createGraphicsResources,
+  runGraphicsFrame,
+  replaceDepthTextureOnResize,
+  onDeviceLost,
+} from "./webgpu-runtime.js";
 
 const INPUT_VALUE = 41.0;
 const EXPECTED_VALUE = 42.0;
@@ -19,6 +28,7 @@ const elements = {
 };
 
 window.faberWebGpuProof = Object.freeze({ ok: false, status: "starting" });
+window.faberWebGpuGraphicsProof = Object.freeze({ ok: false, status: "starting" });
 
 main().catch((error) => {
   const proof = proofFailure(error);
@@ -27,6 +37,15 @@ main().catch((error) => {
 });
 
 async function main() {
+  // Run compute proof (existing path).
+  await runComputeProof();
+  // Run graphics proof (new path — best-effort; failure does not block compute).
+  runGraphicsProof().catch((error) => {
+    window.faberWebGpuGraphicsProof = proofFailure(error);
+  });
+}
+
+async function runComputeProof() {
   setStatus("pending", "Loading");
 
   const artifacts = await fetchFaberKernelArtifacts();
@@ -61,6 +80,104 @@ async function main() {
     value,
     expected: EXPECTED_VALUE,
     dispatchWorkgroups: kernel.dispatchWorkgroups,
+  });
+}
+
+// ── Graphics proof ────────────────────────────────────────────────────────
+
+async function runGraphicsProof() {
+  window.faberWebGpuGraphicsProof = Object.freeze({ ok: false, status: "starting" });
+
+  // Fetch graphics artifacts.
+  const [wgslResponse, reflectionResponse, positionsResponse, colorsResponse, indicesResponse, transformResponse, drawResponse] = await Promise.all([
+    fetch("./generated/graphics.wgsl"),
+    fetch("./generated/graphics-reflection.json"),
+    fetch("./generated/graphics-vertex-positions.bin"),
+    fetch("./generated/graphics-vertex-colors.bin"),
+    fetch("./generated/graphics-indices.bin"),
+    fetch("./generated/graphics-transform.bin"),
+    fetch("./generated/draw.json"),
+  ]);
+
+  for (const [label, response] of [["wgsl", wgslResponse], ["reflection", reflectionResponse], ["positions", positionsResponse], ["colors", colorsResponse], ["indices", indicesResponse], ["transform", transformResponse], ["draw", drawResponse]]) {
+    if (!response.ok) {
+      throw new FaberKernelContractError(label, `failed to fetch graphics ${label}`, "artifact-fetch");
+    }
+  }
+
+  const wgsl = await wgslResponse.text();
+  const reflection = await reflectionResponse.json();
+  const drawManifest = await drawResponse.json();
+
+  const descriptor = loadFaberGraphicsPipeline({ wgsl, reflection, drawManifest });
+
+  const { device } = await acquireWebGpuDevice();
+  onDeviceLost(device, (info) => {
+    window.faberWebGpuGraphicsProof = Object.freeze({
+      ok: false,
+      status: "error",
+      kind: info.kind,
+      reason: info.reason,
+      message: info.message,
+    });
+  });
+
+  // Get or create a canvas with a WebGPU context.
+  let canvas = document.querySelector("#gpu-canvas");
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    canvas.id = "gpu-canvas";
+    canvas.style.display = "none";
+    document.body.append(canvas);
+  }
+
+  const context = canvas.getContext("webgpu");
+  if (!context) {
+    throw new FaberKernelContractError("canvas", "WebGPU canvas context is unavailable", "webgpu");
+  }
+
+  context.configure({
+    device,
+    format: "bgra8unorm",
+    alphaMode: "opaque",
+  });
+
+  // Set canvas to a small size (proof-only; not visible).
+  canvas.width = 256;
+  canvas.height = 256;
+
+  // Create payloads from fetched binary data.
+  const positionsBuffer = await positionsResponse.arrayBuffer();
+  const colorsBuffer = await colorsResponse.arrayBuffer();
+  const indicesBuffer = await indicesResponse.arrayBuffer();
+  const transformBuffer = await transformResponse.arrayBuffer();
+
+  const payloads = {
+    vertexBuffers: [
+      { slot: 0, data: positionsBuffer },
+      { slot: 1, data: colorsBuffer },
+    ],
+    indexData: new Uint32Array(indicesBuffer),
+    storageData: {
+      transform: new Float32Array(transformBuffer),
+    },
+  };
+
+  let resources = createGraphicsResources(device, descriptor, payloads, context);
+
+  const frameState = { submittedFrameCount: 0 };
+
+  // Submit one indexed render pass.
+  runGraphicsFrame(device, context, resources, descriptor, frameState);
+
+  window.faberWebGpuGraphicsProof = Object.freeze({
+    ok: true,
+    status: "ready",
+    kind: "ok",
+    submittedFrameCount: frameState.submittedFrameCount,
+    vertexCount: descriptor.pipeline.vertexCount,
+    indexFormat: descriptor.draw.indexFormat,
+    colorTarget: descriptor.pipeline.colorTargetFormats[0],
   });
 }
 

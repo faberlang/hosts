@@ -8,10 +8,14 @@ HOST="$ROOT/webgpu-browser"
 # Radix is the sibling compiler; emit uses its workspace.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 RADIX_ROOT="$(cd "$ROOT/../radix" && pwd)"
+TRIGA_ROOT="$(cd "$ROOT/../triga" && pwd)"
 FIXTURE="$HOST/fixtures/add-one.fab"
+GRAPHICS_FIXTURE="$TRIGA_ROOT/exempla/triga-hello-voxel-shaders.fab"
 PUBLIC="$HOST/public"
 GENERATED="$PUBLIC/generated"
 PORT="${WEBGPU_BROWSER_PROOF_PORT:-8787}"
+FABER_LIBRARY_HOME="${FABER_LIBRARY_HOME:-$ROOT/..}"
+export FABER_LIBRARY_HOME
 
 usage() {
   cat >&2 <<'USAGE'
@@ -36,18 +40,40 @@ generate_into() {
     -o "$output_dir/reflection.json"
 }
 
+generate_graphics_into() {
+  local output_dir="$1"
+  mkdir -p "$output_dir"
+
+  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
+    emit -t wgsl-text "$GRAPHICS_FIXTURE" \
+    -o "$output_dir/graphics.wgsl"
+  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
+    emit --reflection -t wgsl-text "$GRAPHICS_FIXTURE" \
+    -o "$output_dir/graphics-reflection.json"
+
+  python3 "$ROOT/scripta/generate-graphics-payloads.py" "$output_dir"
+}
+
 generate() {
   generate_into "$GENERATED"
+  generate_graphics_into "$GENERATED"
 
   printf 'generated %s\n' "$GENERATED/kernel.wgsl"
   printf 'generated %s\n' "$GENERATED/reflection.json"
+  printf 'generated %s\n' "$GENERATED/graphics.wgsl"
+  printf 'generated %s\n' "$GENERATED/graphics-reflection.json"
+  printf 'generated %s\n' "$GENERATED/graphics-vertex-positions.bin"
+  printf 'generated %s\n' "$GENERATED/graphics-vertex-colors.bin"
+  printf 'generated %s\n' "$GENERATED/graphics-indices.bin"
+  printf 'generated %s\n' "$GENERATED/graphics-transform.bin"
+  printf 'generated %s\n' "$GENERATED/draw.json"
 }
 
 compare_generated_artifacts() {
   local fresh="$1"
   local drift=0
 
-  for artifact in kernel.wgsl reflection.json; do
+  for artifact in kernel.wgsl reflection.json graphics.wgsl graphics-reflection.json; do
     if ! cmp -s "$fresh/$artifact" "$GENERATED/$artifact"; then
       printf 'webgpu-browser-proof check failed: checked-in generated artifact is stale: %s\n' \
         "$GENERATED/$artifact" >&2
@@ -67,6 +93,7 @@ check_contract() {
   trap "rm -rf '$fresh'" EXIT
 
   generate_into "$fresh"
+  generate_graphics_into "$fresh"
   compare_generated_artifacts "$fresh"
 
   python3 - "$HOST" "$fresh" <<'PY'
@@ -149,7 +176,18 @@ require(manifest.get("schema_version") == 1, "product manifest schema_version mu
 require(manifest.get("kind") == "faber-webgpu-browser-product", "product manifest kind is invalid")
 require(manifest.get("entrypoint") == "./index.html", "product manifest entrypoint must be index.html")
 artifacts = manifest.get("artifacts") or {}
-require(artifacts == {"wgsl": "./generated/kernel.wgsl", "reflection": "./generated/reflection.json"}, "product manifest artifacts are invalid")
+expected_artifacts = {
+    "wgsl": "./generated/kernel.wgsl",
+    "reflection": "./generated/reflection.json",
+    "graphicsWgsl": "./generated/graphics.wgsl",
+    "graphicsReflection": "./generated/graphics-reflection.json",
+    "vertexPositions": "./generated/graphics-vertex-positions.bin",
+    "vertexColors": "./generated/graphics-vertex-colors.bin",
+    "indices": "./generated/graphics-indices.bin",
+    "transform": "./generated/graphics-transform.bin",
+    "drawManifest": "./generated/draw.json",
+}
+require(artifacts == expected_artifacts, f"product manifest artifacts are invalid: {artifacts}")
 admission = manifest.get("admission") or {}
 require(admission.get("fixture") == "../fixtures/add-one.fab", "product manifest fixture is invalid")
 require(admission.get("expected_value") == 42.0, "product manifest expected value is invalid")
@@ -173,6 +211,68 @@ require(
 print("webgpu-browser-proof static contract check passed")
 print("manual browser URL: http://127.0.0.1:8787/")
 print("manual browser assertion: window.faberWebGpuProof.ok === true && window.faberWebGpuProof.value === 42")
+
+# ── Graphics contract checks ───────────────────────────────────────────
+graphics_reflection_path = generated / "graphics-reflection.json"
+graphics_wgsl_path = generated / "graphics.wgsl"
+draw_path = generated / "draw.json"
+vertex_positions_path = generated / "graphics-vertex-positions.bin"
+vertex_colors_path = generated / "graphics-vertex-colors.bin"
+indices_path = generated / "graphics-indices.bin"
+transform_path = generated / "graphics-transform.bin"
+
+graphics_reflection = json.loads(graphics_reflection_path.read_text())
+require(graphics_reflection.get("schema_version") == 1, "graphics: schema_version must be 1")
+require(graphics_reflection.get("target") == "wgsl-text", "graphics: target must be wgsl-text")
+gfx_kernels = graphics_reflection.get("kernels")
+require(isinstance(gfx_kernels, list) and len(gfx_kernels) == 2, "graphics: expected two kernels")
+stages = [k.get("shader_stage") for k in gfx_kernels]
+require("vertex" in stages, "graphics: missing vertex kernel")
+require("fragment" in stages, "graphics: missing fragment kernel")
+
+vertex_kernel = next(k for k in gfx_kernels if k.get("shader_stage") == "vertex")
+require(vertex_kernel.get("entry_name") == "hello_voxel_vertex", "graphics: vertex entry_name mismatch")
+require(vertex_kernel.get("vertex_input_count") == 2, "graphics: vertex_input_count must be 2")
+vertex_inputs = vertex_kernel.get("vertex_inputs")
+require(isinstance(vertex_inputs, list) and len(vertex_inputs) == 2, "graphics: expected two vertex inputs")
+
+fragment_kernel = next(k for k in gfx_kernels if k.get("shader_stage") == "fragment")
+require(fragment_kernel.get("entry_name") == "hello_voxel_fragment", "graphics: fragment entry_name mismatch")
+
+pipeline = graphics_reflection.get("pipeline")
+require(isinstance(pipeline, dict), "graphics: missing pipeline block")
+require(pipeline.get("primitive_topology") == "triangle-list", "graphics: topology must be triangle-list")
+require(pipeline.get("vertex_count") == 36, "graphics: vertex_count must be 36")
+color_targets = pipeline.get("color_target_formats")
+require(isinstance(color_targets, list) and len(color_targets) == 1, "graphics: expected one color target")
+require(color_targets[0] == "bgra8unorm", "graphics: color target must be bgra8unorm")
+
+graphics_wgsl = graphics_wgsl_path.read_text()
+require("@vertex" in graphics_wgsl, "graphics.wgsl must contain @vertex entrypoint")
+require("@fragment" in graphics_wgsl, "graphics.wgsl must contain @fragment entrypoint")
+
+draw = json.loads(draw_path.read_text())
+require(draw.get("index_format") == "uint32", "draw.json: index_format must be uint32")
+require(draw.get("instance_count") == 1, "draw.json: instance_count must be 1")
+require(draw.get("base_vertex") == 0, "draw.json: base_vertex must be 0")
+require(draw.get("first_index") == 0, "draw.json: first_index must be 0")
+
+require(vertex_positions_path.stat().st_size == 432, "graphics-vertex-positions.bin: expected 432 bytes")
+require(vertex_colors_path.stat().st_size == 432, "graphics-vertex-colors.bin: expected 432 bytes")
+require(indices_path.stat().st_size == 144, "graphics-indices.bin: expected 144 bytes")
+require(transform_path.stat().st_size == 256, "graphics-transform.bin: expected 256 bytes")
+
+runtime = (public / "src" / "webgpu-runtime.js").read_text()
+require("createGraphicsResources" in runtime, "runtime must export createGraphicsResources")
+require("runGraphicsFrame" in runtime, "runtime must export runGraphicsFrame")
+require("replaceDepthTextureOnResize" in runtime, "runtime must export replaceDepthTextureOnResize")
+require("onDeviceLost" in runtime, "runtime must export onDeviceLost")
+
+kernel_js = (public / "src" / "faber-kernel.js").read_text()
+require("loadFaberGraphicsPipeline" in kernel_js, "faber-kernel must export loadFaberGraphicsPipeline")
+
+print("graphics static contract check passed")
+print("graphics manual browser assertion: window.faberWebGpuGraphicsProof.submittedFrameCount > 0")
 PY
 
   run_product_boundary_check

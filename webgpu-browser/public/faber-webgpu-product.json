@@ -5,17 +5,29 @@
   "serve": "./scripta/webgpu-browser-proof serve",
   "artifacts": {
     "wgsl": "./generated/kernel.wgsl",
-    "reflection": "./generated/reflection.json"
+    "reflection": "./generated/reflection.json",
+    "graphicsWgsl": "./generated/graphics.wgsl",
+    "graphicsReflection": "./generated/graphics-reflection.json",
+    "vertexPositions": "./generated/graphics-vertex-positions.bin",
+    "vertexColors": "./generated/graphics-vertex-colors.bin",
+    "indices": "./generated/graphics-indices.bin",
+    "transform": "./generated/graphics-transform.bin",
+    "drawManifest": "./generated/draw.json"
   },
   "admission": {
     "fixture": "../fixtures/add-one.fab",
+    "graphicsFixture": "../../triga/exempla/triga-hello-voxel-shaders.fab",
     "input_value": 41.0,
     "expected_value": 42.0,
-    "state_path": "window.faberWebGpuProof"
+    "state_path": "window.faberWebGpuProof",
+    "graphics_state_path": "window.faberWebGpuGraphicsProof"
   },
   "success": {
     "ok": true,
     "value": 42.0
+  },
+  "graphicsSuccess": {
+    "submittedFrameCount": 1
   },
   "unsupported": {
     "artifact_fetch": "kind=artifact-fetch FaberKernelContractError",
@@ -27,6 +39,7 @@
     "product_boundary_check": "./public/src/product-boundary-check.mjs",
     "manual_browser": "http://127.0.0.1:8787/",
     "manual_assertion": "window.faberWebGpuProof.ok === true && window.faberWebGpuProof.value === 42",
-    "static_evidence_note": "check + product-boundary-check are non-GPU evidence; exact 42.0 readback requires a WebGPU-capable browser"
+    "graphics_manual_assertion": "window.faberWebGpuGraphicsProof.submittedFrameCount > 0",
+    "static_evidence_note": "check + product-boundary-check are non-GPU evidence; exact 42.0 readback and graphics frame submission require a WebGPU-capable browser"
   }
 }
