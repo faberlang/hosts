@@ -646,6 +646,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "host-native"
+version = "0.1.0"
+dependencies = [
+ "faber-runtime",
+ "host-kernel",
+]
+
+[[package]]
+name = "host-provider-contracts"
+version = "0.1.0"
+dependencies = [
+ "aleator",
+ "consolum",
+ "faber-runtime",
+ "host-kernel",
+ "processus",
+ "solum",
+ "tempus",
+]
+
+[[package]]
+name = "http"
+version = "0.1.0"
+dependencies = [
+ "faber-runtime",
+ "host-kernel",
+]
+
+[[package]]
 name = "hygiene-ratchet"
 version = "0.1.0"
 

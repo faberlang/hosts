@@ -1,0 +1,18 @@
+[package]
+name = "host-provider-contracts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lints.clippy]
+pedantic = "deny"
+
+[dev-dependencies]
+aleator = { path = "../aleator" }
+consolum = { path = "../consolum" }
+faber = { package = "faber-runtime", path = "../../../faber-runtime" }
+host-kernel = { path = "../host-kernel" }
+processus = { path = "../processus" }
+solum = { path = "../solum" }
+tempus = { path = "../tempus" }

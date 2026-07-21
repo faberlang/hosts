@@ -1,50 +1,53 @@
 # Faber hosts
 
-Platform and browser **host products** for Faber-produced artifacts.
+Platform host **products** and shared host **libraries** for Faber-produced artifacts.
 
-Radix compiles Faber and emits host ABI imports (`radix-host-abi`). This repo
-owns the runtimes that load those artifacts and supply capabilities.
+Radix compiles Faber and emits host ABI imports (`radix-host-abi`). This repo owns:
+
+1. **Libraries** — kernel, native adapter, capability providers  
+2. **Products** — platform/browser runtimes that load artifacts and supply capabilities
 
 ## Layout
 
 ```text
 hosts/
-  macos-arm64/       Cargo crate `faber-host-macos-arm64` (Wasm/component host proof)
-  webgpu-browser/    Browser WebGPU host product (static + JS; not a Cargo member)
-  scripta/           Host-local helpers (e.g. webgpu-browser-proof)
+  crates/
+    host-kernel/       package `host-kernel` — transport-neutral routing / manifests
+    host-native/       package `host-native` — bounded native HostDispatch adapter
+    aleator/ consolum/ http/ processus/ solum/ tempus/
+    provider-contracts/
+  macos-arm64/         product: Wasm/component host for macOS arm64
+  webgpu-browser/      product: browser WebGPU host (JS/static; not a Cargo member)
+  scripta/             host-local helpers
 ```
 
-Each host implementation is its own product directory. Shared libraries remain
-siblings under `faberlang/`:
+Sibling path deps (not in this repo):
 
 | Sibling | Role |
 | --- | --- |
 | `faber-runtime/` | Runtime types (`use faber::…`) |
-| `host-kernel-rs/` | Transport-neutral provider kernel |
-| `host-providers-rs/` | Capability providers |
-| `host-native-rs/` | Native `HostDispatch` adapter |
-| `radix/` | Compiler (ABI contract only; no host runtime) |
+| `radix/` | Compiler (ABI contract only) |
+| `faber/` | User CLI; embeds selected `hosts/crates/*` as core-support |
 
-## Build (macOS arm64 host)
-
-From this repo root (requires sibling checkouts for path deps):
+## Build
 
 ```bash
-cargo build -p faber-host-macos-arm64
+# From this repo root
+cargo test --workspace
 cargo test -p faber-host-macos-arm64
 cargo run -p faber-host-macos-arm64 -- manifest
-```
 
-## WebGPU browser host
-
-```bash
-./scripta/webgpu-browser-proof generate   # needs sibling ../radix
+# Browser host (needs sibling ../radix)
 ./scripta/webgpu-browser-proof check
-./scripta/webgpu-browser-proof serve
 ```
 
-## What does not live here
+Library crates use **explicit** path deps so Faber's embedded core-support archive
+can materialize individual crates without shipping this whole workspace.
 
-- Compiler host ABI table → `radix/crates/radix-host-abi`
-- Norma source → `norma/`
-- Exempla e2e harness → `faber/crates/exempla`
+## Former repo homes
+
+| Old sibling | New path |
+| --- | --- |
+| `host-kernel-rs` | `crates/host-kernel` |
+| `host-native-rs` | `crates/host-native` |
+| `host-providers-rs` | `crates/{aleator,consolum,…}` |

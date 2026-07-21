@@ -1,0 +1,17 @@
+[package]
+name = "host-native"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded native Faber host dispatch adapter"
+license = "MIT"
+readme = "README.md"
+
+[lints.clippy]
+pedantic = "deny"
+
+[dependencies]
+faber = { package = "faber-runtime", path = "../../../faber-runtime" }
+host-kernel = { path = "../host-kernel" }
+
+[dev-dependencies]
+faber = { package = "faber-runtime", path = "../../../faber-runtime", features = ["test-support"] }

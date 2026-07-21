@@ -1,0 +1,19 @@
+{
+  "manifest_version": 1,
+  "provider": "processus",
+  "owner": "faberlang",
+  "prefixes": ["processus"],
+  "calls": [
+    {"route": "processus:exsequi", "summary": "Execute a shell command and return stdout.", "opener": "textus", "result": "textus"},
+    {"route": "processus:exsequetur", "summary": "Execute a shell command asynchronously.", "opener": "textus", "result": "textus"},
+    {"route": "processus:dimitte", "summary": "Spawn a detached process and return its pid.", "opener": "lista<textus>", "result": "numerus"},
+    {"route": "processus:lege", "summary": "Read an environment variable.", "opener": "textus", "result": "textus"},
+    {"route": "processus:scribe", "summary": "Write an environment variable.", "opener": "lista<textus>", "result": "vacuum"},
+    {"route": "processus:sedes", "summary": "Return the current working directory.", "opener": "vacuum", "result": "textus"},
+    {"route": "processus:muta", "summary": "Change the current working directory.", "opener": "textus", "result": "vacuum"},
+    {"route": "processus:identitas", "summary": "Return the process id.", "opener": "vacuum", "result": "numerus"},
+    {"route": "processus:argumenta", "summary": "Return host-provided program arguments.", "opener": "vacuum", "result": "lista<textus>"},
+    {"route": "processus:captura", "summary": "Execute argv and capture status and output.", "opener": "lista<textus>", "result": "valor"}
+  ],
+  "native_dependencies": []
+}

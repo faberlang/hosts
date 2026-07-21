@@ -1,8 +1,19 @@
 [workspace]
 members = [
+    "crates/host-kernel",
+    "crates/host-native",
+    "crates/aleator",
+    "crates/consolum",
+    "crates/http",
+    "crates/processus",
+    "crates/provider-contracts",
+    "crates/solum",
+    "crates/tempus",
     "macos-arm64",
 ]
 resolver = "2"
 
-# Non-Cargo host products live beside members (e.g. webgpu-browser/).
-# Each platform/runtime host is one product directory under this repo.
+# Non-Cargo host product: webgpu-browser/
+# Library crates use explicit path deps (not workspace inheritance) so Faber's
+# embedded core-support archive can path-depend on individual crates without
+# shipping this workspace root or product hosts.

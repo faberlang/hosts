@@ -1,0 +1,13 @@
+{
+  "manifest_version": 1,
+  "provider": "http",
+  "owner": "faberlang",
+  "prefixes": ["http"],
+  "calls": [
+    {"route": "http:listen", "summary": "Bind a loopback HTTP/1.1 listener and return its handle.", "opener": "lista<valor>", "result": "numerus"},
+    {"route": "http:accept", "summary": "Accept one bounded HTTP/1.1 request and return its carrier.", "opener": "numerus", "result": "valor"},
+    {"route": "http:respond", "summary": "Write one HTTP response for a pending request.", "opener": "lista<valor>", "result": "vacuum"},
+    {"route": "http:stop", "summary": "Stop a loopback HTTP listener and close pending requests.", "opener": "numerus", "result": "vacuum"}
+  ],
+  "native_dependencies": []
+}

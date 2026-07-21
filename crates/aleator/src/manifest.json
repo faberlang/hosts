@@ -1,0 +1,14 @@
+{
+  "manifest_version": 1,
+  "provider": "aleator",
+  "owner": "faberlang",
+  "prefixes": ["aleator"],
+  "calls": [
+    {"route": "aleator:fractum", "summary": "Return a pseudo-random fraction.", "opener": "vacuum", "result": "fractus"},
+    {"route": "aleator:sortire", "summary": "Return an integer in an inclusive range.", "opener": "lista<numerus>", "result": "numerus"},
+    {"route": "aleator:octetos", "summary": "Return cryptographic random bytes.", "opener": "numerus", "result": "octeti"},
+    {"route": "aleator:uuid", "summary": "Return a UUID v4 string.", "opener": "vacuum", "result": "textus"},
+    {"route": "aleator:semina", "summary": "Seed pseudo-random generation.", "opener": "numerus", "result": "vacuum"}
+  ],
+  "native_dependencies": []
+}

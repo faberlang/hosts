@@ -1,0 +1,12 @@
+[package]
+name = "tempus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lints.clippy]
+pedantic = "deny"
+
+[dependencies]
+faber = { package = "faber-runtime", path = "../../../faber-runtime" }
+host-kernel = { path = "../host-kernel" }

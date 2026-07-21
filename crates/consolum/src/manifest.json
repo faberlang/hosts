@@ -1,0 +1,25 @@
+{
+  "manifest_version": 1,
+  "provider": "consolum",
+  "owner": "faberlang",
+  "prefixes": ["consolum"],
+  "calls": [
+    {"route": "consolum:hauri", "summary": "Read bytes from stdin.", "opener": "sponte<numerus>", "result": "octeti"},
+    {"route": "consolum:hauriet", "summary": "Read bytes from stdin asynchronously.", "opener": "sponte<numerus>", "result": "octeti"},
+    {"route": "consolum:lege", "summary": "Read one text line from stdin.", "opener": "vacuum", "result": "textus"},
+    {"route": "consolum:leget", "summary": "Read one text line from stdin asynchronously.", "opener": "vacuum", "result": "textus"},
+    {"route": "consolum:funde", "summary": "Write bytes to stdout.", "opener": "octeti", "result": "vacuum"},
+    {"route": "consolum:scribe", "summary": "Write a text line to stdout.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:scribet", "summary": "Write a text line to stdout asynchronously.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:dic", "summary": "Write text to stdout without a newline.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:dicet", "summary": "Write text to stdout without a newline asynchronously.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:mone", "summary": "Write a warning line to stderr.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:monet", "summary": "Write a warning line to stderr asynchronously.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:vide", "summary": "Write a debug line to stderr.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:videbit", "summary": "Write a debug line to stderr asynchronously.", "opener": "textus", "result": "vacuum"},
+    {"route": "consolum:audit", "summary": "Report whether stdin is a terminal.", "opener": "vacuum", "result": "bivalens"},
+    {"route": "consolum:loquitur", "summary": "Report whether stdout is a terminal.", "opener": "vacuum", "result": "bivalens"},
+    {"route": "consolum:admonet", "summary": "Report whether stderr is a terminal.", "opener": "vacuum", "result": "bivalens"}
+  ],
+  "native_dependencies": []
+}
