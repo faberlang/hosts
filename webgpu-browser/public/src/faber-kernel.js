@@ -350,6 +350,35 @@ function validateRolePolicy(object, path) {
   expectValue(object.buffer_type, "storage", `${path}.buffer_type`);
 }
 
+/**
+ * Validate that fragment-declared bind groups are consistent with the
+ * vertex-derived pipeline layout. Reject divergence: a fragment bind group
+ * with a group index absent from the vertex bind groups, or a fragment
+ * binding entry absent from the corresponding vertex bind group.
+ */
+function validateStageBindGroupCohesion(fragmentBindGroups, vertexBindGroups) {
+  for (const fg of fragmentBindGroups) {
+    const vg = vertexBindGroups.find((candidate) => candidate.group === fg.group);
+    if (!vg) {
+      throw new FaberKernelContractError(
+        "fragment.launch.webgpu_adapter.bind_group_descriptors",
+        `fragment declares bind group ${fg.group} which is not in vertex pipeline layout`,
+        "reflection",
+      );
+    }
+    for (const fe of fg.entries) {
+      const ve = vg.entries.find((candidate) => candidate.bindingIndex === fe.bindingIndex);
+      if (!ve) {
+        throw new FaberKernelContractError(
+          `fragment.launch.webgpu_adapter.bind_group_descriptors[*].entries`,
+          `fragment declares binding index ${fe.bindingIndex} (binding=${fe.binding}) in group ${fg.group} which is not in vertex bind group`,
+          "reflection",
+        );
+      }
+    }
+  }
+}
+
 // ── Graphics pipeline admission ───────────────────────────────────────────
 
 /**
@@ -392,6 +421,13 @@ export function loadFaberGraphicsPipeline({ wgsl, reflection, drawManifest }) {
   const bindGroups = parseBindGroups(vertexAdapter);
   validateDescriptorIndexes(vertexAdapter, bindGroupLayouts, bindGroups, pipelineLayout);
   validateLayoutAndGroupEntries(bindGroupLayouts, bindGroups);
+
+  const fragmentAdapter = expectObject(
+    fragmentKernel.launch.webgpu_adapter,
+    "fragment.launch.webgpu_adapter",
+  );
+  const fragmentBindGroups = parseBindGroups(fragmentAdapter);
+  validateStageBindGroupCohesion(fragmentBindGroups, bindGroups);
 
   const pipeline = parsePipelineBlock(document.pipeline);
 

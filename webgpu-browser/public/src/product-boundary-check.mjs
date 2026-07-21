@@ -364,6 +364,29 @@ async function main() {
     loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
   });
 
+  // Fragment bind group divergence: fragment declares bind group not in vertex pipeline layout
+  await expectReject("graphics: fragment bind group divergence (extra group)", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels[1].launch.webgpu_adapter.bind_group_descriptor_count = 2;
+    bad.kernels[1].launch.webgpu_adapter.bind_group_descriptor_indexes = [0, 1];
+    bad.kernels[1].launch.webgpu_adapter.bind_group_descriptor_index_count = 2;
+    bad.kernels[1].launch.webgpu_adapter.bind_group_descriptors.push({
+      bind_group_index: 1, group: 1,
+      entry_indexes: [0], entry_index_count: 1, entry_count: 1,
+      entries: [{ binding: 0, kind: "storage-buffer", role: "input", access: "read", shader_access: "read", shader_visibility: "fragment", element_layout: "f32", element_byte_width: 4, element_count: 64, resource_index: 1, binding_index: 0, buffer_type: "read-only-storage", buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, min_binding_size: 256, has_dynamic_offset: false, source_local: null, source_name: "extra" }],
+    });
+    // Also add the corresponding bind_group_layout_descriptor so parseBindGroups doesn't fail first
+    bad.kernels[1].launch.webgpu_adapter.bind_group_layout_descriptor_count = 2;
+    bad.kernels[1].launch.webgpu_adapter.bind_group_layout_descriptor_indexes = [0, 1];
+    bad.kernels[1].launch.webgpu_adapter.bind_group_layout_descriptor_index_count = 2;
+    bad.kernels[1].launch.webgpu_adapter.bind_group_layout_descriptors.push({
+      bind_group_index: 1, group: 1,
+      layout_entry_indexes: [0], layout_entry_index_count: 1, entry_count: 1,
+      entries: [{ binding: 0, binding_index: 0, buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, visibility: "fragment", buffer_type: "read-only-storage", has_dynamic_offset: false, min_binding_size: 256, resource_index: 1, layout_entry_index: 0, source_local: null, source_name: "extra" }],
+    });
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
   // ── Real generated graphics reflection admission ──────────────────────
 
   // Load real generated files and validate through loadFaberGraphicsPipeline
@@ -407,7 +430,7 @@ async function main() {
 
   console.log("product-boundary-check passed");
   console.log("kinds covered: artifact-fetch, reflection, webgpu, device-lost");
-  console.log("graphics admission: valid descriptor, missing kernel, wrong stage, missing pipeline, empty vertex inputs, mismatched layouts, malformed draw manifest, bad topology, bad color target, missing depth_stencil");
+  console.log("graphics admission: valid descriptor, missing kernel, wrong stage, missing pipeline, empty vertex inputs, mismatched layouts, malformed draw manifest, bad topology, bad color target, missing depth_stencil, fragment bind group divergence");
   console.log("graphics runtime: all exports verified, onDeviceLost callback, compute re-verified");
   console.log(
     "manual browser still required for: window.faberWebGpuProof.ok === true && value === 42",
