@@ -1,5 +1,19 @@
 /** @typedef {"artifact-fetch" | "reflection" | "webgpu" | "product"} FaberKernelErrorKind */
 
+const VISIBILITY_VALUES = ["compute", "vertex", "fragment"];
+const VERTEX_FORMATS = [
+  "float32", "float32x2", "float32x3", "float32x4",
+  "uint32", "uint32x2", "uint32x3", "uint32x4",
+  "sint32", "sint32x2", "sint32x3", "sint32x4",
+];
+const COLOR_TARGET_FORMATS = ["rgba8unorm", "bgra8unorm", "bgra8unorm-srgb"];
+const PRIMITIVE_TOPOLOGIES = ["triangle-list", "line-list", "point-list"];
+const DEPTH_COMPARE_VALUES = [
+  "never", "less", "equal", "less-equal",
+  "greater", "not-equal", "greater-equal", "always",
+];
+const INDEX_FORMATS = ["uint16", "uint32"];
+
 export class FaberKernelContractError extends Error {
   /**
    * @param {string} path
@@ -159,7 +173,7 @@ function parseBindGroupLayouts(adapter) {
 
 function parseLayoutEntry(entry, path) {
   const object = expectObject(entry, path);
-  expectValue(object.visibility, "compute", `${path}.visibility`);
+  expectOneOf(object.visibility, VISIBILITY_VALUES, `${path}.visibility`);
   expectValue(object.has_dynamic_offset, false, `${path}.has_dynamic_offset`);
   expectOneOf(object.buffer_type, ["read-only-storage", "storage"], `${path}.buffer_type`);
 
@@ -208,7 +222,7 @@ function parseBindGroupEntry(entry, path) {
   expectOneOf(object.role, ["input", "output"], `${path}.role`);
   expectOneOf(object.access, ["read", "write"], `${path}.access`);
   expectOneOf(object.shader_access, ["read", "read_write"], `${path}.shader_access`);
-  expectValue(object.shader_visibility, "compute", `${path}.shader_visibility`);
+  expectOneOf(object.shader_visibility, VISIBILITY_VALUES, `${path}.shader_visibility`);
   expectOneOf(object.buffer_type, ["read-only-storage", "storage"], `${path}.buffer_type`);
   expectValue(object.element_layout, "f32", `${path}.element_layout`);
   expectValue(object.element_byte_width, 4, `${path}.element_byte_width`);
@@ -333,6 +347,260 @@ function validateRolePolicy(object, path) {
   expectValue(object.access, "write", `${path}.access`);
   expectValue(object.shader_access, "read_write", `${path}.shader_access`);
   expectValue(object.buffer_type, "storage", `${path}.buffer_type`);
+}
+
+// ── Graphics pipeline admission ───────────────────────────────────────────
+
+/**
+ * Admit a graphics pipeline descriptor from HV-01 reflection, WGSL source,
+ * and a draw manifest. Reuses the shared bind-group parser from the compute
+ * path with generalized visibility (vertex / fragment).
+ *
+ * Returns a frozen descriptor ready for WebGPU effects (HV-02B).
+ */
+export function loadFaberGraphicsPipeline({ wgsl, reflection, drawManifest }) {
+  const document = parseReflection(reflection);
+  expectValue(document.schema_version, 1, "reflection.schema_version");
+  expectValue(document.target, "wgsl-text", "reflection.target");
+
+  const kernels = expectArray(document.kernels, "reflection.kernels");
+  if (kernels.length !== 2) {
+    throw new FaberKernelContractError(
+      "reflection.kernels",
+      `expected two kernels (vertex + fragment), got ${kernels.length}`,
+    );
+  }
+
+  const vertexKernel = kernels.find((k) => k.shader_stage === "vertex");
+  const fragmentKernel = kernels.find((k) => k.shader_stage === "fragment");
+  if (!vertexKernel) {
+    throw new FaberKernelContractError("reflection.kernels", "missing vertex kernel");
+  }
+  if (!fragmentKernel) {
+    throw new FaberKernelContractError("reflection.kernels", "missing fragment kernel");
+  }
+
+  const vertexInputs = parseVertexInputs(vertexKernel);
+
+  const vertexLaunch = expectObject(vertexKernel.launch, "vertex.launch");
+  const vertexAdapter = expectObject(vertexLaunch.webgpu_adapter, "vertex.launch.webgpu_adapter");
+  const vertexBufferLayouts = parseVertexBufferLayouts(vertexAdapter, vertexInputs);
+
+  const pipelineLayout = parsePipelineLayout(vertexAdapter.pipeline_layout_descriptor);
+  const bindGroupLayouts = parseBindGroupLayouts(vertexAdapter);
+  const bindGroups = parseBindGroups(vertexAdapter);
+  validateDescriptorIndexes(vertexAdapter, bindGroupLayouts, bindGroups, pipelineLayout);
+  validateLayoutAndGroupEntries(bindGroupLayouts, bindGroups);
+
+  const pipeline = parsePipelineBlock(document.pipeline);
+
+  const draw = parseDrawManifest(drawManifest, pipeline.vertexCount);
+
+  expectString(fragmentKernel.entry_name, "fragment.entry_name");
+  const fragmentLaunch = expectObject(fragmentKernel.launch, "fragment.launch");
+  expectValue(fragmentLaunch.shader_stage, "fragment", "fragment.launch.shader_stage");
+
+  return Object.freeze({
+    wgsl: expectString(wgsl, "wgsl"),
+    schemaVersion: document.schema_version,
+    target: document.target,
+    kernels: Object.freeze([
+      Object.freeze({
+        entryName: expectString(vertexKernel.entry_name, "vertex.entry_name"),
+        shaderStage: "vertex",
+        vertexInputs,
+        vertexBufferLayouts,
+      }),
+      Object.freeze({
+        entryName: expectString(fragmentKernel.entry_name, "fragment.entry_name"),
+        shaderStage: "fragment",
+      }),
+    ]),
+    pipeline,
+    pipelineLayout,
+    bindGroupLayouts,
+    bindGroups,
+    draw,
+    inputBindings: bindGroups.flatMap((group) =>
+      group.entries.filter((entry) => entry.role === "input"),
+    ),
+    outputBindings: bindGroups.flatMap((group) =>
+      group.entries.filter((entry) => entry.role === "output"),
+    ),
+  });
+}
+
+function parseVertexInputs(kernel) {
+  const count = expectNonNegativeInteger(kernel.vertex_input_count, "kernel.vertex_input_count");
+  const inputs = expectArray(kernel.vertex_inputs, "kernel.vertex_inputs");
+  expectCount(count, inputs.length, "kernel.vertex_input_count");
+
+  if (inputs.length === 0) {
+    throw new FaberKernelContractError(
+      "kernel.vertex_inputs",
+      "vertex kernel requires at least one vertex input",
+    );
+  }
+
+  return Object.freeze(
+    inputs.map((input, index) => {
+      const path = `kernel.vertex_inputs[${index}]`;
+      const obj = expectObject(input, path);
+      expectOneOf(obj.format, VERTEX_FORMATS, `${path}.format`);
+      expectOneOf(obj.step_mode, ["vertex", "instance"], `${path}.step_mode`);
+      return Object.freeze({
+        sourceName: expectString(obj.source_name, `${path}.source_name`),
+        location: expectNonNegativeInteger(obj.location, `${path}.location`),
+        format: obj.format,
+        stepMode: obj.step_mode,
+        offsetBytes: expectNonNegativeInteger(obj.offset_bytes, `${path}.offset_bytes`),
+        strideBytes: expectPositiveInteger(obj.stride_bytes, `${path}.stride_bytes`),
+      });
+    }),
+  );
+}
+
+function parseVertexBufferLayouts(adapter, vertexInputs) {
+  const count = expectNonNegativeInteger(
+    adapter.vertex_buffer_layout_descriptor_count,
+    "webgpu_adapter.vertex_buffer_layout_descriptor_count",
+  );
+  const layouts = expectArray(
+    adapter.vertex_buffer_layout_descriptors,
+    "webgpu_adapter.vertex_buffer_layout_descriptors",
+  );
+  expectCount(count, layouts.length, "webgpu_adapter.vertex_buffer_layout_descriptor_count");
+
+  if (layouts.length !== vertexInputs.length) {
+    throw new FaberKernelContractError(
+      "webgpu_adapter.vertex_buffer_layout_descriptors",
+      `expected ${vertexInputs.length} vertex buffer layouts, got ${layouts.length}`,
+    );
+  }
+
+  return Object.freeze(
+    layouts.map((layout, index) => {
+      const path = `webgpu_adapter.vertex_buffer_layout_descriptors[${index}]`;
+      const obj = expectObject(layout, path);
+      const input = vertexInputs[index];
+
+      expectValue(obj.array_stride, input.strideBytes, `${path}.array_stride`);
+      expectOneOf(obj.step_mode, ["vertex", "instance"], `${path}.step_mode`);
+      expectValue(obj.step_mode, input.stepMode, `${path}.step_mode`);
+
+      const attributes = expectArray(obj.attributes, `${path}.attributes`);
+      expectCount(
+        obj.attribute_count,
+        attributes.length,
+        `${path}.attribute_count`,
+      );
+
+      if (attributes.length !== 1) {
+        throw new FaberKernelContractError(
+          `${path}.attributes`,
+          `expected one attribute per buffer layout, got ${attributes.length}`,
+        );
+      }
+
+      const attr = expectObject(attributes[0], `${path}.attributes[0]`);
+      expectValue(attr.shader_location, input.location, `${path}.attributes[0].shader_location`);
+      expectValue(attr.format, input.format, `${path}.attributes[0].format`);
+      expectValue(attr.offset, input.offsetBytes, `${path}.attributes[0].offset`);
+      expectValue(attr.source_name, input.sourceName, `${path}.attributes[0].source_name`);
+
+      return Object.freeze({
+        bufferIndex: expectNonNegativeInteger(obj.buffer_index, `${path}.buffer_index`),
+        arrayStride: obj.array_stride,
+        stepMode: obj.step_mode,
+        attributes: Object.freeze(
+          attributes.map((a) =>
+            Object.freeze({
+              shaderLocation: a.shader_location,
+              format: a.format,
+              offset: a.offset,
+              sourceName: a.source_name,
+            }),
+          ),
+        ),
+      });
+    }),
+  );
+}
+
+function parsePipelineBlock(pipeline) {
+  const obj = expectObject(pipeline, "reflection.pipeline");
+
+  const colorTargetFormats = expectArray(
+    obj.color_target_formats,
+    "pipeline.color_target_formats",
+  );
+  if (colorTargetFormats.length === 0) {
+    throw new FaberKernelContractError(
+      "pipeline.color_target_formats",
+      "expected at least one color target format",
+    );
+  }
+  colorTargetFormats.forEach((fmt, i) => {
+    expectOneOf(fmt, COLOR_TARGET_FORMATS, `pipeline.color_target_formats[${i}]`);
+  });
+
+  expectOneOf(
+    obj.primitive_topology,
+    PRIMITIVE_TOPOLOGIES,
+    "pipeline.primitive_topology",
+  );
+  const vertexCount = expectPositiveInteger(obj.vertex_count, "pipeline.vertex_count");
+
+  const depthStencil = expectObject(obj.depth_stencil, "pipeline.depth_stencil");
+  if (typeof depthStencil.depth_write_enabled !== "boolean") {
+    throw new FaberKernelContractError(
+      "pipeline.depth_stencil.depth_write_enabled",
+      "expected boolean",
+    );
+  }
+  expectOneOf(
+    depthStencil.depth_compare,
+    DEPTH_COMPARE_VALUES,
+    "pipeline.depth_stencil.depth_compare",
+  );
+
+  return Object.freeze({
+    colorTargetFormats: [...colorTargetFormats],
+    primitiveTopology: obj.primitive_topology,
+    vertexCount,
+    depthStencil: Object.freeze({
+      depthWriteEnabled: depthStencil.depth_write_enabled,
+      depthCompare: depthStencil.depth_compare,
+    }),
+  });
+}
+
+function parseDrawManifest(manifest, pipelineVertexCount) {
+  const obj = expectObject(manifest, "drawManifest");
+
+  const indexFormat = expectString(obj.index_format, "drawManifest.index_format");
+  expectOneOf(indexFormat, INDEX_FORMATS, "drawManifest.index_format");
+
+  const instanceCount = expectPositiveInteger(
+    obj.instance_count,
+    "drawManifest.instance_count",
+  );
+  const baseVertex = expectNonNegativeInteger(obj.base_vertex, "drawManifest.base_vertex");
+  const firstIndex = expectNonNegativeInteger(obj.first_index, "drawManifest.first_index");
+
+  if (baseVertex >= pipelineVertexCount) {
+    throw new FaberKernelContractError(
+      "drawManifest.base_vertex",
+      `base_vertex ${baseVertex} must be less than pipeline vertex_count ${pipelineVertexCount}`,
+    );
+  }
+
+  return Object.freeze({
+    indexFormat,
+    instanceCount,
+    baseVertex,
+    firstIndex,
+  });
 }
 
 function expectObject(value, path) {

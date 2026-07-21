@@ -19,10 +19,122 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(here, "..");
 const generatedDir = path.join(publicDir, "generated");
 
-const { FaberKernelContractError, fetchFaberKernelArtifacts, loadFaberKernel } = await import(
+const { FaberKernelContractError, fetchFaberKernelArtifacts, loadFaberKernel, loadFaberGraphicsPipeline } = await import(
   pathToFileURL(path.join(here, "faber-kernel.js")).href
 );
 const { acquireWebGpuDevice } = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+
+// ── Graphics test fixtures ────────────────────────────────────────────────
+
+function graphicsReflection() {
+  return {
+    schema_version: 1,
+    target: "wgsl-text",
+    kernels: [
+      {
+        entry_name: "hello_voxel_vertex",
+        shader_stage: "vertex",
+        vertex_input_count: 2,
+        vertex_inputs: [
+          { source_name: "position", location: 0, format: "float32x3", step_mode: "vertex", offset_bytes: 0, stride_bytes: 12 },
+          { source_name: "color", location: 1, format: "float32x3", step_mode: "vertex", offset_bytes: 0, stride_bytes: 12 },
+        ],
+        resources: [
+          { group: 0, binding: 0, kind: "storage-buffer", role: "input", access: "read", element_layout: "f32", element_byte_width: 4, element_count: 64, buffer_byte_len: 256, source_local: null, source_name: "transform" },
+        ],
+        launch: {
+          entry_name: "hello_voxel_vertex",
+          shader_stage: "vertex",
+          webgpu_adapter: {
+            pipeline_layout_descriptor: { bind_group_layout_count: 1, bind_group_layout_indexes: [0], bind_group_layout_index_count: 1 },
+            bind_group_layout_descriptor_count: 1,
+            bind_group_layout_descriptor_indexes: [0],
+            bind_group_layout_descriptor_index_count: 1,
+            bind_group_layout_descriptors: [{
+              bind_group_index: 0, group: 0,
+              layout_entry_indexes: [0], layout_entry_index_count: 1, entry_count: 1,
+              entries: [{ binding: 0, binding_index: 0, buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, visibility: "vertex", buffer_type: "read-only-storage", has_dynamic_offset: false, min_binding_size: 256, resource_index: 0, layout_entry_index: 0, source_local: null, source_name: "transform" }],
+            }],
+            bind_group_descriptor_count: 1,
+            bind_group_descriptor_indexes: [0],
+            bind_group_descriptor_index_count: 1,
+            bind_group_descriptors: [{
+              bind_group_index: 0, group: 0,
+              entry_indexes: [0], entry_index_count: 1, entry_count: 1,
+              entries: [{ binding: 0, kind: "storage-buffer", role: "input", access: "read", shader_access: "read", shader_visibility: "vertex", element_layout: "f32", element_byte_width: 4, element_count: 64, resource_index: 0, binding_index: 0, buffer_type: "read-only-storage", buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, min_binding_size: 256, has_dynamic_offset: false, source_local: null, source_name: "transform" }],
+            }],
+            vertex_buffer_layout_descriptor_count: 2,
+            vertex_buffer_layout_descriptor_indexes: [0, 1],
+            vertex_buffer_layout_descriptor_index_count: 2,
+            vertex_buffer_layout_descriptors: [
+              { buffer_index: 0, array_stride: 12, step_mode: "vertex", attribute_indexes: [0], attribute_index_count: 1, attribute_count: 1, attributes: [{ attribute_index: 0, shader_location: 0, format: "float32x3", offset: 0, source_name: "position" }], source_name: "position" },
+              { buffer_index: 1, array_stride: 12, step_mode: "vertex", attribute_indexes: [0], attribute_index_count: 1, attribute_count: 1, attributes: [{ attribute_index: 0, shader_location: 1, format: "float32x3", offset: 0, source_name: "color" }], source_name: "color" },
+            ],
+            dispatch_workgroup_dimension_count: 3,
+            dispatch_workgroups: { x: 1, y: 1, z: 1 },
+          },
+        },
+      },
+      {
+        entry_name: "hello_voxel_fragment",
+        shader_stage: "fragment",
+        vertex_input_count: 0,
+        vertex_inputs: [],
+        resources: [],
+        launch: {
+          entry_name: "hello_voxel_fragment",
+          shader_stage: "fragment",
+          webgpu_adapter: {
+            pipeline_layout_descriptor: { bind_group_layout_count: 1, bind_group_layout_indexes: [0], bind_group_layout_index_count: 1 },
+            bind_group_layout_descriptor_count: 1,
+            bind_group_layout_descriptor_indexes: [0],
+            bind_group_layout_descriptor_index_count: 1,
+            bind_group_layout_descriptors: [{
+              bind_group_index: 0, group: 0,
+              layout_entry_indexes: [0], layout_entry_index_count: 1, entry_count: 1,
+              entries: [{ binding: 0, binding_index: 0, buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, visibility: "fragment", buffer_type: "read-only-storage", has_dynamic_offset: false, min_binding_size: 256, resource_index: 0, layout_entry_index: 0, source_local: null, source_name: "transform" }],
+            }],
+            bind_group_descriptor_count: 1,
+            bind_group_descriptor_indexes: [0],
+            bind_group_descriptor_index_count: 1,
+            bind_group_descriptors: [{
+              bind_group_index: 0, group: 0,
+              entry_indexes: [0], entry_index_count: 1, entry_count: 1,
+              entries: [{ binding: 0, kind: "storage-buffer", role: "input", access: "read", shader_access: "read", shader_visibility: "fragment", element_layout: "f32", element_byte_width: 4, element_count: 64, resource_index: 0, binding_index: 0, buffer_type: "read-only-storage", buffer_byte_len: 256, buffer_byte_offset: 0, binding_byte_len: 256, min_binding_size: 256, has_dynamic_offset: false, source_local: null, source_name: "transform" }],
+            }],
+            vertex_buffer_layout_descriptor_count: 0,
+            vertex_buffer_layout_descriptor_indexes: [],
+            vertex_buffer_layout_descriptor_index_count: 0,
+            vertex_buffer_layout_descriptors: [],
+            dispatch_workgroup_dimension_count: 3,
+            dispatch_workgroups: { x: 1, y: 1, z: 1 },
+          },
+        },
+      },
+    ],
+    pipeline: {
+      color_target_formats: ["bgra8unorm"],
+      primitive_topology: "triangle-list",
+      vertex_count: 36,
+      depth_stencil: {
+        depth_write_enabled: true,
+        depth_compare: "less",
+        stencil_read_mask: 4294967295,
+        stencil_write_mask: 4294967295,
+        stencil_front: { compare: "always", fail_op: "keep", depth_fail_op: "keep", pass_op: "keep" },
+        stencil_back: { compare: "always", fail_op: "keep", depth_fail_op: "keep", pass_op: "keep" },
+      },
+    },
+  };
+}
+
+function graphicsWgsl() {
+  return "@vertex fn hello_voxel_vertex() -> @builtin(position) vec4<f32> {}\n@fragment fn hello_voxel_fragment() -> @location(0) vec4<f32> {}";
+}
+
+function drawManifest() {
+  return { index_format: "uint32", instance_count: 1, base_vertex: 0, first_index: 0 };
+}
 
 function fail(message) {
   console.error(`product-boundary-check failed: ${message}`);
@@ -95,8 +207,124 @@ async function main() {
     }),
   );
 
+  // ── Graphics admission tests ──────────────────────────────────────────
+
+  const gfxWgsl = graphicsWgsl();
+  const gfxRefl = graphicsReflection();
+  const draw = drawManifest();
+
+  // Happy path: valid graphics descriptor
+  {
+    const desc = loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: draw });
+    require(desc.kernels.length === 2, "graphics: expected two kernels");
+    require(desc.kernels[0].shaderStage === "vertex", "graphics: first kernel must be vertex");
+    require(desc.kernels[1].shaderStage === "fragment", "graphics: second kernel must be fragment");
+    require(desc.kernels[0].vertexInputs.length === 2, "graphics: expected two vertex inputs");
+    require(desc.pipeline.colorTargetFormats[0] === "bgra8unorm", "graphics: color target must be bgra8unorm");
+    require(desc.pipeline.primitiveTopology === "triangle-list", "graphics: topology must be triangle-list");
+    require(desc.pipeline.vertexCount === 36, "graphics: vertex count must be 36");
+    require(desc.pipeline.depthStencil.depthWriteEnabled === true, "graphics: depth write must be enabled");
+    require(desc.pipeline.depthStencil.depthCompare === "less", "graphics: depth compare must be less");
+    require(desc.draw.indexFormat === "uint32", "graphics: index format must be uint32");
+    require(desc.draw.instanceCount === 1, "graphics: instance count must be 1");
+    require(desc.draw.baseVertex === 0, "graphics: base vertex must be 0");
+    require(desc.draw.firstIndex === 0, "graphics: first index must be 0");
+    require(desc.inputBindings.length === 1, "graphics: expected one input binding");
+  }
+
+  // Missing vertex kernel
+  await expectReject("graphics: missing vertex kernel", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels[0].shader_stage = "compute";
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Missing fragment kernel
+  await expectReject("graphics: missing fragment kernel", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels[1].shader_stage = "compute";
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Wrong kernel count (only one kernel)
+  await expectReject("graphics: wrong kernel count", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels = [bad.kernels[0]];
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Missing pipeline block
+  await expectReject("graphics: missing pipeline", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    delete bad.pipeline;
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Empty vertex inputs
+  await expectReject("graphics: empty vertex inputs", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels[0].vertex_inputs = [];
+    bad.kernels[0].vertex_input_count = 0;
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Mismatched vertex buffer layouts
+  await expectReject("graphics: mismatched vertex buffer layouts", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.kernels[0].launch.webgpu_adapter.vertex_buffer_layout_descriptors = [];
+    bad.kernels[0].launch.webgpu_adapter.vertex_buffer_layout_descriptor_count = 0;
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Malformed draw manifest (bad index_format)
+  await expectReject("graphics: bad index format", "reflection", () => {
+    const badDraw = { ...draw, index_format: "uint8" };
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: badDraw });
+  });
+
+  // Malformed draw manifest (base_vertex >= vertex_count)
+  await expectReject("graphics: base_vertex out of range", "reflection", () => {
+    const badDraw = { ...draw, base_vertex: 36 };
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: badDraw });
+  });
+
+  // Malformed draw manifest (missing instance_count)
+  await expectReject("graphics: missing instance count", "reflection", () => {
+    const badDraw = { index_format: "uint32", first_index: 0, base_vertex: 0 };
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: badDraw });
+  });
+
+  // Bad primitive topology
+  await expectReject("graphics: bad primitive topology", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.pipeline.primitive_topology = "triangle-strip";
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Bad color target format
+  await expectReject("graphics: bad color target", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    bad.pipeline.color_target_formats = ["rgba16float"];
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Missing depth_stencil
+  await expectReject("graphics: missing depth_stencil", "reflection", () => {
+    const bad = structuredClone(gfxRefl);
+    delete bad.pipeline.depth_stencil;
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
+  });
+
+  // Compute admission unchanged (re-verify after graphics additions)
+  {
+    const kernel = loadFaberKernel({ wgsl, reflection });
+    require(kernel.entryName === "add_one", "compute re-verify: kernel entry must be add_one");
+    require(kernel.inputBindings.length === 1, "compute re-verify: expected one input binding");
+  }
+
   console.log("product-boundary-check passed");
   console.log("kinds covered: artifact-fetch, reflection, webgpu");
+  console.log("graphics admission: valid descriptor, missing kernel, wrong stage, missing pipeline, empty vertex inputs, mismatched layouts, malformed draw manifest, bad topology, bad color target, missing depth_stencil");
   console.log(
     "manual browser still required for: window.faberWebGpuProof.ok === true && value === 42",
   );
