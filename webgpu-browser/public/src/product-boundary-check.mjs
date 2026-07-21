@@ -30,6 +30,11 @@ const {
   runGraphicsFrame,
   replaceDepthTextureOnResize,
   onDeviceLost,
+  createChunkGraphicsResources,
+  applyChunkResourceReplace,
+  destroyRetiredChunkResources,
+  runChunkGraphicsFrame,
+  chunkResourceCounters,
 } = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
 
 // ── Graphics test fixtures ────────────────────────────────────────────────
@@ -222,6 +227,12 @@ async function main() {
   require(typeof runGraphicsFrame === "function", "graphics runtime: runGraphicsFrame must be a function");
   require(typeof replaceDepthTextureOnResize === "function", "graphics runtime: replaceDepthTextureOnResize must be a function");
   require(typeof onDeviceLost === "function", "graphics runtime: onDeviceLost must be a function");
+  // HV-07B per-chunk lifecycle exports
+  require(typeof createChunkGraphicsResources === "function", "graphics runtime: createChunkGraphicsResources must be a function");
+  require(typeof applyChunkResourceReplace === "function", "graphics runtime: applyChunkResourceReplace must be a function");
+  require(typeof destroyRetiredChunkResources === "function", "graphics runtime: destroyRetiredChunkResources must be a function");
+  require(typeof runChunkGraphicsFrame === "function", "graphics runtime: runChunkGraphicsFrame must be a function");
+  require(typeof chunkResourceCounters === "function", "graphics runtime: chunkResourceCounters must be a function");
 
   // onDeviceLost registers a loss callback on a mock device
   {
@@ -432,8 +443,12 @@ async function main() {
   console.log("kinds covered: artifact-fetch, reflection, webgpu, device-lost");
   console.log("graphics admission: valid descriptor, missing kernel, wrong stage, missing pipeline, empty vertex inputs, mismatched layouts, malformed draw manifest, bad topology, bad color target, missing depth_stencil, fragment bind group divergence");
   console.log("graphics runtime: all exports verified, onDeviceLost callback, compute re-verified");
+  console.log("HV-07B exports: createChunkGraphicsResources, applyChunkResourceReplace, destroyRetiredChunkResources, runChunkGraphicsFrame, chunkResourceCounters");
   console.log(
     "manual browser still required for: window.faberWebGpuProof.ok === true && value === 42",
+  );
+  console.log(
+    "HV-07B lifecycle evidence: node public/src/chunk-resource-lifecycle-check.mjs",
   );
 }
 
