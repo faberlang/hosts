@@ -317,16 +317,20 @@ export function createGraphicsResources(device, descriptor, payloads, canvasCont
 /**
  * Encode and submit one indexed render pass. Increments submittedFrameCount
  * on the frameState object.
+ *
+ * options.clearValue — optional GPUColor clear (default black).
+ * options.recordSubmit — when true, append drawIndexed observation to frameState.submits.
  */
-export function runGraphicsFrame(device, context, resources, descriptor, frameState) {
+export function runGraphicsFrame(device, context, resources, descriptor, frameState, options = {}) {
   const textureView = context.getCurrentTexture().createView();
+  const clearValue = options.clearValue ?? { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
   const commandEncoder = device.createCommandEncoder();
   const renderPass = commandEncoder.beginRenderPass({
     colorAttachments: [
       {
         view: textureView,
-        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        clearValue,
         loadOp: "clear",
         storeOp: "store",
       },
@@ -357,6 +361,8 @@ export function runGraphicsFrame(device, context, resources, descriptor, frameSt
 
   const firstIndex = descriptor.draw.firstIndex;
   const indexCount = descriptor.draw.indexCount;
+  const instanceCount = descriptor.draw.instanceCount;
+  const baseVertex = descriptor.draw.baseVertex;
   if (firstIndex + indexCount > resources.indexCount) {
     throw new FaberKernelContractError(
       "drawManifest",
@@ -366,9 +372,9 @@ export function runGraphicsFrame(device, context, resources, descriptor, frameSt
 
   renderPass.drawIndexed(
     indexCount,
-    descriptor.draw.instanceCount,
+    instanceCount,
     firstIndex,
-    descriptor.draw.baseVertex,
+    baseVertex,
     0,
   );
 
@@ -376,6 +382,182 @@ export function runGraphicsFrame(device, context, resources, descriptor, frameSt
   device.queue.submit([commandEncoder.finish()]);
 
   frameState.submittedFrameCount = (frameState.submittedFrameCount ?? 0) + 1;
+  if (options.recordSubmit) {
+    if (!Array.isArray(frameState.submits)) {
+      frameState.submits = [];
+    }
+    frameState.submits.push({
+      method: "drawIndexed",
+      drawIndexed: true,
+      index_count: indexCount,
+      instance_count: instanceCount,
+      first_index: firstIndex,
+      base_vertex: baseVertex,
+      depth_attachment: true,
+      depth_test_enabled: descriptor.pipeline.depthStencil.depthWriteEnabled
+        || descriptor.pipeline.depthStencil.depthCompare !== "always",
+      depth_write_enabled: descriptor.pipeline.depthStencil.depthWriteEnabled,
+      depth_compare: descriptor.pipeline.depthStencil.depthCompare,
+      clear_value: clearValue,
+      frame_index: frameState.submittedFrameCount,
+    });
+  }
+}
+
+/**
+ * Read RGBA8 pixels from a canvas texture that was just drawn.
+ * Must use the same GPUTexture instance as the render pass — calling
+ * context.getCurrentTexture() again yields a new (empty) swapchain image.
+ * Requires COPY_SRC usage on the canvas configuration.
+ */
+export async function readTexturePixelsRgba(device, texture, samples) {
+  const bytesPerRow = 256; // WebGPU copy bytesPerRow alignment
+  const results = [];
+  for (const sample of samples) {
+    const buffer = device.createBuffer({
+      size: bytesPerRow,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture, origin: { x: sample.x, y: sample.y, z: 0 } },
+      { buffer, bytesPerRow },
+      { width: 1, height: 1, depthOrArrayLayers: 1 },
+    );
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const bgra = new Uint8Array(buffer.getMappedRange().slice(0, 4));
+    buffer.unmap();
+    buffer.destroy();
+    results.push({
+      name: sample.name,
+      x: sample.x,
+      y: sample.y,
+      r: bgra[2],
+      g: bgra[1],
+      b: bgra[0],
+      a: bgra[3],
+      hex: `#${[bgra[2], bgra[1], bgra[0]].map((v) => v.toString(16).padStart(2, "0")).join("")}`,
+    });
+  }
+  return results;
+}
+
+/**
+ * Encode + submit one indexed pass. When options.pixelSamples is provided,
+ * copies those pixels in the same command encoder (before swapchain expiry)
+ * and returns { texture, pixelBuffers } for later mapAsync readback.
+ */
+export function runGraphicsFrameWithTexture(device, context, resources, descriptor, frameState, options = {}) {
+  const texture = context.getCurrentTexture();
+  const textureView = texture.createView();
+  const clearValue = options.clearValue ?? { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+  const pixelSamples = options.pixelSamples ?? null;
+
+  const commandEncoder = device.createCommandEncoder();
+  const renderPass = commandEncoder.beginRenderPass({
+    colorAttachments: [
+      {
+        view: textureView,
+        clearValue,
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
+    depthStencilAttachment: {
+      view: resources.depthTexture.createView(),
+      depthClearValue: 1.0,
+      depthLoadOp: "clear",
+      depthStoreOp: "store",
+    },
+  });
+
+  renderPass.setPipeline(resources.pipeline);
+  for (const vb of resources.vertexBuffers) {
+    renderPass.setVertexBuffer(vb.slot, vb.buffer);
+  }
+  renderPass.setIndexBuffer(resources.indexBuffer, descriptor.draw.indexFormat, 0);
+  for (const group of resources.bindGroups) {
+    renderPass.setBindGroup(group.bindGroupIndex, group.bindGroup);
+  }
+
+  const firstIndex = descriptor.draw.firstIndex;
+  const indexCount = descriptor.draw.indexCount;
+  const instanceCount = descriptor.draw.instanceCount;
+  const baseVertex = descriptor.draw.baseVertex;
+  if (firstIndex + indexCount > resources.indexCount) {
+    throw new FaberKernelContractError(
+      "drawManifest",
+      `first_index ${firstIndex} + index_count ${indexCount} exceeds buffer index count ${resources.indexCount}`,
+    );
+  }
+
+  renderPass.drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, 0);
+  renderPass.end();
+
+  // Copy pixels in the same encoder so the swapchain texture is still current.
+  const pixelBuffers = [];
+  const bytesPerRow = 256;
+  if (Array.isArray(pixelSamples)) {
+    for (const sample of pixelSamples) {
+      const buffer = device.createBuffer({
+        size: bytesPerRow,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      commandEncoder.copyTextureToBuffer(
+        { texture, origin: { x: sample.x, y: sample.y, z: 0 } },
+        { buffer, bytesPerRow },
+        { width: 1, height: 1, depthOrArrayLayers: 1 },
+      );
+      pixelBuffers.push({ sample, buffer });
+    }
+  }
+
+  device.queue.submit([commandEncoder.finish()]);
+
+  frameState.submittedFrameCount = (frameState.submittedFrameCount ?? 0) + 1;
+  if (options.recordSubmit) {
+    if (!Array.isArray(frameState.submits)) frameState.submits = [];
+    frameState.submits.push({
+      method: "drawIndexed",
+      drawIndexed: true,
+      index_count: indexCount,
+      instance_count: instanceCount,
+      first_index: firstIndex,
+      base_vertex: baseVertex,
+      depth_attachment: true,
+      depth_test_enabled: descriptor.pipeline.depthStencil.depthWriteEnabled
+        || descriptor.pipeline.depthStencil.depthCompare !== "always",
+      depth_write_enabled: descriptor.pipeline.depthStencil.depthWriteEnabled,
+      depth_compare: descriptor.pipeline.depthStencil.depthCompare,
+      clear_value: clearValue,
+      frame_index: frameState.submittedFrameCount,
+    });
+  }
+
+  return { texture, pixelBuffers };
+}
+
+/** Map pixel buffers produced by runGraphicsFrameWithTexture into RGBA samples. */
+export async function mapPixelBuffers(pixelBuffers) {
+  const results = [];
+  for (const { sample, buffer } of pixelBuffers) {
+    await buffer.mapAsync(GPUMapMode.READ);
+    const bgra = new Uint8Array(buffer.getMappedRange().slice(0, 4));
+    buffer.unmap();
+    buffer.destroy();
+    results.push({
+      name: sample.name,
+      x: sample.x,
+      y: sample.y,
+      r: bgra[2],
+      g: bgra[1],
+      b: bgra[0],
+      a: bgra[3],
+      hex: `#${[bgra[2], bgra[1], bgra[0]].map((v) => v.toString(16).padStart(2, "0")).join("")}`,
+    });
+  }
+  return results;
 }
 
 /**
@@ -434,6 +616,10 @@ function createVertexBuffers(device, descriptor, vertexPayloads) {
   const vertexKernel = descriptor.kernels[0];
   const buffers = [];
 
+  // Indexed draws address unique vertices. pipeline.vertexCount is the draw
+  // element total (e.g. 36), not the unique buffer length (e.g. 8 corners).
+  // Require at least one full vertex and stride alignment; index bounds are
+  // checked when encoding the draw.
   for (const payload of vertexPayloads) {
     const layout = vertexKernel.vertexBufferLayouts.find(
       (vbl) => vbl.bufferIndex === payload.slot,
@@ -449,11 +635,16 @@ function createVertexBuffers(device, descriptor, vertexPayloads) {
       ? new Uint8Array(payload.data)
       : new Uint8Array(payload.data.buffer, payload.data.byteOffset, payload.data.byteLength);
 
-    const expectedBytes = layout.arrayStride * descriptor.pipeline.vertexCount;
-    if (data.byteLength < expectedBytes) {
+    if (layout.arrayStride <= 0 || data.byteLength < layout.arrayStride) {
       throw new FaberKernelContractError(
         "payloads.vertexBuffers",
-        `expected at least ${expectedBytes} bytes for slot ${payload.slot}, got ${data.byteLength}`,
+        `expected at least one vertex (${layout.arrayStride} bytes) for slot ${payload.slot}, got ${data.byteLength}`,
+      );
+    }
+    if (data.byteLength % layout.arrayStride !== 0) {
+      throw new FaberKernelContractError(
+        "payloads.vertexBuffers",
+        `slot ${payload.slot} byte length ${data.byteLength} is not a multiple of stride ${layout.arrayStride}`,
       );
     }
 
