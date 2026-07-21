@@ -357,6 +357,40 @@ async function main() {
     loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: bad, drawManifest: draw });
   });
 
+  // ── Real generated graphics reflection admission ──────────────────────
+
+  // Load real generated files and validate through loadFaberGraphicsPipeline
+  {
+    const realGfxWgsl = await readFile(path.join(generatedDir, "graphics.wgsl"), "utf8");
+    const realGfxRefl = JSON.parse(await readFile(path.join(generatedDir, "graphics-reflection.json"), "utf8"));
+    const realDraw = JSON.parse(await readFile(path.join(generatedDir, "draw.json"), "utf8"));
+
+    const desc = loadFaberGraphicsPipeline({ wgsl: realGfxWgsl, reflection: realGfxRefl, drawManifest: realDraw });
+    require(desc.kernels.length === 2, "real graphics: expected two kernels");
+    require(desc.kernels[0].shaderStage === "vertex", "real graphics: first kernel must be vertex");
+    require(desc.kernels[0].entryName === "hello_voxel_vertex", "real graphics: vertex entry_name mismatch");
+    require(desc.kernels[0].vertexInputs.length === 2, "real graphics: expected two vertex inputs");
+    require(desc.kernels[1].shaderStage === "fragment", "real graphics: second kernel must be fragment");
+    require(desc.kernels[1].entryName === "hello_voxel_fragment", "real graphics: fragment entry_name mismatch");
+    require(desc.pipeline.colorTargetFormats[0] === "bgra8unorm", "real graphics: color target must be bgra8unorm");
+    require(desc.pipeline.primitiveTopology === "triangle-list", "real graphics: topology must be triangle-list");
+    require(desc.pipeline.vertexCount === 36, "real graphics: vertex count must be 36");
+    require(desc.pipeline.depthStencil.depthWriteEnabled === true, "real graphics: depth write must be enabled");
+    require(desc.pipeline.depthStencil.depthCompare === "less", "real graphics: depth compare must be less");
+    require(desc.draw.indexFormat === "uint32", "real graphics: index format must be uint32");
+    require(desc.draw.instanceCount === 1, "real graphics: instance count must be 1");
+    require(desc.draw.baseVertex === 0, "real graphics: base vertex must be 0");
+    require(desc.draw.firstIndex === 0, "real graphics: first index must be 0");
+    require(desc.inputBindings.length === 1, "real graphics: expected one input binding");
+    require(desc.bindGroupLayouts.length === 1, "real graphics: expected one bind group layout");
+    require(desc.bindGroups.length === 1, "real graphics: expected one bind group");
+    require(desc.kernels[0].vertexBufferLayouts.length === 2, "real graphics: expected two vertex buffer layouts");
+    require(desc.kernels[0].vertexBufferLayouts[0].arrayStride === 12, "real graphics: first layout stride must be 12");
+    require(desc.kernels[0].vertexBufferLayouts[0].stepMode === "vertex", "real graphics: first layout step mode must be vertex");
+
+    console.log("real generated graphics reflection: admitted through loadFaberGraphicsPipeline");
+  }
+
   // Compute admission unchanged (re-verify after graphics additions)
   {
     const kernel = loadFaberKernel({ wgsl, reflection });
