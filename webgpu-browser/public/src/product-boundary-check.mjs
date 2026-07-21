@@ -22,7 +22,15 @@ const generatedDir = path.join(publicDir, "generated");
 const { FaberKernelContractError, fetchFaberKernelArtifacts, loadFaberKernel, loadFaberGraphicsPipeline } = await import(
   pathToFileURL(path.join(here, "faber-kernel.js")).href
 );
-const { acquireWebGpuDevice } = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+const {
+  acquireWebGpuDevice,
+  createWebGpuResources,
+  runKernel,
+  createGraphicsResources,
+  runGraphicsFrame,
+  replaceDepthTextureOnResize,
+  onDeviceLost,
+} = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
 
 // ── Graphics test fixtures ────────────────────────────────────────────────
 
@@ -207,6 +215,40 @@ async function main() {
     }),
   );
 
+  // ── Graphics runtime tests ────────────────────────────────────────────
+
+  // Verify all graphics exports are functions
+  require(typeof createGraphicsResources === "function", "graphics runtime: createGraphicsResources must be a function");
+  require(typeof runGraphicsFrame === "function", "graphics runtime: runGraphicsFrame must be a function");
+  require(typeof replaceDepthTextureOnResize === "function", "graphics runtime: replaceDepthTextureOnResize must be a function");
+  require(typeof onDeviceLost === "function", "graphics runtime: onDeviceLost must be a function");
+
+  // onDeviceLost registers a loss callback on a mock device
+  {
+    let received = null;
+    const mockDevice = {
+      lost: Promise.resolve({ reason: "destroyed", message: "test device loss" }),
+    };
+    onDeviceLost(mockDevice, (info) => {
+      received = info;
+    });
+    // Wait for the promise to resolve
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    require(received !== null, "graphics runtime: onDeviceLost must invoke callback");
+    require(received.kind === "device-lost", "graphics runtime: loss kind must be device-lost");
+    require(received.reason === "destroyed", "graphics runtime: loss reason must be destroyed");
+    require(received.message === "test device loss", "graphics runtime: loss message must match");
+  }
+
+  // Compute runtime re-verify: createWebGpuResources and runKernel still export
+  require(typeof createWebGpuResources === "function", "compute runtime: createWebGpuResources must be a function");
+  require(typeof runKernel === "function", "compute runtime: runKernel must be a function");
+
+  // Compute runtime device-failure paths still work (via acquireWebGpuDevice)
+  await expectReject("compute: unavailable WebGPU after graphics addition", "webgpu", () =>
+    acquireWebGpuDevice({ navigator: {} }),
+  );
+
   // ── Graphics admission tests ──────────────────────────────────────────
 
   const gfxWgsl = graphicsWgsl();
@@ -323,8 +365,9 @@ async function main() {
   }
 
   console.log("product-boundary-check passed");
-  console.log("kinds covered: artifact-fetch, reflection, webgpu");
+  console.log("kinds covered: artifact-fetch, reflection, webgpu, device-lost");
   console.log("graphics admission: valid descriptor, missing kernel, wrong stage, missing pipeline, empty vertex inputs, mismatched layouts, malformed draw manifest, bad topology, bad color target, missing depth_stencil");
+  console.log("graphics runtime: all exports verified, onDeviceLost callback, compute re-verified");
   console.log(
     "manual browser still required for: window.faberWebGpuProof.ok === true && value === 42",
   );

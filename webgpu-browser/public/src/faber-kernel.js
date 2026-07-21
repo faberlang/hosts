@@ -187,6 +187,7 @@ function parseLayoutEntry(entry, path) {
     bindingByteLen: expectPositiveInteger(object.binding_byte_len, `${path}.binding_byte_len`),
     minBindingSize: expectPositiveInteger(object.min_binding_size, `${path}.min_binding_size`),
     bufferType: object.buffer_type,
+    visibility: object.visibility,
     sourceLocal: nullableInteger(object.source_local, `${path}.source_local`),
     sourceName: nullableString(object.source_name, `${path}.source_name`),
   });
