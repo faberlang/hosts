@@ -141,7 +141,7 @@ function graphicsWgsl() {
 }
 
 function drawManifest() {
-  return { index_format: "uint32", instance_count: 1, base_vertex: 0, first_index: 0 };
+  return { index_format: "uint32", instance_count: 1, base_vertex: 0, first_index: 0, index_count: 36 };
 }
 
 function fail(message) {
@@ -271,6 +271,7 @@ async function main() {
     require(desc.draw.instanceCount === 1, "graphics: instance count must be 1");
     require(desc.draw.baseVertex === 0, "graphics: base vertex must be 0");
     require(desc.draw.firstIndex === 0, "graphics: first index must be 0");
+    require(desc.draw.indexCount === 36, "graphics: index count must be 36");
     require(desc.inputBindings.length === 1, "graphics: expected one input binding");
   }
 
@@ -333,6 +334,12 @@ async function main() {
   // Malformed draw manifest (missing instance_count)
   await expectReject("graphics: missing instance count", "reflection", () => {
     const badDraw = { index_format: "uint32", first_index: 0, base_vertex: 0 };
+    loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: badDraw });
+  });
+
+  // Malformed draw manifest (index_count <= 0)
+  await expectReject("graphics: bad index count (zero)", "reflection", () => {
+    const badDraw = { ...draw, index_count: 0 };
     loadFaberGraphicsPipeline({ wgsl: gfxWgsl, reflection: gfxRefl, drawManifest: badDraw });
   });
 

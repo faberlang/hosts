@@ -256,6 +256,7 @@ require(draw.get("index_format") == "uint32", "draw.json: index_format must be u
 require(draw.get("instance_count") == 1, "draw.json: instance_count must be 1")
 require(draw.get("base_vertex") == 0, "draw.json: base_vertex must be 0")
 require(draw.get("first_index") == 0, "draw.json: first_index must be 0")
+require(draw.get("index_count") == 36, "draw.json: index_count must be 36")
 
 require(vertex_positions_path.stat().st_size == 432, "graphics-vertex-positions.bin: expected 432 bytes")
 require(vertex_colors_path.stat().st_size == 432, "graphics-vertex-colors.bin: expected 432 bytes")

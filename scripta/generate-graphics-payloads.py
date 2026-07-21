@@ -97,6 +97,7 @@ def generate_draw_manifest(output_dir):
         "instance_count": 1,
         "base_vertex": 0,
         "first_index": 0,
+        "index_count": 36,
     }
     (output_dir / "draw.json").write_text(json.dumps(manifest) + "\n")
 

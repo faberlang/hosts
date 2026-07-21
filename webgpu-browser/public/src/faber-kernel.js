@@ -588,6 +588,7 @@ function parseDrawManifest(manifest, pipelineVertexCount) {
   );
   const baseVertex = expectNonNegativeInteger(obj.base_vertex, "drawManifest.base_vertex");
   const firstIndex = expectNonNegativeInteger(obj.first_index, "drawManifest.first_index");
+  const indexCount = expectPositiveInteger(obj.index_count, "drawManifest.index_count");
 
   if (baseVertex >= pipelineVertexCount) {
     throw new FaberKernelContractError(
@@ -601,6 +602,7 @@ function parseDrawManifest(manifest, pipelineVertexCount) {
     instanceCount,
     baseVertex,
     firstIndex,
+    indexCount,
   });
 }
 

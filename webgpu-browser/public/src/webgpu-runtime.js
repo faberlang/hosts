@@ -355,10 +355,19 @@ export function runGraphicsFrame(device, context, resources, descriptor, frameSt
     renderPass.setBindGroup(group.bindGroupIndex, group.bindGroup);
   }
 
+  const firstIndex = descriptor.draw.firstIndex;
+  const indexCount = descriptor.draw.indexCount;
+  if (firstIndex + indexCount > resources.indexCount) {
+    throw new FaberKernelContractError(
+      "drawManifest",
+      `first_index ${firstIndex} + index_count ${indexCount} exceeds buffer index count ${resources.indexCount}`,
+    );
+  }
+
   renderPass.drawIndexed(
-    resources.indexCount,
+    indexCount,
     descriptor.draw.instanceCount,
-    descriptor.draw.firstIndex,
+    firstIndex,
     descriptor.draw.baseVertex,
     0,
   );
