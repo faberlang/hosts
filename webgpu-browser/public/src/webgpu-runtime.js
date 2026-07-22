@@ -75,17 +75,21 @@ export function createWebGpuResources(device, descriptor, initialInputs = {}) {
   });
 }
 
+/**
+ * Dispatch a compute kernel and read back outputs. For backward compatibility
+ * the single-output path returns { values, outputBinding }; multiple outputs
+ * return { results, outputBindings }.
+ */
 export async function runKernel(device, resources, descriptor) {
-  const outputBinding = expectSingleOutputBinding(descriptor);
-  const outputBuffer = resources.buffers.get(outputBinding.resourceIndex);
-  if (!outputBuffer) {
-    throw new FaberKernelContractError("resources.buffers", `missing output resource ${outputBinding.resourceIndex}`);
+  // Validate all output buffers exist (removes single-output constraint)
+  for (const binding of descriptor.outputBindings) {
+    if (!resources.buffers.has(binding.resourceIndex)) {
+      throw new FaberKernelContractError(
+        "resources.buffers",
+        `missing output resource ${binding.resourceIndex}`,
+      );
+    }
   }
-
-  const readbackBuffer = device.createBuffer({
-    size: outputBinding.bufferByteLen,
-    usage: BUFFER_USAGE.readback(),
-  });
 
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginComputePass();
@@ -99,15 +103,121 @@ export async function runKernel(device, resources, descriptor) {
     descriptor.dispatchWorkgroups.z,
   );
   pass.end();
-  encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputBinding.bufferByteLen);
+  device.queue.submit([encoder.finish()]);
+
+  const results = await placementReadback(device, resources, descriptor.outputBindings);
+
+  // Backward compatibility: single-output returns { values, outputBinding }
+  if (results.length === 1) {
+    return Object.freeze({ values: results[0].values, outputBinding: results[0].binding });
+  }
+  return Object.freeze({ results, outputBindings: descriptor.outputBindings });
+}
+
+// ── Placement operations (D-SPINE-02 S3) ──────────────────────────────────
+
+/**
+ * Write host data to a named device buffer using device.queue.writeBuffer.
+ * Separable from kernel dispatch — call before dispatch to stage input data.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {{ resourceIndex: number, data: ArrayBuffer|TypedArray }} descriptor
+ * @returns {{ status: number }}
+ */
+export function placementCopyIn(device, resources, { resourceIndex, data }) {
+  const buffer = resources.buffers.get(resourceIndex);
+  if (!buffer) {
+    throw new FaberKernelContractError(
+      "placementCopyIn",
+      `missing resource ${resourceIndex}`,
+    );
+  }
+  if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
+    throw new FaberKernelContractError(
+      "placementCopyIn",
+      "data must be an ArrayBuffer or typed array",
+    );
+  }
+  device.queue.writeBuffer(buffer, 0, data);
+  return Object.freeze({ status: 0 });
+}
+
+/**
+ * Read back device buffer contents to the host. Accepts a list of output
+ * bindings — not limited to a single output.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {Array<{ resourceIndex: number, bufferByteLen: number }>} outputBindings
+ * @returns {Promise<Array<{ binding: object, values: number[] }>>}
+ */
+export async function placementReadback(device, resources, outputBindings) {
+  if (!Array.isArray(outputBindings)) {
+    throw new FaberKernelContractError(
+      "placementReadback",
+      "outputBindings must be an array",
+    );
+  }
+
+  const encoder = device.createCommandEncoder();
+  const transfers = [];
+
+  for (const binding of outputBindings) {
+    const buffer = resources.buffers.get(binding.resourceIndex);
+    if (!buffer) {
+      throw new FaberKernelContractError(
+        "placementReadback",
+        `missing resource ${binding.resourceIndex}`,
+      );
+    }
+    const readbackBuffer = device.createBuffer({
+      size: binding.bufferByteLen,
+      usage: BUFFER_USAGE.readback(),
+    });
+    encoder.copyBufferToBuffer(buffer, 0, readbackBuffer, 0, binding.bufferByteLen);
+    transfers.push({ binding, buffer: readbackBuffer });
+  }
 
   device.queue.submit([encoder.finish()]);
-  await readbackBuffer.mapAsync(GPUMapMode.READ);
-  const copy = readbackBuffer.getMappedRange().slice(0);
-  readbackBuffer.unmap();
 
-  const values = Array.from(new Float32Array(copy));
-  return Object.freeze({ values, outputBinding });
+  const results = [];
+  for (const { binding, buffer } of transfers) {
+    await buffer.mapAsync(GPUMapMode.READ);
+    const copy = buffer.getMappedRange().slice(0);
+    buffer.unmap();
+    results.push({
+      binding,
+      values: Array.from(new Float32Array(copy)),
+    });
+  }
+
+  return Object.freeze(results);
+}
+
+/**
+ * Insert a device-side ordering barrier for the named buffer IDs. Does not
+ * block the host — sync is a queue-level ordering assertion, not a host-
+ * visible fence.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {number[]} bufferIds - resource indices to order
+ */
+export function placementSync(device, resources, bufferIds) {
+  for (const bufferId of bufferIds) {
+    if (!resources.buffers.has(bufferId)) {
+      throw new FaberKernelContractError(
+        "placementSync",
+        `unknown buffer ${bufferId}`,
+      );
+    }
+  }
+  // Submit an empty encoder to create an ordering point on the device queue.
+  // WebGPU submission order defines execution order — subsequent submissions
+  // are ordered after this empty submission.
+  const encoder = device.createCommandEncoder();
+  device.queue.submit([encoder.finish()]);
 }
 
 function createBuffers(device, descriptor, initialInputs) {
