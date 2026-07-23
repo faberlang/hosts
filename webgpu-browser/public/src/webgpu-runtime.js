@@ -72,6 +72,15 @@ export function createWebGpuResources(device, descriptor, initialInputs = {}) {
     shaderModule,
     pipeline,
     bindGroups,
+    /** @type {Map<number, object>} */
+    pendingRetire: [],
+    counters: {
+      created: 0,
+      live: 0,
+      retired: 0,
+      destroyed: 0,
+    },
+    path: COMPUTE_RESOURCE_PATH,
   });
 }
 
@@ -121,13 +130,13 @@ export async function runKernel(device, resources, descriptor) {
  * Separable from kernel dispatch — call before dispatch to stage input data.
  *
  * @param {GPUDevice} device
- * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {object} resources - must have resources.buffers Map<number, ComputeResourceEntry>
  * @param {{ resourceIndex: number, data: ArrayBuffer|TypedArray }} descriptor
  * @returns {{ status: number }}
  */
 export function placementCopyIn(device, resources, { resourceIndex, data }) {
-  const buffer = resources.buffers.get(resourceIndex);
-  if (!buffer) {
+  const entry = resources.buffers.get(resourceIndex);
+  if (!entry) {
     throw new FaberKernelContractError(
       "placementCopyIn",
       `missing resource ${resourceIndex}`,
@@ -139,7 +148,7 @@ export function placementCopyIn(device, resources, { resourceIndex, data }) {
       "data must be an ArrayBuffer or typed array",
     );
   }
-  device.queue.writeBuffer(buffer, 0, data);
+  device.queue.writeBuffer(entry.buffer, 0, data);
   return Object.freeze({ status: 0 });
 }
 
@@ -148,7 +157,7 @@ export function placementCopyIn(device, resources, { resourceIndex, data }) {
  * bindings — not limited to a single output.
  *
  * @param {GPUDevice} device
- * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {object} resources - must have resources.buffers Map<number, ComputeResourceEntry>
  * @param {Array<{ resourceIndex: number, bufferByteLen: number }>} outputBindings
  * @returns {Promise<Array<{ binding: object, values: number[] }>>}
  */
@@ -164,8 +173,8 @@ export async function placementReadback(device, resources, outputBindings) {
   const transfers = [];
 
   for (const binding of outputBindings) {
-    const buffer = resources.buffers.get(binding.resourceIndex);
-    if (!buffer) {
+    const entry = resources.buffers.get(binding.resourceIndex);
+    if (!entry) {
       throw new FaberKernelContractError(
         "placementReadback",
         `missing resource ${binding.resourceIndex}`,
@@ -175,7 +184,7 @@ export async function placementReadback(device, resources, outputBindings) {
       size: binding.bufferByteLen,
       usage: BUFFER_USAGE.readback(),
     });
-    encoder.copyBufferToBuffer(buffer, 0, readbackBuffer, 0, binding.bufferByteLen);
+    encoder.copyBufferToBuffer(entry.buffer, 0, readbackBuffer, 0, binding.bufferByteLen);
     transfers.push({ binding, buffer: readbackBuffer });
   }
 
@@ -186,6 +195,7 @@ export async function placementReadback(device, resources, outputBindings) {
     await buffer.mapAsync(GPUMapMode.READ);
     const copy = buffer.getMappedRange().slice(0);
     buffer.unmap();
+    buffer.destroy();
     results.push({
       binding,
       values: Array.from(new Float32Array(copy)),
@@ -201,7 +211,7 @@ export async function placementReadback(device, resources, outputBindings) {
  * visible fence.
  *
  * @param {GPUDevice} device
- * @param {object} resources - must have resources.buffers Map<number, GPUBuffer>
+ * @param {object} resources - must have resources.buffers Map<number, ComputeResourceEntry>
  * @param {number[]} bufferIds - resource indices to order
  */
 export function placementSync(device, resources, bufferIds) {
@@ -239,7 +249,11 @@ function createBuffers(device, descriptor, initialInputs) {
         writeInitialInput(buffer, entry, initialInputs);
       }
 
-      buffers.set(entry.resourceIndex, buffer);
+      buffers.set(entry.resourceIndex, {
+        buffer,
+        generation: 0,
+        logicalId: entry.resourceIndex,
+      });
     }
   }
 
@@ -303,15 +317,15 @@ function createBindGroups(device, descriptor, bindGroupLayouts, buffers) {
     }
 
     const entries = group.entries.map((entry) => {
-      const buffer = buffers.get(entry.resourceIndex);
-      if (!buffer) {
+      const computeEntry = buffers.get(entry.resourceIndex);
+      if (!computeEntry) {
         throw new FaberKernelContractError("buffers", `missing resource ${entry.resourceIndex}`);
       }
 
       return {
         binding: entry.binding,
         resource: {
-          buffer,
+          buffer: computeEntry.buffer,
           offset: entry.bufferByteOffset,
           size: entry.bindingByteLen,
         },
@@ -341,6 +355,86 @@ function expectSingleOutputBinding(descriptor) {
     );
   }
   return descriptor.outputBindings[0];
+}
+
+// ── Compute resource lifecycle ────────────────────────────────────────────
+
+/**
+ * @typedef {object} ComputeResourceEntry
+ * @property {GPUBuffer} buffer - the backing GPU buffer
+ * @property {number} generation - monotonic generation counter
+ * @property {number} logicalId - stable resource identity (resourceIndex)
+ */
+
+/**
+ * Snapshot of honest buffer counters for a compute session.
+ */
+export function computeResourceCounters(resources) {
+  expectComputeResources(resources);
+  return Object.freeze({
+    created: resources.counters.created,
+    live: resources.counters.live,
+    retired: resources.counters.retired,
+    destroyed: resources.counters.destroyed,
+    pending_retire_groups: resources.pendingRetire.length,
+    path: resources.path,
+  });
+}
+
+function expectComputeResources(resources) {
+  if (!resources || resources.path !== COMPUTE_RESOURCE_PATH) {
+    throw new FaberKernelContractError(
+      "resources",
+      "expected compute resource session (compute path)",
+      "product",
+    );
+  }
+  if (!(resources.buffers instanceof Map) || !Array.isArray(resources.pendingRetire) || !resources.counters) {
+    throw new FaberKernelContractError(
+      "resources",
+      "compute resource session is missing map/counters",
+      "product",
+    );
+  }
+}
+
+/**
+ * Create one compute GPU buffer entry. Increments created and live counters.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - compute resource session
+ * @param {number} logicalId
+ * @param {number} generation
+ * @param {{ size: number, usage: number, mappedAtCreation?: boolean }} bufferDescriptor
+ * @returns {{ logicalId: number, generation: number, buffer: GPUBuffer, buffers: GPUBuffer[] }}
+ */
+function createComputeGpuEntry(device, resources, logicalId, generation, bufferDescriptor) {
+  const buffer = device.createBuffer(bufferDescriptor);
+  resources.counters.created += 1;
+  resources.counters.live += 1;
+  return {
+    logicalId,
+    generation,
+    buffer,
+    buffers: [buffer],
+  };
+}
+
+/**
+ * Enqueue a compute entry for deferred destruction after queue completion.
+ * Decrements live and increments retired counters.
+ *
+ * @param {object} resources - compute resource session
+ * @param {{ logicalId: number, generation: number, buffers: GPUBuffer[] }} entry
+ */
+function enqueueComputeRetire(resources, entry) {
+  resources.pendingRetire.push({
+    logicalId: entry.logicalId,
+    generation: entry.generation,
+    buffers: entry.buffers.slice(),
+  });
+  resources.counters.live -= 1;
+  resources.counters.retired += 1;
 }
 
 // ── Graphics WebGPU effects ───────────────────────────────────────────────
@@ -871,6 +965,7 @@ function writeGraphicsStorageInput(buffer, entry, storageData) {
 // equivalent completion promise). Frame-count dispose is forbidden.
 // Admitted path is per-chunk multi-draw — not concatenated-single-buffer.
 
+const COMPUTE_RESOURCE_PATH = "compute";
 const CHUNK_BUFFERS_PER_PAIR = 3; // position VB + color VB + index buffer
 const CHUNK_RESOURCE_PATH = "per-chunk-multi-draw";
 
