@@ -437,6 +437,170 @@ function enqueueComputeRetire(resources, entry) {
   resources.counters.retired += 1;
 }
 
+/**
+ * Apply one compute resource transition under the create-before-retire contract.
+ *
+ * transition = {
+ *   resource_index: number,
+ *   generation: number,
+ *   buffer_descriptor: null | undefined | { size, usage, mappedAtCreation? }
+ * }
+ *
+ * Empty buffer_descriptor removes the live resource (retire previous after
+ * queue completion).  Non-empty creates or replaces (create-before-retire).
+ * Invalid transitions throw FaberKernelContractError kind=product.
+ */
+export function applyComputeResourceReplace(device, resources, transition) {
+  expectComputeResources(resources);
+  if (!device?.createBuffer) {
+    throw new FaberKernelContractError("device", "device is required for compute replace", "product");
+  }
+
+  const resourceIndex = expectNonNegativeInt(transition?.resource_index, "transition.resource_index");
+  const generation = expectNonNegativeInt(transition?.generation, "transition.generation");
+  const empty = isEmptyComputePayload(transition?.buffer_descriptor);
+  const current = resources.buffers.get(resourceIndex) ?? null;
+
+  if (empty) {
+    if (!current) {
+      throw new FaberKernelContractError(
+        "transition",
+        `cannot remove resource ${resourceIndex}: no live resource`,
+        "product",
+      );
+    }
+    if (generation !== current.generation) {
+      throw new FaberKernelContractError(
+        "transition.generation",
+        `remove requires generation ${current.generation}, got ${generation}`,
+        "product",
+      );
+    }
+    enqueueComputeRetire(resources, current);
+    resources.buffers.delete(resourceIndex);
+    return Object.freeze({
+      kind: "removed",
+      resource_index: resourceIndex,
+      generation,
+      previous_generation: current.generation,
+    });
+  }
+
+  const descriptor = normalizeComputePayload(transition.buffer_descriptor, resourceIndex);
+
+  if (!current) {
+    // create
+    const entry = createComputeGpuEntry(device, resources, resourceIndex, generation, descriptor);
+    resources.buffers.set(resourceIndex, entry);
+    return Object.freeze({
+      kind: "created",
+      resource_index: resourceIndex,
+      generation,
+    });
+  }
+
+  if (generation <= current.generation) {
+    throw new FaberKernelContractError(
+      "transition.generation",
+      `replace requires generation > ${current.generation}, got ${generation}`,
+      "product",
+    );
+  }
+
+  // create-before-retire: allocate new, then retire old
+  const next = createComputeGpuEntry(device, resources, resourceIndex, generation, descriptor);
+  enqueueComputeRetire(resources, current);
+  resources.buffers.set(resourceIndex, next);
+  return Object.freeze({
+    kind: "replaced",
+    resource_index: resourceIndex,
+    generation,
+    previous_generation: current.generation,
+  });
+}
+
+/**
+ * After work that referenced retired buffers has been submitted, wait for
+ * queue completion and destroy pending retired buffers.
+ *
+ * Snapshot/splice pendingRetire *before* awaiting onSubmittedWorkDone.
+ * Destroy only that snapshot after completion.  Groups retired during the
+ * wait stay in pendingRetire for a later completion that covers them.
+ */
+export async function destroyRetiredComputeResources(device, resources) {
+  expectComputeResources(resources);
+  if (resources.pendingRetire.length === 0) {
+    return Object.freeze({ destroyed_groups: 0, destroyed_buffers: 0 });
+  }
+
+  const done = device?.queue?.onSubmittedWorkDone;
+  if (typeof done !== "function") {
+    throw new FaberKernelContractError(
+      "queue.onSubmittedWorkDone",
+      "queue completion is required before destroying retired compute buffers",
+      "webgpu",
+    );
+  }
+
+  // Take ownership of currently pending groups before waiting.  Concurrent
+  // retires during the await must not be destroyed under this completion.
+  const groups = resources.pendingRetire.splice(0, resources.pendingRetire.length);
+
+  await done.call(device.queue);
+
+  let destroyedBuffers = 0;
+  for (const group of groups) {
+    for (const buffer of group.buffers) {
+      if (buffer && typeof buffer.destroy === "function" && !buffer.__faberDestroyed) {
+        buffer.destroy();
+        buffer.__faberDestroyed = true;
+        destroyedBuffers += 1;
+        resources.counters.destroyed += 1;
+      }
+    }
+  }
+
+  return Object.freeze({
+    destroyed_groups: groups.length,
+    destroyed_buffers: destroyedBuffers,
+  });
+}
+
+// ── Compute lifecycle helpers ─────────────────────────────────────────────
+
+function isEmptyComputePayload(descriptor) {
+  return descriptor == null;
+}
+
+function normalizeComputePayload(descriptor, resourceIndex) {
+  if (!descriptor || typeof descriptor !== "object") {
+    throw new FaberKernelContractError(
+      "transition.buffer_descriptor",
+      `resource ${resourceIndex}: buffer descriptor is required`,
+      "product",
+    );
+  }
+  if (typeof descriptor.size !== "number" || descriptor.size <= 0) {
+    throw new FaberKernelContractError(
+      "transition.buffer_descriptor.size",
+      `resource ${resourceIndex}: size must be a positive number`,
+      "product",
+    );
+  }
+  if (typeof descriptor.usage !== "number" || descriptor.usage <= 0) {
+    throw new FaberKernelContractError(
+      "transition.buffer_descriptor.usage",
+      `resource ${resourceIndex}: usage must be a positive number`,
+      "product",
+    );
+  }
+  return {
+    size: descriptor.size,
+    usage: descriptor.usage,
+    mappedAtCreation: descriptor.mappedAtCreation ?? false,
+  };
+}
+
 // ── Graphics WebGPU effects ───────────────────────────────────────────────
 
 /**
