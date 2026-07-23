@@ -6,7 +6,12 @@ const BUFFER_USAGE = {
   readback: () => GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   vertex: () => GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   index: () => GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+  gradient: () => GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE,
 };
+
+// Gradient registry: Map<handleIndex, { buffer: GPUBuffer, elementCount: number }>
+const _gradientRegistry = new Map();
+let _nextGradientHandle = 0;
 
 const EXPECTED_CANVAS_FORMAT = "bgra8unorm";
 const DEPTH_FORMAT = "depth24plus";
@@ -1659,4 +1664,95 @@ function enqueueRetire(resources, entry) {
   });
   resources.counters.live -= CHUNK_BUFFERS_PER_PAIR;
   resources.counters.retired += CHUNK_BUFFERS_PER_PAIR;
+}
+
+/**
+ * Allocate a gradient accumulation buffer. Returns an opaque handle index
+ * that the caller uses for accumulate/read/zero operations.
+ *
+ * @param {GPUDevice} device
+ * @param {number} elementCount - number of f32 elements
+ * @returns {number} opaque gradient handle index
+ */
+export function createGradientBuffer(device, elementCount) {
+  const buffer = device.createBuffer({
+    size: elementCount * 4, // f32 = 4 bytes
+    usage: BUFFER_USAGE.gradient(),
+    mappedAtCreation: true,
+  });
+  // Zero-fill on creation — consistent with LLVM gradient_create
+  new Float32Array(buffer.getMappedRange()).fill(0);
+  buffer.unmap();
+
+  const handle = _nextGradientHandle++;
+  _gradientRegistry.set(handle, { buffer, elementCount });
+  return handle;
+}
+
+/**
+ * Accumulate a gradient tensor into the buffer identified by handle.
+ * Host-side elementwise addition — maps the buffer, adds tensorData,
+ * unmaps. Returns after accumulation is complete.
+ *
+ * @param {GPUDevice} device
+ * @param {number} handle - opaque gradient handle index
+ * @param {Float32Array} tensorData - gradient data to accumulate
+ * @returns {Promise<{ status: number }>}
+ */
+export async function accumulateGradient(device, handle, tensorData) {
+  const entry = _gradientRegistry.get(handle);
+  if (!entry) {
+    throw new FaberKernelContractError("accumulateGradient", `unknown handle ${handle}`);
+  }
+  if (tensorData.length !== entry.elementCount) {
+    throw new FaberKernelContractError(
+      "accumulateGradient",
+      `shape mismatch: expected ${entry.elementCount} elements, got ${tensorData.length}`,
+    );
+  }
+  // Host-side accumulation: map → add → unmap
+  await entry.buffer.mapAsync(GPUMapMode.READ | GPUMapMode.WRITE);
+  const mapped = new Float32Array(entry.buffer.getMappedRange());
+  for (let i = 0; i < entry.elementCount; i++) {
+    mapped[i] += tensorData[i];
+  }
+  entry.buffer.unmap();
+  return Object.freeze({ status: 0 });
+}
+
+/**
+ * Read back the accumulated gradient from the buffer identified by handle.
+ * Returns a copy of the gradient data as Float32Array.
+ *
+ * @param {GPUDevice} device
+ * @param {number} handle - opaque gradient handle index
+ * @returns {Promise<Float32Array>} accumulated gradient values
+ */
+export async function readGradient(device, handle) {
+  const entry = _gradientRegistry.get(handle);
+  if (!entry) {
+    throw new FaberKernelContractError("readGradient", `unknown handle ${handle}`);
+  }
+  await entry.buffer.mapAsync(GPUMapMode.READ);
+  const copy = new Float32Array(entry.buffer.getMappedRange().slice(0));
+  entry.buffer.unmap();
+  return copy;
+}
+
+/**
+ * Zero the gradient buffer identified by handle.
+ *
+ * @param {GPUDevice} device
+ * @param {number} handle - opaque gradient handle index
+ * @returns {Promise<{ status: number }>}
+ */
+export async function zeroGradient(device, handle) {
+  const entry = _gradientRegistry.get(handle);
+  if (!entry) {
+    throw new FaberKernelContractError("zeroGradient", `unknown handle ${handle}`);
+  }
+  await entry.buffer.mapAsync(GPUMapMode.WRITE);
+  new Float32Array(entry.buffer.getMappedRange()).fill(0);
+  entry.buffer.unmap();
+  return Object.freeze({ status: 0 });
 }
