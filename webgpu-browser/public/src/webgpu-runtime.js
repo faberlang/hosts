@@ -105,6 +105,40 @@ export async function runKernel(device, resources, descriptor) {
     }
   }
 
+  placementDispatch(device, resources, descriptor);
+
+  const results = await placementReadback(device, resources, descriptor.outputBindings);
+
+  // Backward compatibility: single-output returns { values, outputBinding }
+  if (results.length === 1) {
+    return Object.freeze({ values: results[0].values, outputBinding: results[0].binding });
+  }
+  return Object.freeze({ results, outputBindings: descriptor.outputBindings });
+}
+
+// ── Placement operations ────────────────────────────────────────────────────
+//
+// Protocol alignment with PlacementHost trait (D-SPINE-09):
+//   copy_in    → placementCopyIn   — write host data to device buffer
+//   dispatch   → placementDispatch — encode + submit compute dispatch
+//   readback   → placementReadback — read device buffer back to host
+//   sync       → placementSync     — device-side ordering barrier
+//
+// JS uses natural WebGPU shape (separate device/resources/descriptor params)
+// rather than mirroring Rust `&mut self`. Each operation is independently
+// callable and returns void or a status object — no side-channel state.
+
+/**
+ * Encode and submit a compute dispatch. Creates a command encoder, begins a
+ * compute pass, sets pipeline and bind groups, dispatches workgroups, ends
+ * the pass, and submits the command buffer. Does NOT perform readback —
+ * call placementReadback separately.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - must have resources.pipeline, resources.bindGroups
+ * @param {{ dispatchWorkgroups: { x: number, y: number, z: number } }} descriptor
+ */
+export function placementDispatch(device, resources, descriptor) {
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginComputePass();
   pass.setPipeline(resources.pipeline);
@@ -118,17 +152,7 @@ export async function runKernel(device, resources, descriptor) {
   );
   pass.end();
   device.queue.submit([encoder.finish()]);
-
-  const results = await placementReadback(device, resources, descriptor.outputBindings);
-
-  // Backward compatibility: single-output returns { values, outputBinding }
-  if (results.length === 1) {
-    return Object.freeze({ values: results[0].values, outputBinding: results[0].binding });
-  }
-  return Object.freeze({ results, outputBindings: descriptor.outputBindings });
 }
-
-// ── Placement operations (D-SPINE-02 S3) ──────────────────────────────────
 
 /**
  * Write host data to a named device buffer using device.queue.writeBuffer.
