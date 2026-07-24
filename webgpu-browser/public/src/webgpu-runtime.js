@@ -116,6 +116,79 @@ export async function runKernel(device, resources, descriptor) {
   return Object.freeze({ results, outputBindings: descriptor.outputBindings });
 }
 
+/**
+ * Dispatch multiple compute kernels in sequence through a shared command
+ * encoder, ensuring device-side ordering (kernel N+1 dispatches only after
+ * kernel N completes). Returns combined results for all outputs in the chain.
+ *
+ * Each kernel descriptor must include:
+ *   - pipeline: GPUComputePipeline
+ *   - bindGroups: Array<{ bindGroupIndex, bindGroup }>
+ *   - dispatchWorkgroups: { x, y, z }
+ *   - outputBindings: Array<{ resourceIndex, bufferByteLen }>
+ *
+ * All kernels share one GPUCommandEncoder — no explicit barrier needed
+ * because encoder commands execute in submission order. All output buffers
+ * are validated before the first dispatch (fail-fast).
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - compute resource session with buffers Map
+ * @param {Array<object>} chain - ordered list of kernel descriptors
+ * @returns {Promise<{ results: Array<{ binding, values }> }>}
+ */
+export async function runKernelChain(device, resources, chain) {
+  if (!Array.isArray(chain) || chain.length === 0) {
+    throw new FaberKernelContractError(
+      "runKernelChain",
+      "chain must be a non-empty array of kernel descriptors",
+    );
+  }
+
+  // Validate all output buffers exist before dispatching (fail-fast)
+  for (let i = 0; i < chain.length; i++) {
+    const kernel = chain[i];
+    for (const binding of kernel.outputBindings) {
+      if (!resources.buffers.has(binding.resourceIndex)) {
+        throw new FaberKernelContractError(
+          "resources.buffers",
+          `chain[${i}]: missing output resource ${binding.resourceIndex}`,
+        );
+      }
+    }
+  }
+
+  // Single command encoder for device-side ordering
+  const encoder = device.createCommandEncoder();
+
+  for (const kernel of chain) {
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(kernel.pipeline);
+    for (const group of kernel.bindGroups) {
+      pass.setBindGroup(group.bindGroupIndex, group.bindGroup);
+    }
+    pass.dispatchWorkgroups(
+      kernel.dispatchWorkgroups.x,
+      kernel.dispatchWorkgroups.y,
+      kernel.dispatchWorkgroups.z,
+    );
+    pass.end();
+  }
+
+  device.queue.submit([encoder.finish()]);
+
+  // Collect all output bindings for combined readback
+  const allOutputBindings = [];
+  for (const kernel of chain) {
+    for (const binding of kernel.outputBindings) {
+      allOutputBindings.push(binding);
+    }
+  }
+
+  const results = await placementReadback(device, resources, allOutputBindings);
+
+  return Object.freeze({ results });
+}
+
 // ── Placement operations ────────────────────────────────────────────────────
 //
 // Protocol alignment with PlacementHost trait (D-SPINE-09):
