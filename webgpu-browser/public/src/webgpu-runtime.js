@@ -1635,6 +1635,112 @@ function writeGraphicsStorageInput(buffer, entry, storageData) {
   buffer.unmap();
 }
 
+/**
+ * Update the contents of a graphics storage buffer after creation.
+ * Resolves the target resource by resourceIndex or sourceName, validates
+ * input role and byte bounds before any queue effect, writes via
+ * device.queue.writeBuffer, increments the generation counter, and returns
+ * a frozen status object.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - frozen object from createGraphicsResources
+ * @param {object} descriptor - admitted graphics descriptor (bindGroups array)
+ * @param {{ resourceIndex?: number, sourceName?: string, data: Float32Array }} options
+ * @returns {{ status: number, resourceIndex: number, generation: number }}
+ */
+export function updateGraphicsStorage(device, resources, descriptor, { resourceIndex, sourceName, data }) {
+  // 1. Validate data is Float32Array (matching writeGraphicsStorageInput contract)
+  if (!(data instanceof Float32Array)) {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage.data",
+      "expected Float32Array",
+    );
+  }
+
+  // 2. Resolve resourceIndex by sourceName if needed
+  if (resourceIndex === undefined && sourceName !== undefined) {
+    for (const group of descriptor.bindGroups) {
+      for (const entry of group.entries) {
+        if (entry.sourceName === sourceName) {
+          resourceIndex = entry.resourceIndex;
+          break;
+        }
+      }
+      if (resourceIndex !== undefined) break;
+    }
+    if (resourceIndex === undefined) {
+      throw new FaberKernelContractError(
+        "updateGraphicsStorage.sourceName",
+        `unknown sourceName "${sourceName}"`,
+      );
+    }
+  }
+
+  if (resourceIndex === undefined) {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage",
+      "resourceIndex or sourceName is required",
+    );
+  }
+
+  // 3. Look up the storage buffer entry
+  const entry = resources.storageBuffers.get(resourceIndex);
+  if (!entry) {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage.resourceIndex",
+      `unknown resourceIndex ${resourceIndex}`,
+    );
+  }
+
+  // 4. Find the bind group entry for this resourceIndex
+  let bgEntry = null;
+  for (const group of descriptor.bindGroups) {
+    for (const e of group.entries) {
+      if (e.resourceIndex === resourceIndex) {
+        bgEntry = e;
+        break;
+      }
+    }
+    if (bgEntry) break;
+  }
+
+  if (!bgEntry) {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage",
+      `resourceIndex ${resourceIndex} not found in descriptor bindGroups`,
+    );
+  }
+
+  // 5. Validate input role
+  if (bgEntry.role !== "input") {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage.role",
+      `resourceIndex ${resourceIndex} role is "${bgEntry.role}", expected "input"`,
+    );
+  }
+
+  // 6. Validate byte bounds
+  if (data.byteLength > bgEntry.bufferByteLen) {
+    throw new FaberKernelContractError(
+      "updateGraphicsStorage.data",
+      `data byteLength ${data.byteLength} exceeds bufferByteLen ${bgEntry.bufferByteLen}`,
+    );
+  }
+
+  // 7. Write to the GPU buffer
+  device.queue.writeBuffer(entry.buffer, 0, data);
+
+  // 8. Increment generation
+  entry.generation += 1;
+
+  // 9. Return frozen status
+  return Object.freeze({
+    status: 0,
+    resourceIndex,
+    generation: entry.generation,
+  });
+}
+
 // ── Per-chunk resource lifecycle (HV-07B) ─────────────────────────────────
 //
 // Frozen replace payload contract (HV-07A ↔ HV-07B):
