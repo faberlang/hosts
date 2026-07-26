@@ -648,7 +648,13 @@ export async function destroyRetiredComputeResources(device, resources) {
   // retires during the await must not be destroyed under this completion.
   const groups = resources.pendingRetire.splice(0, resources.pendingRetire.length);
 
-  await done.call(device.queue);
+  try {
+    await done.call(device.queue);
+  } catch (e) {
+    // Re-queue groups so they are not orphaned if the fence rejects.
+    resources.pendingRetire.unshift(...groups);
+    throw e;
+  }
 
   let destroyedBuffers = 0;
   for (const group of groups) {
@@ -1466,7 +1472,13 @@ export async function destroyRetiredChunkResources(device, resources) {
   // retires during the await must not be destroyed under this completion.
   const groups = resources.pendingRetire.splice(0, resources.pendingRetire.length);
 
-  await done.call(device.queue);
+  try {
+    await done.call(device.queue);
+  } catch (e) {
+    // Re-queue groups so they are not orphaned if the fence rejects.
+    resources.pendingRetire.unshift(...groups);
+    throw e;
+  }
 
   let destroyedBuffers = 0;
   for (const group of groups) {

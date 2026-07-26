@@ -743,6 +743,56 @@ async function main() {
     require(result.destroyed_groups === 0 && result.destroyed_buffers === 0, "empty destroy no-op");
   }
 
+  // ── onSubmittedWorkDone rejection re-queues pendingRetire ──────────────
+  {
+    const device = createFakeDevice();
+    const context = createFakeCanvasContext();
+    const resources = createChunkGraphicsResources(
+      device,
+      descriptor,
+      { storageData: { transform } },
+      context,
+    );
+
+    applyChunkResourceReplace(device, resources, {
+      logical_id: 0,
+      generation: 0,
+      payload: meshPayload(0),
+    });
+    applyChunkResourceReplace(device, resources, {
+      logical_id: 0,
+      generation: 1,
+      payload: meshPayloadAlt(0),
+    });
+    require(resources.pendingRetire.length === 1, "one pending retire group before reject");
+
+    const origDone = device.queue.onSubmittedWorkDone.bind(device.queue);
+    device.queue.onSubmittedWorkDone = async function () {
+      throw new Error("simulated fence rejection");
+    };
+
+    try {
+      await destroyRetiredChunkResources(device, resources);
+      fail("expected onSubmittedWorkDone to reject");
+    } catch (_e) {
+      /* expected */
+    }
+    require(
+      resources.pendingRetire.length === 1,
+      "pendingRetire re-queued after reject (not orphaned)",
+    );
+    require(
+      resources.pendingRetire[0].buffers.every((b) => !b.__faberDestroyed),
+      "pending buffers not destroyed after reject",
+    );
+
+    // Restore normal fence; a second call must still succeed.
+    device.queue.onSubmittedWorkDone = origDone;
+    runChunkGraphicsFrame(device, context, resources, descriptor, { submittedFrameCount: 0 });
+    await destroyRetiredChunkResources(device, resources);
+    require(resources.pendingRetire.length === 0, "pendingRetire empty after second call");
+  }
+
   // ── Concurrent retire during onSubmittedWorkDone is not destroyed ──────
   // Snapshot-before-await: groups retired while waiting stay pending.
   {

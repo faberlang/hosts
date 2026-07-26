@@ -10,6 +10,7 @@
  * - queue-completion gate (destroy only after onSubmittedWorkDone)
  * - missing API detection
  * - concurrent retire during completion
+ * - onSubmittedWorkDone rejection re-queues pendingRetire (no orphan)
  * - unaffected resource identity across neighbor replace
  * - empty pending destroy no-op
  */
@@ -651,6 +652,49 @@ async function main() {
     const result = await destroyRetiredComputeResources(device, resources);
     require(result.destroyed_groups === 0 && result.destroyed_buffers === 0, "empty destroy no-op");
     require(resources.pendingRetire.length === 0, "pending stays empty");
+  }
+
+  // ── 14. onSubmittedWorkDone rejection re-queues pendingRetire ─────────
+  {
+    const device = createFakeDevice();
+    const resources = createWebGpuResources(device, computeDescriptor());
+
+    applyComputeResourceReplace(device, resources, {
+      resource_index: 40,
+      generation: 0,
+      buffer_descriptor: storageBuf(256),
+    });
+    applyComputeResourceReplace(device, resources, {
+      resource_index: 40,
+      generation: 1,
+      buffer_descriptor: storageBufAlt(512),
+    });
+    require(resources.pendingRetire.length === 1, "one pending retire group before reject");
+
+    const origDone = device.queue.onSubmittedWorkDone.bind(device.queue);
+    device.queue.onSubmittedWorkDone = async function () {
+      throw new Error("simulated fence rejection");
+    };
+
+    try {
+      await destroyRetiredComputeResources(device, resources);
+      fail("expected onSubmittedWorkDone to reject");
+    } catch (_e) {
+      /* expected */
+    }
+    require(
+      resources.pendingRetire.length === 1,
+      "pendingRetire re-queued after reject (not orphaned)",
+    );
+    require(
+      resources.pendingRetire[0].buffers.every((b) => !b.__faberDestroyed),
+      "pending buffers not destroyed after reject",
+    );
+
+    // Restore normal fence; a second call must still succeed.
+    device.queue.onSubmittedWorkDone = origDone;
+    await destroyRetiredComputeResources(device, resources);
+    require(resources.pendingRetire.length === 0, "pendingRetire empty after second call");
   }
 
   // ── Counters: cross-scenario invariant ────────────────────────────────
