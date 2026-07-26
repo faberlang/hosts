@@ -1249,7 +1249,11 @@ function createStorageBuffers(device, descriptor, storageData) {
         writeGraphicsStorageInput(buffer, entry, storageData);
       }
 
-      buffers.set(entry.resourceIndex, buffer);
+      buffers.set(entry.resourceIndex, {
+        buffer,
+        generation: 0,
+        logicalId: entry.resourceIndex,
+      });
     }
   }
 
@@ -1558,7 +1562,8 @@ export async function destroyRetiredChunkResources(device, resources) {
  */
 export function runChunkGraphicsFrame(device, context, resources, descriptor, frameState, options = {}) {
   expectChunkResources(resources);
-  const textureView = context.getCurrentTexture().createView();
+  const currentTexture = context.getCurrentTexture();
+  const textureView = currentTexture.createView();
   const clearValue = options.clearValue ?? { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
   const commandEncoder = device.createCommandEncoder();
@@ -1628,7 +1633,7 @@ export function runChunkGraphicsFrame(device, context, resources, descriptor, fr
     });
   }
 
-  return Object.freeze({ draw_count: draws.length, draws });
+  return Object.freeze({ draw_count: draws.length, draws, texture: currentTexture });
 }
 
 // ── Chunk lifecycle helpers ───────────────────────────────────────────────
