@@ -191,6 +191,216 @@ export async function runKernelChain(device, resources, chain) {
   return Object.freeze({ results });
 }
 
+/**
+ * Build a runKernelChain-compatible chain from compiler reflection data.
+ *
+ * Reads the compiler's raw MirGpuReflection JSON (produced by
+ * emit_wgsl_text_probe_with_reflection_json) and constructs GPU compute
+ * pipelines, bind groups, and buffer resources for each kernel. All kernels
+ * share one shader module from the concatenated WGSL source.
+ *
+ * @param {GPUDevice} device
+ * @param {string} wgslSource - WGSL text for all kernels (concatenated)
+ * @param {object} reflection - parsed MirGpuReflection JSON
+ * @param {Map<number, Float32Array>} [inputData] - resource index → typed data
+ * @param {Array<{resourceIndex: number}>} [outputBindings] - which buffers to read back
+ * @returns {{ chain: Array<object>, resources: { buffers: Map<number, object> } }}
+ */
+export function buildChainFromReflection(
+  device, wgslSource, reflection, inputData, outputBindings,
+) {
+  if (!reflection || !Array.isArray(reflection.kernels) || reflection.kernels.length === 0) {
+    throw new FaberKernelContractError(
+      "reflection.kernels",
+      "reflection must contain at least one kernel",
+      "reflection",
+    );
+  }
+
+  // 1. Shared shader module — all entry points in one WGSL source
+  const module = device.createShaderModule({ code: wgslSource });
+
+  // 2. Collect resource metadata across all kernels (resourceIndex → meta)
+  //    The bind group descriptors in the webgpu_adapter block are the
+  //    authoritative source for resource_index, buffer_byte_len, and role.
+  /** @type {Map<number, { bufferByteLen: number, role: string, usage: number }>} */
+  const resourceMeta = new Map();
+  for (const kernel of reflection.kernels) {
+    const adapter = kernel.launch?.webgpu_adapter;
+    if (!adapter) continue;
+    for (const bgd of adapter.bind_group_descriptors || []) {
+      for (const entry of bgd.entries || []) {
+        const ri = entry.resource_index;
+        if (ri == null) continue;
+        if (!resourceMeta.has(ri)) {
+          // Determine buffer usage: storage + copy-dst for input, + copy-src for output
+          let usage = GPUBufferUsage.STORAGE;
+          if (entry.role === "input") {
+            usage |= GPUBufferUsage.COPY_DST;
+          }
+          if (entry.role === "output") {
+            usage |= GPUBufferUsage.COPY_SRC;
+          }
+          // If a resource appears in multiple roles across kernels, combine
+          resourceMeta.set(ri, {
+            bufferByteLen: entry.buffer_byte_len,
+            role: entry.role,
+            usage,
+          });
+        } else {
+          // Merge usage for resources shared across kernels
+          const existing = resourceMeta.get(ri);
+          if (entry.role === "output") {
+            existing.usage |= GPUBufferUsage.COPY_SRC;
+          }
+          if (entry.role === "input") {
+            existing.usage |= GPUBufferUsage.COPY_DST;
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Create GPU buffers for all resources
+  /** @type {Map<number, { buffer: GPUBuffer }>} */
+  const buffers = new Map();
+  for (const [resourceIndex, meta] of resourceMeta) {
+    if (buffers.has(resourceIndex)) continue;
+    const buffer = device.createBuffer({
+      size: meta.bufferByteLen,
+      usage: meta.usage,
+    });
+    buffers.set(resourceIndex, { buffer });
+  }
+
+  // 4. Write input data to device buffers
+  if (inputData) {
+    for (const [resourceIndex, data] of inputData) {
+      const entry = buffers.get(resourceIndex);
+      if (!entry) {
+        throw new FaberKernelContractError(
+          "inputData",
+          `unknown resource index ${resourceIndex}`,
+          "product",
+        );
+      }
+      device.queue.writeBuffer(entry.buffer, 0, data);
+    }
+  }
+
+  // 5. Build the chain: one entry per kernel
+  const allOutputBindings = outputBindings || [];
+  const chain = [];
+
+  for (const kernel of reflection.kernels) {
+    const adapter = kernel.launch?.webgpu_adapter;
+    if (!adapter) {
+      throw new FaberKernelContractError(
+        "reflection.kernels[].launch.webgpu_adapter",
+        `kernel "${kernel.entry_name}" missing webgpu_adapter block`,
+        "reflection",
+      );
+    }
+
+    const entryName = kernel.entry_name;
+
+    // 5a. Create bind group layouts
+    const bindGroupLayouts = [];
+    for (const layoutDesc of adapter.bind_group_layout_descriptors || []) {
+      const entries = (layoutDesc.entries || []).map((e) => ({
+        binding: e.binding,
+        visibility: shaderStageFor(e.visibility),
+        buffer: {
+          type: e.buffer_type,
+          hasDynamicOffset: false,
+          minBindingSize: e.min_binding_size,
+        },
+      }));
+      const layout = device.createBindGroupLayout({ entries });
+      bindGroupLayouts.push({ bindGroupIndex: layoutDesc.bind_group_index, layout });
+    }
+
+    // 5b. Create pipeline layout from index references
+    const layoutIndexes = adapter.pipeline_layout_descriptor?.bind_group_layout_indexes || [];
+    const orderedLayouts = layoutIndexes.map((idx) => {
+      const bgl = bindGroupLayouts.find((l) => l.bindGroupIndex === idx);
+      if (!bgl) {
+        throw new FaberKernelContractError(
+          "pipeline_layout_descriptor.bind_group_layout_indexes",
+          `no bind group layout for index ${idx}`,
+          "reflection",
+        );
+      }
+      return bgl.layout;
+    });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: orderedLayouts });
+
+    // 5c. Create compute pipeline
+    const pipeline = device.createComputePipeline({
+      layout: pipelineLayout,
+      compute: { module, entryPoint: entryName },
+    });
+
+    // 5d. Create bind groups
+    const bindGroups = [];
+    for (const bgDesc of adapter.bind_group_descriptors || []) {
+      const bgl = bindGroupLayouts.find((l) => l.bindGroupIndex === bgDesc.bind_group_index);
+      if (!bgl) {
+        throw new FaberKernelContractError(
+          "bind_group_descriptors",
+          `no bind group layout for index ${bgDesc.bind_group_index}`,
+          "reflection",
+        );
+      }
+      const entries = (bgDesc.entries || []).map((e) => {
+        const buf = buffers.get(e.resource_index);
+        if (!buf) {
+          throw new FaberKernelContractError(
+            "bind_group_descriptors.entries",
+            `resource_index ${e.resource_index} not found in buffers`,
+            "product",
+          );
+        }
+        return {
+          binding: e.binding,
+          resource: { buffer: buf.buffer },
+        };
+      });
+      const bindGroup = device.createBindGroup({
+        layout: bgl.layout,
+        entries,
+      });
+      bindGroups.push({ bindGroupIndex: bgDesc.bind_group_index, bindGroup });
+    }
+
+    // 5e. Determine which output bindings this kernel owns
+    const ownedOutputs = [];
+    for (const ob of allOutputBindings) {
+      const owns = (adapter.bind_group_descriptors || []).some((bgd) =>
+        (bgd.entries || []).some(
+          (e) => e.resource_index === ob.resourceIndex && e.role === "output",
+        ),
+      );
+      if (owns) {
+        const meta = resourceMeta.get(ob.resourceIndex);
+        if (meta) {
+          ownedOutputs.push({ resourceIndex: ob.resourceIndex, bufferByteLen: meta.bufferByteLen });
+        }
+      }
+    }
+
+    // 5f. Push chain entry
+    chain.push({
+      pipeline,
+      bindGroups,
+      dispatchWorkgroups: adapter.dispatch_workgroups,
+      outputBindings: ownedOutputs,
+    });
+  }
+
+  return { chain, resources: { buffers } };
+}
+
 // ── Placement operations ────────────────────────────────────────────────────
 //
 // Protocol alignment with PlacementHost trait (D-SPINE-09):
