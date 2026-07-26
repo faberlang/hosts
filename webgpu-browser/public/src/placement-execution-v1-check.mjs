@@ -388,7 +388,8 @@ async function main() {
   // resourceIndex 1 → output buffer; use internal buffer id from the fake device.
   const outputBufObj = resources.buffers.get(1);
   require(outputBufObj !== undefined, "output buffer object exists");
-  const outputData = device.__getBufferData(outputBufObj.__id);
+  require(outputBufObj.buffer !== undefined, "output buffer has .buffer");
+  const outputData = device.__getBufferData(outputBufObj.buffer.__id);
   require(outputData !== null, "output buffer has backing after copyIn");
   const outputPreKernel = new Float32Array(outputData);
   require(
@@ -421,8 +422,8 @@ async function main() {
   // 6. Simulate kernel: manually apply multiply-by-2 before submitting.
   //    The fake device can't execute WGSL, so we apply the kernel effect.
   //    This is equivalent to what the real GPU would compute.
-  const inputBufData = device.__getBufferData(resources.buffers.get(0).__id);
-  const outputBufData = device.__getBufferData(resources.buffers.get(1).__id);
+  const inputBufData = device.__getBufferData(resources.buffers.get(0).buffer.__id);
+  const outputBufData = device.__getBufferData(resources.buffers.get(1).buffer.__id);
   require(inputBufData !== null, "input buffer has backing");
   require(outputBufData !== null, "output buffer has backing");
   const inputF32 = new Float32Array(inputBufData);
