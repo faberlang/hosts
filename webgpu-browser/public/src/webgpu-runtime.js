@@ -160,7 +160,9 @@ export async function runKernelChain(device, resources, chain) {
   // Single command encoder for device-side ordering
   const encoder = device.createCommandEncoder();
 
-  for (const kernel of chain) {
+  for (let i = 0; i < chain.length; i++) {
+    const kernel = chain[i];
+    validateDispatchWorkgroups(device, kernel.dispatchWorkgroups, `runKernelChain.chain[${i}].dispatchWorkgroups`);
     const pass = encoder.beginComputePass();
     pass.setPipeline(kernel.pipeline);
     for (const group of kernel.bindGroups) {
@@ -212,6 +214,7 @@ export async function runKernelChain(device, resources, chain) {
  * @param {{ dispatchWorkgroups: { x: number, y: number, z: number } }} descriptor
  */
 export function placementDispatch(device, resources, descriptor) {
+  validateDispatchWorkgroups(device, descriptor.dispatchWorkgroups, "placementDispatch.dispatchWorkgroups");
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginComputePass();
   pass.setPipeline(resources.pipeline);
@@ -340,6 +343,8 @@ function createBuffers(device, descriptor, initialInputs) {
       if (buffers.has(entry.resourceIndex)) {
         continue;
       }
+
+      validateBufferSize(device, entry.bufferByteLen, `createBuffers.resource[${entry.resourceIndex}].bufferByteLen`);
 
       const buffer = device.createBuffer({
         size: entry.bufferByteLen,
@@ -511,6 +516,7 @@ function expectComputeResources(resources) {
  * @returns {{ logicalId: number, generation: number, buffer: GPUBuffer, buffers: GPUBuffer[] }}
  */
 function createComputeGpuEntry(device, resources, logicalId, generation, bufferDescriptor) {
+  validateBufferSize(device, bufferDescriptor.size, `createComputeGpuEntry.resource[${logicalId}].size`);
   const buffer = device.createBuffer(bufferDescriptor);
   resources.counters.created += 1;
   resources.counters.live += 1;
@@ -588,7 +594,7 @@ export function applyComputeResourceReplace(device, resources, transition) {
     });
   }
 
-  const descriptor = normalizeComputePayload(transition.buffer_descriptor, resourceIndex);
+  const descriptor = normalizeComputePayload(device, transition.buffer_descriptor, resourceIndex);
 
   if (!current) {
     // create
@@ -674,13 +680,55 @@ export async function destroyRetiredComputeResources(device, resources) {
   });
 }
 
+// ── Device-limit helpers (untrusted package gate) ──────────────────────────
+
+/**
+ * Validate that a requested buffer size does not exceed the device's
+ * maxBufferSize limit.  Passes silently when device.limits is absent
+ * (test-fake compatibility).  Throws FaberKernelContractError kind=webgpu
+ * when the limit is exceeded — fail-closed for untrusted package loads.
+ */
+function validateBufferSize(device, size, label) {
+  const maxSize = device?.limits?.maxBufferSize;
+  if (maxSize !== undefined && size > maxSize) {
+    throw new FaberKernelContractError(
+      label,
+      `buffer size ${size} exceeds device limit maxBufferSize ${maxSize}`,
+      "webgpu",
+    );
+  }
+}
+
+/**
+ * Validate that each dispatch workgroup dimension does not exceed the
+ * device's maxComputeWorkgroupsPerDimension limit.  Passes silently when
+ * device.limits is absent.  Throws FaberKernelContractError kind=webgpu
+ * on violation.
+ */
+function validateDispatchWorkgroups(device, dispatch, label) {
+  const maxPerDim = device?.limits?.maxComputeWorkgroupsPerDimension;
+  if (maxPerDim === undefined) {
+    return;
+  }
+  for (const dim of ["x", "y", "z"]) {
+    const value = dispatch[dim];
+    if (typeof value === "number" && value > maxPerDim) {
+      throw new FaberKernelContractError(
+        `${label}.${dim}`,
+        `dispatch ${dim}=${value} exceeds device limit maxComputeWorkgroupsPerDimension ${maxPerDim}`,
+        "webgpu",
+      );
+    }
+  }
+}
+
 // ── Compute lifecycle helpers ─────────────────────────────────────────────
 
 function isEmptyComputePayload(descriptor) {
   return descriptor == null;
 }
 
-function normalizeComputePayload(descriptor, resourceIndex) {
+function normalizeComputePayload(device, descriptor, resourceIndex) {
   if (!descriptor || typeof descriptor !== "object") {
     throw new FaberKernelContractError(
       "transition.buffer_descriptor",
@@ -702,6 +750,7 @@ function normalizeComputePayload(descriptor, resourceIndex) {
       "product",
     );
   }
+  validateBufferSize(device, descriptor.size, `transition.buffer_descriptor.size for resource ${resourceIndex}`);
   return {
     size: descriptor.size,
     usage: descriptor.usage,
@@ -1187,6 +1236,8 @@ function createStorageBuffers(device, descriptor, storageData) {
       if (buffers.has(entry.resourceIndex)) {
         continue;
       }
+
+      validateBufferSize(device, entry.bufferByteLen, `createStorageBuffers.resource[${entry.resourceIndex}].bufferByteLen`);
 
       const buffer = device.createBuffer({
         size: entry.bufferByteLen,
@@ -1708,6 +1759,7 @@ function normalizeChunkPayload(payload, logicalId) {
 }
 
 function createMappedBuffer(device, data, usage) {
+  validateBufferSize(device, data.byteLength, "createMappedBuffer.byteLength");
   const buffer = device.createBuffer({
     size: data.byteLength,
     usage,
@@ -1784,8 +1836,10 @@ function enqueueRetire(resources, entry) {
  * @returns {number} opaque gradient handle index
  */
 export function createGradientBuffer(device, elementCount) {
+  const size = elementCount * 4; // f32 = 4 bytes
+  validateBufferSize(device, size, "createGradientBuffer.size");
   const buffer = device.createBuffer({
-    size: elementCount * 4, // f32 = 4 bytes
+    size,
     usage: BUFFER_USAGE.gradient(),
     mappedAtCreation: true,
   });
