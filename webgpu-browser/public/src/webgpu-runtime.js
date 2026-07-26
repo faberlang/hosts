@@ -401,6 +401,150 @@ export function buildChainFromReflection(
   return { chain, resources: { buffers } };
 }
 
+/**
+ * Dispatch a multi-kernel chain from a G-SPINE-10 KernelChainDescriptor.
+ *
+ * Reads the compiler's simplified chain descriptor JSON (entry_point, source,
+ * storage_buffers, workgroup_size, bind_group_layout, output_bindings,
+ * buffer_identities) and constructs WebGPU pipelines/bind-groups. Uses
+ * `layout: 'auto'` for pipeline creation — no explicit bind group layout
+ * descriptors needed.
+ *
+ * Intermediate buffers declared in buffer_identities are allocated at dispatch
+ * time. Input buffers must exist in resources.buffers before calling, keyed
+ * by the storage buffer's @binding number.
+ *
+ * @param {GPUDevice} device
+ * @param {object} resources - { buffers: Map<number, { buffer: GPUBuffer }> }
+ * @param {object} descriptor - KernelChainDescriptor JSON (parsed)
+ * @returns {Promise<{ results: Array<{ binding: object, values: number[] }> }>}
+ */
+export async function dispatchChainFromDescriptor(device, resources, descriptor) {
+  if (!descriptor || !Array.isArray(descriptor.chain) || descriptor.chain.length === 0) {
+    throw new FaberKernelContractError(
+      "dispatchChainFromDescriptor",
+      "descriptor.chain must be a non-empty array",
+    );
+  }
+
+  // 1. Allocate intermediate buffers from buffer_identities
+  const intermediates = new Map();
+  if (descriptor.buffer_identities) {
+    for (const ident of descriptor.buffer_identities) {
+      const producer = descriptor.chain[ident.output_kernel_index];
+      if (!producer) continue;
+      const bufDecl = producer.storage_buffers[ident.output_binding];
+      if (!bufDecl) continue;
+
+      const key = `intermediate_${ident.output_kernel_index}_${ident.output_binding}`;
+      if (intermediates.has(key)) continue;
+
+      const buffer = device.createBuffer({
+        size: Number(bufDecl.size),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      intermediates.set(key, { buffer });
+    }
+  }
+
+  // 2. Build consumer input → intermediate lookup
+  const inputToIntermediate = new Map();
+  if (descriptor.buffer_identities) {
+    for (const ident of descriptor.buffer_identities) {
+      const key = `intermediate_${ident.output_kernel_index}_${ident.output_binding}`;
+      if (intermediates.has(key)) {
+        inputToIntermediate.set(
+          `${ident.input_kernel_index}:${ident.input_binding}`,
+          intermediates.get(key),
+        );
+      }
+    }
+  }
+
+  // 3. Build chain entries — one per kernel descriptor
+  const chain = [];
+
+  for (let kernelIdx = 0; kernelIdx < descriptor.chain.length; kernelIdx++) {
+    const kernel = descriptor.chain[kernelIdx];
+
+    // 3a. Create shader module and pipeline (layout: 'auto')
+    const shaderModule = device.createShaderModule({ code: kernel.source });
+    const pipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: shaderModule, entryPoint: kernel.entry_point },
+    });
+
+    // 3b. Build bind group entries, grouped by @group
+    const entriesByGroup = new Map();
+    for (const layout of kernel.bind_group_layout) {
+      const bufDecl = kernel.storage_buffers[layout.buffer_index];
+      if (!bufDecl) continue;
+
+      // Resolve buffer: check intermediate lookup first, then resources.buffers
+      const intermediateKey = `${kernelIdx}:${layout.buffer_index}`;
+      const bufEntry = inputToIntermediate.get(intermediateKey)
+        || resources.buffers.get(bufDecl.binding);
+
+      if (!bufEntry) {
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor",
+          `kernel "${kernel.entry_point}": no buffer for ` +
+          `buffer_index ${layout.buffer_index} (binding ${layout.binding}, group ${layout.group})`,
+        );
+      }
+
+      const group = layout.group || 0;
+      if (!entriesByGroup.has(group)) {
+        entriesByGroup.set(group, []);
+      }
+      entriesByGroup.get(group).push({
+        binding: layout.binding,
+        resource: { buffer: bufEntry.buffer },
+      });
+    }
+
+    // 3c. Create bind groups using pipeline's auto-generated layouts
+    const bindGroups = [];
+    for (const [group, entries] of entriesByGroup) {
+      const bindGroupLayout = pipeline.getBindGroupLayout(group);
+      const bindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries,
+      });
+      bindGroups.push({ bindGroupIndex: group, bindGroup });
+    }
+
+    // 3d. Collect output bindings for readback
+    const outputBindings = [];
+    for (const bindingIdx of kernel.output_bindings) {
+      const bufDecl = kernel.storage_buffers[bindingIdx];
+      if (bufDecl) {
+        outputBindings.push({
+          resourceIndex: bufDecl.binding,
+          bufferByteLen: Number(bufDecl.size),
+        });
+      }
+    }
+
+    // 3e. Normalize workgroup_size: Rust tuple [x, y, z] → { x, y, z }
+    const wg = kernel.workgroup_size;
+    const dispatchWorkgroups = Array.isArray(wg)
+      ? { x: wg[0], y: wg[1], z: wg[2] }
+      : wg;
+
+    // 3f. Push chain entry
+    chain.push({
+      pipeline,
+      bindGroups,
+      dispatchWorkgroups,
+      outputBindings,
+    });
+  }
+
+  // 4. Dispatch through runKernelChain
+  return runKernelChain(device, resources, chain);
+}
+
 // ── Placement operations ────────────────────────────────────────────────────
 //
 // Protocol alignment with PlacementHost trait (D-SPINE-09):
