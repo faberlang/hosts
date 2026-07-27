@@ -497,8 +497,7 @@ fn solum_carpe_returns_list_of_lines() {
     let mut workspace = TestWorkspace::new("solum-carpe-list");
     let path = workspace.file("read.txt", "prima\nsecunda\n");
 
-    let (request, context) =
-        request("solum:carpe", DispatchFixture::new(Valor::Textus(path)));
+    let (request, context) = request("solum:carpe", DispatchFixture::new(Valor::Textus(path)));
     let reply = kernel
         .dispatch(&request, &context)
         .expect("solum:carpe lista<textus> dispatch");
@@ -519,8 +518,7 @@ fn solum_hauri_returns_raw_bytes() {
     let mut workspace = TestWorkspace::new("solum-hauri-bytes");
     let path = workspace.file("read.txt", "prima\nsecunda\n");
 
-    let (request, context) =
-        request("solum:hauri", DispatchFixture::new(Valor::Textus(path)));
+    let (request, context) = request("solum:hauri", DispatchFixture::new(Valor::Textus(path)));
     let reply = kernel
         .dispatch(&request, &context)
         .expect("solum:hauri octeti dispatch");

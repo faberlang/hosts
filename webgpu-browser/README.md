@@ -20,11 +20,12 @@ ownership boundaries, not a browser runtime dependency.
 | --- | --- |
 | Product entrypoint | `public/index.html` |
 | Product manifest | `public/faber-webgpu-product.json` |
-| Generated inputs | `public/generated/{kernel.wgsl,reflection.json}` |
+| Generated inputs | `public/generated/{kernel.wgsl,reflection.json,graphics.wgsl,graphics-reflection.json,graphics-*.bin,draw.json}` |
 | Launch / serve | `./scripta/webgpu-browser-proof serve` (this hosts repo root) |
 | Static admission | `./scripta/webgpu-browser-proof check` |
 | Focused non-GPU boundary | `node public/src/product-boundary-check.mjs` |
-| Success state | `window.faberWebGpuProof.ok === true` and `.value === 42` |
+| Focused graphics storage update | `node public/src/graphics-storage-update-check.mjs` |
+| Success state | `window.faberWebGpuProof.ok === true` and `.value === 42`; graphics state reports submitted frames through `window.faberWebGpuGraphicsProof` |
 
 The host consumes generated WGSL plus `launch.webgpu_adapter` reflection,
 dispatches the focused compute kernel through browser WebGPU APIs, reads back
@@ -55,10 +56,17 @@ Browser runtime code consumes the checked-in generated artifacts from:
 ```text
 webgpu-browser/public/generated/kernel.wgsl
 webgpu-browser/public/generated/reflection.json
+webgpu-browser/public/generated/graphics.wgsl
+webgpu-browser/public/generated/graphics-reflection.json
+webgpu-browser/public/generated/graphics-vertex-positions.bin
+webgpu-browser/public/generated/graphics-vertex-colors.bin
+webgpu-browser/public/generated/graphics-indices.bin
+webgpu-browser/public/generated/graphics-transform.bin
+webgpu-browser/public/generated/draw.json
 ```
 
-Regenerate them from this hosts repo root after fixture or compiler reflection changes
-(requires sibling `../radix`):
+Regenerate them from this hosts repo root after fixture, graphics fixture, or compiler reflection changes
+(requires sibling `../radix` and `../triga`):
 
 ```bash
 ./scripta/webgpu-browser-proof generate
@@ -99,11 +107,25 @@ phases can use a stable local URL without adding global package tooling.
 
 `check` does three things and **does not claim browser GPU execution**:
 
-1. Regenerates WGSL + reflection into a temp dir and compares checked-in
-   `public/generated/` artifacts for freshness.
-2. Validates the reflection/static-page/product manifest contract.
+1. Regenerates compute and graphics WGSL/reflection into a temp dir and compares
+   checked-in `public/generated/` text artifacts for freshness.
+2. Validates the reflection/static-page/product manifest contract, including
+   graphics pipeline and checked-in binary payload shape.
 3. Runs `node public/src/product-boundary-check.mjs` for focused product-boundary
    rejects (artifact-fetch, unsupported reflection, unavailable WebGPU).
+
+Additional focused Node checks cover runtime-only contracts without compiler
+regeneration or browser GPU execution:
+
+```bash
+node public/src/graphics-storage-update-check.mjs
+node public/src/chunk-resource-lifecycle-check.mjs
+node public/src/compute-resource-lifecycle-check.mjs
+node public/src/device-limit-check.mjs
+node public/src/gradient-handle-check.mjs
+node public/src/placement-execution-v1-check.mjs
+node public/src/placement-contract-oracle.mjs
+```
 
 ## Failure Outcomes
 
@@ -160,6 +182,7 @@ Console admission:
 window.faberWebGpuProof.ok === true
 window.faberWebGpuProof.value === 42
 window.faberWebGpuProof.kind === "ok"
+window.faberWebGpuGraphicsProof.submittedFrameCount > 0
 ```
 
 On unsupported environments, expect `ok === false` with a specific `kind` from

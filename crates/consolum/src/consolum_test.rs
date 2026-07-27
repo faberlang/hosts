@@ -223,7 +223,6 @@ fn nonblocking_write_honors_cancellation_and_restores_flags() {
 
 #[test]
 fn scribe_with_empty_string_emits_empty_frame_content() {
-    use std::io::Cursor;
     let provider = Consolum::new().expect("provider");
     let reply = provider
         .dispatch(

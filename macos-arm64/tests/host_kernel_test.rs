@@ -23,7 +23,7 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 /// Create a temp directory with one text file and return (dir, file, "salve\nmunde").
-fn solum_fixture(name: &str) -> (tempfile::TempDir, PathBuf, String) {
+fn solum_fixture(_name: &str) -> (tempfile::TempDir, PathBuf, String) {
     let dir = tempfile::tempdir().expect("fixture dir");
     let file = dir.path().join("note.txt");
     let content = "salve\nmunde".to_owned();
@@ -578,10 +578,12 @@ fn solum_renomina_moves_file() {
     assert!(!file.exists());
     assert!(moved.exists());
     assert_eq!(
-        kernel.route(&Frame::request_with(
-            "solum:lege",
-            Valor::Textus(moved.to_string_lossy().into_owned()),
-        )).data,
+        kernel
+            .route(&Frame::request_with(
+                "solum:lege",
+                Valor::Textus(moved.to_string_lossy().into_owned()),
+            ))
+            .data,
         Valor::Textus(content)
     );
 }

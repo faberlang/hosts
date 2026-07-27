@@ -393,10 +393,7 @@ fn respond_with_unknown_id_returns_error() {
 #[test]
 fn stop_invalid_handle_returns_error() {
     let provider = Http::new().expect("provider");
-    let result = provider.dispatch(
-        &request("http:stop", Valor::Numerus(9999)),
-        &context(),
-    );
+    let result = provider.dispatch(&request("http:stop", Valor::Numerus(9999)), &context());
     let error = result.expect_err("stop invalid handle must fail");
     assert_eq!(error.code, "E_INVALID_ARGS");
 }
@@ -407,10 +404,7 @@ fn listen_on_port_below_zero_or_above_u16_rejected() {
     // Port 0 is valid (ephemeral). Reject only out-of-range ports.
     for port in [-1, -8080, 65536, i64::MIN] {
         let result = provider.dispatch(
-            &request(
-                "http:listen",
-                Valor::Lista(vec![Valor::Numerus(port)]),
-            ),
+            &request("http:listen", Valor::Lista(vec![Valor::Numerus(port)])),
             &context(),
         );
         let error = result.expect_err("invalid port must fail");

@@ -230,7 +230,10 @@ mod tests {
     fn seed_returns_vacuum() {
         let (provider, context) = test_provider();
         let reply = provider
-            .dispatch(&request_frame("aleator:semina", Valor::Numerus(42)), &context)
+            .dispatch(
+                &request_frame("aleator:semina", Valor::Numerus(42)),
+                &context,
+            )
             .expect("seed");
         assert!(reply.contents.is_empty(), "seed reply should be vacuum");
     }
@@ -239,10 +242,16 @@ mod tests {
     fn seeded_octetos_returns_four_bytes() {
         let (provider, context) = test_provider();
         provider
-            .dispatch(&request_frame("aleator:semina", Valor::Numerus(42)), &context)
+            .dispatch(
+                &request_frame("aleator:semina", Valor::Numerus(42)),
+                &context,
+            )
             .expect("seed");
         let reply = provider
-            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(4)), &context)
+            .dispatch(
+                &request_frame("aleator:octetos", Valor::Numerus(4)),
+                &context,
+            )
             .expect("octetos");
         assert!(
             matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.len() == 4),
@@ -254,7 +263,10 @@ mod tests {
     fn octetos_zero_returns_empty() {
         let (provider, context) = test_provider();
         let reply = provider
-            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(0)), &context)
+            .dispatch(
+                &request_frame("aleator:octetos", Valor::Numerus(0)),
+                &context,
+            )
             .expect("zero bytes");
         assert!(
             matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty()),
@@ -266,7 +278,10 @@ mod tests {
     fn octetos_negative_clamps_to_zero() {
         let (provider, context) = test_provider();
         let reply = provider
-            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(-1)), &context)
+            .dispatch(
+                &request_frame("aleator:octetos", Valor::Numerus(-1)),
+                &context,
+            )
             .expect("negative byte count");
         assert!(
             matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty()),
@@ -295,30 +310,18 @@ mod tests {
 
     #[test]
     fn bounded_non_negative_len_returns_zero_for_non_positive() {
-        assert_eq!(
-            bounded_non_negative_len(-5, 100, "test", "n").unwrap(),
-            0
-        );
-        assert_eq!(
-            bounded_non_negative_len(0, 100, "test", "n").unwrap(),
-            0
-        );
+        assert_eq!(bounded_non_negative_len(-5, 100, "test", "n").unwrap(), 0);
+        assert_eq!(bounded_non_negative_len(0, 100, "test", "n").unwrap(), 0);
     }
 
     #[test]
     fn bounded_non_negative_len_accepts_valid() {
-        assert_eq!(
-            bounded_non_negative_len(1, 100, "test", "n").unwrap(),
-            1
-        );
+        assert_eq!(bounded_non_negative_len(1, 100, "test", "n").unwrap(), 1);
         assert_eq!(
             bounded_non_negative_len(100, 100, "test", "n").unwrap(),
             100
         );
-        assert_eq!(
-            bounded_non_negative_len(50, 100, "test", "n").unwrap(),
-            50
-        );
+        assert_eq!(bounded_non_negative_len(50, 100, "test", "n").unwrap(), 50);
     }
 
     #[test]
