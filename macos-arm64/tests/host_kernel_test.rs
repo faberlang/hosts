@@ -22,6 +22,15 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("faber-host-{name}-{}-{nanos}", std::process::id()))
 }
 
+/// Create a temp directory with one text file and return (dir, file, "salve\nmunde").
+fn solum_fixture(name: &str) -> (tempfile::TempDir, PathBuf, String) {
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let file = dir.path().join("note.txt");
+    let content = "salve\nmunde".to_owned();
+    std::fs::write(&file, &content).expect("fixture file");
+    (dir, file, content)
+}
+
 #[test]
 fn routes_host_echo_as_done_frame() {
     let kernel = HostKernel::new();
@@ -362,34 +371,51 @@ fn reports_unknown_consolum_member_as_no_route() {
 }
 
 #[test]
-fn routes_solum_text_file_operations_from_ordered_payloads() {
+fn solum_crea_creates_directory() {
     let kernel = HostKernel::new();
-    let dir = temp_path("solum-dir");
-    let file = dir.join("note.txt");
-    let copy = dir.join("copy.txt");
-    let moved = dir.join("moved.txt");
-    let link = dir.join("note-link.txt");
-
-    let create = kernel.route(&Frame::request_with(
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let new_dir = dir.path().join("solum-crea");
+    let response = kernel.route(&Frame::request_with(
         "solum:crea",
-        Valor::Textus(dir.to_string_lossy().into_owned()),
+        Valor::Textus(new_dir.to_string_lossy().into_owned()),
     ));
-    assert_eq!(create.status, Status::Done);
+    assert_eq!(response.status, Status::Done);
+    assert!(new_dir.exists());
+}
+
+#[test]
+fn solum_scribe_writes_and_lege_reads_text() {
+    let kernel = HostKernel::new();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let file = dir.path().join("payload.txt");
 
     let write = kernel.route(&Frame::request_with(
         "solum:scribe",
         Valor::Lista(vec![
             Valor::Textus(file.to_string_lossy().into_owned()),
-            Valor::Textus("salve".into()),
+            Valor::Textus("salve\nmunde".into()),
         ]),
     ));
     assert_eq!(write.status, Status::Done);
+
+    let read = kernel.route(&Frame::request_with(
+        "solum:lege",
+        Valor::Textus(file.to_string_lossy().into_owned()),
+    ));
+    assert_eq!(read.status, Status::Done);
+    assert_eq!(read.data, Valor::Textus("salve\nmunde".into()));
+}
+
+#[test]
+fn solum_appone_appends_to_existing_file() {
+    let kernel = HostKernel::new();
+    let (_dir, file, content) = solum_fixture("appone");
 
     let append = kernel.route(&Frame::request_with(
         "solum:appone",
         Valor::Lista(vec![
             Valor::Textus(file.to_string_lossy().into_owned()),
-            Valor::Textus("\nmunde".into()),
+            Valor::Textus("\ntertia".into()),
         ]),
     ));
     assert_eq!(append.status, Status::Done);
@@ -398,8 +424,13 @@ fn routes_solum_text_file_operations_from_ordered_payloads() {
         "solum:lege",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert_eq!(read.status, Status::Done);
-    assert_eq!(read.data, Valor::Textus("salve\nmunde".into()));
+    assert_eq!(read.data, Valor::Textus(format!("{content}\ntertia")));
+}
+
+#[test]
+fn solum_partem_reads_byte_range() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("partem");
 
     let part = kernel.route(&Frame::request_with(
         "solum:partem",
@@ -409,9 +440,14 @@ fn routes_solum_text_file_operations_from_ordered_payloads() {
             Valor::Numerus(5),
         ]),
     ));
-    // Public solum returns byte-status frames for ranged binary reads.
     assert_eq!(part.status, Status::Byte);
     assert_eq!(part.data, Valor::Octeti(b"munde".to_vec()));
+}
+
+#[test]
+fn solum_inveni_finds_text_offset() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("inveni");
 
     let found = kernel.route(&Frame::request_with(
         "solum:inveni",
@@ -424,87 +460,164 @@ fn routes_solum_text_file_operations_from_ordered_payloads() {
     ));
     assert_eq!(found.status, Status::Done);
     assert_eq!(found.data, Valor::Numerus(6));
+}
 
-    let exists = kernel.route(&Frame::request_with(
+#[test]
+fn solum_exstat_returns_true_for_existing_file() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("exstat");
+    let response = kernel.route(&Frame::request_with(
         "solum:exstat",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert_eq!(exists.data, Valor::Bivalens(true));
+    assert_eq!(response.data, Valor::Bivalens(true));
+}
 
-    let regular = kernel.route(&Frame::request_with(
+#[test]
+fn solum_regularene_identifies_regular_file() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("regularene");
+    let response = kernel.route(&Frame::request_with(
         "solum:regularene",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert_eq!(regular.data, Valor::Bivalens(true));
+    assert_eq!(response.data, Valor::Bivalens(true));
+}
 
-    let readable = kernel.route(&Frame::request_with(
+#[test]
+fn solum_legibilene_identifies_readable_file() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("legibilene");
+    let response = kernel.route(&Frame::request_with(
         "solum:legibilene",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert_eq!(readable.data, Valor::Bivalens(true));
+    assert_eq!(response.data, Valor::Bivalens(true));
+}
 
-    let directory = kernel.route(&Frame::request_with(
+#[test]
+fn solum_directoriumne_identifies_directory() {
+    let kernel = HostKernel::new();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let sub = dir.path().join("solum-directoriumne");
+    std::fs::create_dir(&sub).expect("fixture sub");
+    let response = kernel.route(&Frame::request_with(
         "solum:directoriumne",
-        Valor::Textus(dir.to_string_lossy().into_owned()),
+        Valor::Textus(sub.to_string_lossy().into_owned()),
     ));
-    assert_eq!(directory.data, Valor::Bivalens(true));
+    assert_eq!(response.data, Valor::Bivalens(true));
+}
 
-    let size = kernel.route(&Frame::request_with(
+#[test]
+fn solum_mensura_returns_byte_size() {
+    let kernel = HostKernel::new();
+    let (_dir, file, content) = solum_fixture("mensura");
+    let response = kernel.route(&Frame::request_with(
         "solum:mensura",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert_eq!(size.data, Valor::Numerus(11));
+    assert_eq!(response.data, Valor::Numerus(content.len() as i64));
+}
 
-    let mode = kernel.route(&Frame::request_with(
+#[test]
+fn solum_modus_returns_numeric_mode_with_read_bit() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("modus");
+    let response = kernel.route(&Frame::request_with(
         "solum:modus",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    assert!(matches!(mode.data, Valor::Numerus(bits) if bits & 0o400 != 0));
+    assert!(matches!(response.data, Valor::Numerus(bits) if bits & 0o400 != 0));
+}
 
-    std::os::unix::fs::symlink(&file, &link).expect("create symlink fixture");
-    let symlink = kernel.route(&Frame::request_with(
+#[test]
+fn solum_vinculumne_detects_symlink() {
+    let kernel = HostKernel::new();
+    let (dir, file, _) = solum_fixture("vinculumne");
+    let link = dir.path().join("payload-link.txt");
+    std::os::unix::fs::symlink(&file, &link).expect("create symlink");
+
+    let response = kernel.route(&Frame::request_with(
         "solum:vinculumne",
         Valor::Textus(link.to_string_lossy().into_owned()),
     ));
-    assert_eq!(symlink.data, Valor::Bivalens(true));
+    assert_eq!(response.data, Valor::Bivalens(true));
+}
 
-    let copy_response = kernel.route(&Frame::request_with(
+#[test]
+fn solum_exscribe_copies_file() {
+    let kernel = HostKernel::new();
+    let (dir, file, _) = solum_fixture("exscribe");
+    let copy = dir.path().join("copy.txt");
+
+    let copy_resp = kernel.route(&Frame::request_with(
         "solum:exscribe",
         Valor::Lista(vec![
             Valor::Textus(file.to_string_lossy().into_owned()),
             Valor::Textus(copy.to_string_lossy().into_owned()),
         ]),
     ));
-    assert_eq!(copy_response.status, Status::Done);
+    assert_eq!(copy_resp.status, Status::Done);
+    assert!(copy.exists());
+}
 
-    let move_response = kernel.route(&Frame::request_with(
+#[test]
+fn solum_renomina_moves_file() {
+    let kernel = HostKernel::new();
+    let (dir, file, content) = solum_fixture("renomina");
+    let moved = dir.path().join("moved.txt");
+
+    let move_resp = kernel.route(&Frame::request_with(
         "solum:renomina",
         Valor::Lista(vec![
-            Valor::Textus(copy.to_string_lossy().into_owned()),
+            Valor::Textus(file.to_string_lossy().into_owned()),
             Valor::Textus(moved.to_string_lossy().into_owned()),
         ]),
     ));
-    assert_eq!(move_response.status, Status::Done);
+    assert_eq!(move_resp.status, Status::Done);
+    assert!(!file.exists());
+    assert!(moved.exists());
+    assert_eq!(
+        kernel.route(&Frame::request_with(
+            "solum:lege",
+            Valor::Textus(moved.to_string_lossy().into_owned()),
+        )).data,
+        Valor::Textus(content)
+    );
+}
+
+#[test]
+fn solum_enumera_lists_directory_entries() {
+    let kernel = HostKernel::new();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), "").expect("write fixture");
+    }
 
     let listing = kernel.route(&Frame::request_with(
         "solum:enumera",
-        Valor::Textus(dir.to_string_lossy().into_owned()),
+        Valor::Textus(dir.path().to_string_lossy().into_owned()),
     ));
     assert_eq!(listing.status, Status::Done);
     assert_eq!(
         listing.data,
         Valor::Lista(vec![
-            Valor::Textus("moved.txt".into()),
-            Valor::Textus("note-link.txt".into()),
-            Valor::Textus("note.txt".into())
+            Valor::Textus("a.txt".into()),
+            Valor::Textus("b.txt".into()),
+            Valor::Textus("c.txt".into()),
         ])
     );
+}
 
-    let lines = kernel.open(Frame::request_with(
+#[test]
+fn solum_carpe_reads_lines() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("carpe");
+
+    let mut lines = kernel.open(Frame::request_with(
         "solum:carpe",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
-    let mut lines = lines;
     assert_eq!(
         lines.recv().expect("first line").data,
         Valor::Textus("salve".into())
@@ -514,28 +627,27 @@ fn routes_solum_text_file_operations_from_ordered_payloads() {
         Valor::Textus("munde".into())
     );
     assert_eq!(lines.recv().expect("terminal").status, Status::Done);
+}
+
+#[test]
+fn solum_dele_removes_existing_file() {
+    let kernel = HostKernel::new();
+    let (_dir, file, _) = solum_fixture("dele");
 
     let delete = kernel.route(&Frame::request_with(
         "solum:dele",
         Valor::Textus(file.to_string_lossy().into_owned()),
     ));
     assert_eq!(delete.status, Status::Done);
-
-    std::fs::remove_file(link).expect("cleanup symlink");
-    std::fs::remove_file(moved).expect("cleanup moved file");
-    std::fs::remove_dir(dir).expect("cleanup solum dir");
+    assert!(!file.exists());
 }
 
 #[test]
-fn routes_solum_mode_and_symlink_operations() {
+fn solum_modum_sets_file_mode_bits() {
     let kernel = HostKernel::new();
-    let dir = temp_path("solum-mode-link");
-    let file = dir.join("payload.txt");
-    let link = dir.join("payload-link.txt");
-    let relative_target = "payload.txt";
-
-    std::fs::create_dir(&dir).expect("create solum fixture directory");
-    std::fs::write(&file, "salve").expect("write solum fixture file");
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let file = dir.path().join("payload.txt");
+    std::fs::write(&file, "salve").expect("fixture file");
 
     let set_mode = kernel.route(&Frame::request_with(
         "solum:modum",
@@ -550,6 +662,14 @@ fn routes_solum_mode_and_symlink_operations() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o7777, 0o640);
+}
+
+#[test]
+fn solum_modum_rejects_out_of_range_mode_bits() {
+    let kernel = HostKernel::new();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let file = dir.path().join("payload.txt");
+    std::fs::write(&file, "salve").expect("fixture file");
 
     for invalid_mode in [-1, 0o10000] {
         let response = kernel.route(&Frame::request_with(
@@ -565,6 +685,16 @@ fn routes_solum_mode_and_symlink_operations() {
             Value::String("E_INVALID_ARGS".into())
         );
     }
+}
+
+#[test]
+fn solum_vincula_creates_symlink_and_rejects_existing_target() {
+    let kernel = HostKernel::new();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let file = dir.path().join("payload.txt");
+    let link = dir.path().join("payload-link.txt");
+    let relative_target = "payload.txt";
+    std::fs::write(&file, "salve").expect("fixture file");
 
     let create_link = kernel.route(&Frame::request_with(
         "solum:vincula",
@@ -591,10 +721,6 @@ fn routes_solum_mode_and_symlink_operations() {
         ]),
     ));
     assert_eq!(duplicate.status, Status::Error);
-
-    std::fs::remove_file(&link).expect("cleanup symlink");
-    std::fs::remove_file(&file).expect("cleanup mode fixture");
-    std::fs::remove_dir(&dir).expect("cleanup solum mode directory");
 }
 
 #[test]
@@ -623,7 +749,7 @@ fn attaches_sermo_to_solum_lege_conversation() {
 }
 
 #[test]
-fn routes_processus_environment_and_identity() {
+fn processus_scribe_and_lege_round_trips_env_var() {
     let kernel = HostKernel::new();
     let name = format!("FABER_HOST_TEST_{}", std::process::id());
 
@@ -642,18 +768,32 @@ fn routes_processus_environment_and_identity() {
     ));
     assert_eq!(read.data, Valor::Textus("salve".into()));
 
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::remove_var(name);
+    }
+}
+
+#[test]
+fn processus_sedes_returns_current_directory() {
+    let kernel = HostKernel::new();
     let sedes = kernel.route(&Frame::request("processus:sedes"));
     assert_eq!(sedes.status, Status::Done);
     assert!(matches!(sedes.data, Valor::Textus(_)));
+}
 
+#[test]
+fn processus_identitas_returns_process_id() {
+    let kernel = HostKernel::new();
     let identitas = kernel.route(&Frame::request("processus:identitas"));
     assert_eq!(identitas.data, Valor::Numerus(std::process::id() as i64));
+}
 
+#[test]
+fn processus_argumenta_returns_list_of_textus_items() {
+    let kernel = HostKernel::new();
     let args = kernel.route(&Frame::request("processus:argumenta"));
     assert_eq!(args.status, Status::Done);
-    // Public processus returns the real process argv (skipping argv0). Empty
-    // argv becomes a vacuum done frame; one arg is a single Textus item; many
-    // args collapse to a Lista for the synchronous route() surface.
     match &args.data {
         Valor::Lista(items) => {
             assert!(items.iter().all(|item| matches!(item, Valor::Textus(_))));
@@ -661,11 +801,6 @@ fn routes_processus_environment_and_identity() {
         Valor::Textus(_) | Valor::Nihil => {}
         Valor::Tabula(map) if map.is_empty() => {}
         other => panic!("unexpected argumenta payload: {other:?}"),
-    }
-
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::remove_var(name);
     }
 }
 
@@ -703,9 +838,8 @@ fn routes_processus_capture_accepts_root_text_list_opener() {
 }
 
 #[test]
-fn routes_aleator_seeded_and_crypto_values() {
+fn aleator_seed_produces_deterministic_fractum() {
     let kernel = HostKernel::new();
-
     assert_eq!(
         kernel
             .route(&Frame::request_with("aleator:semina", Valor::Numerus(42)))
@@ -721,7 +855,11 @@ fn routes_aleator_seeded_and_crypto_values() {
     );
     let second = kernel.route(&Frame::request("aleator:fractum")).data;
     assert_eq!(first, second);
+}
 
+#[test]
+fn aleator_sortire_returns_bounded_integer() {
+    let kernel = HostKernel::new();
     let sorted = kernel.route(&Frame::request_with(
         "aleator:sortire",
         Valor::Lista(vec![Valor::Numerus(2), Valor::Numerus(4)]),
@@ -730,11 +868,19 @@ fn routes_aleator_seeded_and_crypto_values() {
         panic!("sortire must return numerus");
     };
     assert!((2..=4).contains(&n));
+}
 
+#[test]
+fn aleator_octetos_returns_requested_byte_count() {
+    let kernel = HostKernel::new();
     let bytes = kernel.route(&Frame::request_with("aleator:octetos", Valor::Numerus(4)));
     assert_eq!(bytes.status, Status::Byte);
     assert!(matches!(&bytes.data, Valor::Octeti(items) if items.len() == 4));
+}
 
+#[test]
+fn aleator_uuid_returns_v4_format() {
+    let kernel = HostKernel::new();
     let uuid = kernel.route(&Frame::request("aleator:uuid"));
     let Valor::Textus(uuid) = uuid.data else {
         panic!("uuid must return textus");
@@ -744,15 +890,18 @@ fn routes_aleator_seeded_and_crypto_values() {
 }
 
 #[test]
-fn routes_tempus_clock_values() {
+fn tempus_nunc_returns_nanosecond_instans() {
     let kernel = HostKernel::new();
-
     let now = kernel.route(&Frame::request("tempus:nunc"));
     assert_eq!(now.status, Status::Done);
     let instant = Instans::try_from_valor(&now.data, InstansPraecisio::Nanosecunda)
         .expect("tempus:nunc must return a nanosecond instans");
     assert_eq!(instant.praecisio(), InstansPraecisio::Nanosecunda);
+}
 
+#[test]
+fn tempus_monotonicum_and_activum_return_non_negative_numerus() {
+    let kernel = HostKernel::new();
     for route in ["tempus:monotonicum", "tempus:activum"] {
         let response = kernel.route(&Frame::request(route));
         assert_eq!(response.status, Status::Done);

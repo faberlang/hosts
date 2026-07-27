@@ -227,4 +227,26 @@ mod tests {
             assert_eq!(error.code, "E_INVALID_ARGS");
         }
     }
+
+    #[test]
+    fn sleep_accepts_zero_and_small_positive_ms() {
+        let provider = Tempus::new().expect("provider");
+        let context = DispatchContext {
+            cancellation: host_kernel::CancellationProbe::new(|| false),
+        };
+        for ms in [0, 1] {
+            let reply = provider
+                .dispatch(
+                    &RequestFrame {
+                        conversation_id: format!("sleep-{ms}"),
+                        route: "tempus:dormiet".into(),
+                        opener: Valor::Numerus(ms),
+                        target: None,
+                    },
+                    &context,
+                )
+                .unwrap_or_else(|error| panic!("sleep({ms}) must succeed: {error}"));
+            assert!(reply.contents.is_empty(), "sleep({ms}) must return vacuum");
+        }
+    }
 }

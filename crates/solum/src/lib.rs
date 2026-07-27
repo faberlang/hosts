@@ -912,4 +912,70 @@ mod tests {
             Err("no home directory environment variable")
         );
     }
+
+    #[test]
+    fn exstat_nonexistent_path_returns_false() {
+        let provider = Solum::new().expect("provider");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("solum-nonexistent");
+        assert!(!missing.exists());
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "exstat-missing".into(),
+                    route: "solum:exstat".into(),
+                    opener: Valor::Textus(missing.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect("exstat missing");
+        assert!(matches!(
+            reply.contents.as_slice(),
+            [ProviderContent::Item(Valor::Bivalens(false))]
+        ));
+    }
+
+    #[test]
+    fn crea_existing_directory_is_idempotent() {
+        let provider = Solum::new().expect("provider");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let existing = dir.path().join("solum-crea-exist");
+        std::fs::create_dir(&existing).expect("first create");
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "crea-existing".into(),
+                    route: "solum:crea".into(),
+                    opener: Valor::Textus(existing.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect("crea existing");
+        assert!(reply.contents.is_empty());
+        assert!(existing.exists());
+    }
+
+    #[test]
+    fn regula_rejects_non_existent_path() {
+        let provider = Solum::new().expect("provider");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("solum-regula-missing");
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "regula-missing".into(),
+                    route: "solum:regularene".into(),
+                    opener: Valor::Textus(missing.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect("regula missing");
+        assert!(matches!(
+            reply.contents.as_slice(),
+            [ProviderContent::Item(Valor::Bivalens(false))]
+        ));
+    }
 }

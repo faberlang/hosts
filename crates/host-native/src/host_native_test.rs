@@ -523,27 +523,29 @@ fn construction_spawn_failure_shuts_down_and_joins_partial_workers() {
 }
 
 #[test]
-fn cancellation_suppresses_content_and_panic_is_terminal_error() {
-    let first_host = host(TestProvider::new("test:echo"), 1, 1);
+fn pre_cancelled_job_emits_cancel_frame() {
+    let host = host(TestProvider::new("test:echo"), 1, 1);
     let (mut sermo, responses, cancellation) = frame::test_response_sender("test:echo");
     cancellation.cancel();
-    first_host
-        .start(
-            SermoRequest {
-                conversation_id: sermo.conversation_id(),
-                route: "test:echo".to_owned(),
-                opener: faber::Valor::Nihil,
-                target: None,
-            },
-            responses,
-            cancellation,
-        )
-        .expect("enqueue cancelled job");
+    host.start(
+        SermoRequest {
+            conversation_id: sermo.conversation_id(),
+            route: "test:echo".to_owned(),
+            opener: faber::Valor::Nihil,
+            target: None,
+        },
+        responses,
+        cancellation,
+    )
+    .expect("enqueue cancelled job");
     assert_eq!(
         frame::sermo_recv(&mut sermo).expect("cancel").status,
         FrameStatus::Cancel
     );
+}
 
+#[test]
+fn provider_panic_emits_error_frame_with_code_and_retryable_false() {
     let host = host(
         TestProvider {
             panic: true,

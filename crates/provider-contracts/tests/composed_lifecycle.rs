@@ -434,30 +434,38 @@ fn excluded_fixture(route: &str) -> DispatchFixture {
 }
 
 #[test]
-fn solum_read_routes_match_manifest_contracts_through_kernel_dispatch() {
+fn solum_lege_returns_textus_content() {
     let mut kernel = Kernel::new();
     solum::register(&mut kernel).expect("register solum");
-    let mut workspace = TestWorkspace::new("solum-read-contracts");
+    let mut workspace = TestWorkspace::new("solum-lege-textus");
     let path = workspace.file("read.txt", "prima\nsecunda\n");
 
-    let (lege_request, lege_context) = request(
+    let (request, context) = request(
         "solum:lege",
         DispatchFixture {
-            opener: Valor::Textus(path.clone()),
+            opener: Valor::Textus(path),
             target: Some(std::any::type_name::<String>().to_owned()),
             cancelled: false,
         },
     );
-    let lege = kernel
-        .dispatch(&lege_request, &lege_context)
+    let reply = kernel
+        .dispatch(&request, &context)
         .expect("solum:lege textus dispatch");
     assert!(
         matches!(
-            lege.contents.as_slice(),
+            reply.contents.as_slice(),
             [host_kernel::ProviderContent::Item(Valor::Textus(text))] if text == "prima\nsecunda\n"
         ),
-        "solum:lege must satisfy its textus manifest result, got {lege:?}"
+        "solum:lege must satisfy its textus manifest result, got {reply:?}"
     );
+}
+
+#[test]
+fn solum_lege_rejects_non_text_targets() {
+    let mut kernel = Kernel::new();
+    solum::register(&mut kernel).expect("register solum");
+    let mut workspace = TestWorkspace::new("solum-lege-reject");
+    let path = workspace.file("read.txt", "prima\nsecunda\n");
 
     for target in [
         std::any::type_name::<Vec<String>>(),
@@ -480,37 +488,50 @@ fn solum_read_routes_match_manifest_contracts_through_kernel_dispatch() {
             "solum:lege target error must point at manifest routes, got {error:?}"
         );
     }
+}
 
-    let (carpe_request, carpe_context) = request(
-        "solum:carpe",
-        DispatchFixture::new(Valor::Textus(path.clone())),
-    );
-    let carpe = kernel
-        .dispatch(&carpe_request, &carpe_context)
+#[test]
+fn solum_carpe_returns_list_of_lines() {
+    let mut kernel = Kernel::new();
+    solum::register(&mut kernel).expect("register solum");
+    let mut workspace = TestWorkspace::new("solum-carpe-list");
+    let path = workspace.file("read.txt", "prima\nsecunda\n");
+
+    let (request, context) =
+        request("solum:carpe", DispatchFixture::new(Valor::Textus(path)));
+    let reply = kernel
+        .dispatch(&request, &context)
         .expect("solum:carpe lista<textus> dispatch");
     assert_eq!(
-        carpe.contents.as_slice(),
+        reply.contents.as_slice(),
         &[
             host_kernel::ProviderContent::Item(Valor::Textus("prima".to_owned())),
             host_kernel::ProviderContent::Item(Valor::Textus("secunda".to_owned())),
         ],
         "solum:carpe must carry the list contract formerly claimed by solum:lege"
     );
+}
 
-    let (hauri_request, hauri_context) =
+#[test]
+fn solum_hauri_returns_raw_bytes() {
+    let mut kernel = Kernel::new();
+    solum::register(&mut kernel).expect("register solum");
+    let mut workspace = TestWorkspace::new("solum-hauri-bytes");
+    let path = workspace.file("read.txt", "prima\nsecunda\n");
+
+    let (request, context) =
         request("solum:hauri", DispatchFixture::new(Valor::Textus(path)));
-    let hauri = kernel
-        .dispatch(&hauri_request, &hauri_context)
+    let reply = kernel
+        .dispatch(&request, &context)
         .expect("solum:hauri octeti dispatch");
     assert!(
-        matches!(hauri.contents.as_slice(), [host_kernel::ProviderContent::Byte(bytes)] if bytes == b"prima\nsecunda\n"),
-        "solum:hauri must carry the byte contract formerly claimed by solum:lege, got {hauri:?}"
+        matches!(reply.contents.as_slice(), [host_kernel::ProviderContent::Byte(bytes)] if bytes == b"prima\nsecunda\n"),
+        "solum:hauri must carry the byte contract formerly claimed by solum:lege, got {reply:?}"
     );
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn composed_kernel_registers_unique_provider_identities_and_routes() {
+fn composed_kernel_has_correct_provider_identities() {
     let cases = provider_cases();
     let mut kernel = Kernel::new();
     for case in &cases {
@@ -539,7 +560,19 @@ fn composed_kernel_registers_unique_provider_identities_and_routes() {
 
     assert_eq!(actual_names, expected_names);
     assert_eq!(actual_prefixes, expected_prefixes);
+}
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn composed_kernel_registers_unique_provider_identities_and_routes() {
+    let cases = provider_cases();
+    let mut kernel = Kernel::new();
+    for case in &cases {
+        (case.register)(&mut kernel)
+            .unwrap_or_else(|error| panic!("register {}: {error}", case.name));
+    }
+
+    let manifest = kernel.manifest();
     let providers_by_name = manifest
         .providers
         .iter()

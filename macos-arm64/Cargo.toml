@@ -20,3 +20,4 @@ wasmtime = "45"
 
 [dev-dependencies]
 hygiene-ratchet = { path = "../../radix/crates/hygiene-ratchet" }
+tempfile = "3"

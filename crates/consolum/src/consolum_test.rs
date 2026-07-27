@@ -220,3 +220,47 @@ fn nonblocking_write_honors_cancellation_and_restores_flags() {
         original_flags & libc::O_NONBLOCK
     );
 }
+
+#[test]
+fn scribe_with_empty_string_emits_empty_frame_content() {
+    use std::io::Cursor;
+    let provider = Consolum::new().expect("provider");
+    let reply = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "scribe-empty".into(),
+                route: "consolum:scribe".into(),
+                opener: Valor::Textus(String::new()),
+                target: None,
+            },
+            &active_context(),
+        )
+        .expect("scribe empty");
+    assert!(reply.contents.is_empty());
+}
+
+#[test]
+fn string_arg_rejects_non_string_positional() {
+    assert!(
+        string_arg(&Valor::Numerus(42), 0, "msg").is_err(),
+        "numerus must be rejected as string arg"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_wrap)]
+fn hauri_rejects_non_numeric_magnitudo() {
+    let provider = Consolum::new().expect("provider");
+    let error = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "hauri-string".into(),
+                route: "consolum:hauri".into(),
+                opener: Valor::Textus("many".into()),
+                target: None,
+            },
+            &active_context(),
+        )
+        .expect_err("string magnitudo must fail");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+}

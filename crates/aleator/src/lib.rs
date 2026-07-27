@@ -200,6 +200,23 @@ mod tests {
     use super::*;
     use host_kernel::{Kernel, ProviderContent};
 
+    fn test_provider() -> (Aleator, host_kernel::DispatchContext) {
+        let provider = Aleator::new().expect("provider");
+        let context = host_kernel::DispatchContext {
+            cancellation: host_kernel::CancellationProbe::new(|| false),
+        };
+        (provider, context)
+    }
+
+    fn request_frame(route: &str, opener: Valor) -> RequestFrame {
+        RequestFrame {
+            conversation_id: route.into(),
+            route: route.into(),
+            opener,
+            target: None,
+        }
+    }
+
     #[test]
     fn manifest_registers_all_canonical_routes() {
         let mut kernel = Kernel::new();
@@ -210,91 +227,106 @@ mod tests {
     }
 
     #[test]
-    fn seeded_integer_and_bytes_match_reply_shapes() {
-        let provider = Aleator::new().expect("provider");
-        let context = DispatchContext {
-            cancellation: host_kernel::CancellationProbe::new(|| false),
-        };
-        let seed = provider
-            .dispatch(
-                &RequestFrame {
-                    conversation_id: "seed".into(),
-                    route: "aleator:semina".into(),
-                    opener: Valor::Numerus(42),
-                    target: None,
-                },
-                &context,
-            )
+    fn seed_returns_vacuum() {
+        let (provider, context) = test_provider();
+        let reply = provider
+            .dispatch(&request_frame("aleator:semina", Valor::Numerus(42)), &context)
             .expect("seed");
-        assert!(seed.contents.is_empty());
-        let bytes = provider
-            .dispatch(
-                &RequestFrame {
-                    conversation_id: "bytes".into(),
-                    route: "aleator:octetos".into(),
-                    opener: Valor::Numerus(4),
-                    target: None,
-                },
-                &context,
-            )
-            .expect("bytes");
+        assert!(reply.contents.is_empty(), "seed reply should be vacuum");
+    }
+
+    #[test]
+    fn seeded_octetos_returns_four_bytes() {
+        let (provider, context) = test_provider();
+        provider
+            .dispatch(&request_frame("aleator:semina", Valor::Numerus(42)), &context)
+            .expect("seed");
+        let reply = provider
+            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(4)), &context)
+            .expect("octetos");
         assert!(
-            matches!(bytes.contents.as_slice(), [ProviderContent::Byte(value)] if value.len() == 4)
+            matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.len() == 4),
+            "expected 4 random bytes"
         );
     }
 
     #[test]
-    fn octetos_rejects_over_limit_before_allocation_and_keeps_zero_policy() {
-        let provider = Aleator::new().expect("provider");
-        let context = DispatchContext {
-            cancellation: host_kernel::CancellationProbe::new(|| false),
-        };
-
-        let zero = provider
-            .dispatch(
-                &RequestFrame {
-                    conversation_id: "zero".into(),
-                    route: "aleator:octetos".into(),
-                    opener: Valor::Numerus(0),
-                    target: None,
-                },
-                &context,
-            )
+    fn octetos_zero_returns_empty() {
+        let (provider, context) = test_provider();
+        let reply = provider
+            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(0)), &context)
             .expect("zero bytes");
         assert!(
-            matches!(zero.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty())
+            matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty()),
+            "zero byte request should return empty"
         );
+    }
 
-        let negative = provider
-            .dispatch(
-                &RequestFrame {
-                    conversation_id: "negative".into(),
-                    route: "aleator:octetos".into(),
-                    opener: Valor::Numerus(-1),
-                    target: None,
-                },
-                &context,
-            )
-            .expect("negative byte count clamps to zero");
+    #[test]
+    fn octetos_negative_clamps_to_zero() {
+        let (provider, context) = test_provider();
+        let reply = provider
+            .dispatch(&request_frame("aleator:octetos", Valor::Numerus(-1)), &context)
+            .expect("negative byte count");
         assert!(
-            matches!(negative.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty())
+            matches!(reply.contents.as_slice(), [ProviderContent::Byte(value)] if value.is_empty()),
+            "negative byte request should clamp to empty"
         );
+    }
 
+    #[test]
+    fn octetos_over_limit_rejected() {
+        let (provider, context) = test_provider();
         // SAFETY: `MAX_RANDOM_BYTES` (1 MiB) fits easily in `i64`.
         #[allow(clippy::cast_possible_wrap)]
         let error = provider
             .dispatch(
-                &RequestFrame {
-                    conversation_id: "too-many".into(),
-                    route: "aleator:octetos".into(),
-                    opener: Valor::Numerus(MAX_RANDOM_BYTES as i64 + 1),
-                    target: None,
-                },
+                &request_frame(
+                    "aleator:octetos",
+                    Valor::Numerus(MAX_RANDOM_BYTES as i64 + 1),
+                ),
                 &context,
             )
-            .expect_err("over-limit random byte request must fail before allocation");
+            .expect_err("over-limit request must fail");
         assert_eq!(error.code, "E_INVALID_ARGS");
         assert!(error.message.contains("aleator:octetos"));
         assert!(error.message.contains(&MAX_RANDOM_BYTES.to_string()));
+    }
+
+    #[test]
+    fn bounded_non_negative_len_returns_zero_for_non_positive() {
+        assert_eq!(
+            bounded_non_negative_len(-5, 100, "test", "n").unwrap(),
+            0
+        );
+        assert_eq!(
+            bounded_non_negative_len(0, 100, "test", "n").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_non_negative_len_accepts_valid() {
+        assert_eq!(
+            bounded_non_negative_len(1, 100, "test", "n").unwrap(),
+            1
+        );
+        assert_eq!(
+            bounded_non_negative_len(100, 100, "test", "n").unwrap(),
+            100
+        );
+        assert_eq!(
+            bounded_non_negative_len(50, 100, "test", "n").unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn bounded_non_negative_len_rejects_over_max() {
+        let error =
+            bounded_non_negative_len(101, 100, "aleator:octetos", "n").expect_err("over max");
+        assert_eq!(error.code, "E_INVALID_ARGS");
+        assert!(error.message.contains("aleator:octetos"));
+        assert!(error.message.contains("must be at most 100"));
     }
 }

@@ -601,4 +601,67 @@ mod tests {
             "cancellation must terminate shell descendants with the owned process"
         );
     }
+
+    #[test]
+    fn exsequi_empty_command_returns_textus_empty_string() {
+        let provider = Processus::new().expect("provider");
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "empty".into(),
+                    route: "processus:exsequi".into(),
+                    opener: Valor::Textus(String::new()),
+                    target: None,
+                },
+                &DispatchContext {
+                    cancellation: host_kernel::CancellationProbe::new(|| false),
+                },
+            )
+            .expect("empty shell command");
+        assert!(matches!(
+            reply.contents.as_slice(),
+            [ProviderContent::Item(Valor::Textus(text))] if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn captura_empty_args_list_rejected() {
+        let provider = Processus::new().expect("provider");
+        let error = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "capture-empty".into(),
+                    route: "processus:captura".into(),
+                    opener: Valor::Lista(Vec::new()),
+                    target: None,
+                },
+                &DispatchContext {
+                    cancellation: host_kernel::CancellationProbe::new(|| false),
+                },
+            )
+            .expect_err("empty captura args must fail");
+        assert_eq!(error.code, "E_INVALID_ARGS");
+    }
+
+    #[test]
+    fn scribe_rejects_empty_env_name() {
+        let provider = Processus::new().expect("provider");
+        let error = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "scribe-empty".into(),
+                    route: "processus:scribe".into(),
+                    opener: Valor::Lista(vec![
+                        Valor::Textus(String::new()),
+                        Valor::Textus("val".into()),
+                    ]),
+                    target: None,
+                },
+                &DispatchContext {
+                    cancellation: host_kernel::CancellationProbe::new(|| false),
+                },
+            )
+            .expect_err("empty env name must fail");
+        assert_eq!(error.code, "E_INVALID_ARGS");
+    }
 }
