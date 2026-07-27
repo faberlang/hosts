@@ -13,6 +13,14 @@ members = [
 ]
 resolver = "2"
 
+[profile.dev]
+debug = 1
+codegen-units = 256
+
+[profile.test]
+debug = 1
+codegen-units = 256
+
 # Non-Cargo host product: webgpu-browser/
 # Library crates use explicit path deps (not workspace inheritance) so Faber's
 # embedded core-support archive can path-depend on individual crates without
