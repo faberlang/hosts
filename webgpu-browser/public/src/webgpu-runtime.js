@@ -402,6 +402,43 @@ export function buildChainFromReflection(
 }
 
 /**
+ * Resolve a kernel's storage buffer declaration by WGSL @binding number.
+ *
+ * A KernelDescriptor's `storage_buffers` array is addressed by position
+ * (buffer_index); `bind_group_layout` entries map each @group/@binding to its
+ * buffer_index. The @binding number and the buffer_index coincide only when
+ * bindings are assigned sequentially in storage-buffer order, so lookups by
+ * @binding must go through the layout mapping, not array indexing.
+ *
+ * @param {object} kernel - KernelDescriptor
+ * @param {number} binding - WGSL @binding number
+ * @returns {object|null} the StorageBufferDecl, or null when not found
+ */
+function storageBufferByBinding(kernel, binding) {
+  for (const entry of kernel.bind_group_layout) {
+    if (entry.binding === binding) {
+      return kernel.storage_buffers[entry.buffer_index] || null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a kernel's storage-buffer position (buffer_index) for a WGSL
+ * @binding number, or undefined when the binding is not in the layout.
+ *
+ * @param {object} kernel - KernelDescriptor
+ * @param {number} binding - WGSL @binding number
+ * @returns {number|undefined}
+ */
+function bufferIndexByBinding(kernel, binding) {
+  for (const entry of kernel.bind_group_layout) {
+    if (entry.binding === binding) return entry.buffer_index;
+  }
+  return undefined;
+}
+
+/**
  * Dispatch a multi-kernel chain from a G-SPINE-10 KernelChainDescriptor.
  *
  * Reads the compiler's simplified chain descriptor JSON (entry_point, source,
@@ -411,8 +448,10 @@ export function buildChainFromReflection(
  * descriptors needed.
  *
  * Intermediate buffers declared in buffer_identities are allocated at dispatch
- * time. Input buffers must exist in resources.buffers before calling, keyed
- * by the storage buffer's @binding number.
+ * time and bound to both the producer's output slot and the consumer's input
+ * slot. External input buffers must exist in resources.buffers before calling,
+ * keyed by the storage buffer's @binding number. Chain-internal intermediate
+ * outputs are not read back; results cover external (final) outputs only.
  *
  * @param {GPUDevice} device
  * @param {object} resources - { buffers: Map<number, { buffer: GPUBuffer }> }
@@ -428,12 +467,19 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
   }
 
   // 1. Allocate intermediate buffers from buffer_identities
+  //
+  // An identity maps a producer output (output_kernel_index, output_binding)
+  // to a consumer input (input_kernel_index, input_binding). Both numbers are
+  // WGSL @binding values; the storage buffer's position in `storage_buffers`
+  // (its buffer_index) may differ from its @binding, so declarations must be
+  // resolved through the kernel's bind_group_layout.
   const intermediates = new Map();
   if (descriptor.buffer_identities) {
     for (const ident of descriptor.buffer_identities) {
       const producer = descriptor.chain[ident.output_kernel_index];
       if (!producer) continue;
-      const bufDecl = producer.storage_buffers[ident.output_binding];
+      const bufDecl = storageBufferByBinding(producer, ident.output_binding)
+        || producer.storage_buffers[ident.output_binding];
       if (!bufDecl) continue;
 
       const key = `intermediate_${ident.output_kernel_index}_${ident.output_binding}`;
@@ -447,17 +493,30 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
     }
   }
 
-  // 2. Build consumer input → intermediate lookup
+  // 2. Map chained buffers → intermediate, keyed by `${kernelIndex}:${bufferIndex}`
+  //    (buffer_index is the storage_buffers position, unique per kernel).
+  //    Both the producer's output slot and the consumer's input slot resolve
+  //    to the same intermediate, so the producer's write lands on the buffer
+  //    the consumer reads. Keying consistently by buffer_index keeps the
+  //    lookups in step 3b aligned even when @binding numbers do not match
+  //    their buffer's position in storage_buffers.
   const inputToIntermediate = new Map();
   if (descriptor.buffer_identities) {
     for (const ident of descriptor.buffer_identities) {
       const key = `intermediate_${ident.output_kernel_index}_${ident.output_binding}`;
-      if (intermediates.has(key)) {
-        inputToIntermediate.set(
-          `${ident.input_kernel_index}:${ident.input_binding}`,
-          intermediates.get(key),
-        );
-      }
+      const entry = intermediates.get(key);
+      if (!entry) continue;
+
+      const producer = descriptor.chain[ident.output_kernel_index];
+      const consumer = descriptor.chain[ident.input_kernel_index];
+      if (!producer || !consumer) continue;
+
+      const producerIndex = bufferIndexByBinding(producer, ident.output_binding)
+        ?? ident.output_binding;
+      const consumerIndex = bufferIndexByBinding(consumer, ident.input_binding)
+        ?? ident.input_binding;
+      inputToIntermediate.set(`${ident.output_kernel_index}:${producerIndex}`, entry);
+      inputToIntermediate.set(`${ident.input_kernel_index}:${consumerIndex}`, entry);
     }
   }
 
@@ -480,7 +539,9 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
       const bufDecl = kernel.storage_buffers[layout.buffer_index];
       if (!bufDecl) continue;
 
-      // Resolve buffer: check intermediate lookup first, then resources.buffers
+      // Resolve buffer: check intermediate lookup first (keyed by
+      // kernelIndex:buffer_index, matching step 2), then resources.buffers
+      // keyed by the storage buffer's @binding number.
       const intermediateKey = `${kernelIdx}:${layout.buffer_index}`;
       const bufEntry = inputToIntermediate.get(intermediateKey)
         || resources.buffers.get(bufDecl.binding);
@@ -514,16 +575,19 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
       bindGroups.push({ bindGroupIndex: group, bindGroup });
     }
 
-    // 3d. Collect output bindings for readback
+    // 3d. Collect output bindings for readback. Chain-internal buffers
+    // (intermediates allocated in step 1) are not present in
+    // resources.buffers, so they cannot be read back; their data flows to
+    // the consuming kernel, and readback covers external outputs only.
     const outputBindings = [];
     for (const bindingIdx of kernel.output_bindings) {
       const bufDecl = kernel.storage_buffers[bindingIdx];
-      if (bufDecl) {
-        outputBindings.push({
-          resourceIndex: bufDecl.binding,
-          bufferByteLen: Number(bufDecl.size),
-        });
-      }
+      if (!bufDecl) continue;
+      if (inputToIntermediate.has(`${kernelIdx}:${bindingIdx}`)) continue;
+      outputBindings.push({
+        resourceIndex: bufDecl.binding,
+        bufferByteLen: Number(bufDecl.size),
+      });
     }
 
     // 3e. Normalize workgroup_size: Rust tuple [x, y, z] → { x, y, z }

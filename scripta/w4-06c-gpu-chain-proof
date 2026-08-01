@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# W4-06c — multi-kernel chain dispatch proof (G-SPINE-10 S3).
+#
+# Runs the headless-Chrome chain proof probe (triga/scripta/w4-06c-gpu-chain-proof.mjs)
+# against the checked-in KernelChainDescriptor fixtures in webgpu-browser/fixtures:
+#   - chain-shared-bindings.json      (2 kernels, globally-shared bindings)
+#   - chain-per-kernel-bindings.json  (2 kernels, per-kernel bindings)
+#   - chain-single-kernel.json        (1 kernel — no-regression baseline)
+#
+# Requires: node >= 18, puppeteer + Chrome for Testing (triga/package.json),
+# and the triga sibling repo (probe ships there; fixtures ship here).
+#
+# Usage: ./scripta/w4-06c-gpu-chain-proof
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TRIGA_ROOT="$(cd "$ROOT/../triga" && pwd)"
+PROBE="$TRIGA_ROOT/scripta/w4-06c-gpu-chain-proof.mjs"
+FIXTURES="$ROOT/webgpu-browser/fixtures"
+
+if [[ ! -f "$PROBE" ]]; then
+  printf 'w4-06c chain proof: probe not found: %s\n' "$PROBE" >&2
+  printf 'the probe ships in the triga repo (scripta/w4-06c-gpu-chain-proof.mjs)\n' >&2
+  exit 2
+fi
+
+X='[1,1,1,2,2,2,3,3,3,4,4,4]'
+W='[1,2,3,4,5,6]'
+B='[0.1,0.2,0.1,0.2,0.1,0.2,0.1,0.2]'
+ZERO8='[0,0,0,0,0,0,0,0]'
+CHAIN_EXPECTED='[9.1,12.2,18.1,24.2,27.1,36.2,36.1,48.2]'
+SINGLE_EXPECTED='[9,12,18,24,27,36,36,48]'
+
+run_probe() {
+  local name="$1" descriptor="$2" input="$3" expected="$4"
+  printf '── %s\n' "$name"
+  node "$PROBE" --descriptor "$descriptor" --input "$input" --expected "$expected"
+}
+
+INPUT_SHARED="{\"0\":$X,\"1\":$W,\"3\":$B,\"4\":$ZERO8}"
+run_probe "2-kernel, globally-shared bindings" \
+  "$FIXTURES/chain-shared-bindings.json" "$INPUT_SHARED" "$CHAIN_EXPECTED"
+
+run_probe "2-kernel, per-kernel bindings" \
+  "$FIXTURES/chain-per-kernel-bindings.json" "$INPUT_SHARED" "$CHAIN_EXPECTED"
+
+run_probe "single-kernel (no-regression baseline)" \
+  "$FIXTURES/chain-single-kernel.json" "{\"0\":$X,\"1\":$W,\"2\":$ZERO8}" "$SINGLE_EXPECTED"
+
+printf 'w4-06c chain dispatch proof: all green\n'
