@@ -611,7 +611,17 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor,
     const entriesByGroup = new Map();
     for (const layout of kernel.bind_group_layout) {
       const bufDecl = kernel.storage_buffers[layout.buffer_index];
-      if (!bufDecl) continue;
+      if (!bufDecl) {
+        // A layout entry whose buffer_index has no storage_buffers
+        // declaration is malformed — fail closed with a diagnostic naming
+        // the buffer_index (asymmetric silent-skip residual, Wave 6 item 5).
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor",
+          `kernel "${kernel.entry_point}": bind_group_layout buffer_index ` +
+          `${layout.buffer_index} (binding ${layout.binding}, group ${layout.group}) ` +
+          "has no storage_buffers declaration",
+        );
+      }
 
       // Resolve buffer: check intermediate lookup first (keyed by
       // kernelIndex:buffer_index, matching step 2), then resources.buffers

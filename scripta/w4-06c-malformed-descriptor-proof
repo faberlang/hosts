@@ -4,13 +4,18 @@
 # Proves dispatchChainFromDescriptor FAILS CLOSED when a buffer_identity
 # references a @binding absent from the relevant kernel's bind_group_layout
 # (auditor-2 residual on the S3 multi-kernel dispatch fix): the dispatch must
-# throw a clear diagnostic instead of falling back to @binding-as-index.
+# throw a clear diagnostic instead of falling back to @binding-as-index. Also
+# proves FAILS CLOSED when a bind_group_layout entry's buffer_index has no
+# storage_buffers declaration (Wave 6 review item 5): the dispatch must throw
+# a diagnostic naming the offending buffer_index instead of silently skipping
+# the layout entry.
 #
 # Reuses the triga headless-Chrome chain probe (scripta/w4-06c-gpu-chain-proof.mjs)
 # against the malformed KernelChainDescriptor fixtures in
 # webgpu-browser/fixtures:
 #   - chain-malformed-output-binding.json  (identity output_binding absent from producer bind_group_layout)
 #   - chain-malformed-input-binding.json   (identity input_binding absent from consumer bind_group_layout)
+#   - chain-malformed-layout-buffer-index.json (layout buffer_index with no storage_buffers declaration)
 #
 # Each run must (a) fail (non-zero probe exit — no silent dispatch) and (b)
 # surface the bind_group_layout diagnostic. If the dispatcher falls back to
@@ -42,35 +47,45 @@ ZERO8='[0,0,0,0,0,0,0,0]'
 CHAIN_EXPECTED='[9.1,12.2,18.1,24.2,27.1,36.2,36.1,48.2]'
 
 INPUT_SHARED="{\"0\":$X,\"1\":$W,\"3\":$B,\"4\":$ZERO8}"
-DIAGNOSTIC='is not present in bind_group_layout'
+INPUT_SINGLE="{\"0\":$X,\"1\":$W,\"2\":$ZERO8}"
 
 # Run the chain probe against a malformed descriptor and assert fail-closed:
 # non-zero probe exit AND the captured output carries the fail-closed
-# diagnostic naming the missing bind_group_layout binding.
+# diagnostic naming the offending field.
 run_expect_fail_closed() {
-  local name="$1" descriptor="$2"
+  local name="$1" descriptor="$2" diagnostic="$3" input="${4:-$INPUT_SHARED}"
   local output code
   printf '── %s\n' "$name"
   set +e
-  output="$(node "$PROBE" --descriptor "$descriptor" --input "$INPUT_SHARED" --expected "$CHAIN_EXPECTED" 2>&1)"
+  output="$(node "$PROBE" --descriptor "$descriptor" --input "$input" --expected "$CHAIN_EXPECTED" 2>&1)"
   code=$?
   set -e
   if [[ "$code" -eq 0 ]]; then
     printf 'malformed-descriptor proof FAILED: %s did not fail closed (dispatch succeeded)\n' "$name" >&2
     exit 1
   fi
-  if ! grep -q "$DIAGNOSTIC" <<<"$output"; then
-    printf 'malformed-descriptor proof FAILED: %s failed without the fail-closed diagnostic (%s)\n' "$name" "$DIAGNOSTIC" >&2
+  if ! grep -q "$diagnostic" <<<"$output"; then
+    printf 'malformed-descriptor proof FAILED: %s failed without the fail-closed diagnostic (%s)\n' "$name" "$diagnostic" >&2
     printf '%s\n' "$output" >&2
     exit 1
   fi
   printf 'fail-closed OK (diagnostic present)\n'
 }
 
+DIAGNOSTIC_MISSING_BINDING='is not present in bind_group_layout'
+DIAGNOSTIC_MISSING_DECL='has no storage_buffers declaration'
+
 run_expect_fail_closed "malformed output_binding (absent from producer bind_group_layout)" \
-  "$FIXTURES/chain-malformed-output-binding.json"
+  "$FIXTURES/chain-malformed-output-binding.json" \
+  "$DIAGNOSTIC_MISSING_BINDING"
 
 run_expect_fail_closed "malformed input_binding (absent from consumer bind_group_layout)" \
-  "$FIXTURES/chain-malformed-input-binding.json"
+  "$FIXTURES/chain-malformed-input-binding.json" \
+  "$DIAGNOSTIC_MISSING_BINDING"
+
+run_expect_fail_closed "malformed layout buffer_index (no storage_buffers declaration)" \
+  "$FIXTURES/chain-malformed-layout-buffer-index.json" \
+  "$DIAGNOSTIC_MISSING_DECL" \
+  "$INPUT_SINGLE"
 
 printf 'w4-06c malformed-descriptor proof: all fail-closed green\n'
