@@ -472,15 +472,23 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
   // to a consumer input (input_kernel_index, input_binding). Both numbers are
   // WGSL @binding values; the storage buffer's position in `storage_buffers`
   // (its buffer_index) may differ from its @binding, so declarations must be
-  // resolved through the kernel's bind_group_layout.
+  // resolved through the kernel's bind_group_layout. An identity referencing a
+  // @binding absent from the kernel's bind_group_layout is malformed — fail
+  // closed with a clear diagnostic rather than guessing by @binding-as-index.
   const intermediates = new Map();
   if (descriptor.buffer_identities) {
     for (const ident of descriptor.buffer_identities) {
       const producer = descriptor.chain[ident.output_kernel_index];
       if (!producer) continue;
-      const bufDecl = storageBufferByBinding(producer, ident.output_binding)
-        || producer.storage_buffers[ident.output_binding];
-      if (!bufDecl) continue;
+      const bufDecl = storageBufferByBinding(producer, ident.output_binding);
+      if (!bufDecl) {
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor.buffer_identities",
+          `buffer_identity output_binding ${ident.output_binding} of kernel ` +
+            `${ident.output_kernel_index} ("${producer.entry_point}") is not present ` +
+            "in bind_group_layout",
+        );
+      }
 
       const key = `intermediate_${ident.output_kernel_index}_${ident.output_binding}`;
       if (intermediates.has(key)) continue;
@@ -511,10 +519,24 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
       const consumer = descriptor.chain[ident.input_kernel_index];
       if (!producer || !consumer) continue;
 
-      const producerIndex = bufferIndexByBinding(producer, ident.output_binding)
-        ?? ident.output_binding;
-      const consumerIndex = bufferIndexByBinding(consumer, ident.input_binding)
-        ?? ident.input_binding;
+      const producerIndex = bufferIndexByBinding(producer, ident.output_binding);
+      if (producerIndex === undefined) {
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor.buffer_identities",
+          `buffer_identity output_binding ${ident.output_binding} of kernel ` +
+            `${ident.output_kernel_index} ("${producer.entry_point}") is not present ` +
+            "in bind_group_layout",
+        );
+      }
+      const consumerIndex = bufferIndexByBinding(consumer, ident.input_binding);
+      if (consumerIndex === undefined) {
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor.buffer_identities",
+          `buffer_identity input_binding ${ident.input_binding} of kernel ` +
+            `${ident.input_kernel_index} ("${consumer.entry_point}") is not present ` +
+            "in bind_group_layout",
+        );
+      }
       inputToIntermediate.set(`${ident.output_kernel_index}:${producerIndex}`, entry);
       inputToIntermediate.set(`${ident.input_kernel_index}:${consumerIndex}`, entry);
     }

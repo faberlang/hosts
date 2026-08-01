@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# W4-06c malformed-descriptor proof — fail-closed on missing bindings.
+#
+# Proves dispatchChainFromDescriptor FAILS CLOSED when a buffer_identity
+# references a @binding absent from the relevant kernel's bind_group_layout
+# (auditor-2 residual on the S3 multi-kernel dispatch fix): the dispatch must
+# throw a clear diagnostic instead of falling back to @binding-as-index.
+#
+# Reuses the triga headless-Chrome chain probe (scripta/w4-06c-gpu-chain-proof.mjs)
+# against the malformed KernelChainDescriptor fixtures in
+# webgpu-browser/fixtures:
+#   - chain-malformed-output-binding.json  (identity output_binding absent from producer bind_group_layout)
+#   - chain-malformed-input-binding.json   (identity input_binding absent from consumer bind_group_layout)
+#
+# Each run must (a) fail (non-zero probe exit — no silent dispatch) and (b)
+# surface the bind_group_layout diagnostic. If the dispatcher falls back to
+# @binding-index lookup instead, the probe either succeeds silently (exit 0)
+# or fails with a different error — both are caught here.
+#
+# Requires: node >= 18, puppeteer + Chrome for Testing (triga/package.json),
+# and the triga sibling repo (probe ships there; fixtures ship here).
+#
+# Usage: ./scripta/w4-06c-malformed-descriptor-proof
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TRIGA_ROOT="$(cd "$ROOT/../triga" && pwd)"
+PROBE="$TRIGA_ROOT/scripta/w4-06c-gpu-chain-proof.mjs"
+FIXTURES="$ROOT/webgpu-browser/fixtures"
+
+if [[ ! -f "$PROBE" ]]; then
+  printf 'w4-06c malformed-descriptor proof: probe not found: %s\n' "$PROBE" >&2
+  printf 'the probe ships in the triga repo (scripta/w4-06c-gpu-chain-proof.mjs)\n' >&2
+  exit 2
+fi
+
+X='[1,1,1,2,2,2,3,3,3,4,4,4]'
+W='[1,2,3,4,5,6]'
+B='[0.1,0.2,0.1,0.2,0.1,0.2,0.1,0.2]'
+ZERO8='[0,0,0,0,0,0,0,0]'
+CHAIN_EXPECTED='[9.1,12.2,18.1,24.2,27.1,36.2,36.1,48.2]'
+
+INPUT_SHARED="{\"0\":$X,\"1\":$W,\"3\":$B,\"4\":$ZERO8}"
+DIAGNOSTIC='is not present in bind_group_layout'
+
+# Run the chain probe against a malformed descriptor and assert fail-closed:
+# non-zero probe exit AND the captured output carries the fail-closed
+# diagnostic naming the missing bind_group_layout binding.
+run_expect_fail_closed() {
+  local name="$1" descriptor="$2"
+  local output code
+  printf '── %s\n' "$name"
+  set +e
+  output="$(node "$PROBE" --descriptor "$descriptor" --input "$INPUT_SHARED" --expected "$CHAIN_EXPECTED" 2>&1)"
+  code=$?
+  set -e
+  if [[ "$code" -eq 0 ]]; then
+    printf 'malformed-descriptor proof FAILED: %s did not fail closed (dispatch succeeded)\n' "$name" >&2
+    exit 1
+  fi
+  if ! grep -q "$DIAGNOSTIC" <<<"$output"; then
+    printf 'malformed-descriptor proof FAILED: %s failed without the fail-closed diagnostic (%s)\n' "$name" "$DIAGNOSTIC" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  printf 'fail-closed OK (diagnostic present)\n'
+}
+
+run_expect_fail_closed "malformed output_binding (absent from producer bind_group_layout)" \
+  "$FIXTURES/chain-malformed-output-binding.json"
+
+run_expect_fail_closed "malformed input_binding (absent from consumer bind_group_layout)" \
+  "$FIXTURES/chain-malformed-input-binding.json"
+
+printf 'w4-06c malformed-descriptor proof: all fail-closed green\n'
