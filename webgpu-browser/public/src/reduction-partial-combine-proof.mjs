@@ -41,7 +41,19 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import puppeteer from "puppeteer";
+
+// puppeteer is imported dynamically (not statically): a missing package is a
+// recorded environment condition (exit 2) per the skip-discipline contract
+// in the header, not an uncaught module-evaluation error (exit 1).
+let puppeteer = null;
+try {
+  puppeteer = (await import("puppeteer")).default;
+} catch {
+  console.error("Reduction Partial-Combine Proof SKIPPED (environment): puppeteer package unavailable");
+  console.error("Recorded condition: cannot import 'puppeteer' — run `npm install puppeteer` (or `npx puppeteer browsers install chrome` for a Chrome-only fix).");
+  console.error("This is NOT a pass; no combine claim is asserted from this run.");
+  process.exit(2);
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
