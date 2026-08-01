@@ -20,7 +20,7 @@ const publicDir = path.resolve(here, "..");
 const generatedDir = path.join(publicDir, "generated");
 
 const { FaberKernelContractError, fetchFaberKernelArtifacts, loadFaberKernel, loadFaberGraphicsPipeline } = await import(
-  pathToFileURL(path.join(here, "faber-kernel.js")).href
+  pathToFileURL(path.join(here, "contract", "artifact-admission.js")).href
 );
 const {
   acquireWebGpuDevice,
@@ -35,7 +35,7 @@ const {
   destroyRetiredChunkResources,
   runChunkGraphicsFrame,
   chunkResourceCounters,
-} = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+} = await import(pathToFileURL(path.join(here, "backend", "webgpu-runtime.js")).href);
 
 // ── Graphics test fixtures ────────────────────────────────────────────────
 

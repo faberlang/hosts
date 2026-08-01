@@ -1,0 +1,173 @@
+{
+  "kernels": [
+    {
+      "entry_name": "greybox_vertex",
+      "shader_stage": "vertex",
+      "resources": [
+        {
+          "group": 0,
+          "binding": 0,
+          "kind": "StorageBuffer",
+          "role": "Input",
+          "access": "Read",
+          "element_byte_width": 4,
+          "element_count": 64,
+          "buffer_byte_len": 256,
+          "source_name": "transform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "kind": "UniformBuffer",
+          "role": "Uniform",
+          "access": "Read",
+          "element_byte_width": 4,
+          "element_count": 12,
+          "buffer_byte_len": 48,
+          "source_name": "lighting"
+        }
+      ],
+      "vertex_inputs": [
+        {
+          "location": 0,
+          "format": "float32x3",
+          "step_mode": "vertex",
+          "offset_bytes": 0,
+          "stride_bytes": 36,
+          "source_name": "position"
+        },
+        {
+          "location": 1,
+          "format": "float32x3",
+          "step_mode": "vertex",
+          "offset_bytes": 12,
+          "stride_bytes": 36,
+          "source_name": "normal"
+        },
+        {
+          "location": 2,
+          "format": "float32x3",
+          "step_mode": "vertex",
+          "offset_bytes": 24,
+          "stride_bytes": 36,
+          "source_name": "color"
+        }
+      ],
+      "varyings": [
+        {
+          "source_name": "world_normal",
+          "location": 0,
+          "format": "float32x3",
+          "interpolation": "perspective"
+        },
+        {
+          "source_name": "base_color",
+          "location": 1,
+          "format": "float32x3",
+          "interpolation": "perspective"
+        },
+        {
+          "source_name": "view_depth",
+          "location": 2,
+          "format": "float32",
+          "interpolation": "perspective"
+        }
+      ],
+      "fragment_outputs": [],
+      "builtin_inputs": [],
+      "called_builtins": [],
+      "workgroup": { "x": 1, "y": 1, "z": 1 },
+      "dispatch_size": { "x": 1, "y": 1, "z": 1 },
+      "workgroup_count": { "x": 1, "y": 1, "z": 1 }
+    },
+    {
+      "entry_name": "greybox_fragment",
+      "shader_stage": "fragment",
+      "resources": [],
+      "vertex_inputs": [],
+      "varyings": [
+        {
+          "source_name": "world_normal",
+          "location": 0,
+          "format": "float32x3",
+          "interpolation": "perspective"
+        },
+        {
+          "source_name": "base_color",
+          "location": 1,
+          "format": "float32x3",
+          "interpolation": "perspective"
+        },
+        {
+          "source_name": "view_depth",
+          "location": 2,
+          "format": "float32",
+          "interpolation": "perspective"
+        }
+      ],
+      "fragment_outputs": [
+        {
+          "location": 0,
+          "format": "float32x4"
+        }
+      ],
+      "builtin_inputs": [],
+      "called_builtins": [],
+      "workgroup": { "x": 1, "y": 1, "z": 1 },
+      "dispatch_size": { "x": 1, "y": 1, "z": 1 },
+      "workgroup_count": { "x": 1, "y": 1, "z": 1 }
+    }
+  ],
+  "pipeline": {
+    "color_target_formats": ["bgra8unorm"],
+    "primitive_topology": "triangle-list",
+    "vertex_count": 36,
+    "vertex_input_count": 3,
+    "varying_count": 3,
+    "vertex_resources": [
+      {
+        "group": 0,
+        "binding": 0,
+        "kind": "StorageBuffer",
+        "role": "Input",
+        "access": "Read",
+        "element_byte_width": 4,
+        "element_count": 64,
+        "buffer_byte_len": 256,
+        "source_name": "transform"
+      },
+      {
+        "group": 0,
+        "binding": 1,
+        "kind": "UniformBuffer",
+        "role": "Uniform",
+        "access": "Read",
+        "element_byte_width": 4,
+        "element_count": 12,
+        "buffer_byte_len": 48,
+        "source_name": "lighting"
+      }
+    ],
+    "vertex_resource_count": 2,
+    "fragment_resources": [],
+    "fragment_resource_count": 0,
+    "depth_stencil": {
+      "depth_write_enabled": true,
+      "depth_compare": "less-equal",
+      "stencil_read_mask": 4294967295,
+      "stencil_write_mask": 4294967295,
+      "stencil_front": {
+        "compare": "always",
+        "fail_op": "keep",
+        "depth_fail_op": "keep",
+        "pass_op": "keep"
+      },
+      "stencil_back": {
+        "compare": "always",
+        "fail_op": "keep",
+        "depth_fail_op": "keep",
+        "pass_op": "keep"
+      }
+    }
+  }
+}

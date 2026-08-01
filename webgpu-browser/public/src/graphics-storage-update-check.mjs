@@ -50,10 +50,10 @@ if (typeof globalThis.GPUTextureUsage === "undefined") {
 // ── Imports ──────────────────────────────────────────────────────────
 
 const { FaberKernelContractError } = await import(
-  pathToFileURL(path.join(here, "faber-kernel.js")).href
+  pathToFileURL(path.join(here, "contract", "artifact-admission.js")).href
 );
 const { updateGraphicsStorage } = await import(
-  pathToFileURL(path.join(here, "webgpu-runtime.js")).href
+  pathToFileURL(path.join(here, "backend", "webgpu-runtime.js")).href
 );
 
 // ── Fixture constants (from HV-02 generated graphics-reflection.json) ─

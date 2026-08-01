@@ -9,11 +9,11 @@
  *   y = [[9.1, 12.2], [18.1, 24.2], [27.1, 36.2], [36.1, 48.2]]
  */
 
-import { FaberKernelContractError } from "./faber-kernel.js";
+import { FaberKernelContractError } from "./contract/artifact-admission.js";
 import {
   acquireWebGpuDevice,
   runKernelChain,
-} from "./webgpu-runtime.js";
+} from "./backend/webgpu-runtime.js";
 
 // ── Matrix shape constants ────────────────────────────────────────────────
 const M = 4; // x rows

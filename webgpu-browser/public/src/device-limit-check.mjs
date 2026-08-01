@@ -57,7 +57,7 @@ if (typeof globalThis.GPUMapMode === "undefined") {
 }
 
 const { FaberKernelContractError } = await import(
-  pathToFileURL(path.join(here, "faber-kernel.js")).href
+  pathToFileURL(path.join(here, "contract", "artifact-admission.js")).href
 );
 const {
   createWebGpuResources,
@@ -66,7 +66,7 @@ const {
   applyComputeResourceReplace,
   createGradientBuffer,
   createChunkGraphicsResources,
-} = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+} = await import(pathToFileURL(path.join(here, "backend", "webgpu-runtime.js")).href);
 
 // ── Test harness ──────────────────────────────────────────────────────────
 

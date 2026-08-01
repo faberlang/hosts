@@ -45,7 +45,7 @@ const {
   placementDispatch,
   placementReadback,
   placementSync,
-} = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+} = await import(pathToFileURL(path.join(here, "backend", "webgpu-runtime.js")).href);
 
 // ── Kernel descriptor (elementwise multiply-by-2) ──────────────────────
 

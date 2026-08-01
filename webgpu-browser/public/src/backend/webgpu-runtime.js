@@ -1,4 +1,4 @@
-import { FaberKernelContractError } from "./faber-kernel.js";
+import { FaberKernelContractError } from "../contract/artifact-admission.js";
 
 const BUFFER_USAGE = {
   input: () => GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -6,6 +6,7 @@ const BUFFER_USAGE = {
   readback: () => GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   vertex: () => GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   index: () => GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+  uniform: () => GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   gradient: () => GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE,
 };
 
@@ -15,6 +16,11 @@ let _nextGradientHandle = 0;
 
 const EXPECTED_CANVAS_FORMAT = "bgra8unorm";
 const DEPTH_FORMAT = "depth24plus";
+
+// MSAA sample count for all graphics pipelines. 4x is universally supported
+// and removes the visible staircase aliasing on box edges. (Corpus fork delta:
+// re-applied on top of the hosts base in the DS-S2 fork merge.)
+const GRAPHICS_SAMPLE_COUNT = 4;
 
 /**
  * Normalize caller-supplied reduction combine metadata into a
@@ -1387,7 +1393,19 @@ export function createGraphicsResources(device, descriptor, payloads, canvasCont
   const vertexBuffers = createVertexBuffers(device, descriptor, payloads.vertexBuffers ?? []);
   const { indexBuffer, indexCount } = createIndexBuffer(device, descriptor, payloads.indexData);
 
-  const depthTexture = createDepthTexture(device, currentTexture.width, currentTexture.height);
+  const depthTexture = createDepthTexture(
+    device,
+    currentTexture.width,
+    currentTexture.height,
+    GRAPHICS_SAMPLE_COUNT,
+  );
+  const msaaTexture = createMsaaColorTexture(
+    device,
+    currentTexture.width,
+    currentTexture.height,
+    currentTexture.format,
+    GRAPHICS_SAMPLE_COUNT,
+  );
 
   const pipeline = device.createRenderPipeline({
     layout: pipelineLayout,
@@ -1420,6 +1438,9 @@ export function createGraphicsResources(device, descriptor, payloads, canvasCont
       depthCompare: descriptor.pipeline.depthStencil.depthCompare,
       format: DEPTH_FORMAT,
     },
+    multisample: {
+      count: GRAPHICS_SAMPLE_COUNT,
+    },
   });
 
   return Object.freeze({
@@ -1433,7 +1454,28 @@ export function createGraphicsResources(device, descriptor, payloads, canvasCont
     pipeline,
     bindGroups,
     depthTexture,
+    msaaTexture,
+    sampleCount: GRAPHICS_SAMPLE_COUNT,
   });
+}
+
+/**
+ * Color attachment for a graphics render pass. When the resources carry a
+ * multisampled target, the pass draws into it and resolves into the canvas
+ * view; otherwise it draws straight into the canvas view. loadOp is "clear"
+ * for the first pass of a frame, "load" for continuation passes.
+ */
+function msaaColorAttachment(resources, canvasView, clearValue, loadOp) {
+  if (resources.msaaTexture) {
+    return {
+      view: resources.msaaTexture.createView(),
+      resolveTarget: canvasView,
+      clearValue,
+      loadOp,
+      storeOp: "store",
+    };
+  }
+  return { view: canvasView, clearValue, loadOp, storeOp: "store" };
 }
 
 /**
@@ -1450,12 +1492,7 @@ export function runGraphicsFrame(device, context, resources, descriptor, frameSt
   const commandEncoder = device.createCommandEncoder();
   const renderPass = commandEncoder.beginRenderPass({
     colorAttachments: [
-      {
-        view: textureView,
-        clearValue,
-        loadOp: "clear",
-        storeOp: "store",
-      },
+      msaaColorAttachment(resources, textureView, clearValue, "clear"),
     ],
     depthStencilAttachment: {
       view: resources.depthTexture.createView(),
@@ -1579,12 +1616,7 @@ export function runGraphicsFrameWithTexture(device, context, resources, descript
   const commandEncoder = device.createCommandEncoder();
   const renderPass = commandEncoder.beginRenderPass({
     colorAttachments: [
-      {
-        view: textureView,
-        clearValue,
-        loadOp: "clear",
-        storeOp: "store",
-      },
+      msaaColorAttachment(resources, textureView, clearValue, "clear"),
     ],
     depthStencilAttachment: {
       view: resources.depthTexture.createView(),
@@ -1683,17 +1715,27 @@ export async function mapPixelBuffers(pixelBuffers) {
 }
 
 /**
- * Replace the depth texture after a physical canvas resize. Destroys the old
- * texture and returns a new resources object with the updated depth texture.
+ * Replace the depth (and MSAA color) texture after a physical canvas resize.
+ * Destroys the old textures and returns a new resources object with the
+ * updated attachments.
  */
 export function replaceDepthTextureOnResize(device, resources, width, height) {
   if (resources.depthTexture) {
     resources.depthTexture.destroy();
   }
-  const depthTexture = createDepthTexture(device, width, height);
+  const sampleCount = resources.sampleCount ?? 1;
+  const depthTexture = createDepthTexture(device, width, height, sampleCount);
+
+  let msaaTexture = resources.msaaTexture;
+  if (msaaTexture) {
+    msaaTexture.destroy();
+    msaaTexture = createMsaaColorTexture(device, width, height, msaaTexture.format, sampleCount);
+  }
+
   return Object.freeze({
     ...resources,
     depthTexture,
+    msaaTexture,
   });
 }
 
@@ -1817,10 +1859,24 @@ function createIndexBuffer(device, descriptor, indexData) {
   return Object.freeze({ indexBuffer: buffer, indexCount });
 }
 
-function createDepthTexture(device, width, height) {
+function createDepthTexture(device, width, height, sampleCount = 1) {
   return device.createTexture({
     size: { width, height },
     format: DEPTH_FORMAT,
+    sampleCount,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+}
+
+/**
+ * Multisampled color target. Render passes draw into this texture and resolve
+ * into the single-sampled canvas texture (resolveTarget).
+ */
+function createMsaaColorTexture(device, width, height, format, sampleCount) {
+  return device.createTexture({
+    size: { width, height },
+    format,
+    sampleCount,
     usage: GPUTextureUsage.RENDER_ATTACHMENT,
   });
 }
@@ -1836,13 +1892,17 @@ function createStorageBuffers(device, descriptor, storageData) {
 
       validateBufferSize(device, entry.bufferByteLen, `createStorageBuffers.resource[${entry.resourceIndex}].bufferByteLen`);
 
+      // Uniform-role entries are initialized the same way as inputs: written
+      // from mappedAtCreation payloads before the first draw.
+      const needsInit = entry.role === "input" || entry.role === "uniform";
+
       const buffer = device.createBuffer({
         size: entry.bufferByteLen,
         usage: bufferUsageForRole(entry.role),
-        mappedAtCreation: entry.role === "input",
+        mappedAtCreation: needsInit,
       });
 
-      if (entry.role === "input") {
+      if (needsInit) {
         writeGraphicsStorageInput(buffer, entry, storageData);
       }
 

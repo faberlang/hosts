@@ -223,8 +223,8 @@ import {
   acquireWebGpuDevice,
   buildChainFromReflection,
   runKernelChain,
-} from "./src/webgpu-runtime.js";
-import { FaberKernelContractError } from "./src/faber-kernel.js";
+} from "./src/backend/webgpu-runtime.js";
+import { FaberKernelContractError } from "./src/contract/artifact-admission.js";
 
 // ── Embedded compiler output ──────────────────────────────────────────
 const WGSL_SOURCE = ${wgslJson};

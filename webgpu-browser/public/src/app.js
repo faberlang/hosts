@@ -4,7 +4,7 @@ import {
   fetchFaberKernelArtifacts,
   loadFaberKernel,
   loadFaberGraphicsPipeline,
-} from "./faber-kernel.js";
+} from "./contract/artifact-admission.js";
 import {
   acquireWebGpuDevice,
   createWebGpuResources,
@@ -13,7 +13,7 @@ import {
   runGraphicsFrame,
   replaceDepthTextureOnResize,
   onDeviceLost,
-} from "./webgpu-runtime.js";
+} from "./backend/webgpu-runtime.js";
 
 const INPUT_VALUE = 41.0;
 const EXPECTED_VALUE = 42.0;

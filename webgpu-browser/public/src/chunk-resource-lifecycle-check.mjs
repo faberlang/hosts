@@ -53,7 +53,7 @@ if (typeof globalThis.GPUMapMode === "undefined") {
 }
 
 const { FaberKernelContractError, loadFaberGraphicsPipeline } = await import(
-  pathToFileURL(path.join(here, "faber-kernel.js")).href
+  pathToFileURL(path.join(here, "contract", "artifact-admission.js")).href
 );
 const {
   createChunkGraphicsResources,
@@ -63,7 +63,7 @@ const {
   chunkResourceCounters,
   liveChunkIds,
   chunkResourceSnapshot,
-} = await import(pathToFileURL(path.join(here, "webgpu-runtime.js")).href);
+} = await import(pathToFileURL(path.join(here, "backend", "webgpu-runtime.js")).href);
 
 function fail(message) {
   console.error(`chunk-resource-lifecycle-check failed: ${message}`);
