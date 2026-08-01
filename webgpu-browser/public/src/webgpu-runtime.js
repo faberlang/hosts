@@ -666,7 +666,17 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor,
     const outputBindings = [];
     for (const bindingIdx of kernel.output_bindings) {
       const bufDecl = kernel.storage_buffers[bindingIdx];
-      if (!bufDecl) continue;
+      if (!bufDecl) {
+        // An output_bindings entry whose buffer_index has no
+        // storage_buffers declaration is malformed — fail closed with a
+        // diagnostic naming the buffer_index (asymmetric silent-skip
+        // residual, Wave 6 item 5 follow-up; same shape as step 3b).
+        throw new FaberKernelContractError(
+          "dispatchChainFromDescriptor",
+          `kernel "${kernel.entry_point}": output_bindings buffer_index ` +
+          `${bindingIdx} has no storage_buffers declaration`,
+        );
+      }
       if (inputToIntermediate.has(`${kernelIdx}:${bindingIdx}`)) continue;
       const outputBinding = {
         resourceIndex: bufDecl.binding,

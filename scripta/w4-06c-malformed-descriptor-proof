@@ -16,6 +16,7 @@
 #   - chain-malformed-output-binding.json  (identity output_binding absent from producer bind_group_layout)
 #   - chain-malformed-input-binding.json   (identity input_binding absent from consumer bind_group_layout)
 #   - chain-malformed-layout-buffer-index.json (layout buffer_index with no storage_buffers declaration)
+#   - chain-malformed-output-bindings-index.json (output_bindings buffer_index with no storage_buffers declaration)
 #
 # Each run must (a) fail (non-zero probe exit — no silent dispatch) and (b)
 # surface the bind_group_layout diagnostic. If the dispatcher falls back to
@@ -86,6 +87,11 @@ run_expect_fail_closed "malformed input_binding (absent from consumer bind_group
 run_expect_fail_closed "malformed layout buffer_index (no storage_buffers declaration)" \
   "$FIXTURES/chain-malformed-layout-buffer-index.json" \
   "$DIAGNOSTIC_MISSING_DECL" \
+  "$INPUT_SINGLE"
+
+run_expect_fail_closed "malformed output_bindings buffer_index (no storage_buffers declaration)" \
+  "$FIXTURES/chain-malformed-output-bindings-index.json" \
+  "output_bindings buffer_index 5 has no storage_buffers declaration" \
   "$INPUT_SINGLE"
 
 printf 'w4-06c malformed-descriptor proof: all fail-closed green\n'

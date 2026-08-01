@@ -1,0 +1,52 @@
+{
+  "chain": [
+    {
+      "entry_point": "matmul_4x3_3x2",
+      "source": "@group(0) @binding(0) var<storage, read> a_in: array<f32>;\n@group(0) @binding(1) var<storage, read> b_in: array<f32>;\n@group(0) @binding(2) var<storage, read_write> output: array<f32>;\n\n@compute @workgroup_size(4, 2, 1)\nfn matmul_4x3_3x2(@builtin(global_invocation_id) id: vec3<u32>) {\n  let row: u32 = id.x;\n  let col: u32 = id.y;\n  if (row >= 4u || col >= 2u) { return; }\n  var sum: f32 = 0.0;\n  for (var k: u32 = 0u; k < 3u; k = k + 1u) {\n    sum = sum + a_in[row * 3u + k] * b_in[k * 2u + col];\n  }\n  output[row * 2u + col] = sum;\n}",
+      "storage_buffers": [
+        {
+          "binding": 0,
+          "group": 0,
+          "size": 48
+        },
+        {
+          "binding": 1,
+          "group": 0,
+          "size": 24
+        },
+        {
+          "binding": 2,
+          "group": 0,
+          "size": 32
+        }
+      ],
+      "workgroup_size": [
+        4,
+        2,
+        1
+      ],
+      "bind_group_layout": [
+        {
+          "group": 0,
+          "binding": 0,
+          "buffer_index": 0
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "buffer_index": 1
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "buffer_index": 2
+        }
+      ],
+      "output_bindings": [
+        2,
+        5
+      ]
+    }
+  ],
+  "buffer_identities": []
+}
