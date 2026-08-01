@@ -16,6 +16,34 @@ let _nextGradientHandle = 0;
 const EXPECTED_CANVAS_FORMAT = "bgra8unorm";
 const DEPTH_FORMAT = "depth24plus";
 
+/**
+ * Normalize caller-supplied reduction combine metadata into a
+ * Map<resourceIndex, { op, partialCount, fullLength }>.
+ *
+ * Accepts either a Map keyed by resource index or a plain object
+ * (`{ [resourceIndex]: { op, partialCount, fullLength } }`). The metadata is
+ * validated lazily by combineReductionPartials when the readback applies it;
+ * here we only normalize the container shape (null/undefined → empty map).
+ *
+ * @param {Map<number, object>|object|null|undefined} combineMetadata
+ * @returns {Map<number, object>}
+ */
+function normalizeCombineMetadata(combineMetadata) {
+  if (combineMetadata == null) return new Map();
+  if (combineMetadata instanceof Map) return combineMetadata;
+  if (typeof combineMetadata === "object") {
+    const map = new Map();
+    for (const [key, value] of Object.entries(combineMetadata)) {
+      map.set(Number(key), value);
+    }
+    return map;
+  }
+  throw new FaberKernelContractError(
+    "combineMetadata",
+    "combineMetadata must be a Map or a plain object keyed by resource index",
+  );
+}
+
 function shaderStageFor(visibility) {
   switch (visibility) {
     case "compute":
@@ -204,10 +232,15 @@ export async function runKernelChain(device, resources, chain) {
  * @param {object} reflection - parsed MirGpuReflection JSON
  * @param {Map<number, Float32Array>} [inputData] - resource index → typed data
  * @param {Array<{resourceIndex: number}>} [outputBindings] - which buffers to read back
+ * @param {Map<number, object>|object} [combineMetadata] - optional reduction
+ *   combine metadata per output resource index
+ *   (`{ op: "sum"|"mean", partialCount, fullLength }`). Attached to the
+ *   chain's output bindings and applied by placementReadback; absent
+ *   metadata means raw readback (see combineReductionPartials).
  * @returns {{ chain: Array<object>, resources: { buffers: Map<number, object> } }}
  */
 export function buildChainFromReflection(
-  device, wgslSource, reflection, inputData, outputBindings,
+  device, wgslSource, reflection, inputData, outputBindings, combineMetadata,
 ) {
   if (!reflection || !Array.isArray(reflection.kernels) || reflection.kernels.length === 0) {
     throw new FaberKernelContractError(
@@ -290,6 +323,7 @@ export function buildChainFromReflection(
 
   // 5. Build the chain: one entry per kernel
   const allOutputBindings = outputBindings || [];
+  const combineByResource = normalizeCombineMetadata(combineMetadata);
   const chain = [];
 
   for (const kernel of reflection.kernels) {
@@ -384,7 +418,18 @@ export function buildChainFromReflection(
       if (owns) {
         const meta = resourceMeta.get(ob.resourceIndex);
         if (meta) {
-          ownedOutputs.push({ resourceIndex: ob.resourceIndex, bufferByteLen: meta.bufferByteLen });
+          const outputBinding = {
+            resourceIndex: ob.resourceIndex,
+            bufferByteLen: meta.bufferByteLen,
+          };
+          // Optional reduction combine metadata (D-A2-A): attaches the
+          // caller-supplied combine to this output; placementReadback applies
+          // it when present, raw otherwise.
+          const combine = combineByResource.get(ob.resourceIndex);
+          if (combine != null) {
+            outputBinding.combine = combine;
+          }
+          ownedOutputs.push(outputBinding);
         }
       }
     }
@@ -456,15 +501,22 @@ function bufferIndexByBinding(kernel, binding) {
  * @param {GPUDevice} device
  * @param {object} resources - { buffers: Map<number, { buffer: GPUBuffer }> }
  * @param {object} descriptor - KernelChainDescriptor JSON (parsed)
+ * @param {Map<number, object>|object} [combineMetadata] - optional reduction
+ *   combine metadata per output resource index
+ *   (`{ op: "sum"|"mean", partialCount, fullLength }`), keyed by storage
+ *   buffer @binding. A runtime parameter only — the descriptor JSON shape is
+ *   unchanged (live S3 host contract).
  * @returns {Promise<{ results: Array<{ binding: object, values: number[] }> }>}
  */
-export async function dispatchChainFromDescriptor(device, resources, descriptor) {
+export async function dispatchChainFromDescriptor(device, resources, descriptor, combineMetadata) {
   if (!descriptor || !Array.isArray(descriptor.chain) || descriptor.chain.length === 0) {
     throw new FaberKernelContractError(
       "dispatchChainFromDescriptor",
       "descriptor.chain must be a non-empty array",
     );
   }
+
+  const combineByResource = normalizeCombineMetadata(combineMetadata);
 
   // 1. Allocate intermediate buffers from buffer_identities
   //
@@ -606,10 +658,18 @@ export async function dispatchChainFromDescriptor(device, resources, descriptor)
       const bufDecl = kernel.storage_buffers[bindingIdx];
       if (!bufDecl) continue;
       if (inputToIntermediate.has(`${kernelIdx}:${bindingIdx}`)) continue;
-      outputBindings.push({
+      const outputBinding = {
         resourceIndex: bufDecl.binding,
         bufferByteLen: Number(bufDecl.size),
-      });
+      };
+      // Optional reduction combine metadata (D-A2-A), keyed by storage
+      // buffer @binding. Runtime parameter only — the descriptor JSON shape
+      // is unchanged.
+      const combine = combineByResource.get(bufDecl.binding);
+      if (combine != null) {
+        outputBinding.combine = combine;
+      }
+      outputBindings.push(outputBinding);
     }
 
     // 3e. Normalize workgroup_size: Rust tuple [x, y, z] → { x, y, z }
@@ -698,13 +758,86 @@ export function placementCopyIn(device, resources, { resourceIndex, data }) {
 }
 
 /**
+ * Combine reduction partial slots into the final reduction value.
+ *
+ * Contract (radix/docs/factory/mir-wgsl/reduction-output-contract.md,
+ * W6-A2): a reduction output buffer holds `ceil(n/ws)` partial slots — one
+ * per workgroup. The combine signal is caller-driven (D-A2 default A): the
+ * caller supplies explicit metadata per output binding; absent metadata the
+ * readback returns raw slots (fail-closed, never a guessed combine).
+ *
+ * @param {number[]} values - the partial slots read back from the device
+ * @param {{ op: "sum"|"mean", partialCount: number, fullLength?: number }} combine
+ * @returns {number} the combined reduction value
+ */
+export function combineReductionPartials(values, combine) {
+  if (!Array.isArray(values)) {
+    throw new FaberKernelContractError(
+      "combineReductionPartials",
+      "values must be an array of partial slots",
+    );
+  }
+  if (!combine || typeof combine !== "object") {
+    throw new FaberKernelContractError(
+      "combineReductionPartials",
+      "combine metadata must be an object",
+    );
+  }
+  const { op, partialCount, fullLength } = combine;
+  if (op !== "sum" && op !== "mean") {
+    throw new FaberKernelContractError(
+      "combineReductionPartials.op",
+      `unknown combine op: ${JSON.stringify(op)} (expected "sum" or "mean")`,
+    );
+  }
+  if (!Number.isInteger(partialCount) || partialCount <= 0) {
+    throw new FaberKernelContractError(
+      "combineReductionPartials.partialCount",
+      `partialCount must be a positive integer, got ${JSON.stringify(partialCount)}`,
+    );
+  }
+  if (values.length !== partialCount) {
+    throw new FaberKernelContractError(
+      "combineReductionPartials.partialCount",
+      `partialCount ${partialCount} does not match ${values.length} read-back slots — ` +
+        "refusing a possibly wrong combine",
+    );
+  }
+  if (op === "mean" && (!Number.isInteger(fullLength) || fullLength <= 0)) {
+    throw new FaberKernelContractError(
+      "combineReductionPartials.fullLength",
+      `mean combine requires a positive fullLength (tensor length n), got ${JSON.stringify(fullLength)}`,
+    );
+  }
+
+  // Sum: total = Σ partial slots.
+  // Mean: the WGSL-text emission divides each workgroup partial by the
+  // tensor length n inside the kernel (`shared[0] = shared[0] / f32(n)`),
+  // so each slot already carries workgroup_sum / n and summing the slots
+  // recovers the mean. A second division by fullLength would divide twice
+  // (see the correction note in the reduction output-buffer contract doc).
+  let total = 0;
+  for (const value of values) {
+    total += value;
+  }
+  return total;
+}
+
+/**
  * Read back device buffer contents to the host. Accepts a list of output
  * bindings — not limited to a single output.
  *
+ * Each binding may optionally carry combine metadata
+ * (`{ op, partialCount, fullLength }`, see combineReductionPartials) for
+ * reduction-shaped outputs. When present, the raw partial slots are
+ * combined into the final value and returned as a single-element `values`
+ * array plus the scalar `combined` field. When absent, the readback is raw
+ * and byte-identical to the pre-combine behavior.
+ *
  * @param {GPUDevice} device
  * @param {object} resources - must have resources.buffers Map<number, ComputeResourceEntry>
- * @param {Array<{ resourceIndex: number, bufferByteLen: number }>} outputBindings
- * @returns {Promise<Array<{ binding: object, values: number[] }>>}
+ * @param {Array<{ resourceIndex: number, bufferByteLen: number, combine?: object }>} outputBindings
+ * @returns {Promise<Array<{ binding: object, values: number[], combined?: number }>>}
  */
 export async function placementReadback(device, resources, outputBindings) {
   if (!Array.isArray(outputBindings)) {
@@ -741,10 +874,14 @@ export async function placementReadback(device, resources, outputBindings) {
     const copy = buffer.getMappedRange().slice(0);
     buffer.unmap();
     buffer.destroy();
-    results.push({
-      binding,
-      values: Array.from(new Float32Array(copy)),
-    });
+    const rawValues = Array.from(new Float32Array(copy));
+    const entry = { binding, values: rawValues };
+    if (binding.combine != null) {
+      const combined = combineReductionPartials(rawValues, binding.combine);
+      entry.values = [combined];
+      entry.combined = combined;
+    }
+    results.push(entry);
   }
 
   return Object.freeze(results);

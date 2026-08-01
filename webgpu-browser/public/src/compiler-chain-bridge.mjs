@@ -13,7 +13,13 @@
  *     --reflection ./reflection.json \
  *     --input '{"0":[1,1,1,2,2,2,3,3,3,4,4,4],"1":[1,2,3,4,5,6],"3":[0.1,0.2,0.1,0.2,0.1,0.2,0.1,0.2]}' \
  *     --output '[{"resourceIndex":4}]' \
+ *     --combine '{"4":{"op":"sum","partialCount":2,"fullLength":16}}' \
  *     --expected '[9.1,12.2,18.1,24.2,27.1,36.2,36.1,48.2]'
+ *
+ * `--combine` is optional reduction combine metadata (W6-A2 D-A2-A): a JSON
+ * object mapping output resource index → { op: "sum"|"mean", partialCount,
+ * fullLength }. Attached to the bridge's output bindings and applied by
+ * placementReadback; absent metadata means raw readback.
  *
  * Dependencies:
  *   - Node.js >= 18
@@ -60,6 +66,9 @@ function parseArgs() {
       case "--output":
         opts.outputJson = args[++i];
         break;
+      case "--combine":
+        opts.combineJson = args[++i];
+        break;
       case "--expected":
         opts.expectedJson = args[++i];
         break;
@@ -96,6 +105,10 @@ Options:
                             '{"0":[1,2,3],"1":[4,5,6]}'
   --output <json>           Output bindings as JSON array, e.g.
                             '[{"resourceIndex":4}]'
+  --combine <json>          Optional reduction combine metadata per output
+                            resource index (D-A2, W6-A2), e.g.
+                            '{"4":{"op":"sum","partialCount":2,"fullLength":16}}'.
+                            Applied by placementReadback; absent → raw readback.
   --expected <json>         Expected output values as JSON array, e.g.
                             '[9.1,12.2,18.1,24.2]'
   --help, -h                Show this help
@@ -165,13 +178,15 @@ let _wgslSource = "";
 let _reflection = null;
 let _inputData = null;
 let _outputBindings = null;
+let _combineMetadata = null;
 let _expectedValues = null;
 
-function setProofData(wgsl, reflection, input, output, expected) {
+function setProofData(wgsl, reflection, input, output, combine, expected) {
   _wgslSource = wgsl;
   _reflection = reflection;
   _inputData = input;
   _outputBindings = output;
+  _combineMetadata = combine;
   _expectedValues = expected;
 }
 
@@ -181,6 +196,9 @@ function serveProofPage(res) {
     : "null";
   const outputBindingsJson = _outputBindings
     ? JSON.stringify(_outputBindings)
+    : "null";
+  const combineJson = _combineMetadata
+    ? JSON.stringify(Object.fromEntries(_combineMetadata.entries()))
     : "null";
   const expectedJson = _expectedValues
     ? JSON.stringify(_expectedValues)
@@ -213,6 +231,7 @@ const WGSL_SOURCE = ${wgslJson};
 const REFLECTION = ${reflectionJson};
 const INPUT_DATA = ${inputDataJson};
 const OUTPUT_BINDINGS = ${outputBindingsJson};
+const COMBINE_METADATA = ${combineJson};
 const EXPECTED_VALUES = ${expectedJson};
 
 window.faberCompilerProof = { ok: false, status: "starting" };
@@ -240,6 +259,7 @@ async function main() {
     REFLECTION,
     inputMap,
     outputBindings,
+    COMBINE_METADATA,
   );
 
   const { results } = await runKernelChain(device, resources, chain);
@@ -425,8 +445,28 @@ async function main() {
     }
   }
 
+  // 4b. Parse reduction combine metadata (W6-A2 D-A2-A): optional map of
+  //     resource index → { op, partialCount, fullLength }.
+  let combineMetadata = null;
+  if (opts.combineJson) {
+    try {
+      const parsed = JSON.parse(opts.combineJson);
+      if (typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.error("error: --combine must be a JSON object keyed by resource index");
+        process.exit(2);
+      }
+      combineMetadata = new Map();
+      for (const [key, value] of Object.entries(parsed)) {
+        combineMetadata.set(Number(key), value);
+      }
+    } catch (e) {
+      console.error("error: invalid combine JSON:", e.message);
+      process.exit(2);
+    }
+  }
+
   // 5. Inject proof data into the server's state
-  setProofData(wgslSource, reflection, inputData, outputBindings, expectedValues);
+  setProofData(wgslSource, reflection, inputData, outputBindings, combineMetadata, expectedValues);
 
   // 6. Verify dependencies
   const chromePath = await puppeteer.executablePath();
