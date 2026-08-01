@@ -4,7 +4,14 @@
  * host-init.js (DS-S2 P1.2). The DOM facts contract is unchanged:
  * `data-scene-geometry`, `data-transform-payload`, `.triga-canvas`,
  * `.triga-facts` keep working for the demos' Faber controllers.
+ *
+ * Phase 2 (S2 slice): the transform-payload *parser* moves to
+ * engine/scene-extractor.js (the extractor owns render-fact parsing — no host
+ * guessing). This module keeps the DOM bridge (attribute read/publish) and
+ * re-exports the parser for callers that read the payload text directly.
  */
+
+import { parseTransformPayload } from "../engine/scene-extractor.js";
 
 export const FACTS_SELECTOR = ".triga-facts";
 export const GEOMETRY_ATTR = "data-scene-geometry";
@@ -48,22 +55,8 @@ export function waitForSceneGeometry({ timeoutMs = GEOMETRY_WAIT_MS, pollMs = GE
   });
 }
 
-/**
- * Parse transform payload text ("f0 f1 ... f31") into Float32Array(32).
- * @param {string|null} text
- * @returns {Float32Array|null}
- */
-export function parseTransformPayload(text) {
-  if (!text) return null;
-  const parts = text.trim().split(/\s+/);
-  if (parts.length !== 32) return null;
-  const floats = new Float32Array(32);
-  for (let i = 0; i < 32; i++) {
-    floats[i] = Number(parts[i]);
-    if (!Number.isFinite(floats[i])) return null;
-  }
-  return floats;
-}
+// Re-export the transform-payload parser (owned by engine/scene-extractor).
+export { parseTransformPayload };
 
 /**
  * Read + parse the current `data-transform-payload` from the facts element.
@@ -72,4 +65,13 @@ export function parseTransformPayload(text) {
 export function readTransformPayload() {
   const el = factsEl();
   return parseTransformPayload(el?.getAttribute(TRANSFORM_ATTR) ?? null);
+}
+
+/**
+ * Read the RAW `data-transform-payload` text from the facts element (the
+ * scene-extractor validates the 32-float shape from the raw text).
+ * @returns {string|null}
+ */
+export function readTransformPayloadText() {
+  return factsEl()?.getAttribute(TRANSFORM_ATTR) ?? null;
 }
