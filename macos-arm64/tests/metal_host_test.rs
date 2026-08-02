@@ -115,8 +115,8 @@ fn fake_driver_sequences_generalized_launch_kernel() {
     session.copy_in_f32(a, &[1.0, 2.0]).expect("copy a");
     session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
     session
-        .launch_kernel(module, "add_one", &[a, b, out], 1, 8)
-        .expect("generalized launch");
+        .launch_kernel_3d(module, "add_one", &[a, b, out], 2, 2, 1, 8, 8, 1)
+        .expect("generalized 3D launch");
     let values = session.readback_f32(out).expect("readback");
     assert_eq!(values, vec![4.0, 6.0]);
 

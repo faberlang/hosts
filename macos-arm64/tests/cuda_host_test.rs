@@ -79,6 +79,29 @@ fn fake_driver_sequences_elementwise_add_without_product_label() {
 }
 
 #[test]
+fn fake_driver_sequences_generalized_3d_launch_kernel() {
+    let mut session =
+        CudaHostSession::with_driver(Box::new(FakeCudaDriver::default())).expect("fake admit");
+
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = session.alloc_bytes(8).expect("alloc a");
+    let b = session.alloc_bytes(8).expect("alloc b");
+    let out = session.alloc_bytes(8).expect("alloc out");
+
+    session.copy_in_f32(a, &[1.0, 2.0]).expect("copy a");
+    session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
+    session
+        .launch_kernel_3d(module, "addita", &[a, b, out], 2, 2, 1, 8, 8, 1)
+        .expect("generalized 3D launch");
+    let values = session.readback_f32(out).expect("readback");
+    assert_eq!(values, vec![4.0, 6.0]);
+
+    session.sync().expect("session sync barrier");
+}
+
+#[test]
 fn fake_unavailable_driver_rejects_session_open() {
     let err = CudaHostSession::with_driver(Box::new(FakeCudaDriver::unavailable()))
         .expect_err("unavailable fake");

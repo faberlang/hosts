@@ -240,9 +240,8 @@ impl CudaHostSession {
     /// Generalized launch: resolve `entry` inside `module` and dispatch over
     /// `buffers` (inputs first, output last) with the given grid/block shape.
     /// Every buffer handle is validated and resolved to a backend token before
-    /// the driver is touched; the launch synchronizes internally. The session
-    /// surface keeps the 1D grid/block shape; the y/z dimensions default to 1
-    /// on the driver.
+    /// the driver is touched; the launch synchronizes internally. This helper
+    /// preserves the original 1D session surface for elementwise callers.
     pub fn launch_kernel(
         &mut self,
         module: CudaHandleId,
@@ -250,6 +249,25 @@ impl CudaHostSession {
         buffers: &[CudaHandleId],
         grid_x: u32,
         block_x: u32,
+    ) -> HostResult<()> {
+        self.launch_kernel_3d(module, entry, buffers, grid_x, 1, 1, block_x, 1, 1)
+    }
+
+    /// Generalized launch with explicit 3D grid and block shape. Matmul and
+    /// other collection kernels use y/z dimensions; elementwise callers can use
+    /// `launch_kernel`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kernel_3d(
+        &mut self,
+        module: CudaHandleId,
+        entry: &str,
+        buffers: &[CudaHandleId],
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
     ) -> HostResult<()> {
         self.require_admitted()?;
         let module_token = self.module_token(module)?;
@@ -266,11 +284,11 @@ impl CudaHostSession {
             entry.as_bytes(),
             &tokens,
             grid_x,
-            1,
-            1,
+            grid_y,
+            grid_z,
             block_x,
-            1,
-            1,
+            block_y,
+            block_z,
         )?;
         self.driver.sync()
     }
