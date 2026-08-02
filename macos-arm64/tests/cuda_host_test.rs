@@ -1,6 +1,7 @@
 //! CUDA host admission + lifecycle sequencing tests (Track C2 path A).
 
 use faber::Valor;
+use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::{
     probe_cuda_environment, CudaHostSession, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
     E_CUDA_UNAVAILABLE,
@@ -21,24 +22,21 @@ fn probe_reports_structured_admission_without_claiming_product_run() {
 #[test]
 fn try_open_fails_closed_when_environment_unavailable() {
     let result = CudaHostSession::try_open();
-    // On this hunter machine nvidia-smi/libcuda are absent → Err.
-    // If a future proof machine admits, this test still accepts Ok without
-    // claiming a kernel product path (create_context still unsupported).
+    // On this hunter machine nvidia-smi/libcuda are absent → Err
+    // (E_CUDA_UNAVAILABLE). If a future proof machine admits (dlopen +
+    // cuInit succeed), the real Driver API binding is live and loading a bogus
+    // PTX image must fail closed as a driver-level error — never
+    // product-claim a launch.
     match result {
         Err(error) => {
             assert_eq!(error.code, E_CUDA_UNAVAILABLE);
         }
         Ok(mut session) => {
-            // Admitted signals only; real launch remains unsupported until Driver API wiring.
             assert!(session.is_admitted());
             let err = session
                 .load_module(b"not-a-real-ptx")
-                .expect_err("system adapter must not product-launch without Driver API");
-            assert!(
-                err.code == "E_CUDA_UNSUPPORTED" || err.code == E_CUDA_UNAVAILABLE,
-                "unexpected code {}",
-                err.code
-            );
+                .expect_err("system adapter must not product-launch without valid PTX");
+            assert_eq!(err.code, E_CUDA_DRIVER);
         }
     }
 }
