@@ -184,10 +184,15 @@ fi
 if ! grep -qE '\.(visible\s+)?entry\s+addita\b' "$PTX"; then
   fail "PTX missing '.entry addita' (NVPTX did not mark the kernel entry)"
 fi
-if ! grep -q '\.param .u64 .ptr .global' "$PTX"; then
-  fail "PTX missing '.param .u64 .ptr .global' buffer params"
+for param in 0 1 2; do
+  if ! grep -q "\\.param \\.u64 addita_param_$param" "$PTX"; then
+    fail "PTX missing u64 buffer param addita_param_$param"
+  fi
+done
+if ! grep -q 'ld\.global\.f32' "$PTX" || ! grep -q 'st\.global\.f32' "$PTX"; then
+  fail "PTX missing global f32 load/store buffer operations"
 fi
-printf '── PTX OK: .entry addita present, backend=%s path=%s pin=+%s\n' \
+printf '── PTX OK: .entry addita present, 3 u64 buffer params, backend=%s path=%s pin=+%s\n' \
   "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
 
 # --- 4. build the host proof binary ------------------------------------------

@@ -424,6 +424,10 @@ struct SystemCudaDriver {
     modules: BTreeMap<u64, OpaqueHandle>,
     /// Buffer tokens mapped to `CUdeviceptr` values.
     buffers: BTreeMap<u64, u64>,
+    /// Retained primary context made current before each context-dependent API
+    /// call. CUDA current-context state is thread-local; reassert it so the
+    /// one-shot proof is not sensitive to driver calls that disturb it.
+    context: Option<OpaqueHandle>,
     next_token: u64,
 }
 
@@ -483,11 +487,18 @@ impl CudaDriver for SystemCudaDriver {
                 "cuDevicePrimaryCtxRetain failed with CUDA result {result}"
             )));
         }
+        result = unsafe { (api.cu_ctx_set_current)(context) };
+        if result != CUDA_SUCCESS {
+            return Err(cuda_driver(format!(
+                "cuCtxSetCurrent failed with CUDA result {result}"
+            )));
+        }
+        self.context = Some(OpaqueHandle(context));
         Ok(())
     }
 
     fn load_module(&mut self, image: &[u8]) -> HostResult<u64> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         // cuModuleLoadData requires a NUL-terminated image. PTX files end with
         // a newline, so append the terminator explicitly.
         let mut image_terminated = Vec::with_capacity(image.len() + 1);
@@ -508,7 +519,7 @@ impl CudaDriver for SystemCudaDriver {
     }
 
     fn alloc(&mut self, len_bytes: usize) -> HostResult<u64> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         let mut device_ptr: u64 = 0;
         let result = unsafe { (api.cu_mem_alloc)(&mut device_ptr, len_bytes) };
         if result != CUDA_SUCCESS {
@@ -523,7 +534,7 @@ impl CudaDriver for SystemCudaDriver {
     }
 
     fn copy_in(&mut self, token: u64, bytes: &[u8]) -> HostResult<()> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         let device_ptr = self
             .buffers
             .get(&token)
@@ -561,7 +572,7 @@ impl CudaDriver for SystemCudaDriver {
         grid_x: u32,
         block_x: u32,
     ) -> HostResult<()> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         let module_handle = self
             .modules
             .get(&module)
@@ -629,7 +640,7 @@ impl CudaDriver for SystemCudaDriver {
     }
 
     fn sync(&mut self) -> HostResult<()> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         let result = unsafe { (api.cu_ctx_synchronize)() };
         if result != CUDA_SUCCESS {
             return Err(cuda_driver(format!(
@@ -640,7 +651,7 @@ impl CudaDriver for SystemCudaDriver {
     }
 
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>> {
-        let api = self.loaded_api()?;
+        let api = self.current_api()?;
         let device_ptr = self
             .buffers
             .get(&token)
@@ -659,7 +670,7 @@ impl CudaDriver for SystemCudaDriver {
 
     fn free(&mut self, token: u64) -> HostResult<()> {
         if let Some(device_ptr) = self.buffers.remove(&token) {
-            let api = self.loaded_api()?;
+            let api = self.current_api()?;
             let result = unsafe { (api.cu_mem_free)(device_ptr) };
             if result != CUDA_SUCCESS {
                 return Err(cuda_driver(format!(
@@ -681,6 +692,22 @@ impl SystemCudaDriver {
         self.api
             .ok_or_else(|| cuda_unavailable("SystemCudaDriver has no loaded Driver API"))
     }
+
+    /// Resolved symbol table after reasserting the retained primary context as
+    /// current for this thread.
+    fn current_api(&self) -> HostResult<CudaDriverApi> {
+        let api = self.loaded_api()?;
+        let context = self
+            .context
+            .ok_or_else(|| cuda_driver("SystemCudaDriver has no retained CUDA context"))?;
+        let result = unsafe { (api.cu_ctx_set_current)(context.0) };
+        if result != CUDA_SUCCESS {
+            return Err(cuda_driver(format!(
+                "cuCtxSetCurrent failed with CUDA result {result}"
+            )));
+        }
+        Ok(api)
+    }
 }
 
 /// `CUresult` success code (`cudaError_t`); any non-zero value is an error.
@@ -697,6 +724,7 @@ struct CudaDriverApi {
     cu_init: unsafe extern "C" fn(u32) -> i32,
     cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> i32,
     cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, i32) -> i32,
+    cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
     cu_module_get_function: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32,
     cu_launch_kernel: unsafe extern "C" fn(
@@ -748,13 +776,14 @@ unsafe fn resolve_cuda_api(library: &libloading::Library) -> HostResult<CudaDriv
                 library,
                 b"cuDevicePrimaryCtxRetain\0",
             )?,
+            cu_ctx_set_current: resolve_symbol(library, b"cuCtxSetCurrent\0")?,
             cu_module_load_data: resolve_symbol(library, b"cuModuleLoadData\0")?,
             cu_module_get_function: resolve_symbol(library, b"cuModuleGetFunction\0")?,
             cu_launch_kernel: resolve_symbol(library, b"cuLaunchKernel\0")?,
-            cu_mem_alloc: resolve_symbol(library, b"cuMemAlloc\0")?,
-            cu_mem_free: resolve_symbol(library, b"cuMemFree\0")?,
-            cu_memcpy_htod: resolve_symbol(library, b"cuMemcpyHtoD\0")?,
-            cu_memcpy_dtoh: resolve_symbol(library, b"cuMemcpyDtoH\0")?,
+            cu_mem_alloc: resolve_symbol(library, b"cuMemAlloc_v2\0")?,
+            cu_mem_free: resolve_symbol(library, b"cuMemFree_v2\0")?,
+            cu_memcpy_htod: resolve_symbol(library, b"cuMemcpyHtoD_v2\0")?,
+            cu_memcpy_dtoh: resolve_symbol(library, b"cuMemcpyDtoH_v2\0")?,
             cu_ctx_synchronize: resolve_symbol(library, b"cuCtxSynchronize\0")?,
         })
     }
