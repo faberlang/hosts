@@ -10,6 +10,7 @@ pub mod component;
 pub mod cuda_host;
 pub mod kernel;
 pub mod manifest;
+pub mod metal_host;
 pub mod syscall_import;
 pub mod wasm;
 pub mod wasm_rt_v1;
@@ -17,6 +18,10 @@ pub mod wasm_rt_v1;
 pub use cuda_host::{
     probe_cuda_environment, CudaEnvReport, CudaHandleId, CudaHostSession, FakeCudaDriver,
     E_CUDA_INVALID_HANDLE, E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED,
+};
+pub use metal_host::{
+    probe_metal_environment, FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession,
+    E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };
 pub use kernel::{Conversation, Direction, Frame, HostError, HostKernel, Status};
 pub use manifest::{CapabilityManifest, RegisteredProvider, SyscallManifest};
