@@ -219,13 +219,20 @@ function parseBindGroups(adapter) {
 
 function parseBindGroupEntry(entry, path) {
   const object = expectObject(entry, path);
-  expectValue(object.kind, "storage-buffer", `${path}.kind`);
+  // U2 runtime-extent channel: a scalar-shaped kernel carries an explicit
+  // runtime-extent resource (kind "runtime-extent", u32 count, role input,
+  // access read) at the next-free binding; the host supplies the count.
+  expectOneOf(object.kind, ["storage-buffer", "runtime-extent"], `${path}.kind`);
   expectOneOf(object.role, ["input", "output"], `${path}.role`);
   expectOneOf(object.access, ["read", "write"], `${path}.access`);
   expectOneOf(object.shader_access, ["read", "read_write"], `${path}.shader_access`);
   expectOneOf(object.shader_visibility, VISIBILITY_VALUES, `${path}.shader_visibility`);
   expectOneOf(object.buffer_type, ["read-only-storage", "storage"], `${path}.buffer_type`);
-  expectValue(object.element_layout, "f32", `${path}.element_layout`);
+  if (object.kind === "runtime-extent") {
+    expectValue(object.element_layout, "u32", `${path}.element_layout`);
+  } else {
+    expectValue(object.element_layout, "f32", `${path}.element_layout`);
+  }
   expectValue(object.element_byte_width, 4, `${path}.element_byte_width`);
   expectValue(object.has_dynamic_offset, false, `${path}.has_dynamic_offset`);
   validateRolePolicy(object, path);

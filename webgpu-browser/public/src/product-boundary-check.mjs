@@ -183,8 +183,14 @@ async function main() {
   // Happy path for static reflection consumer (not GPU execution).
   const kernel = loadFaberKernel({ wgsl, reflection });
   require(kernel.entryName === "add_one", "kernel entry must be add_one");
-  require(kernel.dispatchWorkgroups.x === 1, "dispatch x must be 1");
-  require(kernel.inputBindings.length === 1, "expected one input binding");
+  // U2: the reflection keeps the static (1,1,1) dispatch hint; the host
+  // supplies the real extent through the runtime-extent binding.
+  require(kernel.dispatchWorkgroups.x === 1, "dispatch x must be 1 (static shape hint)");
+  const dataInputs = kernel.inputBindings.filter((entry) => entry.kind === "storage-buffer");
+  const extentInputs = kernel.inputBindings.filter((entry) => entry.kind === "runtime-extent");
+  require(dataInputs.length === 1, "expected one storage-buffer input binding");
+  require(extentInputs.length === 1, "expected one runtime-extent input binding");
+  require(kernel.inputBindings.length === 2, "expected input + runtime-extent bindings");
   require(kernel.outputBindings.length === 1, "expected one output binding");
 
   await expectReject("artifact-fetch failure", "artifact-fetch", () =>
@@ -436,7 +442,11 @@ async function main() {
   {
     const kernel = loadFaberKernel({ wgsl, reflection });
     require(kernel.entryName === "add_one", "compute re-verify: kernel entry must be add_one");
-    require(kernel.inputBindings.length === 1, "compute re-verify: expected one input binding");
+    require(kernel.inputBindings.length === 2, "compute re-verify: expected input + runtime-extent bindings");
+    require(
+      kernel.inputBindings.filter((entry) => entry.kind === "storage-buffer").length === 1,
+      "compute re-verify: expected one storage-buffer input binding",
+    );
   }
 
   console.log("product-boundary-check passed");

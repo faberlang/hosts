@@ -26,6 +26,22 @@
     "ok": true,
     "value": 42.0
   },
+  "multi_element": {
+    "fixture": "../fixtures/add-one.fab",
+    "element_count": 16,
+    "buffers": {
+      "input": { "binding": 0, "element_layout": "f32", "byte_len": 64 },
+      "output": { "binding": 1, "element_layout": "f32", "byte_len": 64 },
+      "extent": { "binding": 2, "element_layout": "u32", "value": 16, "byte_len": 4 }
+    },
+    "dispatch_workgroups": { "x": 16, "y": 1, "z": 1 },
+    "state_path": "window.faberWebGpuMultiElementProof",
+    "success": {
+      "ok": true,
+      "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
+    },
+    "manual_assertion": "window.faberWebGpuMultiElementProof.ok === true && window.faberWebGpuMultiElementProof.values.length === 16"
+  },
   "graphicsSuccess": {
     "submittedFrameCount": 1
   },

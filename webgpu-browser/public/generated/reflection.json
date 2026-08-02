@@ -18,7 +18,7 @@
           "role": "input",
           "access": "read",
           "element_type": {
-            "semantic": 48,
+            "semantic": 23,
             "layout": null
           },
           "element_layout": "f32",
@@ -30,12 +30,29 @@
         },
         {
           "group": 0,
+          "binding": 2,
+          "kind": "runtime-extent",
+          "role": "input",
+          "access": "read",
+          "element_type": {
+            "semantic": 15,
+            "layout": null
+          },
+          "element_layout": "u32",
+          "element_byte_width": 4,
+          "element_count": 1,
+          "buffer_byte_len": 4,
+          "source_local": null,
+          "source_name": "runtime_extent"
+        },
+        {
+          "group": 0,
           "binding": 1,
           "kind": "storage-buffer",
           "role": "output",
           "access": "write",
           "element_type": {
-            "semantic": 49,
+            "semantic": 23,
             "layout": null
           },
           "element_layout": "f32",
@@ -58,7 +75,7 @@
             {
               "bind_group_index": 0,
               "group": 0,
-              "layout_entry_count": 2
+              "layout_entry_count": 3
             }
           ]
         },
@@ -69,81 +86,95 @@
             "group": 0,
             "resource_indexes": [
               0,
+              2,
               1
             ],
-            "resource_index_count": 2,
+            "resource_index_count": 3,
             "resource_kinds": [
               "storage-buffer",
-              "storage-buffer"
+              "storage-buffer",
+              "runtime-extent"
             ],
-            "resource_kind_count": 2,
+            "resource_kind_count": 3,
             "resource_roles": [
               "input",
-              "output"
+              "output",
+              "input"
             ],
-            "resource_role_count": 2,
+            "resource_role_count": 3,
             "shader_accesses": [
               "read",
-              "read_write"
+              "read_write",
+              "read"
             ],
-            "shader_access_count": 2,
+            "shader_access_count": 3,
             "buffer_binding_types": [
               "read-only-storage",
-              "storage"
+              "storage",
+              "read-only-storage"
             ],
-            "buffer_binding_type_count": 2,
+            "buffer_binding_type_count": 3,
             "buffer_byte_offsets": [
+              0,
               0,
               0
             ],
-            "buffer_byte_offset_count": 2,
+            "buffer_byte_offset_count": 3,
             "buffer_byte_lens": [
               4,
+              4,
               4
             ],
-            "buffer_byte_len_count": 2,
+            "buffer_byte_len_count": 3,
             "binding_byte_lens": [
               4,
-              4
-            ],
-            "binding_byte_len_count": 2,
-            "min_binding_sizes": [
               4,
               4
             ],
-            "min_binding_size_count": 2,
+            "binding_byte_len_count": 3,
+            "min_binding_sizes": [
+              4,
+              4,
+              4
+            ],
+            "min_binding_size_count": 3,
             "has_dynamic_offsets": [
+              false,
               false,
               false
             ],
-            "dynamic_offset_flag_count": 2,
+            "dynamic_offset_flag_count": 3,
             "offset_modes": [
+              "fixed",
               "fixed",
               "fixed"
             ],
-            "offset_mode_entry_count": 2,
+            "offset_mode_entry_count": 3,
             "requires_dynamic_offsets": false,
             "has_non_dynamic_offsets": true,
             "has_mixed_offset_modes": false,
             "offset_mode_count": 1,
             "has_only_non_dynamic_offsets": true,
             "has_only_dynamic_offsets": false,
-            "non_dynamic_offset_count": 2,
+            "non_dynamic_offset_count": 3,
             "non_dynamic_offset_resource_indexes": [
               0,
+              2,
               1
             ],
-            "non_dynamic_offset_resource_index_count": 2,
+            "non_dynamic_offset_resource_index_count": 3,
             "non_dynamic_offset_binding_indexes": [
               0,
-              1
+              1,
+              2
             ],
-            "non_dynamic_offset_binding_index_count": 2,
+            "non_dynamic_offset_binding_index_count": 3,
             "non_dynamic_offset_layout_entry_indexes": [
               0,
-              1
+              1,
+              2
             ],
-            "non_dynamic_offset_layout_entry_index_count": 2,
+            "non_dynamic_offset_layout_entry_index_count": 3,
             "dynamic_offset_count": 0,
             "dynamic_offset_resource_indexes": [],
             "dynamic_offset_resource_index_count": 0,
@@ -153,24 +184,27 @@
             "dynamic_offset_layout_entry_index_count": 0,
             "binding_indexes": [
               0,
-              1
+              1,
+              2
             ],
-            "binding_index_count": 2,
+            "binding_index_count": 3,
             "layout_entry_indexes": [
               0,
-              1
+              1,
+              2
             ],
-            "layout_entry_index_count": 2,
+            "layout_entry_index_count": 3,
             "source_locals": [
               0
             ],
             "source_local_count": 1,
             "source_names": [
-              "x"
+              "x",
+              "runtime_extent"
             ],
-            "source_name_count": 1,
-            "binding_count": 2,
-            "layout_entry_count": 2,
+            "source_name_count": 2,
+            "binding_count": 3,
+            "layout_entry_count": 3,
             "layout_entries": [
               {
                 "layout_entry_index": 0,
@@ -185,13 +219,24 @@
               },
               {
                 "layout_entry_index": 1,
-                "resource_index": 1,
+                "resource_index": 2,
                 "binding": 1,
                 "shader_visibility": "compute",
                 "buffer_binding_type": "storage",
                 "min_binding_size": 4,
                 "has_dynamic_offset": false,
                 "source_local": null
+              },
+              {
+                "layout_entry_index": 2,
+                "resource_index": 1,
+                "binding": 2,
+                "shader_visibility": "compute",
+                "buffer_binding_type": "read-only-storage",
+                "min_binding_size": 4,
+                "has_dynamic_offset": false,
+                "source_local": null,
+                "source_name": "runtime_extent"
               }
             ],
             "bindings": [
@@ -206,7 +251,7 @@
                 "shader_visibility": "compute",
                 "buffer_binding_type": "read-only-storage",
                 "element_type": {
-                  "semantic": 48,
+                  "semantic": 23,
                   "layout": null
                 },
                 "element_layout": "f32",
@@ -222,7 +267,7 @@
               },
               {
                 "binding_index": 1,
-                "resource_index": 1,
+                "resource_index": 2,
                 "binding": 1,
                 "kind": "storage-buffer",
                 "role": "output",
@@ -231,7 +276,7 @@
                 "shader_visibility": "compute",
                 "buffer_binding_type": "storage",
                 "element_type": {
-                  "semantic": 49,
+                  "semantic": 23,
                   "layout": null
                 },
                 "element_layout": "f32",
@@ -243,6 +288,31 @@
                 "min_binding_size": 4,
                 "has_dynamic_offset": false,
                 "source_local": null
+              },
+              {
+                "binding_index": 2,
+                "resource_index": 1,
+                "binding": 2,
+                "kind": "runtime-extent",
+                "role": "input",
+                "access": "read",
+                "shader_access": "read",
+                "shader_visibility": "compute",
+                "buffer_binding_type": "read-only-storage",
+                "element_type": {
+                  "semantic": 15,
+                  "layout": null
+                },
+                "element_layout": "u32",
+                "element_byte_width": 4,
+                "element_count": 1,
+                "buffer_byte_len": 4,
+                "buffer_byte_offset": 0,
+                "binding_byte_len": 4,
+                "min_binding_size": 4,
+                "has_dynamic_offset": false,
+                "source_local": null,
+                "source_name": "runtime_extent"
               }
             ]
           }
@@ -266,10 +336,11 @@
               "group": 0,
               "layout_entry_indexes": [
                 0,
-                1
+                1,
+                2
               ],
-              "layout_entry_index_count": 2,
-              "entry_count": 2,
+              "layout_entry_index_count": 3,
+              "entry_count": 3,
               "entries": [
                 {
                   "binding": 0,
@@ -296,9 +367,24 @@
                   "buffer_type": "storage",
                   "has_dynamic_offset": false,
                   "min_binding_size": 4,
-                  "resource_index": 1,
+                  "resource_index": 2,
                   "layout_entry_index": 1,
                   "source_local": null
+                },
+                {
+                  "binding": 2,
+                  "binding_index": 2,
+                  "buffer_byte_len": 4,
+                  "buffer_byte_offset": 0,
+                  "binding_byte_len": 4,
+                  "visibility": "compute",
+                  "buffer_type": "read-only-storage",
+                  "has_dynamic_offset": false,
+                  "min_binding_size": 4,
+                  "resource_index": 1,
+                  "layout_entry_index": 2,
+                  "source_local": null,
+                  "source_name": "runtime_extent"
                 }
               ]
             }
@@ -314,10 +400,11 @@
               "group": 0,
               "entry_indexes": [
                 0,
-                1
+                1,
+                2
               ],
-              "entry_index_count": 2,
-              "entry_count": 2,
+              "entry_index_count": 3,
+              "entry_count": 3,
               "entries": [
                 {
                   "binding": 0,
@@ -327,7 +414,7 @@
                   "shader_access": "read",
                   "shader_visibility": "compute",
                   "element_type": {
-                    "semantic": 48,
+                    "semantic": 23,
                     "layout": null
                   },
                   "element_layout": "f32",
@@ -352,13 +439,13 @@
                   "shader_access": "read_write",
                   "shader_visibility": "compute",
                   "element_type": {
-                    "semantic": 49,
+                    "semantic": 23,
                     "layout": null
                   },
                   "element_layout": "f32",
                   "element_byte_width": 4,
                   "element_count": 1,
-                  "resource_index": 1,
+                  "resource_index": 2,
                   "binding_index": 1,
                   "buffer_type": "storage",
                   "buffer_byte_len": 4,
@@ -367,6 +454,31 @@
                   "min_binding_size": 4,
                   "has_dynamic_offset": false,
                   "source_local": null
+                },
+                {
+                  "binding": 2,
+                  "kind": "runtime-extent",
+                  "role": "input",
+                  "access": "read",
+                  "shader_access": "read",
+                  "shader_visibility": "compute",
+                  "element_type": {
+                    "semantic": 15,
+                    "layout": null
+                  },
+                  "element_layout": "u32",
+                  "element_byte_width": 4,
+                  "element_count": 1,
+                  "resource_index": 1,
+                  "binding_index": 2,
+                  "buffer_type": "read-only-storage",
+                  "buffer_byte_len": 4,
+                  "buffer_byte_offset": 0,
+                  "binding_byte_len": 4,
+                  "min_binding_size": 4,
+                  "has_dynamic_offset": false,
+                  "source_local": null,
+                  "source_name": "runtime_extent"
                 }
               ]
             }

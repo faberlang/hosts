@@ -53,6 +53,10 @@ async function runComputeProof() {
   const { device } = await acquireWebGpuDevice();
   const resources = createWebGpuResources(device, kernel, {
     x: new Float32Array([INPUT_VALUE]),
+    // U2 runtime-extent channel: the scalar-shaped add_one kernel reads its
+    // OOB guard from the extent binding; the host supplies the count (1 for
+    // the single-element proof).
+    runtime_extent: new Uint32Array([1]),
   });
   const result = await runKernel(device, resources, kernel);
   const value = result.values[0];

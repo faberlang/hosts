@@ -973,7 +973,17 @@ function createBuffers(device, descriptor, initialInputs) {
 function writeInitialInput(buffer, entry, initialInputs) {
   const inputName = entry.sourceName ?? `resource_${entry.resourceIndex}`;
   const value = initialInputs[inputName];
-  if (!(value instanceof Float32Array)) {
+  // U2 runtime-extent channel: the extent binding is a u32 count buffer
+  // (`Uint32Array`), distinct from f32 storage-buffer inputs. Accept both
+  // typed-array shapes so the host can populate the extent binding before
+  // dispatch (host contract: element count for the documented extent
+  // binding, keyed by source name).
+  const isExtent = entry.kind === "runtime-extent";
+  if (isExtent) {
+    if (!(value instanceof Uint32Array)) {
+      throw new FaberKernelContractError(`initialInputs.${inputName}`, "expected Uint32Array for runtime-extent");
+    }
+  } else if (!(value instanceof Float32Array)) {
     throw new FaberKernelContractError(`initialInputs.${inputName}`, "expected Float32Array");
   }
   if (value.byteLength !== entry.bufferByteLen) {
