@@ -20,7 +20,7 @@ use crate::kernel::{HostError, HostResult};
 
 /// Stable host error code for missing CUDA driver/device/toolchain.
 pub const E_CUDA_UNAVAILABLE: &str = "E_CUDA_UNAVAILABLE";
-/// Stable host error for unsupported CUDA host operations / product claims.
+/// Reserved for future use — no current emit site; today's codes are E_CUDA_UNAVAILABLE / E_CUDA_DRIVER.
 pub const E_CUDA_UNSUPPORTED: &str = "E_CUDA_UNSUPPORTED";
 /// Stale or unknown opaque handle.
 pub const E_CUDA_INVALID_HANDLE: &str = "E_CUDA_INVALID_HANDLE";
