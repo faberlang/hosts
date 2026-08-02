@@ -13,6 +13,7 @@ use std::fmt;
 use std::path::Path;
 
 use faber::Valor;
+#[cfg(target_os = "macos")]
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLResourceOptions, MTLSize,
@@ -111,19 +112,28 @@ impl MetalHostSession {
     /// Open a session against the live Metal stack. Fails closed when the
     /// machine cannot admit a Metal product stack.
     pub fn try_open() -> HostResult<Self> {
-        let mut driver = Box::new(SystemMetalDriver::default());
-        let report = driver.discover()?;
-        if !report.admitted {
-            return Err(metal_unavailable(report.reason));
+        #[cfg(target_os = "macos")]
+        {
+            let mut driver = Box::new(SystemMetalDriver::default());
+            let report = driver.discover()?;
+            if !report.admitted {
+                return Err(metal_unavailable(report.reason));
+            }
+            let mut session = Self {
+                driver,
+                handles: BTreeMap::new(),
+                next_id: 1,
+                admitted: true,
+            };
+            session.driver.create_context()?;
+            Ok(session)
         }
-        let mut session = Self {
-            driver,
-            handles: BTreeMap::new(),
-            next_id: 1,
-            admitted: true,
-        };
-        session.driver.create_context()?;
-        Ok(session)
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(metal_unavailable(
+                "Metal is not available on this platform (not macOS)",
+            ))
+        }
     }
 
     /// Inject a driver for unit tests (sequencing / reject paths only).
@@ -550,6 +560,7 @@ impl MetalDriver for FakeMetalDriver {
 /// map to `E_METAL_*` codes. Private like `SystemCudaDriver`: reachable only
 /// through [`MetalHostSession::try_open`] so the session API surface is the
 /// symmetric parity entry point.
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct SystemMetalDriver {
     device: Option<Device>,
@@ -567,6 +578,7 @@ struct MetalModule {
     pipeline: ComputePipelineState,
 }
 
+#[cfg(target_os = "macos")]
 impl MetalDriver for SystemMetalDriver {
     fn discover(&mut self) -> HostResult<MetalEnvReport> {
         match Device::system_default() {

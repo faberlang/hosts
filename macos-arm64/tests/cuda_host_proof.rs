@@ -1,6 +1,73 @@
 //! Environment-gated CUDA Driver API proof (G3 artifact; the G2 wiring that
 //! carries it).
 //!
+//! # How to compile and run the CUDA proof
+//!
+//! The proof runs end-to-end on a machine with an NVIDIA GPU and the CUDA
+//! Driver API (e.g. pharos: RTX 5070, sm_120, driver 595.71.05,
+//! `libcuda.so.1` at `/lib/x86_64-linux-gnu/libcuda.so.1`). It requires three
+//! artifacts: the PTX file (compiler-emitted LLVM IR lowered through an
+//! NVPTX backend), the kernel descriptor JSON sidecar, and this test binary
+//! (compiled from the `faber-host-macos-arm64` crate).
+//!
+//! ## Prerequisites
+//!
+//! 1. **Rust toolchain** on the GPU machine (rustup + stable).
+//! 2. **LLVM with NVPTX target** — either on the GPU machine or on a build
+//!    machine that can emit PTX. Check with `clang --print-targets | grep
+//!    nvptx64` or `llc --version | grep nvptx64`.
+//! 3. **The faberlang repos** — `radix/` and `hosts/` checked out as siblings
+//!    (the standard faberlang container layout).
+//! 4. **cfg-gate**: the `metal` crate dependency in
+//!    `hosts/macos-arm64/Cargo.toml` must be target-gated to macOS so the
+//!    crate compiles on Linux:
+//!    ```toml
+//!    [target.'cfg(target_os = "macos")'.dependencies]
+//!    metal = "0.33"
+//!    ```
+//!    If `metal_host.rs` has unconditional `use metal::*`, those must be
+//!    cfg-gated too.
+//!
+//! ## Option A — Split build (recommended for single-GPU setups)
+//!
+//! Emit and lower on a machine with LLVM, run the proof on the GPU machine:
+//!
+//! ```sh
+//! # Step 1: Emit .ll + descriptor (build machine with Rust + radix)
+//! cd /path/to/faberlang/radix
+//! cargo build -p radix --bin radix
+//! ./target/debug/radix emit -t llvm-text \
+//!   --cuda-descriptor /tmp/addita.json \
+//!   corpus/cuda/addita-proof.fab > /tmp/addita.ll
+//!
+//! # Step 2: Lower to PTX (build machine with LLVM NVPTX backend)
+//! clang --target=nvptx64-nvidia-cuda -S -O1 --cuda-feature=+ptx87 \
+//!   -o /tmp/addita.ptx /tmp/addita.ll
+//! # Or: llc -mtriple=nvptx64-nvidia-cuda -mattr=+ptx87 -o /tmp/addita.ptx /tmp/addita.ll
+//!
+//! # Step 3: Copy artifacts to the GPU machine
+//! scp /tmp/addita.ptx /tmp/addita.json pharos:/tmp/
+//!
+//! # Step 4: Build and run the proof (GPU machine)
+//! cd /path/to/faberlang/hosts
+//! cargo test --manifest-path macos-arm64/Cargo.toml --test cuda_host_proof -- --nocapture
+//! ```
+//!
+//! ## Option B — Full script (GPU machine has everything)
+//!
+//! Run the entire pipeline in one shot:
+//!
+//! ```sh
+//! cd /path/to/faberlang/hosts
+//! ./scripta/cuda-tier-f-proof
+//! ```
+//!
+//! The script builds radix, emits, lowers, builds the host proof, and runs it.
+//! Exit codes: 0 = PASS, 1 = FAIL, 2 = G3 not attempted (no NVPTX backend),
+//! 3 = config error.
+//!
+//! ## Anti-false-green contract
+//!
 //! Requires both `CUDA_PROOF_PTX` and `CUDA_PROOF_DESCRIPTOR`. When either is
 //! absent the test prints SKIP and exits clean — that is the only skip-worthy
 //! state (anti-false-green: a present-but-broken CUDA stack must never look
