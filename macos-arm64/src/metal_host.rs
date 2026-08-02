@@ -377,7 +377,8 @@ pub fn probe_metal_environment() -> MetalEnvReport {
 
     let admitted = mtl_device.is_some();
     let reason = if admitted {
-        "Metal default device present; SystemMetalDriver can compile MSL and launch add_one".to_owned()
+        "Metal default device present; SystemMetalDriver can compile MSL and launch add_one"
+            .to_owned()
     } else {
         "no Metal default device detected (MTLCreateSystemDefaultDevice returned null, or this OS is not macOS); Metal product execution is not admitted".to_owned()
     };
@@ -610,7 +611,8 @@ impl MetalDriver for SystemMetalDriver {
                     admitted: true,
                     mtl_device: Some(name),
                     metal_framework_paths: detect_metal_framework_paths(),
-                    reason: "system default Metal device present; SystemMetalDriver admits".to_owned(),
+                    reason: "system default Metal device present; SystemMetalDriver admits"
+                        .to_owned(),
                 })
             }
             None => Err(metal_unavailable(
@@ -633,9 +635,8 @@ impl MetalDriver for SystemMetalDriver {
             .device
             .as_ref()
             .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
-        let source = std::str::from_utf8(image).map_err(|_| {
-            HostError::invalid_args("Metal module image is not UTF-8 MSL source")
-        })?;
+        let source = std::str::from_utf8(image)
+            .map_err(|_| HostError::invalid_args("Metal module image is not UTF-8 MSL source"))?;
         let entry = msl_kernel_entry_name(source).ok_or_else(|| {
             HostError::invalid_args("Metal MSL source has no `kernel void` entry function")
         })?;
@@ -771,7 +772,8 @@ impl MetalDriver for SystemMetalDriver {
                 String::from_utf8_lossy(entry)
             )));
         }
-        if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0 {
+        if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0
+        {
             return Err(metal_driver(
                 "launch: all grid and block dimensions must be non-zero",
             ));

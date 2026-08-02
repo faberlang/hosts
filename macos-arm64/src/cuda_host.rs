@@ -556,7 +556,8 @@ impl CudaDriver for SystemCudaDriver {
             .get(&token)
             .copied()
             .ok_or_else(|| cuda_driver("copy_in: unknown buffer token"))?;
-        let result = unsafe { (api.cu_memcpy_htod)(device_ptr, bytes.as_ptr().cast(), bytes.len()) };
+        let result =
+            unsafe { (api.cu_memcpy_htod)(device_ptr, bytes.as_ptr().cast(), bytes.len()) };
         if result != CUDA_SUCCESS {
             return Err(cuda_driver(format!(
                 "cuMemcpyHtoD failed with CUDA result {result}"
@@ -756,7 +757,8 @@ struct CudaDriverApi {
     cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, i32) -> i32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
-    cu_module_get_function: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32,
+    cu_module_get_function:
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32,
     cu_launch_kernel: unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -802,10 +804,7 @@ unsafe fn resolve_cuda_api(library: &libloading::Library) -> HostResult<CudaDriv
         Ok(CudaDriverApi {
             cu_init: resolve_symbol(library, b"cuInit\0")?,
             cu_device_get: resolve_symbol(library, b"cuDeviceGet\0")?,
-            cu_device_primary_ctx_retain: resolve_symbol(
-                library,
-                b"cuDevicePrimaryCtxRetain\0",
-            )?,
+            cu_device_primary_ctx_retain: resolve_symbol(library, b"cuDevicePrimaryCtxRetain\0")?,
             cu_ctx_set_current: resolve_symbol(library, b"cuCtxSetCurrent\0")?,
             cu_module_load_data: resolve_symbol(library, b"cuModuleLoadData\0")?,
             cu_module_get_function: resolve_symbol(library, b"cuModuleGetFunction\0")?,
@@ -822,17 +821,17 @@ unsafe fn resolve_cuda_api(library: &libloading::Library) -> HostResult<CudaDriv
 /// Resolve one symbol and copy the raw `fn` pointer out. The
 /// `libloading::Symbol` wrapper (not `Send`) is dropped immediately; the
 /// pointer stays valid for the lifetime of the owned `Library`.
-unsafe fn resolve_symbol<T: Copy>(
-    library: &libloading::Library,
-    name: &[u8],
-) -> HostResult<T> {
+unsafe fn resolve_symbol<T: Copy>(library: &libloading::Library, name: &[u8]) -> HostResult<T> {
     unsafe {
-        library.get::<T>(name).map(|symbol| *symbol).map_err(|error| {
-            cuda_unavailable(format!(
-                "libcuda symbol {} could not be resolved: {error}",
-                String::from_utf8_lossy(&name[..name.len() - 1])
-            ))
-        })
+        library
+            .get::<T>(name)
+            .map(|symbol| *symbol)
+            .map_err(|error| {
+                cuda_unavailable(format!(
+                    "libcuda symbol {} could not be resolved: {error}",
+                    String::from_utf8_lossy(&name[..name.len() - 1])
+                ))
+            })
     }
 }
 
@@ -856,7 +855,13 @@ impl FakeCudaDriver {
     /// Simulate the `addita` kernel: `out[i] = a[i] + b[i]` elementwise.
     /// Shared by the legacy elementwise-add path and the generalized
     /// `launch_kernel` (the emitted kernel is the same add shape).
-    fn simulate_elementwise_add(&mut self, module: u64, a: u64, b: u64, out: u64) -> HostResult<()> {
+    fn simulate_elementwise_add(
+        &mut self,
+        module: u64,
+        a: u64,
+        b: u64,
+        out: u64,
+    ) -> HostResult<()> {
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake launch missing module"));
         }
