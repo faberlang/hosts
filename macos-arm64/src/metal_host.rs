@@ -573,6 +573,7 @@ struct SystemMetalDriver {
 /// A compiled Metal compute module: the pipeline for its single `kernel void`
 /// entry plus the entry name, so a generalized launch can fail closed on an
 /// unknown entry name (mirroring `cuModuleGetFunction` on the CUDA lane).
+#[cfg(target_os = "macos")]
 struct MetalModule {
     entry: String,
     pipeline: ComputePipelineState,
