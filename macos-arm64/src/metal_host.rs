@@ -798,19 +798,25 @@ impl MetalDriver for SystemMetalDriver {
             encoder.set_buffer(index as u64, Some(*buffer), 0);
         }
 
-        // Metal threadgroups are capped by the pipeline; clamp the requested
-        // per-threadgroup thread volume and widen the grid along x so the
-        // requested thread volume is preserved. The elementwise path passes
-        // grid_y=grid_z=1 and block_y=block_z=1, so the clamp is a no-op for
-        // the current launch shape.
+        // Metal caps threads per threadgroup; a block shape whose volume
+        // exceeds the pipeline limit fails closed rather than being clamped,
+        // because clamping would flatten the block shape and break 2D/3D
+        // thread indexing (`thread_position_in_threadgroup.y` would read 0).
+        // The elementwise path passes block_y=block_z=1, so its shape is
+        // (block_x, 1, 1) — unchanged from before.
         let max_threads = module_record.pipeline.max_total_threads_per_threadgroup();
         let block_volume = (block_x as u128) * (block_y as u128) * (block_z as u128);
-        let threads_per_threadgroup = block_volume.min(max_threads as u128).max(1) as u64;
-        let thread_groups_x =
-            ((grid_x as u128) * block_volume).div_ceil(threads_per_threadgroup as u128) as u64;
+        if block_volume > max_threads as u128 {
+            return Err(metal_driver(format!(
+                "launch: threadgroup volume {block_volume} exceeds the pipeline limit of {max_threads} threads per threadgroup"
+            )));
+        }
+        // Each threadgroup carries exactly one block now that the volume is
+        // guaranteed to fit, so the grid needs no widening along x.
+        let thread_groups_x = grid_x as u64;
         encoder.dispatch_thread_groups(
             MTLSize::new(thread_groups_x, grid_y as u64, grid_z as u64),
-            MTLSize::new(threads_per_threadgroup, 1, 1),
+            MTLSize::new(block_x as u64, block_y as u64, block_z as u64),
         );
         encoder.end_encoding();
 
