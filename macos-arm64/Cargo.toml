@@ -17,6 +17,8 @@ tempus = { path = "../crates/tempus" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasmtime = "45"
+# Real Metal binding for the SystemMetalDriver (lane M, M2). macOS-only crate.
+metal = "0.33"
 
 [dev-dependencies]
 hygiene-ratchet = { path = "../../radix/crates/hygiene-ratchet" }

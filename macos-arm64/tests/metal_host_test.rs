@@ -2,6 +2,7 @@
 
 use faber::Valor;
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
+use faber_host_macos_arm64::metal_host::SystemMetalDriver;
 use faber_host_macos_arm64::{
     probe_metal_environment, FakeMetalDriver, MetalHostSession, E_METAL_INVALID_HANDLE,
     E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
@@ -105,4 +106,51 @@ fn session_fails_closed_on_guard_checks() {
         .launch_elementwise_add_f32(a, a, b, out)
         .expect_err("module handle must be a module");
     assert_eq!(err.code, "E_INVALID_ARGS");
+}
+
+/// Emitted kernel text (radix metal-text, U2 runtime-extent guard): input at
+/// buffer 0, output at buffer 1, element count at buffer 2.
+const ADD_ONE_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void add_one(
+    device const float* x_in [[buffer(0)]],
+    device const uint* extent_2 [[buffer(2)]],
+    device float* output [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+  if (id >= extent_2[0]) {
+    return;
+  }
+  float x = x_in[id];
+  output[id] = (x + 1.0f);
+}
+"#;
+
+#[test]
+fn system_driver_compiles_msl_launches_add_one_and_reads_back() {
+    // Environment-gated: only runs where a real Metal device exists. On a
+    // machine without Metal, admission fails closed and the real-binding proof
+    // is skipped (the fake-driver tests cover sequencing everywhere).
+    let Ok(mut session) = SystemMetalDriver::try_open() else {
+        return;
+    };
+    assert!(session.is_admitted());
+
+    let module = session
+        .load_module(ADD_ONE_MSL.as_bytes())
+        .expect("runtime MSL compile");
+    let a = session.alloc_bytes(16 * 4).expect("alloc a");
+    let b = session.alloc_bytes(16 * 4).expect("alloc b");
+    let out = session.alloc_bytes(16 * 4).expect("alloc out");
+
+    let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    session.copy_in_f32(a, &input).expect("copy in a");
+    session
+        .launch_elementwise_add_f32(module, a, b, out)
+        .expect("launch add_one");
+    let values = session.readback_f32(out).expect("readback out");
+
+    let expected: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+    assert_eq!(values, expected);
 }

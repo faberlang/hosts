@@ -1,16 +1,20 @@
 //! Metal product-host lifecycle scaffolding for MIR v1 (lane M).
 //!
 //! Path A (this checkout): proof-environment admission and fail-closed
-//! discovery, mirroring [`cuda_host`] naming 1:1. M1 is a skeleton: an
-//! injectable driver seam plus a sequencing fake. The real system binding
-//! (`SystemMetalDriver`, gfx-rs `metal`) is M2; no product run is claimed
-//! without a loadable device stack.
+//! discovery, mirroring [`cuda_host`] naming 1:1. M1 delivered the injectable
+//! driver seam plus a sequencing fake; M2 adds `SystemMetalDriver`, the real
+//! gfx-rs `metal` binding that compiles MSL at runtime and launches on the
+//! local Apple GPU. No product run is claimed without a loadable device stack.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
 use faber::Valor;
+use metal::{
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::frame_data;
@@ -263,39 +267,22 @@ fn metal_invalid_handle(id: MetalHandleId) -> HostError {
     }
 }
 
-// System default Metal device probe (null check only; M1 has no binding).
-//
-// `MTLCreateSystemDefaultDevice` is the single Metal framework touchpoint at
-// M1 — the admission check is a device null probe, not a binding. The function
-// returns a retained reference to the process-wide system default device; M1
-// deliberately keeps that singleton alive (the framework caches it for the
-// process lifetime, and M2's binding manages its own reference).
-#[cfg(target_os = "macos")]
-#[link(name = "Metal", kind = "framework")]
-extern "C" {
-    fn MTLCreateSystemDefaultDevice() -> *mut std::ffi::c_void;
-}
+// System default Metal device probe. The `metal` crate (gfx-rs) manages the
+// `MTLCreateSystemDefaultDevice` framework link; the probe fills the real
+// device name from the binding (M2).
 
 /// Probe this machine for a loadable Metal device stack without claiming a run.
 pub fn probe_metal_environment() -> MetalEnvReport {
     let metal_framework_paths = detect_metal_framework_paths();
 
     #[cfg(target_os = "macos")]
-    let device_detected = {
-        let device = unsafe { MTLCreateSystemDefaultDevice() };
-        !device.is_null()
-    };
+    let mtl_device = Device::system_default().map(|device| device.name().to_owned());
     #[cfg(not(target_os = "macos"))]
-    let device_detected = false;
+    let mtl_device: Option<String> = None;
 
-    let admitted = device_detected;
-    let mtl_device = if device_detected {
-        Some("system default Metal device".to_owned())
-    } else {
-        None
-    };
+    let admitted = mtl_device.is_some();
     let reason = if admitted {
-        "Metal default device present; product launch still requires the M2 SystemMetalDriver binding and a compiled MSL kernel artifact".to_owned()
+        "Metal default device present; SystemMetalDriver can compile MSL and launch add_one".to_owned()
     } else {
         "no Metal default device detected (MTLCreateSystemDefaultDevice returned null, or this OS is not macOS); Metal product execution is not admitted".to_owned()
     };
@@ -447,6 +434,237 @@ impl MetalDriver for FakeMetalDriver {
         self.buffers.remove(&token);
         self.modules.remove(&token);
         Ok(())
+    }
+}
+
+/// Live Metal driver: real gfx-rs `metal` binding (M2).
+///
+/// Owns the system default Metal device, a command queue, compiled compute
+/// pipelines (MSL compiled at runtime via `new_library_with_source`), and
+/// `StorageModeShared` buffers. Mirrors `SystemCudaDriver`'s method shape but
+/// actually executes on the Apple GPU; MSL compile/pipeline/launch failures
+/// map to `E_METAL_*` codes.
+#[derive(Default)]
+pub struct SystemMetalDriver {
+    device: Option<Device>,
+    queue: Option<CommandQueue>,
+    modules: BTreeMap<u64, ComputePipelineState>,
+    buffers: BTreeMap<u64, Buffer>,
+    next_token: u64,
+}
+
+impl SystemMetalDriver {
+    /// Open a product session against the live Metal stack, or fail closed.
+    pub fn try_open() -> HostResult<MetalHostSession> {
+        MetalHostSession::with_driver(Box::new(SystemMetalDriver::default()))
+    }
+}
+
+impl MetalDriver for SystemMetalDriver {
+    fn discover(&mut self) -> HostResult<MetalEnvReport> {
+        match Device::system_default() {
+            Some(device) => {
+                let name = device.name().to_owned();
+                self.device = Some(device);
+                Ok(MetalEnvReport {
+                    admitted: true,
+                    mtl_device: Some(name),
+                    metal_framework_paths: detect_metal_framework_paths(),
+                    reason: "system default Metal device present; SystemMetalDriver admits".to_owned(),
+                })
+            }
+            None => Err(metal_unavailable(
+                "no Metal default device (MTLCreateSystemDefaultDevice returned null)",
+            )),
+        }
+    }
+
+    fn create_context(&mut self) -> HostResult<()> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+        self.queue = Some(device.new_command_queue());
+        Ok(())
+    }
+
+    fn load_module(&mut self, image: &[u8]) -> HostResult<u64> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+        let source = std::str::from_utf8(image).map_err(|_| {
+            HostError::invalid_args("Metal module image is not UTF-8 MSL source")
+        })?;
+        let entry = msl_kernel_entry_name(source).ok_or_else(|| {
+            HostError::invalid_args("Metal MSL source has no `kernel void` entry function")
+        })?;
+        let options = CompileOptions::new();
+        let library = device
+            .new_library_with_source(source, &options)
+            .map_err(|message| metal_driver(format!("MSL compile failed: {message}")))?;
+        let function = library
+            .get_function(entry, None)
+            .map_err(|message| metal_driver(format!("Metal entry lookup failed: {message}")))?;
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|message| metal_driver(format!("compute pipeline failed: {message}")))?;
+        let token = self.next_token;
+        self.next_token += 1;
+        self.modules.insert(token, pipeline);
+        Ok(token)
+    }
+
+    fn alloc(&mut self, len_bytes: usize) -> HostResult<u64> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+        let buffer = device.new_buffer(len_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let token = self.next_token;
+        self.next_token += 1;
+        self.buffers.insert(token, buffer);
+        Ok(token)
+    }
+
+    fn copy_in(&mut self, token: u64, bytes: &[u8]) -> HostResult<()> {
+        let buffer = self
+            .buffers
+            .get(&token)
+            .ok_or_else(|| metal_driver("copy_in: unknown buffer token"))?;
+        if buffer.length() as usize != bytes.len() {
+            return Err(HostError::invalid_args("Metal copy_in size mismatch"));
+        }
+        let destination = buffer.contents().cast::<u8>();
+        // Safe: the buffer length is exactly `bytes.len()` (checked above), and
+        // shared-memory storage is host-accessible.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+        }
+        Ok(())
+    }
+
+    fn launch_elementwise_add_f32(
+        &mut self,
+        module: u64,
+        a: u64,
+        b: u64,
+        out: u64,
+        len: usize,
+    ) -> HostResult<()> {
+        let pipeline = self
+            .modules
+            .get(&module)
+            .ok_or_else(|| metal_driver("launch: unknown module token"))?;
+        let buffer_a = self
+            .buffers
+            .get(&a)
+            .ok_or_else(|| metal_driver("launch: unknown a buffer token"))?;
+        let buffer_out = self
+            .buffers
+            .get(&out)
+            .ok_or_else(|| metal_driver("launch: unknown out buffer token"))?;
+        // The emitted `add_one` kernel is unary (input + extent + output);
+        // `b` is accepted for trait parity but is not bound by the kernel.
+        // Validate the token fail-closed so a stale id cannot launch silently.
+        if !self.buffers.contains_key(&b) {
+            return Err(metal_driver("launch: unknown b buffer token"));
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no command queue"))?;
+
+        // U2 runtime-extent channel: bind the host-supplied element count so
+        // the emitted kernel guards against the runtime extent, never a static
+        // dispatch_size.
+        let extent = len as u32;
+        let extent_buffer = device.new_buffer_with_data(
+            (&extent as *const u32).cast(),
+            std::mem::size_of::<u32>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(buffer_a), 0);
+        encoder.set_buffer(1, Some(buffer_out), 0);
+        encoder.set_buffer(2, Some(&extent_buffer), 0);
+
+        let threads_per_threadgroup =
+            (len as u64).min(pipeline.max_total_threads_per_threadgroup());
+        let thread_groups = (len as u64).div_ceil(threads_per_threadgroup.max(1));
+        encoder.dispatch_thread_groups(
+            MTLSize::new(thread_groups, 1, 1),
+            MTLSize::new(threads_per_threadgroup, 1, 1),
+        );
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(metal_driver("Metal command buffer did not complete"));
+        }
+        Ok(())
+    }
+
+    fn sync(&mut self) -> HostResult<()> {
+        // Launch already calls `wait_until_completed`; shared-memory reads are
+        // coherent without an additional barrier.
+        Ok(())
+    }
+
+    fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>> {
+        let buffer = self
+            .buffers
+            .get(&token)
+            .ok_or_else(|| metal_driver("copy_out: unknown buffer token"))?;
+        if buffer.length() as usize != len_bytes {
+            return Err(HostError::internal("Metal copy_out size mismatch"));
+        }
+        let mut output = vec![0u8; len_bytes];
+        let source = buffer.contents().cast::<u8>();
+        // Safe: the buffer length is exactly `len_bytes` (checked above), and
+        // shared-memory storage is host-readable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), len_bytes);
+        }
+        Ok(output)
+    }
+
+    fn free(&mut self, token: u64) -> HostResult<()> {
+        self.buffers.remove(&token);
+        self.modules.remove(&token);
+        Ok(())
+    }
+}
+
+/// First `kernel void <name>` entry point in an MSL module.
+fn msl_kernel_entry_name(source: &str) -> Option<&str> {
+    const MARKER: &str = "kernel void";
+    let marker_at = source.find(MARKER)?;
+    let rest = source[marker_at + MARKER.len()..].trim_start();
+    let name_len = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_len == 0 {
+        None
+    } else {
+        Some(&rest[..name_len])
+    }
+}
+
+fn metal_driver(message: impl Into<String>) -> HostError {
+    HostError {
+        code: E_METAL_DRIVER.to_owned(),
+        message: message.into(),
+        retryable: false,
     }
 }
 
