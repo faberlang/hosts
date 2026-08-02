@@ -4,7 +4,9 @@
 //! discovery, mirroring [`cuda_host`] naming 1:1. M1 delivered the injectable
 //! driver seam plus a sequencing fake; M2 adds `SystemMetalDriver`, the real
 //! gfx-rs `metal` binding that compiles MSL at runtime and launches on the
-//! local Apple GPU. No product run is claimed without a loadable device stack.
+//! local Apple GPU. M4 closes the C5 API parity gap: generalized
+//! `launch_kernel` (trait + session), session-level `sync()`, and session-side
+//! `try_open`. No product run is claimed without a loadable device stack.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,6 +30,11 @@ pub const E_METAL_UNSUPPORTED: &str = "E_METAL_UNSUPPORTED";
 pub const E_METAL_INVALID_HANDLE: &str = "E_METAL_INVALID_HANDLE";
 /// Driver-level failure after admission.
 pub const E_METAL_DRIVER: &str = "E_METAL_DRIVER";
+
+/// Default kernel entry for the legacy `launch_elementwise_add_f32` session
+/// path. Matches the emitted `add_one` entry of the U2 proof fixture
+/// (input@0, output@1, extent@2).
+const ELEMENTWISE_ADD_ENTRY: &[u8] = b"add_one";
 
 /// Read-only environment admission report (never a product run claim).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,15 +81,25 @@ pub trait MetalDriver: Send {
         out: u64,
         len: usize,
     ) -> HostResult<()>;
+    /// Generalized kernel launch: resolve `entry` inside `module` and launch
+    /// over the given device buffers (binding order: inputs first, output
+    /// last) with the given grid/block shape. The session synchronizes after
+    /// launching; the system driver routes the legacy elementwise-add path
+    /// through this so there is exactly one encoder/commit site.
+    fn launch_kernel(
+        &mut self,
+        module: u64,
+        entry: &[u8],
+        buffers: &[u64],
+        grid_x: u32,
+        block_x: u32,
+    ) -> HostResult<()>;
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
     fn free(&mut self, token: u64) -> HostResult<()>;
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
-///
-/// M1 is injectable-driver only: `SystemMetalDriver` and `try_open` land with
-/// the M2 binding, so a session is always opened against an injected driver.
 pub struct MetalHostSession {
     driver: Box<dyn MetalDriver>,
     handles: BTreeMap<u64, MetalHandle>,
@@ -91,6 +108,24 @@ pub struct MetalHostSession {
 }
 
 impl MetalHostSession {
+    /// Open a session against the live Metal stack. Fails closed when the
+    /// machine cannot admit a Metal product stack.
+    pub fn try_open() -> HostResult<Self> {
+        let mut driver = Box::new(SystemMetalDriver::default());
+        let report = driver.discover()?;
+        if !report.admitted {
+            return Err(metal_unavailable(report.reason));
+        }
+        let mut session = Self {
+            driver,
+            handles: BTreeMap::new(),
+            next_id: 1,
+            admitted: true,
+        };
+        session.driver.create_context()?;
+        Ok(session)
+    }
+
     /// Inject a driver for unit tests (sequencing / reject paths only).
     pub fn with_driver(mut driver: Box<dyn MetalDriver>) -> HostResult<Self> {
         let report = driver.discover()?;
@@ -168,6 +203,40 @@ impl MetalHostSession {
         let len = a_len / 4;
         self.driver
             .launch_elementwise_add_f32(module_token, a_token, b_token, out_token, len)?;
+        self.driver.sync()
+    }
+
+    /// Generalized launch: resolve `entry` inside `module` and dispatch over
+    /// `buffers` (inputs first, output last) with the given grid/block shape.
+    /// Every buffer handle is validated and resolved to a backend token before
+    /// the driver is touched; the launch synchronizes internally.
+    pub fn launch_kernel(
+        &mut self,
+        module: MetalHandleId,
+        entry: &str,
+        buffers: &[MetalHandleId],
+        grid_x: u32,
+        block_x: u32,
+    ) -> HostResult<()> {
+        self.require_admitted()?;
+        let module_token = self.module_token(module)?;
+        if entry.is_empty() {
+            return Err(HostError::invalid_args("Metal kernel entry name is empty"));
+        }
+        let mut tokens = Vec::with_capacity(buffers.len());
+        for id in buffers {
+            let (token, _len_bytes) = self.buffer_token(*id)?;
+            tokens.push(token);
+        }
+        self.driver
+            .launch_kernel(module_token, entry.as_bytes(), &tokens, grid_x, block_x)?;
+        self.driver.sync()
+    }
+
+    /// Explicit device synchronization barrier. The launch paths already sync
+    /// internally; this exposes the barrier for callers that need it directly.
+    pub fn sync(&mut self) -> HostResult<()> {
+        self.require_admitted()?;
         self.driver.sync()
     }
 
@@ -321,6 +390,56 @@ impl FakeMetalDriver {
             ..Self::default()
         }
     }
+
+    /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
+    /// the legacy elementwise-add path and the generalized `launch_kernel`
+    /// (the emitted kernel is the same add shape), mirroring the CUDA fake.
+    fn simulate_elementwise_add(
+        &mut self,
+        module: u64,
+        a: u64,
+        b: u64,
+        out: u64,
+    ) -> HostResult<()> {
+        if !self.modules.contains_key(&module) {
+            return Err(HostError::internal("fake launch missing module"));
+        }
+        let a_bytes = self
+            .buffers
+            .get(&a)
+            .ok_or_else(|| HostError::internal("fake launch missing a"))?
+            .clone();
+        let b_bytes = self
+            .buffers
+            .get(&b)
+            .ok_or_else(|| HostError::internal("fake launch missing b"))?
+            .clone();
+        let out_buf = self
+            .buffers
+            .get_mut(&out)
+            .ok_or_else(|| HostError::internal("fake launch missing out"))?;
+        if a_bytes.len() != b_bytes.len() || a_bytes.len() != out_buf.len() {
+            return Err(HostError::invalid_args("fake launch length mismatch"));
+        }
+        let len = a_bytes.len() / 4;
+        for i in 0..len {
+            let ai = f32::from_le_bytes([
+                a_bytes[i * 4],
+                a_bytes[i * 4 + 1],
+                a_bytes[i * 4 + 2],
+                a_bytes[i * 4 + 3],
+            ]);
+            let bi = f32::from_le_bytes([
+                b_bytes[i * 4],
+                b_bytes[i * 4 + 1],
+                b_bytes[i * 4 + 2],
+                b_bytes[i * 4 + 3],
+            ]);
+            let sum = (ai + bi).to_le_bytes();
+            out_buf[i * 4..i * 4 + 4].copy_from_slice(&sum);
+        }
+        Ok(())
+    }
 }
 
 impl MetalDriver for FakeMetalDriver {
@@ -374,45 +493,30 @@ impl MetalDriver for FakeMetalDriver {
         a: u64,
         b: u64,
         out: u64,
-        len: usize,
+        _len: usize,
     ) -> HostResult<()> {
-        if !self.modules.contains_key(&module) {
-            return Err(HostError::internal("fake launch missing module"));
+        // `_len` mirrors the session's element count; the shared simulation
+        // derives it from the (session-validated, equal) buffer sizes.
+        self.simulate_elementwise_add(module, a, b, out)
+    }
+
+    fn launch_kernel(
+        &mut self,
+        module: u64,
+        _entry: &[u8],
+        buffers: &[u64],
+        _grid_x: u32,
+        _block_x: u32,
+    ) -> HostResult<()> {
+        // The simulated elementwise-add kernel takes exactly three buffers
+        // (a, b, out). Anything else fails closed in the fake just as it
+        // would on device.
+        if buffers.len() != 3 {
+            return Err(HostError::invalid_args(
+                "fake launch_kernel simulates the 3-buffer elementwise-add kernel (a, b, out)",
+            ));
         }
-        let a_bytes = self
-            .buffers
-            .get(&a)
-            .ok_or_else(|| HostError::internal("fake launch missing a"))?
-            .clone();
-        let b_bytes = self
-            .buffers
-            .get(&b)
-            .ok_or_else(|| HostError::internal("fake launch missing b"))?
-            .clone();
-        let out_buf = self
-            .buffers
-            .get_mut(&out)
-            .ok_or_else(|| HostError::internal("fake launch missing out"))?;
-        if a_bytes.len() != len * 4 || b_bytes.len() != len * 4 || out_buf.len() != len * 4 {
-            return Err(HostError::invalid_args("fake launch length mismatch"));
-        }
-        for i in 0..len {
-            let ai = f32::from_le_bytes([
-                a_bytes[i * 4],
-                a_bytes[i * 4 + 1],
-                a_bytes[i * 4 + 2],
-                a_bytes[i * 4 + 3],
-            ]);
-            let bi = f32::from_le_bytes([
-                b_bytes[i * 4],
-                b_bytes[i * 4 + 1],
-                b_bytes[i * 4 + 2],
-                b_bytes[i * 4 + 3],
-            ]);
-            let sum = (ai + bi).to_le_bytes();
-            out_buf[i * 4..i * 4 + 4].copy_from_slice(&sum);
-        }
-        Ok(())
+        self.simulate_elementwise_add(module, buffers[0], buffers[1], buffers[2])
     }
 
     fn sync(&mut self) -> HostResult<()> {
@@ -443,21 +547,24 @@ impl MetalDriver for FakeMetalDriver {
 /// pipelines (MSL compiled at runtime via `new_library_with_source`), and
 /// `StorageModeShared` buffers. Mirrors `SystemCudaDriver`'s method shape but
 /// actually executes on the Apple GPU; MSL compile/pipeline/launch failures
-/// map to `E_METAL_*` codes.
+/// map to `E_METAL_*` codes. Private like `SystemCudaDriver`: reachable only
+/// through [`MetalHostSession::try_open`] so the session API surface is the
+/// symmetric parity entry point.
 #[derive(Default)]
-pub struct SystemMetalDriver {
+struct SystemMetalDriver {
     device: Option<Device>,
     queue: Option<CommandQueue>,
-    modules: BTreeMap<u64, ComputePipelineState>,
+    modules: BTreeMap<u64, MetalModule>,
     buffers: BTreeMap<u64, Buffer>,
     next_token: u64,
 }
 
-impl SystemMetalDriver {
-    /// Open a product session against the live Metal stack, or fail closed.
-    pub fn try_open() -> HostResult<MetalHostSession> {
-        MetalHostSession::with_driver(Box::new(SystemMetalDriver::default()))
-    }
+/// A compiled Metal compute module: the pipeline for its single `kernel void`
+/// entry plus the entry name, so a generalized launch can fail closed on an
+/// unknown entry name (mirroring `cuModuleGetFunction` on the CUDA lane).
+struct MetalModule {
+    entry: String,
+    pipeline: ComputePipelineState,
 }
 
 impl MetalDriver for SystemMetalDriver {
@@ -511,7 +618,13 @@ impl MetalDriver for SystemMetalDriver {
             .map_err(|message| metal_driver(format!("compute pipeline failed: {message}")))?;
         let token = self.next_token;
         self.next_token += 1;
-        self.modules.insert(token, pipeline);
+        self.modules.insert(
+            token,
+            MetalModule {
+                entry: entry.to_owned(),
+                pipeline,
+            },
+        );
         Ok(token)
     }
 
@@ -552,53 +665,104 @@ impl MetalDriver for SystemMetalDriver {
         out: u64,
         len: usize,
     ) -> HostResult<()> {
-        let pipeline = self
+        // The emitted `add_one` kernel is unary (input + extent + output);
+        // `b` is accepted for trait parity but is not bound by the kernel.
+        // Validate every token fail-closed so a stale id cannot launch
+        // silently, then route through the generalized launch so there is
+        // exactly one encoder/commit site per backend (as CUDA does).
+        for token in [a, b, out] {
+            if !self.buffers.contains_key(&token) {
+                return Err(metal_driver("launch: unknown buffer token"));
+            }
+        }
+        let block_x = 256u32;
+        let grid_x = len.div_ceil(block_x as usize) as u32;
+
+        // U2 runtime-extent channel: bind the host-supplied element count so
+        // the emitted kernel guards against the runtime extent, never a static
+        // dispatch shape. The extent buffer rides the buffer slice at the
+        // kernel's next-free binding (index 2 for add_one: input=0, output=1)
+        // and is dropped after the launch completes.
+        let extent = len as u32;
+        let extent_buffer = {
+            let device = self
+                .device
+                .as_ref()
+                .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+            device.new_buffer_with_data(
+                (&extent as *const u32).cast(),
+                std::mem::size_of::<u32>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let extent_token = self.next_token;
+        self.next_token += 1;
+        self.buffers.insert(extent_token, extent_buffer);
+
+        let result = self.launch_kernel(
+            module,
+            ELEMENTWISE_ADD_ENTRY,
+            &[a, out, extent_token],
+            grid_x,
+            block_x,
+        );
+        self.buffers.remove(&extent_token);
+        result
+    }
+
+    fn launch_kernel(
+        &mut self,
+        module: u64,
+        entry: &[u8],
+        buffers: &[u64],
+        grid_x: u32,
+        block_x: u32,
+    ) -> HostResult<()> {
+        // A module is compiled for exactly one kernel entry; an unknown entry
+        // name fails closed (mirroring cuModuleGetFunction on the CUDA lane).
+        let module_record = self
             .modules
             .get(&module)
             .ok_or_else(|| metal_driver("launch: unknown module token"))?;
-        let buffer_a = self
-            .buffers
-            .get(&a)
-            .ok_or_else(|| metal_driver("launch: unknown a buffer token"))?;
-        let buffer_out = self
-            .buffers
-            .get(&out)
-            .ok_or_else(|| metal_driver("launch: unknown out buffer token"))?;
-        // The emitted `add_one` kernel is unary (input + extent + output);
-        // `b` is accepted for trait parity but is not bound by the kernel.
-        // Validate the token fail-closed so a stale id cannot launch silently.
-        if !self.buffers.contains_key(&b) {
-            return Err(metal_driver("launch: unknown b buffer token"));
+        if entry != module_record.entry.as_bytes() {
+            return Err(metal_driver(format!(
+                "launch: module has no entry named {}",
+                String::from_utf8_lossy(entry)
+            )));
         }
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+        if grid_x == 0 || block_x == 0 {
+            return Err(metal_driver(
+                "launch: grid_x and block_x must be non-zero",
+            ));
+        }
+        // Resolve every buffer token fail-closed before touching the encoder,
+        // so a stale or non-buffer id cannot silently launch.
+        let mut bound = Vec::with_capacity(buffers.len());
+        for token in buffers {
+            let buffer = self
+                .buffers
+                .get(token)
+                .ok_or_else(|| metal_driver("launch: unknown buffer token"))?;
+            bound.push(buffer);
+        }
         let queue = self
             .queue
             .as_ref()
             .ok_or_else(|| metal_unavailable("SystemMetalDriver has no command queue"))?;
 
-        // U2 runtime-extent channel: bind the host-supplied element count so
-        // the emitted kernel guards against the runtime extent, never a static
-        // dispatch_size.
-        let extent = len as u32;
-        let extent_buffer = device.new_buffer_with_data(
-            (&extent as *const u32).cast(),
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(buffer_a), 0);
-        encoder.set_buffer(1, Some(buffer_out), 0);
-        encoder.set_buffer(2, Some(&extent_buffer), 0);
+        encoder.set_compute_pipeline_state(&module_record.pipeline);
+        for (index, buffer) in bound.iter().enumerate() {
+            encoder.set_buffer(index as u64, Some(*buffer), 0);
+        }
 
-        let threads_per_threadgroup =
-            (len as u64).min(pipeline.max_total_threads_per_threadgroup());
-        let thread_groups = (len as u64).div_ceil(threads_per_threadgroup.max(1));
+        // Metal threadgroups are capped by the pipeline; clamp block_x and
+        // widen the group count so the requested thread volume is preserved.
+        let threads_per_threadgroup = (block_x as u64)
+            .min(module_record.pipeline.max_total_threads_per_threadgroup())
+            .max(1);
+        let thread_groups = ((grid_x as u64) * (block_x as u64)).div_ceil(threads_per_threadgroup);
         encoder.dispatch_thread_groups(
             MTLSize::new(thread_groups, 1, 1),
             MTLSize::new(threads_per_threadgroup, 1, 1),
