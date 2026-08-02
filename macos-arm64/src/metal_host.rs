@@ -84,16 +84,21 @@ pub trait MetalDriver: Send {
     ) -> HostResult<()>;
     /// Generalized kernel launch: resolve `entry` inside `module` and launch
     /// over the given device buffers (binding order: inputs first, output
-    /// last) with the given grid/block shape. The session synchronizes after
-    /// launching; the system driver routes the legacy elementwise-add path
-    /// through this so there is exactly one encoder/commit site.
+    /// last) with the given 3D grid and 3D block shape. The session
+    /// synchronizes after launching; the system driver routes the legacy
+    /// elementwise-add path through this so there is exactly one
+    /// encoder/commit site.
     fn launch_kernel(
         &mut self,
         module: u64,
         entry: &[u8],
         buffers: &[u64],
         grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
         block_x: u32,
+        block_y: u32,
+        block_z: u32,
     ) -> HostResult<()>;
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
@@ -219,7 +224,9 @@ impl MetalHostSession {
     /// Generalized launch: resolve `entry` inside `module` and dispatch over
     /// `buffers` (inputs first, output last) with the given grid/block shape.
     /// Every buffer handle is validated and resolved to a backend token before
-    /// the driver is touched; the launch synchronizes internally.
+    /// the driver is touched; the launch synchronizes internally. The session
+    /// surface keeps the 1D grid/block shape; the y/z dimensions default to 1
+    /// on the driver.
     pub fn launch_kernel(
         &mut self,
         module: MetalHandleId,
@@ -238,8 +245,17 @@ impl MetalHostSession {
             let (token, _len_bytes) = self.buffer_token(*id)?;
             tokens.push(token);
         }
-        self.driver
-            .launch_kernel(module_token, entry.as_bytes(), &tokens, grid_x, block_x)?;
+        self.driver.launch_kernel(
+            module_token,
+            entry.as_bytes(),
+            &tokens,
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+        )?;
         self.driver.sync()
     }
 
@@ -516,7 +532,11 @@ impl MetalDriver for FakeMetalDriver {
         _entry: &[u8],
         buffers: &[u64],
         _grid_x: u32,
+        _grid_y: u32,
+        _grid_z: u32,
         _block_x: u32,
+        _block_y: u32,
+        _block_z: u32,
     ) -> HostResult<()> {
         // The simulated elementwise-add kernel takes exactly three buffers
         // (a, b, out). Anything else fails closed in the fake just as it
@@ -717,7 +737,11 @@ impl MetalDriver for SystemMetalDriver {
             ELEMENTWISE_ADD_ENTRY,
             &[a, out, extent_token],
             grid_x,
+            1,
+            1,
             block_x,
+            1,
+            1,
         );
         self.buffers.remove(&extent_token);
         result
@@ -729,7 +753,11 @@ impl MetalDriver for SystemMetalDriver {
         entry: &[u8],
         buffers: &[u64],
         grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
         block_x: u32,
+        block_y: u32,
+        block_z: u32,
     ) -> HostResult<()> {
         // A module is compiled for exactly one kernel entry; an unknown entry
         // name fails closed (mirroring cuModuleGetFunction on the CUDA lane).
@@ -743,9 +771,9 @@ impl MetalDriver for SystemMetalDriver {
                 String::from_utf8_lossy(entry)
             )));
         }
-        if grid_x == 0 || block_x == 0 {
+        if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0 {
             return Err(metal_driver(
-                "launch: grid_x and block_x must be non-zero",
+                "launch: all grid and block dimensions must be non-zero",
             ));
         }
         // Resolve every buffer token fail-closed before touching the encoder,
@@ -770,14 +798,18 @@ impl MetalDriver for SystemMetalDriver {
             encoder.set_buffer(index as u64, Some(*buffer), 0);
         }
 
-        // Metal threadgroups are capped by the pipeline; clamp block_x and
-        // widen the group count so the requested thread volume is preserved.
-        let threads_per_threadgroup = (block_x as u64)
-            .min(module_record.pipeline.max_total_threads_per_threadgroup())
-            .max(1);
-        let thread_groups = ((grid_x as u64) * (block_x as u64)).div_ceil(threads_per_threadgroup);
+        // Metal threadgroups are capped by the pipeline; clamp the requested
+        // per-threadgroup thread volume and widen the grid along x so the
+        // requested thread volume is preserved. The elementwise path passes
+        // grid_y=grid_z=1 and block_y=block_z=1, so the clamp is a no-op for
+        // the current launch shape.
+        let max_threads = module_record.pipeline.max_total_threads_per_threadgroup();
+        let block_volume = (block_x as u128) * (block_y as u128) * (block_z as u128);
+        let threads_per_threadgroup = block_volume.min(max_threads as u128).max(1) as u64;
+        let thread_groups_x =
+            ((grid_x as u128) * block_volume).div_ceil(threads_per_threadgroup as u128) as u64;
         encoder.dispatch_thread_groups(
-            MTLSize::new(thread_groups, 1, 1),
+            MTLSize::new(thread_groups_x, grid_y as u64, grid_z as u64),
             MTLSize::new(threads_per_threadgroup, 1, 1),
         );
         encoder.end_encoding();

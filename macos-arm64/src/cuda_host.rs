@@ -109,16 +109,21 @@ pub trait CudaDriver: Send {
     ) -> HostResult<()>;
     /// Generalized kernel launch: resolve `entry` inside `module` and launch
     /// over the given device buffers (binding order: inputs first, output
-    /// last) with the given grid/block shape. The session synchronizes after
-    /// launching; the system driver routes the legacy elementwise-add path
-    /// through this so there is exactly one `cuLaunchKernel` call site.
+    /// last) with the given 3D grid and 3D block shape. The session
+    /// synchronizes after launching; the system driver routes the legacy
+    /// elementwise-add path through this so there is exactly one
+    /// `cuLaunchKernel` call site.
     fn launch_kernel(
         &mut self,
         module: u64,
         entry: &[u8],
         buffers: &[u64],
         grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
         block_x: u32,
+        block_y: u32,
+        block_z: u32,
     ) -> HostResult<()>;
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
@@ -235,7 +240,9 @@ impl CudaHostSession {
     /// Generalized launch: resolve `entry` inside `module` and dispatch over
     /// `buffers` (inputs first, output last) with the given grid/block shape.
     /// Every buffer handle is validated and resolved to a backend token before
-    /// the driver is touched; the launch synchronizes internally.
+    /// the driver is touched; the launch synchronizes internally. The session
+    /// surface keeps the 1D grid/block shape; the y/z dimensions default to 1
+    /// on the driver.
     pub fn launch_kernel(
         &mut self,
         module: CudaHandleId,
@@ -254,8 +261,17 @@ impl CudaHostSession {
             let (token, _len_bytes) = self.buffer_token(*id)?;
             tokens.push(token);
         }
-        self.driver
-            .launch_kernel(module_token, entry.as_bytes(), &tokens, grid_x, block_x)?;
+        self.driver.launch_kernel(
+            module_token,
+            entry.as_bytes(),
+            &tokens,
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+        )?;
         self.driver.sync()
     }
 
@@ -561,7 +577,17 @@ impl CudaDriver for SystemCudaDriver {
         // binding has exactly one cuLaunchKernel call site.
         let block_x = 256u32;
         let grid_x = len.div_ceil(block_x as usize) as u32;
-        self.launch_kernel(module, ELEMENTWISE_ADD_ENTRY, &[a, b, out], grid_x, block_x)
+        self.launch_kernel(
+            module,
+            ELEMENTWISE_ADD_ENTRY,
+            &[a, b, out],
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+        )
     }
 
     fn launch_kernel(
@@ -570,7 +596,11 @@ impl CudaDriver for SystemCudaDriver {
         entry: &[u8],
         buffers: &[u64],
         grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
         block_x: u32,
+        block_y: u32,
+        block_z: u32,
     ) -> HostResult<()> {
         let api = self.current_api()?;
         let module_handle = self
@@ -619,11 +649,11 @@ impl CudaDriver for SystemCudaDriver {
             (api.cu_launch_kernel)(
                 function,
                 grid_x,
-                1,
-                1,
+                grid_y,
+                grid_z,
                 block_x,
-                1,
-                1,
+                block_y,
+                block_z,
                 0,
                 std::ptr::null_mut(), // default stream
                 kernel_params.as_mut_ptr(),
@@ -932,7 +962,11 @@ impl CudaDriver for FakeCudaDriver {
         _entry: &[u8],
         buffers: &[u64],
         _grid_x: u32,
+        _grid_y: u32,
+        _grid_z: u32,
         _block_x: u32,
+        _block_y: u32,
+        _block_z: u32,
     ) -> HostResult<()> {
         // The emitted `addita` kernel takes exactly three buffers (a, b, out).
         // Anything else fails closed in the fake just as it would on device.
