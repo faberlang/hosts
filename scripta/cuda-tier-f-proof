@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# CUDA tier-F proof (G3): compiler-emitted NVVM -> external PTX -> Driver API
+# launch -> readback -> Rust parity, run on pharos (RTX 5070 Ti / sm_120,
+# CUDA 13.2, driver 595.71.05).
+#
+# Pipeline (per radix/docs/factory/cuda-first-product-proof/goal.md
+# §Normalized spec — proof script):
+#   1. build radix
+#   2. radix emit -t llvm-text --cuda-descriptor <desc> <fixture>  (.ll -> stdout)
+#   3. discover an NVPTX-capable external backend (clang --print-targets
+#      advertises nvptx64, else llc -mtriple=nvptx64-nvidia-cuda) and produce
+#      PTX with the PTX ISA version pinned (-mattr=+ptxXX for llc /
+#      --cuda-feature=+ptxXX for clang; default CUDA_PROOF_PTX_ISA=ptx87,
+#      the minimum PTX ISA that carries sm_120)
+#   4. build the host proof binary (hosts/macos-arm64)
+#   5. run the environment-gated host proof:
+#        CUDA_PROOF_PTX=<ptx> CUDA_PROOF_DESCRIPTOR=<desc> \
+#          cargo test --test cuda_host_proof
+#   6. require PASS
+#
+# On pharos the Driver API JIT-compiles the PTX for sm_120 at module load; the
+# PTX is deliberately emitted arch-generic (no -mcpu/-march pin) so any NVPTX
+# backend that advertises nvptx64 works, and the driver performs the final
+# sm_120 lowering.
+#
+# Honesty contract (goal §Normalized spec — proof script): this script NEVER
+# claims device execution. The host proof test is environment-gated and
+# anti-false-green: when CUDA_PROOF_PTX / CUDA_PROOF_DESCRIPTOR are set but the
+# CUDA stack is broken (dlopen/cuInit fail, load/launch/readback fail), the
+# test FAILs loudly; the script always sets the vars, so a broken stack cannot
+# look green. Missing NVPTX backend or a rejected PTX-ISA pin stops the script
+# as "G3 not attempted" (emit + host rejection evidence only, G1/G2 still
+# green), never as a PASS.
+#
+# Exit codes:
+#   0  PASS (G3)
+#   1  FAIL (proof ran and failed)
+#   2  G3 not attempted (no NVPTX backend, or pinned PTX ISA rejected)
+#   3  configuration error (missing fixture/radix)
+#
+# Usage: ./scripta/cuda-tier-f-proof
+# Env overrides:
+#   CUDA_PROOF_SCRATCH        scratch dir for artifacts (default /tmp/cuda-tier-f-proof)
+#   CUDA_PROOF_PTX_ISA        PTX ISA pin, e.g. ptx87 (default ptx87)
+#   CUDA_PROOF_CLANG          explicit clang binary advertising nvptx64
+#   CUDA_PROOF_LLC            explicit llc binary with NVPTX target
+#   CUDA_PROOF_RADIX_BIN      prebuilt radix binary (skips the radix build)
+#   CUDA_PROOF_RADIX_ROOT     radix checkout root (default sibling of hosts)
+#   CUDA_PROOF_FIXTURE        proof fixture path (default radix/corpus/cuda/addita-proof.fab)
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RADIX_ROOT="${CUDA_PROOF_RADIX_ROOT:-$(cd "$ROOT/../radix" && pwd)}"
+SCRATCH="${CUDA_PROOF_SCRATCH:-/tmp/cuda-tier-f-proof}"
+PTX_ISA="${CUDA_PROOF_PTX_ISA:-ptx87}"
+
+FIXTURE="${CUDA_PROOF_FIXTURE:-$RADIX_ROOT/corpus/cuda/addita-proof.fab}"
+LL="$SCRATCH/addita.ll"
+DESCRIPTOR="$SCRATCH/addita.json"
+PTX="$SCRATCH/addita.ptx"
+
+mkdir -p "$SCRATCH"
+
+fail() {
+  printf 'cuda-tier-f-proof: FAIL — %s\n' "$*" >&2
+  exit 1
+}
+
+not_attempted() {
+  printf 'cuda-tier-f-proof: G3 not attempted — %s\n' "$*" >&2
+  exit 2
+}
+
+if [[ ! -f "$FIXTURE" ]]; then
+  printf 'cuda-tier-f-proof: config error — fixture not found: %s\n' "$FIXTURE" >&2
+  exit 3
+fi
+
+# --- 1. build radix ---------------------------------------------------------
+RADIX_BIN="${CUDA_PROOF_RADIX_BIN:-}"
+if [[ -z "$RADIX_BIN" ]]; then
+  printf '── build radix\n'
+  if ! (cd "$RADIX_ROOT" && cargo build -q -p radix --bin radix); then
+    fail "radix build failed (cargo build -p radix --bin radix in $RADIX_ROOT)"
+  fi
+  RADIX_BIN="$RADIX_ROOT/target/debug/radix"
+  if [[ ! -x "$RADIX_BIN" ]]; then
+    fail "radix binary did not materialize at $RADIX_BIN"
+  fi
+fi
+
+# --- 2. emit .ll + descriptor -----------------------------------------------
+printf '── emit .ll + kernel descriptor\n'
+if ! "$RADIX_BIN" emit -t llvm-text --cuda-descriptor "$DESCRIPTOR" "$FIXTURE" > "$LL"; then
+  fail "radix emit failed for $FIXTURE (descriptor target $DESCRIPTOR)"
+fi
+
+# G1 evidence: NVVM kernel markers and the device buffer ABI must be present.
+if ! grep -q '@nucleum device-entry' "$LL"; then
+  fail "emitted .ll missing '@nucleum device-entry' (compiler-owned kernel provenance)"
+fi
+if ! grep -q '!nvvm.annotations' "$LL"; then
+  fail "emitted .ll missing '!nvvm.annotations' (NVPTX kernel marker)"
+fi
+if ! grep -q 'addrspace(1)' "$LL"; then
+  fail "emitted .ll has no addrspace(1) buffer params (host-style scalar signature leaked)"
+fi
+
+# Descriptor must parse and match the kernel-signature contract.
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$DESCRIPTOR" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+assert d.get("schema_version") == 1, f"schema_version {d.get('schema_version')}"
+assert d.get("target") == "llvm-nvvm", f"target {d.get('target')}"
+ks = d.get("kernels")
+assert isinstance(ks, list) and len(ks) == 1, f"kernels {ks}"
+k = ks[0]
+assert k.get("entry") == "addita", f"entry {k.get('entry')}"
+assert k.get("element_type") == "f32", f"element_type {k.get('element_type')}"
+assert k.get("element_byte_width") == 4, f"element_byte_width {k.get('element_byte_width')}"
+assert k.get("element_count") == 256, f"element_count {k.get('element_count')}"
+assert k.get("input_buffers") == 2, f"input_buffers {k.get('input_buffers')}"
+assert k.get("output_buffers") == 1, f"output_buffers {k.get('output_buffers')}"
+print(f"descriptor OK: target={d['target']} entry={k['entry']} "
+      f"element={k['element_type']}[{k['element_count']}] "
+      f"in={k['input_buffers']} out={k['output_buffers']}")
+PY
+else
+  # python3 absent: structural grep fallback, not a deep parse.
+  for needle in '"target": "llvm-nvvm"' '"entry": "addita"' '"element_type": "f32"' \
+                '"element_count": 256' '"input_buffers": 2' '"output_buffers": 1'; do
+    grep -q "$needle" "$DESCRIPTOR" || fail "descriptor missing $needle"
+  done
+  printf 'descriptor OK (grep fallback): llvm-nvvm addita f32[256] in=2 out=1\n'
+fi
+
+# Optional G1 verifier when llvm-as is present (NVPTX lowering also parses the
+# IR, so this is corroborating, not load-bearing).
+if command -v llvm-as >/dev/null 2>&1; then
+  llvm-as -o /dev/null "$LL" || fail "llvm-as rejected the emitted .ll"
+fi
+
+# --- 3. discover NVPTX backend + produce PTX ---------------------------------
+printf '── discover NVPTX-capable external backend\n'
+BACKEND=""
+BACKEND_PATH=""
+if [[ -n "${CUDA_PROOF_CLANG:-}" ]]; then
+  if "$CUDA_PROOF_CLANG" --print-targets 2>/dev/null | grep -q nvptx64; then
+    BACKEND="clang"; BACKEND_PATH="$CUDA_PROOF_CLANG"
+  else
+    not_attempted "explicit CUDA_PROOF_CLANG does not advertise nvptx64: $CUDA_PROOF_CLANG"
+  fi
+elif command -v clang >/dev/null 2>&1 && clang --print-targets 2>/dev/null | grep -q nvptx64; then
+  BACKEND="clang"; BACKEND_PATH="$(command -v clang)"
+elif [[ -n "${CUDA_PROOF_LLC:-}" ]] && "$CUDA_PROOF_LLC" --version 2>/dev/null | grep -q nvptx64; then
+  BACKEND="llc"; BACKEND_PATH="$CUDA_PROOF_LLC"
+elif command -v llc >/dev/null 2>&1 && llc --version 2>/dev/null | grep -q nvptx64; then
+  BACKEND="llc"; BACKEND_PATH="$(command -v llc)"
+fi
+
+if [[ -z "$BACKEND" ]]; then
+  not_attempted "no NVPTX-capable backend (need clang advertising nvptx64, or llc with NVPTX); emit + host rejection evidence only (G1/G2 green)"
+fi
+
+printf '── produce PTX (%s: %s, PTX ISA pin +%s)\n' "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
+if [[ "$BACKEND" == "clang" ]]; then
+  if ! "$BACKEND_PATH" --target=nvptx64-nvidia-cuda -S -O1 --cuda-feature=+"$PTX_ISA" \
+      -o "$PTX" "$LL" 2>"$SCRATCH/ptx.err"; then
+    cat "$SCRATCH/ptx.err" >&2
+    not_attempted "clang rejected the pinned PTX ISA +$PTX_ISA (set CUDA_PROOF_PTX_ISA to a version this toolchain supports)"
+  fi
+else
+  if ! "$BACKEND_PATH" -mtriple=nvptx64-nvidia-cuda -mattr=+"$PTX_ISA" \
+      -o "$PTX" "$LL" 2>"$SCRATCH/ptx.err"; then
+    cat "$SCRATCH/ptx.err" >&2
+    not_attempted "llc rejected the pinned PTX ISA +$PTX_ISA (set CUDA_PROOF_PTX_ISA to a version this toolchain supports)"
+  fi
+fi
+
+# The lowered PTX must expose the kernel entry and the device buffer params.
+if ! grep -qE '\.(visible\s+)?entry\s+addita\b' "$PTX"; then
+  fail "PTX missing '.entry addita' (NVPTX did not mark the kernel entry)"
+fi
+if ! grep -q '\.param .u64 .ptr .global' "$PTX"; then
+  fail "PTX missing '.param .u64 .ptr .global' buffer params"
+fi
+printf '── PTX OK: .entry addita present, backend=%s path=%s pin=+%s\n' \
+  "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
+
+# --- 4. build the host proof binary ------------------------------------------
+printf '── build host proof binary\n'
+if ! cargo build --release --manifest-path "$ROOT/macos-arm64/Cargo.toml"; then
+  fail "host proof binary build failed (cargo build --release --manifest-path hosts/macos-arm64/Cargo.toml)"
+fi
+
+# --- 5. run the host proof with artifact paths -------------------------------
+printf '── run host proof (CUDA_PROOF_PTX=%s CUDA_PROOF_DESCRIPTOR=%s)\n' "$PTX" "$DESCRIPTOR"
+set +e
+(
+  cd "$ROOT/macos-arm64"
+  CUDA_PROOF_PTX="$PTX" CUDA_PROOF_DESCRIPTOR="$DESCRIPTOR" \
+    cargo test --test cuda_host_proof -- --nocapture
+) > "$SCRATCH/proof-test.log" 2>&1
+test_status=$?
+set -e
+cat "$SCRATCH/proof-test.log"
+
+# --- 6. require PASS ----------------------------------------------------------
+if [[ $test_status -ne 0 ]]; then
+  fail "host proof exited $test_status (see $SCRATCH/proof-test.log)"
+fi
+if ! grep -q 'PASS: CUDA proof' "$SCRATCH/proof-test.log"; then
+  fail "host proof exited 0 but no 'PASS: CUDA proof' marker (anti-false-green)"
+fi
+
+printf 'cuda-tier-f-proof: PASS — entry addita matched the Rust reference; backend=%s path=%s ptx_isa=+%s\n' \
+  "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
