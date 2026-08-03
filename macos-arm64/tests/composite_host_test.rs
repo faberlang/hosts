@@ -97,6 +97,41 @@ fn cuda_composite(entry: &str) -> HostResult<CompositeHost> {
     CompositeHost::with_device(runtime, "fake-cuda-device")
 }
 
+/// A fake-metal composite whose module declares every kernel entry of the
+/// S3-B3 Mul+Mean companion program (S3-B3 tests launch all four kernels).
+fn mul_mean_metal_composite() -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(
+            Box::new(
+                FakeMetalDriver::default()
+                    .with_known_entry("loss_mul")
+                    .with_known_entry("loss_mean")
+                    .with_known_entry("loss_backward_x")
+                    .with_known_entry("loss_backward_w"),
+            ),
+        )
+        .expect("fake metal admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-metal-device")
+}
+
+/// The CUDA lane of [`mul_mean_metal_composite`].
+fn mul_mean_cuda_composite() -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(
+            Box::new(
+                FakeCudaDriver::default()
+                    .with_known_entry("loss_mul")
+                    .with_known_entry("loss_mean")
+                    .with_known_entry("loss_backward_x")
+                    .with_known_entry("loss_backward_w"),
+            ),
+        )
+        .expect("fake cuda admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-cuda-device")
+}
+
 /// A fake-metal composite whose driver fails the `call`-th invocation of
 /// `stage` with a typed `E_METAL_DRIVER` error (S2-3 failure injection).
 fn metal_composite_failing(
@@ -179,6 +214,87 @@ fn two_kernel_inputs() -> BTreeMap<u32, Vec<f32>> {
     inputs.insert(1, vec![1.0, 2.0]);
     inputs.insert(2, vec![3.0, 4.0]);
     inputs.insert(4, vec![10.0, 10.0]);
+    inputs
+}
+
+/// The S3-B3 Mul+Mean companion fixture (S3-B1 shape) as a descriptor: the
+/// forward kernels (`loss_mul` elementwise mul, `loss_mean` mean reduction)
+/// plus the generated backward companion, whose tuple gradient outputs
+/// `grad_x`/`grad_w` are ObservationPoint and whose accumulation/partial
+/// intermediates are PerStep. The buffer inventory mirrors the S3-B3
+/// evidence-note classification:
+///
+/// | Buffer | Role → class |
+/// | --- | --- |
+/// | x, w (1, 2) | Input → PerProgram |
+/// | product, partial, acc (3, 4, 5) | InOut → PerStep |
+/// | grad_x, grad_w (6, 7) | Output → ObservationPoint |
+///
+/// The fake driver simulates the 3-buffer elementwise-add kernel only, so
+/// the companion's `(grad_x, grad_w)` tuple is modeled as two companion
+/// kernels, each producing one gradient output (the real materialized
+/// companion writes both tuple elements in one kernel via the S3-A1
+/// multi-output ABI). Every slot's lifetime is derived by the same
+/// `lifetime_for_role` mapping the faber constructor uses (S2-4), so the
+/// fake-driver sequencing proves the constructor-derived classification's
+/// allocation/recycle/release policy: PerProgram allocated once, PerStep
+/// recycled at the step boundary, ObservationPoint read-then-released.
+fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    DeviceDescriptor {
+        backend,
+        module_image: MODULE_IMAGE.to_vec(),
+        kernels: vec![
+            DescriptorKernel {
+                entry: "loss_mul".to_owned(),
+                buffers: vec![
+                    add_slot(1, "x", DeviceBufferRole::Input, 0, 2),
+                    add_slot(2, "w", DeviceBufferRole::Input, 1, 2),
+                    add_slot(3, "product", DeviceBufferRole::InOut, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "loss_mean".to_owned(),
+                buffers: vec![
+                    add_slot(3, "product", DeviceBufferRole::InOut, 0, 2),
+                    add_slot(4, "partial", DeviceBufferRole::InOut, 1, 2),
+                    add_slot(5, "acc", DeviceBufferRole::InOut, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "loss_backward_x".to_owned(),
+                buffers: vec![
+                    add_slot(5, "acc", DeviceBufferRole::InOut, 0, 2),
+                    add_slot(1, "x", DeviceBufferRole::Input, 1, 2),
+                    add_slot(6, "grad_x", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "loss_backward_w".to_owned(),
+                buffers: vec![
+                    add_slot(5, "acc", DeviceBufferRole::InOut, 0, 2),
+                    add_slot(2, "w", DeviceBufferRole::Input, 1, 2),
+                    add_slot(7, "grad_w", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
+    }
+}
+
+/// Host inputs for [`mul_mean_companion_descriptor`]: x and w (PerProgram
+/// inputs read by the forward `loss_mul` kernel and the companion kernels).
+fn mul_mean_inputs() -> BTreeMap<u32, Vec<f32>> {
+    let mut inputs = BTreeMap::new();
+    inputs.insert(1, vec![1.0, 2.0]);
+    inputs.insert(2, vec![3.0, 4.0]);
     inputs
 }
 
@@ -1371,6 +1487,113 @@ fn per_step_buffers_recycle_at_step_boundary() {
     let counters = host.device().expect("device").driver_counters();
     assert_eq!(counters.buffer_allocs, 7);
     assert_eq!(counters.buffer_releases, 7);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S3-B3: Mul+Mean companion classification — the fake-driver suite reuses
+// the S2-4 lifetime policy against the S3-B1 companion fixture shape.
+// PerProgram once, PerStep recycled, ObservationPoint read-then-released.
+// ---------------------------------------------------------------------------
+
+/// The S3-B3 classified-buffer policy over the Mul+Mean companion program:
+/// the session allocates the PerProgram inputs (x, w) exactly once at
+/// creation, recycles the PerStep intermediates (product, partial, acc) at
+/// the step boundary, and read-then-releases the ObservationPoint tuple
+/// gradient outputs (grad_x, grad_w). Same-shaped grad_x/grad_w stay
+/// distinct buffer ids (6 vs 7) in the session's declared resource graph.
+#[test]
+fn mul_mean_companion_classified_buffers_follow_lifetime_policy() {
+    let mut host = mul_mean_metal_composite().expect("metal composite");
+    let descriptor = mul_mean_companion_descriptor(DeviceBackend::Metal);
+    let inputs = mul_mean_inputs();
+
+    // Creation: module loaded once + the two PerProgram inputs allocated
+    // once. The PerStep intermediates (3, 4, 5) and the ObservationPoint
+    // gradient outputs (6, 7) are NOT allocated at creation — they are
+    // allocated per execution and released at the step boundary / after
+    // readback (S2-4).
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
+    assert_eq!(session.driver_counters().module_loads, 1);
+    assert_eq!(session.driver_counters().buffer_allocs, 2);
+    assert_eq!(session.allocated_buffers(), vec![1, 2, 3, 4, 5, 6, 7]);
+
+    // Execute 1: four launches (mul, mean, backward_x, backward_w);
+    // PerProgram inputs copied per input slot (x, w in loss_mul, x in
+    // loss_backward_x, w in loss_backward_w = 4); grad_x/grad_w read back
+    // and released; the PerStep intermediates recycled at the step
+    // boundary.
+    let receipt = session.execute(&inputs, &[6, 7]).expect("execute 1");
+    assert_eq!(receipt.launches, 4);
+    assert_eq!(receipt.copy_ins, 4);
+    assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0])); // grad_x
+    assert_eq!(receipt.outputs.get(&7), Some(&vec![7.0, 10.0])); // grad_w
+    assert_eq!(receipt.per_program_buffers, vec![1, 2]);
+    assert_eq!(receipt.per_step_buffers, vec![3, 4, 5]);
+    assert_eq!(receipt.observation_buffers, vec![6, 7]);
+    // The session is back to module + PerProgram only: the per-step and
+    // observation buffers were released (read-then-release + step recycle).
+    assert_eq!(session.session_handle_count(), 3);
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 2 + 5); // + product, partial, acc, grad_x, grad_w
+    assert_eq!(counters.buffer_releases, 5);
+    assert_eq!(counters.module_loads, 1);
+
+    // Execute 2 on the SAME session: no reload, no PerProgram realloc; the
+    // PerStep and ObservationPoint buffers are allocated fresh and released
+    // again (recycled at each step boundary, read-then-released after).
+    let receipt2 = session.execute(&inputs, &[6, 7]).expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&6), Some(&vec![5.0, 8.0]));
+    assert_eq!(receipt2.outputs.get(&7), Some(&vec![7.0, 10.0]));
+    assert_eq!(session.session_handle_count(), 3);
+    let counters = session.driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 10);
+    assert_eq!(counters.buffer_releases, 10);
+
+    // Teardown releases the module + PerProgram buffers; nothing persists.
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 10);
+    assert_eq!(counters.buffer_releases, 2 + 10);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The same classified-buffer policy on the CUDA fake-driver lane
+/// (backend-neutral surface): PerProgram once, PerStep recycled,
+/// ObservationPoint read-then-released, grad_x/grad_w distinct ids.
+#[test]
+fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
+    let mut host = mul_mean_cuda_composite().expect("cuda composite");
+    let descriptor = mul_mean_companion_descriptor(DeviceBackend::Cuda);
+    let inputs = mul_mean_inputs();
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
+    assert_eq!(session.driver_counters().buffer_allocs, 2);
+
+    let receipt = session.execute(&inputs, &[6, 7]).expect("execute 1");
+    assert_eq!(receipt.launches, 4);
+    assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0]));
+    assert_eq!(receipt.outputs.get(&7), Some(&vec![7.0, 10.0]));
+    assert_eq!(receipt.per_program_buffers, vec![1, 2]);
+    assert_eq!(receipt.per_step_buffers, vec![3, 4, 5]);
+    assert_eq!(receipt.observation_buffers, vec![6, 7]);
+    assert_eq!(session.session_handle_count(), 3);
+
+    let receipt2 = session.execute(&inputs, &[6, 7]).expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&6), Some(&vec![5.0, 8.0]));
+    assert_eq!(receipt2.outputs.get(&7), Some(&vec![7.0, 10.0]));
+    assert_eq!(session.session_handle_count(), 3);
+
+    session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
