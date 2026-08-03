@@ -11,11 +11,6 @@ fn radix_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../radix")
 }
 
-fn faberlang_root() -> PathBuf {
-    // hosts/macos-arm64 → faberlang/
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn emit_wasm_text(source_path: &std::path::Path) -> String {
     let radix_manifest = radix_root().join("crates/radix/Cargo.toml");
     let output = Command::new("cargo")
@@ -118,11 +113,10 @@ fn assert_closed_set_v1_only(wat: &str) {
 
 #[test]
 fn salve_munde_wasm_rt_v1_matches_expected_stdout() {
-    let source = faberlang_root().join("examples/corpus/incipit/salve-munde.fab");
-    let expected = std::fs::read_to_string(
-        faberlang_root().join("examples/corpus/incipit/salve-munde.expected"),
-    )
-    .expect("expected file");
+    let source = radix_root().join("corpus/incipit/salve-munde.fab");
+    let expected =
+        std::fs::read_to_string(radix_root().join("corpus/incipit/salve-munde.expected"))
+            .expect("expected file");
     let wat = emit_wasm_text(&source);
 
     assert!(
@@ -152,9 +146,9 @@ fn salve_munde_wasm_rt_v1_matches_expected_stdout() {
 /// scalar `nota_i64` (second closed-set import family beyond salve-munde's ptr).
 #[test]
 fn functio_wasm_rt_v1_matches_expected_stdout() {
-    let source = faberlang_root().join("examples/corpus/functio/functio.fab");
+    let source = radix_root().join("corpus/functio/functio.fab");
     let expected =
-        std::fs::read_to_string(faberlang_root().join("examples/corpus/functio/functio.expected"))
+        std::fs::read_to_string(radix_root().join("corpus/functio/functio.expected"))
             .expect("expected file");
     let wat = emit_wasm_text(&source);
 
