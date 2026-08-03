@@ -7,7 +7,11 @@
 //! runtime dependency.
 
 pub mod component;
+pub mod composite_host;
 pub mod cuda_host;
+pub mod device_descriptor;
+pub mod device_host;
+pub mod device_registry;
 pub mod kernel;
 pub mod manifest;
 pub mod metal_host;

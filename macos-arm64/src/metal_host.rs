@@ -20,6 +20,7 @@ use metal::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::device_registry::HandleRegistry;
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
 
@@ -59,12 +60,6 @@ pub struct MetalHandleId(pub u64);
 enum MetalHandleKind {
     Module,
     Buffer { len_bytes: usize },
-}
-
-struct MetalHandle {
-    kind: MetalHandleKind,
-    /// Backend token; fake drivers use synthetic ids. Never tensor payload.
-    backend_token: u64,
 }
 
 /// Injectable driver boundary (real Metal binding adapter or sequencing fake).
@@ -108,8 +103,7 @@ pub trait MetalDriver: Send {
 /// Product-facing session: opaque handles + ordered lifecycle.
 pub struct MetalHostSession {
     driver: Box<dyn MetalDriver>,
-    handles: BTreeMap<u64, MetalHandle>,
-    next_id: u64,
+    handles: HandleRegistry<MetalHandleKind>,
     admitted: bool,
 }
 
@@ -126,8 +120,7 @@ impl MetalHostSession {
             }
             let mut session = Self {
                 driver,
-                handles: BTreeMap::new(),
-                next_id: 1,
+                handles: HandleRegistry::new(),
                 admitted: true,
             };
             session.driver.create_context()?;
@@ -150,14 +143,20 @@ impl MetalHostSession {
         }
         Ok(Self {
             driver,
-            handles: BTreeMap::new(),
-            next_id: 1,
+            handles: HandleRegistry::new(),
             admitted,
         })
     }
 
     pub fn is_admitted(&self) -> bool {
         self.admitted
+    }
+
+    /// Number of live opaque handles (module + buffer registrations). Used by
+    /// lifecycle tests to prove teardown released every handle.
+    #[must_use]
+    pub fn live_handle_count(&self) -> usize {
+        self.handles.len()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<MetalHandleId> {
@@ -300,7 +299,7 @@ impl MetalHostSession {
     }
 
     pub fn release(&mut self, id: MetalHandleId) -> HostResult<()> {
-        let Some(handle) = self.handles.remove(&id.0) else {
+        let Some(handle) = self.handles.remove(id.0) else {
             return Err(metal_invalid_handle(id));
         };
         self.driver.free(handle.backend_token)
@@ -322,36 +321,25 @@ impl MetalHostSession {
     }
 
     fn insert(&mut self, kind: MetalHandleKind, backend_token: u64) -> MetalHandleId {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.handles.insert(
-            id,
-            MetalHandle {
-                kind,
-                backend_token,
-            },
-        );
-        MetalHandleId(id)
+        MetalHandleId(self.handles.insert(kind, backend_token))
     }
 
     fn module_token(&self, id: MetalHandleId) -> HostResult<u64> {
-        match self.handles.get(&id.0) {
-            Some(MetalHandle {
-                kind: MetalHandleKind::Module,
-                backend_token,
-            }) => Ok(*backend_token),
+        match self.handles.get(id.0) {
+            Some(handle) if matches!(handle.kind, MetalHandleKind::Module) => {
+                Ok(handle.backend_token)
+            }
             Some(_) => Err(HostError::invalid_args("handle is not a Metal module")),
             None => Err(metal_invalid_handle(id)),
         }
     }
 
     fn buffer_token(&self, id: MetalHandleId) -> HostResult<(u64, usize)> {
-        match self.handles.get(&id.0) {
-            Some(MetalHandle {
-                kind: MetalHandleKind::Buffer { len_bytes },
-                backend_token,
-            }) => Ok((*backend_token, *len_bytes)),
-            Some(_) => Err(HostError::invalid_args("handle is not a Metal buffer")),
+        match self.handles.get(id.0) {
+            Some(handle) => match &handle.kind {
+                MetalHandleKind::Buffer { len_bytes } => Ok((handle.backend_token, *len_bytes)),
+                _ => Err(HostError::invalid_args("handle is not a Metal buffer")),
+            },
             None => Err(metal_invalid_handle(id)),
         }
     }
@@ -426,6 +414,12 @@ pub struct FakeMetalDriver {
     buffers: BTreeMap<u64, Vec<u8>>,
     modules: BTreeMap<u64, Vec<u8>>,
     force_unavailable: bool,
+    /// Entry names the loaded module's function table declares. Empty means
+    /// the fake does not enforce entry checks (legacy sequencing behavior);
+    /// non-empty means an unknown launch entry fails closed with
+    /// `E_DEVICE_ENTRY_MISMATCH`, mirroring the compiled-pipeline entry check
+    /// on the real lane.
+    known_entries: Vec<String>,
 }
 
 impl FakeMetalDriver {
@@ -434,6 +428,12 @@ impl FakeMetalDriver {
             force_unavailable: true,
             ..Self::default()
         }
+    }
+
+    /// Declare a module entry for launch-time entry validation.
+    pub fn with_known_entry(mut self, entry: impl Into<String>) -> Self {
+        self.known_entries.push(entry.into());
+        self
     }
 
     /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
@@ -548,7 +548,7 @@ impl MetalDriver for FakeMetalDriver {
     fn launch_kernel(
         &mut self,
         module: u64,
-        _entry: &[u8],
+        entry: &[u8],
         buffers: &[u64],
         _grid_x: u32,
         _grid_y: u32,
@@ -557,6 +557,24 @@ impl MetalDriver for FakeMetalDriver {
         _block_y: u32,
         _block_z: u32,
     ) -> HostResult<()> {
+        // When the harness declares the module's function table, an unknown
+        // entry fails closed before dispatch (mirrors the compiled-pipeline
+        // entry lookup on the real lane).
+        if !self.known_entries.is_empty()
+            && !self
+                .known_entries
+                .iter()
+                .any(|entry_name| entry_name.as_bytes() == entry)
+        {
+            return Err(HostError {
+                code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
+                message: format!(
+                    "module has no entry named {}",
+                    String::from_utf8_lossy(entry)
+                ),
+                retryable: false,
+            });
+        }
         // The simulated elementwise-add kernel takes exactly three buffers
         // (a, b, out). Anything else fails closed in the fake just as it
         // would on device.

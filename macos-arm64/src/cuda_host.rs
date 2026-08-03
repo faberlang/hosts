@@ -15,6 +15,7 @@ use std::process::Command;
 use faber::Valor;
 use serde::{Deserialize, Serialize};
 
+use crate::device_registry::HandleRegistry;
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
 
@@ -86,12 +87,6 @@ enum CudaHandleKind {
     Buffer { len_bytes: usize },
 }
 
-struct CudaHandle {
-    kind: CudaHandleKind,
-    /// Backend token; fake drivers use synthetic ids. Never tensor payload.
-    backend_token: u64,
-}
-
 /// Injectable driver boundary (real Driver API adapter or sequencing fake).
 pub trait CudaDriver: Send {
     fn discover(&mut self) -> HostResult<CudaEnvReport>;
@@ -133,8 +128,7 @@ pub trait CudaDriver: Send {
 /// Product-facing session: opaque handles + ordered lifecycle.
 pub struct CudaHostSession {
     driver: Box<dyn CudaDriver>,
-    handles: BTreeMap<u64, CudaHandle>,
-    next_id: u64,
+    handles: HandleRegistry<CudaHandleKind>,
     admitted: bool,
 }
 
@@ -149,8 +143,7 @@ impl CudaHostSession {
         }
         let mut session = Self {
             driver,
-            handles: BTreeMap::new(),
-            next_id: 1,
+            handles: HandleRegistry::new(),
             admitted: true,
         };
         session.driver.create_context()?;
@@ -166,14 +159,20 @@ impl CudaHostSession {
         }
         Ok(Self {
             driver,
-            handles: BTreeMap::new(),
-            next_id: 1,
+            handles: HandleRegistry::new(),
             admitted,
         })
     }
 
     pub fn is_admitted(&self) -> bool {
         self.admitted
+    }
+
+    /// Number of live opaque handles (module + buffer registrations). Used by
+    /// lifecycle tests to prove teardown released every handle.
+    #[must_use]
+    pub fn live_handle_count(&self) -> usize {
+        self.handles.len()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<CudaHandleId> {
@@ -316,7 +315,7 @@ impl CudaHostSession {
     }
 
     pub fn release(&mut self, id: CudaHandleId) -> HostResult<()> {
-        let Some(handle) = self.handles.remove(&id.0) else {
+        let Some(handle) = self.handles.remove(id.0) else {
             return Err(cuda_invalid_handle(id));
         };
         self.driver.free(handle.backend_token)
@@ -338,36 +337,25 @@ impl CudaHostSession {
     }
 
     fn insert(&mut self, kind: CudaHandleKind, backend_token: u64) -> CudaHandleId {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.handles.insert(
-            id,
-            CudaHandle {
-                kind,
-                backend_token,
-            },
-        );
-        CudaHandleId(id)
+        CudaHandleId(self.handles.insert(kind, backend_token))
     }
 
     fn module_token(&self, id: CudaHandleId) -> HostResult<u64> {
-        match self.handles.get(&id.0) {
-            Some(CudaHandle {
-                kind: CudaHandleKind::Module,
-                backend_token,
-            }) => Ok(*backend_token),
+        match self.handles.get(id.0) {
+            Some(handle) if matches!(handle.kind, CudaHandleKind::Module) => {
+                Ok(handle.backend_token)
+            }
             Some(_) => Err(HostError::invalid_args("handle is not a CUDA module")),
             None => Err(cuda_invalid_handle(id)),
         }
     }
 
     fn buffer_token(&self, id: CudaHandleId) -> HostResult<(u64, usize)> {
-        match self.handles.get(&id.0) {
-            Some(CudaHandle {
-                kind: CudaHandleKind::Buffer { len_bytes },
-                backend_token,
-            }) => Ok((*backend_token, *len_bytes)),
-            Some(_) => Err(HostError::invalid_args("handle is not a CUDA buffer")),
+        match self.handles.get(id.0) {
+            Some(handle) => match &handle.kind {
+                CudaHandleKind::Buffer { len_bytes } => Ok((handle.backend_token, *len_bytes)),
+                _ => Err(HostError::invalid_args("handle is not a CUDA buffer")),
+            },
             None => Err(cuda_invalid_handle(id)),
         }
     }
@@ -860,6 +848,12 @@ pub struct FakeCudaDriver {
     buffers: BTreeMap<u64, Vec<u8>>,
     modules: BTreeMap<u64, Vec<u8>>,
     force_unavailable: bool,
+    /// Entry names the loaded module's function table declares. Empty means
+    /// the fake does not enforce entry checks (legacy sequencing behavior);
+    /// non-empty means an unknown launch entry fails closed with
+    /// `E_DEVICE_ENTRY_MISMATCH`, mirroring `cuModuleGetFunction` on the real
+    /// lane.
+    known_entries: Vec<String>,
 }
 
 impl FakeCudaDriver {
@@ -868,6 +862,12 @@ impl FakeCudaDriver {
             force_unavailable: true,
             ..Self::default()
         }
+    }
+
+    /// Declare a module entry for launch-time entry validation.
+    pub fn with_known_entry(mut self, entry: impl Into<String>) -> Self {
+        self.known_entries.push(entry.into());
+        self
     }
 
     /// Simulate the `addita` kernel: `out[i] = a[i] + b[i]` elementwise.
@@ -982,7 +982,7 @@ impl CudaDriver for FakeCudaDriver {
     fn launch_kernel(
         &mut self,
         module: u64,
-        _entry: &[u8],
+        entry: &[u8],
         buffers: &[u64],
         _grid_x: u32,
         _grid_y: u32,
@@ -991,6 +991,23 @@ impl CudaDriver for FakeCudaDriver {
         _block_y: u32,
         _block_z: u32,
     ) -> HostResult<()> {
+        // When the harness declares the module's function table, an unknown
+        // entry fails closed before dispatch (mirrors cuModuleGetFunction).
+        if !self.known_entries.is_empty()
+            && !self
+                .known_entries
+                .iter()
+                .any(|entry_name| entry_name.as_bytes() == entry)
+        {
+            return Err(HostError {
+                code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
+                message: format!(
+                    "module has no entry named {}",
+                    String::from_utf8_lossy(entry)
+                ),
+                retryable: false,
+            });
+        }
         // The emitted `addita` kernel takes exactly three buffers (a, b, out).
         // Anything else fails closed in the fake just as it would on device.
         if buffers.len() != 3 {
