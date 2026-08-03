@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use faber::device::{DeviceBackend, DeviceHandle, DeviceHandleKind, DeviceSelection};
 use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
-    resolve_device_selection, CompositeHost, CompositeHostConfig,
+    resolve_device_selection, CompositeHost, CompositeHostConfig, DataFlowEdge,
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
@@ -1475,5 +1475,71 @@ fn per_step_allocation_failure_releases_every_handle() {
         .execute(&two_kernel_inputs(), &[5])
         .expect_err("injected per-step allocation failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The S2-8 A9/A10 receipt: the declared logical resource graph (every
+/// buffer identity + content version, roles, lifetimes) and the observed
+/// lifecycle events (launches, syncs, transfers, readbacks, releases) for
+/// the two-kernel chain. The data-flow edge matches the schema's
+/// `data_flow_pairs`: launch 1 writes the InOut intermediate `acc`, launch 2
+/// reads it.
+#[test]
+fn receipt_declares_resource_graph_and_observed_events() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let receipt = session
+        .execute(&two_kernel_inputs(), &[5])
+        .expect("execute");
+
+    // Declared resource graph (A10), buffer-id order: identity facts +
+    // content version 1 for all five buffers.
+    let graph = &receipt.resource_graph;
+    assert_eq!(graph.len(), 5);
+    assert_eq!(graph[0].id, 1);
+    assert_eq!(graph[0].name, "a");
+    assert_eq!(graph[0].role, DeviceBufferRole::Input);
+    assert_eq!(graph[0].lifetime, DeviceBufferLifetime::PerProgram);
+    assert_eq!(graph[2].id, 3);
+    assert_eq!(graph[2].name, "acc");
+    assert_eq!(graph[2].role, DeviceBufferRole::InOut);
+    assert_eq!(graph[2].lifetime, DeviceBufferLifetime::PerStep);
+    assert_eq!(graph[4].id, 5);
+    assert_eq!(graph[4].name, "out");
+    assert_eq!(graph[4].role, DeviceBufferRole::Output);
+    assert_eq!(graph[4].lifetime, DeviceBufferLifetime::ObservationPoint);
+    for buffer in graph {
+        assert_eq!(buffer.element_count, 2);
+        assert_eq!(buffer.element_ty, DeviceDataType::F32);
+        assert_eq!(buffer.version, 1);
+    }
+
+    // Data-flow edges (A10): launch 1 produces the InOut intermediate, launch
+    // 2 consumes it; no other inter-kernel edge.
+    assert_eq!(
+        receipt.data_flow_edges,
+        vec![DataFlowEdge {
+            buffer_id: 3,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }]
+    );
+
+    // Observed lifecycle events (A9): 2 launches, 1 step-boundary sync, 3
+    // copy-ins + 1 readback = 4 transfers, 1 readback, and 2 releases
+    // (read-then-release of `out` + step-boundary recycle of `acc`).
+    assert_eq!(receipt.launches, 2);
+    assert_eq!(receipt.syncs, 1);
+    assert_eq!(receipt.copy_ins, 3);
+    assert_eq!(receipt.transfers, 4);
+    assert_eq!(receipt.outputs.len(), 1);
+    assert_eq!(receipt.releases, 2);
+
+    session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }

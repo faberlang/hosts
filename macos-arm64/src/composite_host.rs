@@ -50,8 +50,8 @@ use std::collections::BTreeMap;
 use faber::device::{DeviceBackend, DeviceHandle, DeviceSelection};
 
 use crate::device_descriptor::{
-    errors as descriptor_errors, fnv1a64, DeviceBufferLifetime, DeviceBufferRole, DeviceDescriptor,
-    DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
+    errors as descriptor_errors, fnv1a64, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
+    DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
@@ -133,6 +133,59 @@ pub struct DeviceExecutionReceipt {
     /// ObservationPoint buffer ids: read back and released per execution
     /// (read-then-release).
     pub observation_buffers: Vec<u32>,
+    /// Declared logical resource graph (A10): every buffer identity +
+    /// content version, in first-reference order.
+    pub resource_graph: Vec<ReceiptBuffer>,
+    /// Declared inter-kernel data-flow edges (A10), producer → consumer
+    /// launch ids, in first-reference order. Derived from the launch
+    /// sequence with the schema's rule: a buffer's producing launch is its
+    /// first Output/InOut reference; consuming launches are later
+    /// Input/InOut references — equal to `BufferRegistry::data_flow_pairs`
+    /// for constructor-valid programs.
+    pub data_flow_edges: Vec<DataFlowEdge>,
+    /// Observed step-boundary synchronizations this execution.
+    pub syncs: usize,
+    /// Observed transfers this execution (host→device copy-ins plus
+    /// device→host readbacks).
+    pub transfers: usize,
+    /// Observed buffer releases this execution (read-then-release plus the
+    /// step-boundary PerStep recycle).
+    pub releases: usize,
+}
+
+/// One declared buffer of the program's logical resource graph (A10): the
+/// identity facts (id, name, role, lifetime) plus the content version the
+/// session executes. Mirrors the schema's `RegistryBuffer` identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiptBuffer {
+    /// Program-level buffer identity key.
+    pub id: u32,
+    /// Logical name (diagnostics; target-neutral).
+    pub name: String,
+    /// Program-level role.
+    pub role: DeviceBufferRole,
+    /// Lifetime class (S2-4).
+    pub lifetime: DeviceBufferLifetime,
+    /// Element type of this content version.
+    pub element_ty: DeviceDataType,
+    /// Element count of this content version.
+    pub element_count: u64,
+    /// Content version executed (the codec carries one version, 1).
+    pub version: u32,
+}
+
+/// One declared inter-kernel data-flow edge (A10): a buffer content version
+/// produced by launch `producer` and consumed by launch `consumer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataFlowEdge {
+    /// Buffer whose content flows.
+    pub buffer_id: u32,
+    /// Content version that flows.
+    pub version: u32,
+    /// Producing launch id (1-based).
+    pub producer: u32,
+    /// Consuming launch id (1-based).
+    pub consumer: u32,
 }
 
 /// One kernel's launch plan stored by the program session. Cloned from the
@@ -159,9 +212,16 @@ struct SessionSlot {
     role: DeviceBufferRole,
 }
 
-/// Per-buffer metadata captured at session creation for input validation and
-/// lifetime-distinct allocation/release (S2-4).
+/// Per-buffer metadata captured at session creation for input validation,
+/// lifetime-distinct allocation/release (S2-4), and the A10 declared
+/// resource graph (S2-8).
 struct SessionBufferMeta {
+    /// Logical name of the first reference (resource-graph fact).
+    name: String,
+    /// Program role of the first reference (resource-graph fact).
+    role: DeviceBufferRole,
+    /// Element type declared by the descriptor (resource-graph fact).
+    element_ty: DeviceDataType,
     /// Element count declared by the descriptor (input size check).
     element_count: u64,
     /// Byte length this buffer's storage needs on the device.
@@ -313,6 +373,9 @@ impl<'host> ProgramSession<'host> {
                     buffer_meta
                         .entry(slot.buffer_id)
                         .or_insert(SessionBufferMeta {
+                            name: slot.buffer_name.clone(),
+                            role: slot.role,
+                            element_ty: slot.element_ty,
                             element_count: slot.element_count,
                             byte_length: slot.byte_length(),
                             lifetime: slot.lifetime,
@@ -493,6 +556,7 @@ impl<'host> ProgramSession<'host> {
         // observation buffers, then release each immediately. Only
         // ObservationPoint buffers are readable — a readback request for any
         // other lifetime class is an undeclared readback and fails closed.
+        let mut release_count = 0usize;
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
         for output_id in outputs {
             if readbacks.contains_key(output_id) {
@@ -517,6 +581,7 @@ impl<'host> ProgramSession<'host> {
             let values = self.runtime.readback_f32(&handle)?;
             readbacks.insert(*output_id, values);
             self.release_buffer(*output_id)?;
+            release_count += 1;
         }
 
         // Step-boundary recycle (S2-4): PerStep buffers are released at the
@@ -533,7 +598,13 @@ impl<'host> ProgramSession<'host> {
             .collect();
         for id in per_step_ids {
             self.release_buffer(id)?;
+            release_count += 1;
         }
+
+        // Declared logical resource graph + data-flow edges (A10) from the
+        // session's declared facts (the descriptor projected onto the
+        // program).
+        let (resource_graph, data_flow_edges) = self.declared_resource_graph();
 
         Ok(DeviceExecutionReceipt {
             backend: self.backend,
@@ -547,6 +618,11 @@ impl<'host> ProgramSession<'host> {
             per_program_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerProgram),
             per_step_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerStep),
             observation_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::ObservationPoint),
+            resource_graph,
+            data_flow_edges,
+            syncs: 1,
+            transfers: copy_ins + outputs.len(),
+            releases: release_count,
         })
     }
 
@@ -592,6 +668,77 @@ impl<'host> ProgramSession<'host> {
             .filter(|(_, meta)| meta.lifetime == lifetime)
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// The declared logical resource graph (A10): every buffer identity +
+    /// content version plus the inter-kernel data-flow edges derived from
+    /// the launch sequence.
+    ///
+    /// Graph order is buffer-id ascending, which equals first-reference
+    /// order for constructor-built programs (buffer ids are minted in
+    /// reference order). Edge derivation matches the schema's
+    /// `BufferRegistry::data_flow_pairs` rule for constructor-valid
+    /// programs: a buffer's producing launch is its FIRST Output/InOut
+    /// reference (the earliest writer); consuming launches are the later
+    /// Input/InOut references. Self-edges are excluded. This is the declared
+    /// (payload-derived) graph — the session never observes the intermediate
+    /// (S2-4/S2-5: no undeclared readback).
+    fn declared_resource_graph(&self) -> (Vec<ReceiptBuffer>, Vec<DataFlowEdge>) {
+        let graph = self
+            .buffer_meta
+            .iter()
+            .map(|(id, meta)| ReceiptBuffer {
+                id: *id,
+                name: meta.name.clone(),
+                role: meta.role,
+                lifetime: meta.lifetime,
+                element_ty: meta.element_ty,
+                element_count: meta.element_count,
+                version: 1,
+            })
+            .collect();
+
+        let mut first_writer: Vec<(u32, u32)> = Vec::new();
+        let mut read_refs: Vec<(u32, u32)> = Vec::new();
+        for (kernel_index, kernel) in self.kernels.iter().enumerate() {
+            let launch = u32::try_from(kernel_index + 1).unwrap_or(u32::MAX);
+            for slot in &kernel.slots {
+                match slot.role {
+                    DeviceBufferRole::Output | DeviceBufferRole::InOut => {
+                        if !first_writer.iter().any(|(id, _)| *id == slot.buffer_id) {
+                            first_writer.push((slot.buffer_id, launch));
+                        }
+                    }
+                    DeviceBufferRole::Input => {}
+                }
+                match slot.role {
+                    DeviceBufferRole::Input | DeviceBufferRole::InOut => {
+                        read_refs.push((slot.buffer_id, launch));
+                    }
+                    DeviceBufferRole::Output => {}
+                }
+            }
+        }
+
+        let mut edges = Vec::new();
+        for (buffer, producer) in first_writer {
+            let mut consumers: Vec<u32> = read_refs
+                .iter()
+                .filter(|(id, launch)| *id == buffer && *launch != producer)
+                .map(|(_, launch)| *launch)
+                .collect();
+            consumers.sort_unstable();
+            consumers.dedup();
+            for consumer in consumers {
+                edges.push(DataFlowEdge {
+                    buffer_id: buffer,
+                    version: 1,
+                    producer,
+                    consumer,
+                });
+            }
+        }
+        (graph, edges)
     }
 
     /// Ordered teardown: release every buffer, then the module. After this
