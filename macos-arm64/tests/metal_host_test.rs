@@ -2,6 +2,7 @@
 //! M4 C5 API parity closure).
 
 use faber::Valor;
+use faber_host_macos_arm64::device_descriptor::E_DEVICE_ENTRY_MISMATCH;
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     probe_metal_environment, FakeMetalDriver, MetalHostSession, E_METAL_INVALID_HANDLE,
@@ -266,4 +267,71 @@ fn system_session_launch_kernel_dispatches_over_buffer_slice() {
 
     let expected: Vec<f32> = (0..16).map(|i| (i as f32) * 2.0).collect();
     assert_eq!(values, expected);
+}
+
+/// MSL module declaring TWO kernel entries (S2-5 multi-kernel modules): the
+/// proven `scale_two` and `add_one` bodies in one library, so the driver
+/// loads one module and dispatches both entries — the Metal lane of the
+/// ordinary two-kernel chain.
+const TWO_ENTRY_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void scale_two(
+    device const float* x [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+  y[id] = (x[id] * 2.0f);
+}
+
+kernel void add_one(
+    device const float* x [[buffer(0)]],
+    device const float* unused [[buffer(2)]],
+    device float* y [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+  y[id] = (x[id] + 1.0f);
+}
+"#;
+
+#[test]
+fn system_driver_loads_multi_entry_module_and_dispatches_both_entries() {
+    // Real-device proof of S2-5 multi-entry Metal modules: one module holds
+    // a pipeline per declared `kernel void` entry, and the generalized
+    // launch resolves each entry by name (mirroring cuModuleGetFunction on
+    // the CUDA lane). Environment-gated like the other real-binding proofs.
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    let module = session
+        .load_module(TWO_ENTRY_MSL.as_bytes())
+        .expect("runtime MSL compile with two entries");
+    let a = session.alloc_bytes(16 * 4).expect("alloc a");
+    let out = session.alloc_bytes(16 * 4).expect("alloc out");
+
+    let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    session.copy_in_f32(a, &input).expect("copy in a");
+
+    // Kernel 1: scale_two (a -> out). Kernel 2: add_one over the SAME
+    // device-resident buffer (out -> out): the second entry reads what the
+    // first wrote, exactly the two-kernel chain shape.
+    session
+        .launch_kernel(module, "scale_two", &[a, out], 1, 16)
+        .expect("launch scale_two");
+    session
+        .launch_kernel(module, "add_one", &[out, out, a], 1, 16)
+        .expect("launch add_one");
+    session.sync().expect("session sync barrier");
+
+    let values = session.readback_f32(out).expect("readback out");
+    let expected: Vec<f32> = (0..16).map(|i| (i as f32) * 2.0 + 1.0).collect();
+    assert_eq!(values, expected);
+
+    // An entry the module does not declare fails closed with the typed
+    // E_DEVICE_ENTRY_MISMATCH (multi-entry module, unknown name).
+    let err = session
+        .launch_kernel(module, "nope", &[a, out], 1, 16)
+        .expect_err("unknown entry must fail closed");
+    assert_eq!(err.code, E_DEVICE_ENTRY_MISMATCH);
+    assert!(err.message.contains("nope"));
 }

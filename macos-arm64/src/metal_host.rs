@@ -700,13 +700,15 @@ struct SystemMetalDriver {
     next_token: u64,
 }
 
-/// A compiled Metal compute module: the pipeline for its single `kernel void`
-/// entry plus the entry name, so a generalized launch can fail closed on an
-/// unknown entry name (mirroring `cuModuleGetFunction` on the CUDA lane).
+/// A compiled Metal compute module: a compute pipeline per declared `kernel
+/// void` entry. A program module can declare several kernels (S2-5: the
+/// ordered launch sequence dispatches multiple kernels from one module), so
+/// each entry carries its own pipeline and a generalized launch can fail
+/// closed on an unknown entry name (mirroring `cuModuleGetFunction` on the
+/// CUDA lane).
 #[cfg(target_os = "macos")]
 struct MetalModule {
-    entry: String,
-    pipeline: ComputePipelineState,
+    pipelines: BTreeMap<String, ComputePipelineState>,
 }
 
 #[cfg(target_os = "macos")]
@@ -746,28 +748,30 @@ impl MetalDriver for SystemMetalDriver {
             .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
         let source = std::str::from_utf8(image)
             .map_err(|_| HostError::invalid_args("Metal module image is not UTF-8 MSL source"))?;
-        let entry = msl_kernel_entry_name(source).ok_or_else(|| {
+        // A module declares one `kernel void` entry per kernel (S2-5
+        // multi-kernel modules); every declared entry gets a compute pipeline
+        // at load time so each launch resolves its own pipeline and an
+        // unknown entry fails closed with E_DEVICE_ENTRY_MISMATCH.
+        let entries = msl_kernel_entry_names(source).ok_or_else(|| {
             HostError::invalid_args("Metal MSL source has no `kernel void` entry function")
         })?;
         let options = CompileOptions::new();
         let library = device
             .new_library_with_source(source, &options)
             .map_err(|message| metal_driver(format!("MSL compile failed: {message}")))?;
-        let function = library
-            .get_function(entry, None)
-            .map_err(|message| metal_driver(format!("Metal entry lookup failed: {message}")))?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|message| metal_driver(format!("compute pipeline failed: {message}")))?;
+        let mut pipelines = BTreeMap::new();
+        for entry in &entries {
+            let function = library
+                .get_function(entry, None)
+                .map_err(|message| metal_driver(format!("Metal entry lookup failed: {message}")))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|message| metal_driver(format!("compute pipeline failed: {message}")))?;
+            pipelines.insert(entry.clone(), pipeline);
+        }
         let token = self.next_token;
         self.next_token += 1;
-        self.modules.insert(
-            token,
-            MetalModule {
-                entry: entry.to_owned(),
-                pipeline,
-            },
-        );
+        self.modules.insert(token, MetalModule { pipelines });
         Ok(token)
     }
 
@@ -878,16 +882,16 @@ impl MetalDriver for SystemMetalDriver {
             .modules
             .get(&module)
             .ok_or_else(|| metal_driver("launch: unknown module token"))?;
-        if entry != module_record.entry.as_bytes() {
-            return Err(HostError {
+        let entry_name = String::from_utf8_lossy(entry);
+        let pipeline = module_record.pipelines.get(entry_name.as_ref()).ok_or_else(|| {
+            HostError {
                 code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
                 message: format!(
-                    "launch: module has no entry named {}",
-                    String::from_utf8_lossy(entry)
+                    "launch: module has no entry named {entry_name}"
                 ),
                 retryable: false,
-            });
-        }
+            }
+        })?;
         if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0
         {
             return Err(metal_driver(
@@ -911,7 +915,7 @@ impl MetalDriver for SystemMetalDriver {
 
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&module_record.pipeline);
+        encoder.set_compute_pipeline_state(pipeline);
         for (index, buffer) in bound.iter().enumerate() {
             encoder.set_buffer(index as u64, Some(*buffer), 0);
         }
@@ -922,7 +926,7 @@ impl MetalDriver for SystemMetalDriver {
         // thread indexing (`thread_position_in_threadgroup.y` would read 0).
         // The elementwise path passes block_y=block_z=1, so its shape is
         // (block_x, 1, 1) — unchanged from before.
-        let max_threads = module_record.pipeline.max_total_threads_per_threadgroup();
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
         let block_volume = (block_x as u128) * (block_y as u128) * (block_z as u128);
         if block_volume > max_threads as u128 {
             return Err(metal_driver(format!(
@@ -977,19 +981,31 @@ impl MetalDriver for SystemMetalDriver {
     }
 }
 
-/// First `kernel void <name>` entry point in an MSL module.
-fn msl_kernel_entry_name(source: &str) -> Option<&str> {
+/// Every `kernel void <name>` entry point in an MSL module, in source order.
+/// A program module declares one entry per kernel (S2-5 multi-kernel
+/// modules); a source that declares no kernels yields `None`, and a malformed
+/// marker (a `kernel void` with no name) also fails closed.
+fn msl_kernel_entry_names(source: &str) -> Option<Vec<String>> {
     const MARKER: &str = "kernel void";
-    let marker_at = source.find(MARKER)?;
-    let rest = source[marker_at + MARKER.len()..].trim_start();
-    let name_len = rest
-        .bytes()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        .count();
-    if name_len == 0 {
+    let mut names = Vec::new();
+    let mut rest = source;
+    while let Some(marker_at) = rest.find(MARKER) {
+        let after = &rest[marker_at + MARKER.len()..];
+        let trimmed = after.trim_start();
+        let name_len = trimmed
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 {
+            return None;
+        }
+        names.push(trimmed[..name_len].to_owned());
+        rest = &trimmed[name_len..];
+    }
+    if names.is_empty() {
         None
     } else {
-        Some(&rest[..name_len])
+        Some(names)
     }
 }
 
