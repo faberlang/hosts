@@ -139,10 +139,13 @@ fn cuda_composite_failing(
 
 /// The two-kernel InOut chain descriptor (kernel 1 writes `acc`, kernel 2
 /// reads it): a, b → acc → out, with c as kernel 2's second input. Shared by
-/// the mid-chain failure-injection test and the S2-1 chaining tests.
-fn two_kernel_inout_descriptor() -> DeviceDescriptor {
+/// the mid-chain failure-injection test and the S2-1 chaining tests. The
+/// `backend` targets the fake driver of the composite host under test (the
+/// shape is backend-neutral, so the same mid-chain coverage runs on the fake
+/// Metal and fake CUDA lanes).
+fn two_kernel_inout_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     DeviceDescriptor {
-        backend: DeviceBackend::Metal,
+        backend,
         module_image: MODULE_IMAGE.to_vec(),
         kernels: vec![
             DescriptorKernel {
@@ -1192,11 +1195,47 @@ fn cuda_readback_failure_releases_every_handle() {
 fn mid_chain_second_launch_failure_releases_every_handle() {
     let mut host = metal_composite_failing("add_one", FakeFailureStage::Launch, 2)
         .expect("metal composite");
-    let descriptor = two_kernel_inout_descriptor();
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     let err = host
         .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
         .expect_err("injected second-launch failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// Mid-chain failure on the fake CUDA driver, mirroring the Metal lane:
+/// kernel 1 fully succeeds, then the second launch fails via
+/// `with_failure_at(Launch, 2)`. The typed `E_CUDA_DRIVER` error escapes and
+/// release-on-error leaves zero live handles — CUDA proves the same
+/// mid-chain shape, not just single-launch failure stages.
+#[test]
+fn cuda_mid_chain_second_launch_failure_releases_every_handle() {
+    let mut host = cuda_composite_failing("add_one", FakeFailureStage::Launch, 2)
+        .expect("cuda composite");
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Cuda);
+    let err = host
+        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .expect_err("injected second-launch failure must fail the execution");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The two-kernel InOut chain executes end-to-end on the fake CUDA driver:
+/// kernel 1 writes the device-resident intermediate (id 3), kernel 2 reads
+/// it, and the observation output (id 5) comes back as `(a+b)+c = 14/16`.
+/// This proves the mid-chain shape (two ordered launches + step-boundary
+/// sync + observation readback) succeeds on CUDA, not just Metal.
+#[test]
+fn cuda_two_kernel_chain_executes_end_to_end() {
+    let mut host = cuda_composite("add_one").expect("cuda composite");
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Cuda);
+    let receipt = host
+        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .expect("two-kernel chain must execute");
+    assert_eq!(receipt.backend, DeviceBackend::Cuda);
+    assert_eq!(receipt.launches, 2);
+    assert_eq!(receipt.copy_ins, 3); // a, b at kernel 1; c at kernel 2
+    assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
@@ -1296,7 +1335,7 @@ fn per_program_persists_while_observation_read_then_releases() {
 #[test]
 fn per_step_buffers_recycle_at_step_boundary() {
     let mut host = metal_composite("add_one").expect("metal composite");
-    let descriptor = two_kernel_inout_descriptor();
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     let inputs = two_kernel_inputs();
 
     let mut session = host
@@ -1340,7 +1379,7 @@ fn per_step_buffers_recycle_at_step_boundary() {
 #[test]
 fn receipt_reports_lifetime_classes_and_program_lifetime() {
     let mut host = metal_composite("add_one").expect("metal composite");
-    let mut descriptor = two_kernel_inout_descriptor();
+    let mut descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
 
     let mut session = host
@@ -1429,7 +1468,7 @@ fn per_step_allocation_failure_releases_every_handle() {
     // per-step allocation (id 3) is alloc call 4.
     let mut host = metal_composite_failing("add_one", FakeFailureStage::Alloc, 4)
         .expect("metal composite");
-    let descriptor = two_kernel_inout_descriptor();
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     let err = host
         .create_program_session(&descriptor)
         .expect("session create")
