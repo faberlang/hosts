@@ -50,7 +50,8 @@ use std::collections::BTreeMap;
 use faber::device::{DeviceBackend, DeviceHandle, DeviceSelection};
 
 use crate::device_descriptor::{
-    errors as descriptor_errors, fnv1a64, DeviceBufferRole, DeviceDescriptor, E_DEVICE_DESCRIPTOR,
+    errors as descriptor_errors, fnv1a64, DeviceBufferLifetime, DeviceBufferRole, DeviceDescriptor,
+    DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
@@ -103,7 +104,9 @@ pub enum CompositeDeviceState {
 
 /// A9-style execution receipt: every observable device fact of one
 /// descriptor execution (allocations, launches, transfers, syncs, readbacks,
-/// module hash, selected hardware).
+/// module hash, selected hardware) plus the program's lifetime regime and the
+/// lifetime-classified buffer sets (S2-4: which buffers are allocated once,
+/// which recycled, which read-then-released).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceExecutionReceipt {
     /// Selected backend.
@@ -120,6 +123,16 @@ pub struct DeviceExecutionReceipt {
     pub outputs: BTreeMap<u32, Vec<f32>>,
     /// Program-level buffer ids allocated during the run (A9 allocations).
     pub allocated_buffers: Vec<u32>,
+    /// Program execution-lifetime regime (S2-4).
+    pub program_lifetime: DeviceProgramLifetime,
+    /// PerProgram buffer ids: allocated once per session, released at program
+    /// end (persist across executions).
+    pub per_program_buffers: Vec<u32>,
+    /// PerStep buffer ids: recycled at each step boundary.
+    pub per_step_buffers: Vec<u32>,
+    /// ObservationPoint buffer ids: read back and released per execution
+    /// (read-then-release).
+    pub observation_buffers: Vec<u32>,
 }
 
 /// One kernel's launch plan stored by the program session. Cloned from the
@@ -146,28 +159,60 @@ struct SessionSlot {
     role: DeviceBufferRole,
 }
 
-/// Per-buffer metadata captured at session creation for input validation.
+/// Per-buffer metadata captured at session creation for input validation and
+/// lifetime-distinct allocation/release (S2-4).
 struct SessionBufferMeta {
     /// Element count declared by the descriptor (input size check).
     element_count: u64,
+    /// Byte length this buffer's storage needs on the device.
+    byte_length: u64,
+    /// Lifetime class that drives the session's allocation/release policy.
+    lifetime: DeviceBufferLifetime,
 }
 
 /// A program-scoped device session that outlives individual launches (S2-1).
 ///
 /// Created from one [`DeviceDescriptor`], a `ProgramSession` owns:
 /// - the **module** (loaded once at creation; reused by every execution);
-/// - the **PerProgram buffers** (allocated once at creation; reused by every
-///   execution — in S2-1 every buffer is PerProgram; S2-4 adds PerStep and
-///   ObservationPoint lifetimes).
+/// - the **PerProgram buffers** (allocated once at creation; persist across
+///   executions; released at program end);
+/// - the **PerStep buffers** (allocated per execution, recycled at the step
+///   boundary — released at the end of each execution and re-allocated for
+///   the next);
+/// - the **ObservationPoint buffers** (allocated per execution, read back at
+///   the declared observation point, then released — read-then-release).
 ///
 /// [`ProgramSession::execute`] runs the ordered launch sequence once (one
-/// step), synchronizes at the step boundary, and reads back declared outputs.
+/// step), synchronizes at the step boundary, reads back the declared
+/// observation buffers, and releases the per-step + observation buffers.
 /// It can be called repeatedly on the same session without reloading the
-/// module or re-allocating buffers. [`ProgramSession::teardown`] performs
-/// the ordered release (buffers then module).
+/// module or re-allocating PerProgram buffers. [`ProgramSession::teardown`]
+/// performs the ordered release (remaining buffers then module).
 ///
 /// The S1-4 [`CompositeHost::execute_descriptor`] surface is a single-run
 /// convenience over this session (create → execute → teardown).
+///
+/// # Lifetime-distinct release (S2-4; the schema-debt closer)
+///
+/// The session consumes the descriptor's typed [`DeviceBufferLifetime`]
+/// facts — it never derives a lifetime from slot role alone (that would be
+/// coincidence, council 3):
+/// - **PerProgram** — allocated once at session creation, released at program
+///   end (persists across steps);
+/// - **PerStep** — live within one step, recycled at the step boundary
+///   (released between executions, re-allocated for the next);
+/// - **ObservationPoint** — read back at the declared observation point, then
+///   released (read-then-release); it is the only class the session reads
+///   back, so a readback request for any other class fails closed (no
+///   undeclared readback).
+///
+/// The [`DeviceProgramLifetime`] regime is carried and consumed as the
+/// declared program fact: `SingleRun` is the Stage 2 fixture regime, where
+/// repeated `execute()` calls are a one-shot-with-repeat surface for the
+/// leak proof (each execution re-runs the whole program; per-step recycling
+/// between executions is not yet meaningful). `RepeatingStep` — where
+/// per-step buffers recycle as a training-iteration pool — is recorded and
+/// reported but its Stage 5 training-loop semantics are out of Stage 2 scope.
 ///
 /// # Module cache policy (S2-2)
 ///
@@ -196,10 +241,13 @@ pub struct ProgramSession<'host> {
     device_name: String,
     module_handle: DeviceHandle,
     module_hash: u64,
-    /// PerProgram buffers: buffer_id → device handle. Allocated once at
-    /// creation, released at teardown.
+    /// Program execution-lifetime regime (S2-4).
+    program_lifetime: DeviceProgramLifetime,
+    /// Currently-live device buffers: buffer_id → device handle. PerProgram
+    /// buffers are live from creation until teardown; PerStep and
+    /// ObservationPoint buffers are live only within one execution.
     buffers: BTreeMap<u32, DeviceHandle>,
-    /// Per-buffer declared element count (input validation in execute).
+    /// Per-buffer declared element count / byte length / lifetime class.
     buffer_meta: BTreeMap<u32, SessionBufferMeta>,
     /// The ordered launch plan cloned from the descriptor.
     kernels: Vec<SessionKernel>,
@@ -210,7 +258,8 @@ pub struct ProgramSession<'host> {
 
 impl<'host> ProgramSession<'host> {
     /// Create a program session: validate the descriptor, load the module
-    /// once, and allocate every distinct buffer once.
+    /// once, and allocate every distinct **PerProgram** buffer once (PerStep
+    /// and ObservationPoint buffers are allocated per execution — S2-4).
     ///
     /// # Errors
     /// - `E_DEVICE_DESCRIPTOR` — the descriptor targets a different backend
@@ -245,12 +294,14 @@ impl<'host> ProgramSession<'host> {
         let module_handle = runtime.load_module(&descriptor.module_image)?;
         let module_hash = fnv1a64(&descriptor.module_image);
 
-        // Allocate every distinct buffer once. In S2-1 every buffer is
-        // PerProgram; S2-4 will split PerStep / ObservationPoint. A failure
-        // at any allocation runs the error-path teardown first (S2-3
-        // release-on-error): the module and every already-allocated buffer
-        // are released before the error escapes, so a failed creation leaves
-        // `live_handle_count() == 0`.
+        // Allocate every distinct PerProgram buffer once (S2-4): they persist
+        // for the program's lifetime. PerStep and ObservationPoint buffers
+        // are not allocated here — they are allocated at each execution's
+        // start and released at its step boundary / after readback. A
+        // failure at any PerProgram allocation runs the error-path teardown
+        // first (S2-3 release-on-error): the module and every already-
+        // allocated buffer are released before the error escapes, so a
+        // failed creation leaves `live_handle_count() == 0`.
         let mut buffers: BTreeMap<u32, DeviceHandle> = BTreeMap::new();
         let mut buffer_meta: BTreeMap<u32, SessionBufferMeta> = BTreeMap::new();
         let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
@@ -263,8 +314,12 @@ impl<'host> ProgramSession<'host> {
                         .entry(slot.buffer_id)
                         .or_insert(SessionBufferMeta {
                             element_count: slot.element_count,
+                            byte_length: slot.byte_length(),
+                            lifetime: slot.lifetime,
                         });
-                    if !buffers.contains_key(&slot.buffer_id) {
+                    if !buffers.contains_key(&slot.buffer_id)
+                        && slot.lifetime == DeviceBufferLifetime::PerProgram
+                    {
                         let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
                         buffers.insert(slot.buffer_id, handle);
                     }
@@ -302,6 +357,7 @@ impl<'host> ProgramSession<'host> {
             device_name,
             module_handle,
             module_hash,
+            program_lifetime: descriptor.program_lifetime,
             buffers,
             buffer_meta,
             kernels,
@@ -311,8 +367,11 @@ impl<'host> ProgramSession<'host> {
 
     /// Execute the ordered launch sequence once (one step). Reuses the
     /// session's module and PerProgram buffers — does not reload the module
-    /// or re-allocate buffers. Synchronizes at the step boundary before
-    /// reading back declared outputs.
+    /// or re-allocate PerProgram buffers. PerStep buffers are allocated for
+    /// the step and recycled at the step boundary; ObservationPoint buffers
+    /// are allocated, read back at the declared observation point, and
+    /// released (read-then-release — the only readback the session performs,
+    /// S2-4). Synchronizes at the step boundary before reading back.
     ///
     /// **Error-path teardown is designed into this method (S2-3):** a failure
     /// at any stage runs the ordered release (buffers then module) before the
@@ -325,7 +384,8 @@ impl<'host> ProgramSession<'host> {
     /// - `E_DEVICE_SHAPE_MISMATCH` — a declared input is missing or its size
     ///   contradicts the declared element count;
     /// - `E_INVALID_ARGS` — a declared output id was not allocated by the
-    ///   session;
+    ///   session, or the id names a buffer whose lifetime is not
+    ///   ObservationPoint (an undeclared readback fails closed, S2-4);
     /// - session-level failures (copy-in, launch, sync, readback) bubble
     ///   through unchanged.
     pub fn execute(
@@ -351,8 +411,9 @@ impl<'host> ProgramSession<'host> {
     }
 
     /// The executable body of [`ProgramSession::execute`]: the ordered launch
-    /// sequence (copy-in → launch → step-boundary sync → readback) without
-    /// the error-path release, which the caller owns.
+    /// sequence (step-buffer allocation → copy-in → launch → step-boundary
+    /// sync → observation readback + release → per-step release) without the
+    /// error-path release, which the caller owns.
     fn execute_inner(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
@@ -361,9 +422,14 @@ impl<'host> ProgramSession<'host> {
         let mut launch_count = 0usize;
         let mut copy_ins = 0usize;
 
+        // Allocate this step's PerStep + ObservationPoint buffers (S2-4).
+        // PerProgram buffers were allocated once at session creation and
+        // stay live. A failure here runs the error-path teardown (S2-3).
+        self.allocate_step_buffers()?;
+
         for kernel in &self.kernels {
-            // Resolve buffer handles for this kernel's launch (all
-            // pre-allocated at session creation).
+            // Resolve buffer handles for this kernel's launch (PerProgram
+            // live from creation; PerStep/ObservationPoint just allocated).
             let mut launch_buffers: Vec<DeviceHandle> = Vec::with_capacity(kernel.slots.len());
             for slot in &kernel.slots {
                 let handle = self
@@ -423,15 +489,50 @@ impl<'host> ProgramSession<'host> {
         // this barrier makes the step boundary explicit and observable.
         self.runtime.sync()?;
 
-        // Readback declared outputs.
+        // ObservationPoint read-then-release (S2-4): read back the declared
+        // observation buffers, then release each immediately. Only
+        // ObservationPoint buffers are readable — a readback request for any
+        // other lifetime class is an undeclared readback and fails closed.
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
         for output_id in outputs {
-            let handle = self.buffers.get(output_id).copied().ok_or_else(|| {
+            if readbacks.contains_key(output_id) {
+                continue;
+            }
+            let meta = self.buffer_meta.get(output_id).ok_or_else(|| {
                 HostError::invalid_args(format!(
                     "declared output buffer id {output_id} was not allocated by the session"
                 ))
             })?;
-            readbacks.insert(*output_id, self.runtime.readback_f32(&handle)?);
+            if meta.lifetime != DeviceBufferLifetime::ObservationPoint {
+                return Err(HostError::invalid_args(format!(
+                    "declared output buffer id {output_id} has lifetime `{}`; only observation-point buffers are read back (no undeclared readback)",
+                    meta.lifetime.spelling()
+                )));
+            }
+            let handle = self
+                .buffers
+                .get(output_id)
+                .copied()
+                .ok_or_else(|| HostError::internal("session observation buffer disappeared"))?;
+            let values = self.runtime.readback_f32(&handle)?;
+            readbacks.insert(*output_id, values);
+            self.release_buffer(*output_id)?;
+        }
+
+        // Step-boundary recycle (S2-4): PerStep buffers are released at the
+        // step boundary and re-allocated for the next execution.
+        let per_step_ids: Vec<u32> = self
+            .buffers
+            .iter()
+            .filter(|(id, _)| {
+                self.buffer_meta
+                    .get(id)
+                    .is_some_and(|meta| meta.lifetime == DeviceBufferLifetime::PerStep)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in per_step_ids {
+            self.release_buffer(id)?;
         }
 
         Ok(DeviceExecutionReceipt {
@@ -441,8 +542,56 @@ impl<'host> ProgramSession<'host> {
             launches: launch_count,
             copy_ins,
             outputs: readbacks,
-            allocated_buffers: self.buffers.keys().copied().collect(),
+            allocated_buffers: self.allocated_buffers(),
+            program_lifetime: self.program_lifetime,
+            per_program_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerProgram),
+            per_step_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerStep),
+            observation_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::ObservationPoint),
         })
+    }
+
+    /// Allocate this step's PerStep and ObservationPoint buffers (S2-4);
+    /// PerProgram buffers are already live from session creation. Buffer ids
+    /// already live are left untouched (a PerProgram buffer, or a step buffer
+    /// left live by an interrupted path that has not yet run the error path,
+    /// is never double-allocated).
+    fn allocate_step_buffers(&mut self) -> HostResult<()> {
+        let to_allocate: Vec<u32> = self
+            .buffer_meta
+            .iter()
+            .filter(|(id, meta)| {
+                meta.lifetime != DeviceBufferLifetime::PerProgram
+                    && !self.buffers.contains_key(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in to_allocate {
+            let meta = self
+                .buffer_meta
+                .get(&id)
+                .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
+            let handle = self.runtime.alloc_bytes(meta.byte_length as usize)?;
+            self.buffers.insert(id, handle);
+        }
+        Ok(())
+    }
+
+    /// Release one live buffer by id (no-op when the id is not live). Used by
+    /// the read-then-release and step-boundary paths.
+    fn release_buffer(&mut self, id: u32) -> HostResult<()> {
+        if let Some(handle) = self.buffers.remove(&id) {
+            self.runtime.release(&handle)?;
+        }
+        Ok(())
+    }
+
+    /// The program's buffer ids classified by lifetime class (S2-4 receipt).
+    fn buffers_by_lifetime(&self, lifetime: DeviceBufferLifetime) -> Vec<u32> {
+        self.buffer_meta
+            .iter()
+            .filter(|(_, meta)| meta.lifetime == lifetime)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Ordered teardown: release every buffer, then the module. After this
@@ -486,16 +635,22 @@ impl<'host> ProgramSession<'host> {
         }
     }
 
-    /// The program-level buffer ids this session allocated (A9 receipt).
+    /// The program-level buffer ids this session manages (A9 receipt): every
+    /// distinct buffer id the descriptor declares, classified by lifetime.
+    /// PerProgram ids are live for the program's lifetime; PerStep and
+    /// ObservationPoint ids are live only within one execution (S2-4).
     #[must_use]
     pub fn allocated_buffers(&self) -> Vec<u32> {
-        self.buffers.keys().copied().collect()
+        self.buffer_meta.keys().copied().collect()
     }
 
     /// Number of live device handles the session currently holds (module +
-    /// buffers). Used by lifecycle tests to prove no reload/realloc between
-    /// executions and full release at teardown. A session closed by an
-    /// error-path release (S2-3) holds no live handles and reports 0.
+    /// currently-live buffers). Used by lifecycle tests to prove no reload /
+    /// no PerProgram realloc between executions and full release at teardown.
+    /// PerStep and ObservationPoint buffers are released at the step boundary
+    /// / after readback (S2-4), so between executions the session holds the
+    /// module + PerProgram buffers only. A session closed by an error-path
+    /// release (S2-3) holds no live handles and reports 0.
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
         if self.closed {
@@ -698,8 +853,11 @@ impl CompositeHost {
     /// Create a program-scoped session for one device program (S2-1).
     ///
     /// The session owns the module (loaded once) and every PerProgram buffer
-    /// (allocated once); it survives repeated [`ProgramSession::execute`]
-    /// calls on the same session without reloading or re-allocating. Call
+    /// (allocated once at creation, persisting across executions); PerStep
+    /// and ObservationPoint buffers are allocated per execution and recycled
+    /// / read-then-released at each step boundary (S2-4). It survives
+    /// repeated [`ProgramSession::execute`] calls on the same session without
+    /// reloading or re-allocating PerProgram buffers. Call
     /// [`ProgramSession::teardown`] to release every handle in order.
     ///
     /// # Errors

@@ -16,9 +16,10 @@ use faber_host_macos_arm64::composite_host::{
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorKernel, DeviceBufferRole, DeviceDataType,
-    DeviceDescriptor, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR,
-    E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    fnv1a64, DescriptorBuffer, DescriptorKernel, DeviceBufferLifetime, DeviceBufferRole,
+    DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE,
+    E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH,
+    E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
@@ -32,6 +33,18 @@ const MODULE_IMAGE: &[u8] = b"// fake compiler-owned module image";
 
 /// One elementwise-add kernel: `out = a + b` over `count` f32 elements.
 /// Matches the simulated `addita` / `add_one` kernel shape (3 buffers).
+/// The S2-4 lifetime mapping the faber constructor derives from ABI facts:
+/// Input → PerProgram, Output → ObservationPoint, InOut → PerStep. Test
+/// descriptors mirror that mapping so the fake-driver sequencing proves the
+/// constructor-derived payload path.
+fn lifetime_for_role(role: DeviceBufferRole) -> DeviceBufferLifetime {
+    match role {
+        DeviceBufferRole::Input => DeviceBufferLifetime::PerProgram,
+        DeviceBufferRole::Output => DeviceBufferLifetime::ObservationPoint,
+        DeviceBufferRole::InOut => DeviceBufferLifetime::PerStep,
+    }
+}
+
 fn add_slot(
     id: u32,
     name: &str,
@@ -43,6 +56,7 @@ fn add_slot(
         buffer_id: id,
         buffer_name: name.to_owned(),
         role,
+        lifetime: lifetime_for_role(role),
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
@@ -63,6 +77,7 @@ fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -
             grid: [1, 1, 1],
             block: [count as u32, 1, 1],
         }],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     }
 }
 
@@ -151,6 +166,7 @@ fn two_kernel_inout_descriptor() -> DeviceDescriptor {
                 block: [2, 1, 1],
             },
         ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     }
 }
 
@@ -334,6 +350,7 @@ fn inout_buffer_stays_device_resident_across_kernels() {
                 block: [2, 1, 1],
             },
         ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     };
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -461,6 +478,7 @@ fn conflicting_buffer_roles_fail_as_abi_mismatch() {
                 block: [2, 1, 1],
             },
         ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     };
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
@@ -530,6 +548,7 @@ fn conflicting_shapes_fail_as_shape_mismatch() {
                 block: [4, 1, 1],
             },
         ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     };
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
@@ -622,36 +641,41 @@ fn cross_backend_handle_use_fails_closed() {
 // S2-1: program session sequencing (create → run → run again → teardown)
 // ---------------------------------------------------------------------------
 
-/// The session loads the module once and allocates every buffer once at
-/// creation; repeated `execute` calls on the same session do NOT reload the
-/// module or re-allocate buffers; teardown releases every handle.
+/// The session loads the module once and allocates every PerProgram buffer
+/// once at creation; repeated `execute` calls on the same session do NOT
+/// reload the module or re-allocate PerProgram buffers; the ObservationPoint
+/// output is allocated per execution, read back, and released (S2-4);
+/// teardown releases every handle.
 #[test]
 fn program_session_executes_repeatedly_without_reload_or_realloc() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
 
-    // Create: module loaded once (1) + 3 PerProgram buffers allocated = 4 handles.
+    // Create: module loaded once (1) + 2 PerProgram buffers (a, b) = 3
+    // handles. The ObservationPoint output is NOT allocated at creation — it
+    // is allocated per execution and read-then-released (S2-4).
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    assert_eq!(session.session_handle_count(), 4);
+    assert_eq!(session.session_handle_count(), 3);
     assert_eq!(session.module_hash(), fnv1a64(MODULE_IMAGE));
     assert_eq!(session.allocated_buffers(), vec![1, 2, 3]);
 
-    // Execute 1: no new handles (module + buffers reused).
+    // Execute 1: no new persistent handles (module + PerProgram reused; the
+    // observation buffer is allocated, read back, released).
     let receipt1 = session.execute(&inputs, &[3]).expect("execute 1");
     assert_eq!(receipt1.launches, 1);
     assert_eq!(receipt1.copy_ins, 2);
     assert_eq!(receipt1.outputs.get(&3), Some(&vec![4.0, 6.0]));
-    assert_eq!(session.session_handle_count(), 4); // unchanged
+    assert_eq!(session.session_handle_count(), 3); // unchanged
 
-    // Execute 2 on the SAME session: no reload, no realloc.
+    // Execute 2 on the SAME session: no reload, no PerProgram realloc.
     let receipt2 = session
         .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]), &[3])
         .expect("execute 2");
     assert_eq!(receipt2.outputs.get(&3), Some(&vec![40.0, 60.0]));
-    assert_eq!(session.session_handle_count(), 4); // still unchanged
+    assert_eq!(session.session_handle_count(), 3); // still unchanged
 
     // Teardown: ordered release (buffers then module); every handle gone.
     session.teardown().expect("teardown");
@@ -668,19 +692,19 @@ fn program_session_repeated_execution_cuda() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    assert_eq!(session.session_handle_count(), 4); // module + 3 buffers
+    assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
 
     let r1 = session
         .execute(&add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]), &[3])
         .expect("execute 1");
     assert_eq!(r1.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
-    assert_eq!(session.session_handle_count(), 4);
+    assert_eq!(session.session_handle_count(), 3);
 
     let r2 = session
         .execute(&add_inputs(vec![10.0, 20.0, 30.0], vec![1.0, 2.0, 3.0]), &[3])
         .expect("execute 2");
     assert_eq!(r2.outputs.get(&3), Some(&vec![11.0, 22.0, 33.0]));
-    assert_eq!(session.session_handle_count(), 4);
+    assert_eq!(session.session_handle_count(), 3);
 
     session.teardown().expect("teardown");
     assert_eq!(
@@ -720,6 +744,7 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
                 block: [2, 1, 1],
             },
         ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
     };
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -729,20 +754,23 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    // Module + 5 distinct buffers (ids 1-5).
-    assert_eq!(session.session_handle_count(), 6);
+    // Module + 3 PerProgram buffers (ids 1, 2, 4). The InOut intermediate
+    // (id 3, PerStep) and the ObservationPoint output (id 5) are allocated
+    // per execution and released at the step boundary (S2-4).
+    assert_eq!(session.session_handle_count(), 4);
     assert_eq!(session.allocated_buffers(), vec![1, 2, 3, 4, 5]);
 
     let receipt = session.execute(&inputs, &[5]).expect("execute");
     assert_eq!(receipt.launches, 2);
     assert_eq!(receipt.copy_ins, 3); // only Input slots (a, b, c)
     assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
-    assert_eq!(session.session_handle_count(), 6); // no realloc
+    assert_eq!(session.session_handle_count(), 4); // per-step + observation released
 
-    // Second step: same session, same buffers.
+    // Second step: same session, same PerProgram buffers, fresh per-step /
+    // observation allocations (recycled at the step boundary).
     let receipt2 = session.execute(&inputs, &[5]).expect("execute 2");
     assert_eq!(receipt2.outputs.get(&5), Some(&vec![14.0, 16.0]));
-    assert_eq!(session.session_handle_count(), 6);
+    assert_eq!(session.session_handle_count(), 4);
 
     session.teardown().expect("teardown");
     assert_eq!(
@@ -813,7 +841,11 @@ fn program_session_creation_validates_descriptor_before_launch() {
 /// repeated executions; teardown releases it exactly once (module release =
 /// 1); nothing persists past teardown (loads == releases, live handles == 0).
 /// This is the S2-2 leak-free bar: repeated execution does not leak — not
-/// "module persists across steps".
+/// "module persists across steps". With the S2-4 lifetime policy the two
+/// PerProgram input buffers are allocated once at creation while the
+/// ObservationPoint output is allocated/read/released per execution, so the
+/// buffer counters climb exactly one alloc + one release per execution and
+/// still return to balance at teardown.
 #[test]
 fn module_cache_loads_once_and_releases_on_teardown() {
     let mut host = metal_composite("add_one").expect("metal composite");
@@ -824,37 +856,42 @@ fn module_cache_loads_once_and_releases_on_teardown() {
         .create_program_session(&descriptor)
         .expect("session create");
 
-    // Session creation loaded the module once (plus one alloc per buffer).
+    // Session creation loaded the module once and allocated the two PerProgram
+    // inputs (a, b); the ObservationPoint output is allocated per execution.
     let counters = session.driver_counters();
     assert_eq!(counters.module_loads, 1);
-    assert_eq!(counters.buffer_allocs, 3);
+    assert_eq!(counters.buffer_allocs, 2);
     // One live module: loaded, not yet released — the only persistence the
     // policy allows is the session keeping the module alive for the program.
     assert_eq!(counters.module_loads - counters.module_releases, 1);
 
-    // N repeated executions: still one load, no reload, no re-alloc.
-    for _ in 0..5 {
+    // N repeated executions: still one load, no reload; each execution
+    // allocates the ObservationPoint output, reads it back, and releases it
+    // (read-then-release, S2-4) — exactly one alloc + one release per run.
+    for step in 0..5usize {
         let receipt = session.execute(&inputs, &[3]).expect("execute");
         assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
         let counters = session.driver_counters();
         assert_eq!(counters.module_loads, 1);
-        assert_eq!(counters.buffer_allocs, 3);
+        assert_eq!(counters.buffer_allocs, 2 + step + 1);
+        assert_eq!(counters.buffer_releases, step + 1);
     }
 
-    // Teardown releases the module exactly once; buffers released too.
+    // Teardown releases the module exactly once and the PerProgram buffers.
     session.teardown().expect("teardown");
     let counters = host.device().expect("device").driver_counters();
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.module_releases, 1);
-    assert_eq!(counters.buffer_allocs, 3);
-    assert_eq!(counters.buffer_releases, 3);
+    assert_eq!(counters.buffer_allocs, 2 + 5);
+    assert_eq!(counters.buffer_releases, 2 + 5);
     // Nothing persists past teardown: no live module, no live handles.
     assert_eq!(counters.module_loads, counters.module_releases);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 /// The same leak-free bar on CUDA (backend-neutral surface): one module
-/// load, one release, no module persists past teardown.
+/// load, one release, no module persists past teardown; the ObservationPoint
+/// output is read-then-released per execution.
 #[test]
 fn module_cache_loads_once_and_releases_on_teardown_cuda() {
     let mut host = cuda_composite("addita").expect("cuda composite");
@@ -865,11 +902,15 @@ fn module_cache_loads_once_and_releases_on_teardown_cuda() {
         .create_program_session(&descriptor)
         .expect("session create");
     assert_eq!(session.driver_counters().module_loads, 1);
+    assert_eq!(session.driver_counters().buffer_allocs, 2);
 
-    for _ in 0..5 {
+    for step in 0..5usize {
         let receipt = session.execute(&inputs, &[3]).expect("execute");
         assert_eq!(receipt.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
-        assert_eq!(session.driver_counters().module_loads, 1);
+        let counters = session.driver_counters();
+        assert_eq!(counters.module_loads, 1);
+        assert_eq!(counters.buffer_allocs, 2 + step + 1);
+        assert_eq!(counters.buffer_releases, step + 1);
     }
 
     session.teardown().expect("teardown");
@@ -877,6 +918,8 @@ fn module_cache_loads_once_and_releases_on_teardown_cuda() {
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.module_releases, 1);
     assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(counters.buffer_allocs, 2 + 5);
+    assert_eq!(counters.buffer_releases, 2 + 5);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
@@ -1170,7 +1213,7 @@ fn failed_execution_closes_session_and_blocks_reuse() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    assert_eq!(session.session_handle_count(), 4); // module + 3 buffers
+    assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
 
     let err = session
         .execute(&inputs, &[3])
@@ -1190,5 +1233,208 @@ fn failed_execution_closes_session_and_blocks_reuse() {
     // Teardown of an already-closed session is a safe no-op (no double
     // release).
     session.teardown().expect("teardown of closed session");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S2-4: BufferLifetime host-interpretation (council 3)
+// ---------------------------------------------------------------------------
+
+/// The two-lifetime fixture from the S2-4 done-when: a PerProgram input is
+/// allocated once at session creation and persists across executions (no
+/// realloc), while an ObservationPoint output is allocated, read back, and
+/// released on every execution (read-then-release). The fake-driver counters
+/// make the lifetime-distinct allocation/release events observable.
+#[test]
+fn per_program_persists_while_observation_read_then_releases() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Creation allocates only the two PerProgram inputs; the observation
+    // output (id 3) is not allocated until an execution.
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 2);
+
+    // Execute 1: observation buffer allocated (allocs 3), read back, released
+    // (releases 1). PerProgram inputs stay live; no realloc.
+    let receipt = session.execute(&inputs, &[3]).expect("execute 1");
+    assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
+    assert_eq!(receipt.per_program_buffers, vec![1, 2]);
+    assert_eq!(receipt.observation_buffers, vec![3]);
+    assert!(receipt.per_step_buffers.is_empty());
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 3);
+    assert_eq!(counters.buffer_releases, 1);
+    assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
+
+    // Execute 2: the observation buffer is re-allocated, read back, released
+    // again; the PerProgram inputs were never re-allocated (allocs stay 4).
+    let receipt2 = session
+        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]), &[3])
+        .expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&3), Some(&vec![40.0, 60.0]));
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 4);
+    assert_eq!(counters.buffer_releases, 2);
+
+    // Teardown releases the PerProgram inputs; balance returns to zero.
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.buffer_allocs, 4);
+    assert_eq!(counters.buffer_releases, 4);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// PerStep buffers are recycled at the step boundary: allocated per
+/// execution, released at the end of each execution (so a second execution
+/// re-allocates them), and never persist past teardown. The InOut
+/// intermediate (id 3) of the two-kernel chain is the PerStep buffer.
+#[test]
+fn per_step_buffers_recycle_at_step_boundary() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = two_kernel_inout_descriptor();
+    let inputs = two_kernel_inputs();
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Creation allocates the three PerProgram inputs (ids 1, 2, 4).
+    assert_eq!(session.driver_counters().buffer_allocs, 3);
+    assert_eq!(session.session_handle_count(), 4); // module + 3 PerProgram
+
+    // Execute 1 allocates the PerStep intermediate (id 3) and the
+    // ObservationPoint output (id 5), then releases both at the step
+    // boundary / after readback: allocs 3 → 5, releases 0 → 2.
+    let receipt = session.execute(&inputs, &[5]).expect("execute 1");
+    assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
+    assert_eq!(receipt.per_program_buffers, vec![1, 2, 4]);
+    assert_eq!(receipt.per_step_buffers, vec![3]);
+    assert_eq!(receipt.observation_buffers, vec![5]);
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 5);
+    assert_eq!(counters.buffer_releases, 2);
+
+    // Execute 2: the PerStep intermediate and the observation output are
+    // allocated fresh and released again — recycled at each step boundary.
+    let receipt2 = session.execute(&inputs, &[5]).expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&5), Some(&vec![14.0, 16.0]));
+    let counters = session.driver_counters();
+    assert_eq!(counters.buffer_allocs, 7);
+    assert_eq!(counters.buffer_releases, 4);
+
+    // Teardown releases the three PerProgram inputs; every allocation is
+    // released (no leak) and the PerStep pool is gone.
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.buffer_allocs, 7);
+    assert_eq!(counters.buffer_releases, 7);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The A9 receipt reflects the lifetime policy: per-buffer lifetime class
+/// sets and the program-level lifetime regime (S2-4 done-when).
+#[test]
+fn receipt_reports_lifetime_classes_and_program_lifetime() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = two_kernel_inout_descriptor();
+    descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let receipt = session
+        .execute(&two_kernel_inputs(), &[5])
+        .expect("execute");
+    assert_eq!(
+        receipt.program_lifetime,
+        DeviceProgramLifetime::RepeatingStep,
+        "the program regime is carried on the descriptor and consumed into the receipt"
+    );
+    assert_eq!(receipt.per_program_buffers, vec![1, 2, 4]);
+    assert_eq!(receipt.per_step_buffers, vec![3]);
+    assert_eq!(receipt.observation_buffers, vec![5]);
+    assert_eq!(
+        receipt.allocated_buffers,
+        vec![1, 2, 3, 4, 5],
+        "allocated_buffers is the union of the three lifetime classes"
+    );
+    session.teardown().expect("teardown");
+}
+
+/// ObservationPoint is the only readback: requesting a readback of a
+/// PerProgram buffer is an undeclared readback and fails closed with
+/// `E_INVALID_ARGS` before any copy-out, releasing every handle (S2-3).
+#[test]
+fn non_observation_readback_fails_closed() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Buffer 1 is a PerProgram input; reading it back is not a declared
+    // observation point and must fail closed.
+    let err = session
+        .execute(&inputs, &[1])
+        .expect_err("reading back a PerProgram buffer is an undeclared readback");
+    assert_eq!(err.code, "E_INVALID_ARGS");
+    assert!(err.message.contains("observation-point"));
+    // The failed execution released every handle (S2-3 release-on-error).
+    assert_eq!(session.session_handle_count(), 0);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// A buffer's lifetime is an identity fact: two kernels referencing the same
+/// buffer id with different lifetimes is a descriptor conflict that fails
+/// before launch (E_DEVICE_ABI_MISMATCH), matching the radix schema's
+/// BufferIdentityConflict on lifetime.
+#[test]
+fn conflicting_buffer_lifetimes_fail_as_abi_mismatch() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    // Relabel buffer id 3 (the observation output) as PerProgram in the
+    // second reference — no, a single-kernel descriptor has one reference;
+    // add a second kernel referencing id 3 with a different lifetime.
+    descriptor.kernels.push(DescriptorKernel {
+        entry: "add_one".to_owned(),
+        buffers: vec![
+            add_slot(3, "out", DeviceBufferRole::Output, 0, 2),
+            add_slot(4, "c", DeviceBufferRole::Input, 1, 2),
+            add_slot(5, "d", DeviceBufferRole::Input, 2, 2),
+        ],
+        grid: [1, 1, 1],
+        block: [2, 1, 1],
+    });
+    descriptor.kernels[1].buffers[0].lifetime = DeviceBufferLifetime::PerProgram;
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("conflicting lifetimes must fail before launch");
+    assert_eq!(err.code, E_DEVICE_ABI_MISMATCH);
+    assert!(err.message.contains("lifetimes"));
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// A failure while allocating a PerStep buffer (a new allocation point
+/// introduced by S2-4) leaves live_handle_count() == 0 — the S2-3 error-path
+/// teardown covers the per-step allocation stage too.
+#[test]
+fn per_step_allocation_failure_releases_every_handle() {
+    // Creation allocates PerProgram ids 1, 2, 4 (alloc calls 1-3); the first
+    // per-step allocation (id 3) is alloc call 4.
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Alloc, 4)
+        .expect("metal composite");
+    let descriptor = two_kernel_inout_descriptor();
+    let err = host
+        .create_program_session(&descriptor)
+        .expect("session create")
+        .execute(&two_kernel_inputs(), &[5])
+        .expect_err("injected per-step allocation failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }

@@ -125,12 +125,61 @@ impl DeviceBufferRole {
     }
 }
 
+/// How long a buffer's storage lives in the device program (S2-4).
+///
+/// Mirrors the radix S1-1 [`BufferLifetime`]: **per-program** buffers are
+/// allocated once at session creation and released at program end;
+/// **per-step** buffers are live within one step and recycled at the step
+/// boundary; an **observation point** buffer is read back at a declared
+/// observation point and then released (read-then-release). The host session
+/// consumes these typed facts — it never derives a lifetime from slot role
+/// alone (that would be coincidence, council 3).
+///
+/// [`BufferLifetime`]: https://docs.rs/radix-mir/latest/radix_mir/device_program/enum.BufferLifetime.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceBufferLifetime {
+    /// Allocated once for the whole program; persists across executions.
+    PerProgram,
+    /// Live within one step; recycled at the step boundary.
+    PerStep,
+    /// Read back at a declared observation point; read-then-release.
+    ObservationPoint,
+}
+
+impl DeviceBufferLifetime {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Self::PerProgram => "per-program",
+            Self::PerStep => "per-step",
+            Self::ObservationPoint => "observation-point",
+        }
+    }
+}
+
+/// Program execution-lifetime regime (S2-4), mirroring the radix S1-1
+/// [`DeviceProgramLifetime`]: whether the program runs once (a one-shot-with-
+/// repeat surface for the leak proof) or repeats as a training step (when
+/// per-step recycling between executions becomes meaningful).
+///
+/// [`DeviceProgramLifetime`]: https://docs.rs/radix-mir/latest/radix_mir/device_program/enum.DeviceProgramLifetime.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DeviceProgramLifetime {
+    /// One-shot program run.
+    #[default]
+    SingleRun,
+    /// Repeating training step; per-step buffers recycle between iterations.
+    RepeatingStep,
+}
+
 /// One typed buffer slot of a kernel.
 ///
 /// `buffer_id`/`buffer_name` are the program-level buffer identity repeated
 /// across kernels; validation requires every reference to the same id to
-/// agree on dtype and shape (a shape change must be a new version — the S1-1
-/// contract; hosts reject in-place reinterpretation at the descriptor).
+/// agree on dtype, shape (a shape change must be a new version — the S1-1
+/// contract; hosts reject in-place reinterpretation at the descriptor), and
+/// lifetime (a lifetime is an identity fact, not a per-slot choice).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorBuffer {
     /// Program-level buffer identity key.
@@ -139,6 +188,9 @@ pub struct DescriptorBuffer {
     pub buffer_name: String,
     /// Slot role at this kernel.
     pub role: DeviceBufferRole,
+    /// How long this buffer's storage lives (S2-4; consumed by the session's
+    /// lifetime-distinct allocation/release policy).
+    pub lifetime: DeviceBufferLifetime,
     /// Target-neutral binding index (backends map it to their binding syntax).
     pub binding: u32,
     /// Element type of this buffer version.
@@ -169,8 +221,9 @@ pub struct DescriptorKernel {
 }
 
 /// Typed runtime device descriptor: the host's contract for one device
-/// program (module image + ordered kernels). The faber package layer maps the
-/// canonical S1-1 payload onto this shape; hosts validate it before launch.
+/// program (module image + ordered kernels + program lifetime). The faber
+/// package layer maps the canonical S1-1 payload onto this shape; hosts
+/// validate it before launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDescriptor {
     /// Backend the descriptor targets.
@@ -179,6 +232,10 @@ pub struct DeviceDescriptor {
     pub module_image: Vec<u8>,
     /// Ordered kernel declarations.
     pub kernels: Vec<DescriptorKernel>,
+    /// Program execution-lifetime regime (S2-4): the session consumes it as
+    /// the declared program fact (single-run one-shot-with-repeat surface for
+    /// the leak proof vs a repeating training step).
+    pub program_lifetime: DeviceProgramLifetime,
 }
 
 /// FNV-1a 64-bit provenance hash (the campaign's per-blob provenance
@@ -209,7 +266,11 @@ impl DeviceDescriptor {
     /// 3. cross-reference dtype/shape consistency: every reference to the
     ///    same buffer id carries the same element type (`E_DEVICE_DTYPE_MISMATCH`)
     ///    and the same element count (`E_DEVICE_SHAPE_MISMATCH`) — a shape
-    ///    change must be a new version, never an in-place reinterpretation.
+    ///    change must be a new version, never an in-place reinterpretation;
+    /// 4. cross-reference lifetime consistency (S2-4): every reference to the
+    ///    same buffer id carries the same [`DeviceBufferLifetime`] — a
+    ///    lifetime is an identity fact of the buffer, not a per-slot choice
+    ///    (`E_DEVICE_ABI_MISMATCH`).
     ///
     /// # Errors
     /// Returns the first typed [`HostError`] the descriptor violates.
@@ -225,6 +286,7 @@ impl DeviceDescriptor {
 
         let mut identities: Vec<(u32, String, DeviceBufferRole)> = Vec::new();
         let mut shapes: Vec<(u32, DeviceDataType, u64)> = Vec::new();
+        let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
 
         for kernel in &self.kernels {
             if kernel.entry.trim().is_empty() {
@@ -306,6 +368,25 @@ impl DeviceDescriptor {
                     }
                 } else {
                     shapes.push((slot.buffer_id, slot.element_ty, slot.element_count));
+                }
+
+                // S2-4: a lifetime is a buffer identity fact; two references
+                // to the same id must agree on it (the session's per-class
+                // allocation/release policy is driven by this single fact).
+                if let Some((_, first_lifetime)) =
+                    lifetimes.iter().find(|(id, _)| *id == slot.buffer_id)
+                {
+                    if *first_lifetime != slot.lifetime {
+                        return Err(abi_error(format!(
+                            "device buffer `{}` (id {}) is referenced with conflicting lifetimes {} and {}",
+                            slot.buffer_name,
+                            slot.buffer_id,
+                            first_lifetime.spelling(),
+                            slot.lifetime.spelling()
+                        )));
+                    }
+                } else {
+                    lifetimes.push((slot.buffer_id, slot.lifetime));
                 }
             }
         }
