@@ -12,6 +12,7 @@
 use faber::device::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
 use crate::cuda_host::{CudaHandleId, CudaHostSession};
+use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 use crate::metal_host::{MetalHandleId, MetalHostSession};
 
@@ -54,6 +55,18 @@ impl DeviceRuntime {
         match self {
             Self::Metal(session) => session.live_handle_count(),
             Self::Cuda(session) => session.live_handle_count(),
+        }
+    }
+
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
+    /// fake drivers track cumulative module loads/releases and buffer
+    /// allocs/releases so session tests prove the policy at the driver
+    /// boundary; the real drivers report all-zero (S2-8 real-device gate).
+    #[must_use]
+    pub fn driver_counters(&self) -> DriverCounters {
+        match self {
+            Self::Metal(session) => session.driver_counters(),
+            Self::Cuda(session) => session.driver_counters(),
         }
     }
 }

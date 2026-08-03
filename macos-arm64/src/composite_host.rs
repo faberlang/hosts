@@ -53,6 +53,7 @@ use crate::device_descriptor::{
     errors as descriptor_errors, fnv1a64, DeviceBufferRole, DeviceDescriptor, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{DeviceRuntime, DeviceSession};
+use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostKernel, HostResult};
 use crate::manifest::CapabilityManifest;
 use crate::Frame;
@@ -167,6 +168,18 @@ struct SessionBufferMeta {
 ///
 /// The S1-4 [`CompositeHost::execute_descriptor`] surface is a single-run
 /// convenience over this session (create → execute → teardown).
+///
+/// # Module cache policy (S2-2)
+///
+/// The session owns the module: it is loaded exactly once per program
+/// (keyed by its FNV-1a provenance hash, [`ProgramSession::module_hash`]),
+/// reused by every [`ProgramSession::execute`] call, and released at
+/// [`ProgramSession::teardown`]. There is no global or LRU cache and no
+/// cross-process persistence — a second session re-loads the same image
+/// independently. The testable bar is "repeated execution does not leak",
+/// proven with the fake drivers' lifecycle counters (module load = 1, module
+/// release = 1, nothing persists past teardown) — NOT "module persists
+/// across steps".
 pub struct ProgramSession<'host> {
     runtime: &'host mut DeviceRuntime,
     backend: DeviceBackend,
@@ -211,8 +224,11 @@ impl<'host> ProgramSession<'host> {
         }
         descriptor.validate()?;
 
-        // Load the module once (session-scoped ownership; S2-2 formalizes
-        // the cache policy around this single load).
+        // Load the module once (session-scoped ownership). The module-cache
+        // policy (S2-2): loaded once per program keyed by its provenance
+        // hash, reused by every execution, released at teardown — repeated
+        // execution does not leak, and there is no cross-session or
+        // cross-process cache.
         let module_handle = runtime.load_module(&descriptor.module_image)?;
         let module_hash = fnv1a64(&descriptor.module_image);
 
@@ -398,6 +414,16 @@ impl<'host> ProgramSession<'host> {
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
         self.buffers.len() + 1 // buffers + module
+    }
+
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
+    /// fake drivers track cumulative module loads/releases and buffer
+    /// allocs/releases so session tests prove the cache policy at the driver
+    /// boundary: one load per program, one release at teardown, nothing
+    /// persists past teardown.
+    #[must_use]
+    pub fn driver_counters(&self) -> DriverCounters {
+        self.runtime.driver_counters()
     }
 
     /// The backend this session speaks for.

@@ -715,3 +715,139 @@ fn program_session_creation_validates_descriptor_before_launch() {
         .expect("empty kernels must fail before session creation");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
+
+// ---------------------------------------------------------------------------
+// S2-2: module cache at the leak-free bar (council 2)
+// ---------------------------------------------------------------------------
+
+/// The session loads the module exactly once (module load = 1) even across N
+/// repeated executions; teardown releases it exactly once (module release =
+/// 1); nothing persists past teardown (loads == releases, live handles == 0).
+/// This is the S2-2 leak-free bar: repeated execution does not leak — not
+/// "module persists across steps".
+#[test]
+fn module_cache_loads_once_and_releases_on_teardown() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+
+    // Session creation loaded the module once (plus one alloc per buffer).
+    let counters = session.driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.buffer_allocs, 3);
+    // One live module: loaded, not yet released — the only persistence the
+    // policy allows is the session keeping the module alive for the program.
+    assert_eq!(counters.module_loads - counters.module_releases, 1);
+
+    // N repeated executions: still one load, no reload, no re-alloc.
+    for _ in 0..5 {
+        let receipt = session.execute(&inputs, &[3]).expect("execute");
+        assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
+        let counters = session.driver_counters();
+        assert_eq!(counters.module_loads, 1);
+        assert_eq!(counters.buffer_allocs, 3);
+    }
+
+    // Teardown releases the module exactly once; buffers released too.
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.buffer_allocs, 3);
+    assert_eq!(counters.buffer_releases, 3);
+    // Nothing persists past teardown: no live module, no live handles.
+    assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The same leak-free bar on CUDA (backend-neutral surface): one module
+/// load, one release, no module persists past teardown.
+#[test]
+fn module_cache_loads_once_and_releases_on_teardown_cuda() {
+    let mut host = cuda_composite("addita").expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let inputs = add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.driver_counters().module_loads, 1);
+
+    for _ in 0..5 {
+        let receipt = session.execute(&inputs, &[3]).expect("execute");
+        assert_eq!(receipt.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
+        assert_eq!(session.driver_counters().module_loads, 1);
+    }
+
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// A second program session re-loads the module independently: there is no
+/// cross-session cache, so the same provenance-hash image is loaded again by
+/// session 2 (module load = 2) and released again at its teardown (module
+/// release = 2). No module persists past either teardown.
+#[test]
+fn second_session_reloads_module_independently() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    // Session 1: load once, execute, teardown releases.
+    let mut session1 = host
+        .create_program_session(&descriptor)
+        .expect("session 1 create");
+    assert_eq!(session1.module_hash(), fnv1a64(MODULE_IMAGE));
+    assert_eq!(session1.driver_counters().module_loads, 1);
+    session1.execute(&inputs, &[3]).expect("session 1 execute");
+    assert_eq!(session1.driver_counters().module_loads, 1);
+    session1.teardown().expect("session 1 teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+
+    // Session 2 on the same host, same image hash: re-loads independently.
+    let mut session2 = host
+        .create_program_session(&descriptor)
+        .expect("session 2 create");
+    assert_eq!(session2.module_hash(), fnv1a64(MODULE_IMAGE));
+    assert_eq!(session2.driver_counters().module_loads, 2);
+    session2.execute(&inputs, &[3]).expect("session 2 execute");
+    assert_eq!(session2.driver_counters().module_loads, 2);
+    session2.teardown().expect("session 2 teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 2);
+    assert_eq!(counters.module_releases, 2);
+    assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The S1-4 single-run convenience (`execute_descriptor`) also hits the
+/// leak-free bar: one load, one release, nothing persists.
+#[test]
+fn execute_descriptor_single_run_releases_module() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    host.execute_descriptor(
+        &descriptor,
+        &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+        &[3],
+    )
+    .expect("execute_descriptor");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.buffer_allocs, 3);
+    assert_eq!(counters.buffer_releases, 3);
+    assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}

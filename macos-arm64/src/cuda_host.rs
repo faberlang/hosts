@@ -15,7 +15,7 @@ use std::process::Command;
 use faber::Valor;
 use serde::{Deserialize, Serialize};
 
-use crate::device_registry::HandleRegistry;
+use crate::device_registry::{DriverCounters, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
 
@@ -123,6 +123,13 @@ pub trait CudaDriver: Send {
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
     fn free(&mut self, token: u64) -> HostResult<()>;
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). Real
+    /// drivers report all-zero (their leak evidence is the S2-8 real-device
+    /// gate); the fake drivers track cumulative loads/releases so tests can
+    /// prove the cache policy at the driver boundary.
+    fn counters(&self) -> DriverCounters {
+        DriverCounters::default()
+    }
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
@@ -173,6 +180,15 @@ impl CudaHostSession {
     #[must_use]
     pub fn live_handle_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
+    /// fake drivers track cumulative module loads/releases and buffer
+    /// allocs/releases so session tests prove the policy at the driver
+    /// boundary; the real drivers report all-zero (S2-8 real-device gate).
+    #[must_use]
+    pub fn driver_counters(&self) -> DriverCounters {
+        self.driver.counters()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<CudaHandleId> {
@@ -874,6 +890,14 @@ pub struct FakeCudaDriver {
     /// `E_DEVICE_ENTRY_MISMATCH`, mirroring `cuModuleGetFunction` on the real
     /// lane.
     known_entries: Vec<String>,
+    /// Cumulative module loads (S2-2 module-cache leak bar).
+    module_loads: usize,
+    /// Cumulative module releases.
+    module_releases: usize,
+    /// Cumulative buffer allocations.
+    buffer_allocs: usize,
+    /// Cumulative buffer releases.
+    buffer_releases: usize,
 }
 
 impl FakeCudaDriver {
@@ -961,6 +985,7 @@ impl CudaDriver for FakeCudaDriver {
     }
 
     fn load_module(&mut self, image: &[u8]) -> HostResult<u64> {
+        self.module_loads += 1;
         let token = self.next_token;
         self.next_token += 1;
         self.modules.insert(token, image.to_vec());
@@ -968,6 +993,7 @@ impl CudaDriver for FakeCudaDriver {
     }
 
     fn alloc(&mut self, len_bytes: usize) -> HostResult<u64> {
+        self.buffer_allocs += 1;
         let token = self.next_token;
         self.next_token += 1;
         self.buffers.insert(token, vec![0; len_bytes]);
@@ -1054,9 +1080,21 @@ impl CudaDriver for FakeCudaDriver {
     }
 
     fn free(&mut self, token: u64) -> HostResult<()> {
-        self.buffers.remove(&token);
-        self.modules.remove(&token);
+        if self.buffers.remove(&token).is_some() {
+            self.buffer_releases += 1;
+        } else if self.modules.remove(&token).is_some() {
+            self.module_releases += 1;
+        }
         Ok(())
+    }
+
+    fn counters(&self) -> DriverCounters {
+        DriverCounters {
+            module_loads: self.module_loads,
+            module_releases: self.module_releases,
+            buffer_allocs: self.buffer_allocs,
+            buffer_releases: self.buffer_releases,
+        }
     }
 }
 
