@@ -766,7 +766,9 @@ const CUDA_SUCCESS: i32 = 0;
 
 /// `CUresult` for a symbol/entry not found (`CUDA_ERROR_NOT_FOUND`): the
 /// real-driver signal for an unknown kernel entry (`cuModuleGetFunction`).
-const CUDA_ERROR_NOT_FOUND: i32 = 303;
+/// Value 500 is the CUDA 12+ renumbering (verified against the CUDA 13.2
+/// toolkit header on pharos: `/usr/local/cuda-13.2/include/cuda.h:2972`).
+const CUDA_ERROR_NOT_FOUND: i32 = 500;
 
 /// Raw CUDA Driver API symbol table, resolved once at load time.
 ///
