@@ -797,16 +797,23 @@ impl MetalDriver for SystemMetalDriver {
         block_z: u32,
     ) -> HostResult<()> {
         // A module is compiled for exactly one kernel entry; an unknown entry
-        // name fails closed (mirroring cuModuleGetFunction on the CUDA lane).
+        // name fails closed with the typed E_DEVICE_ENTRY_MISMATCH (S1-4 audit
+        // P2-2: the real-driver adapter reports the same stable code the fake
+        // driver enforces, so entry mismatches never surface as a generic
+        // driver failure).
         let module_record = self
             .modules
             .get(&module)
             .ok_or_else(|| metal_driver("launch: unknown module token"))?;
         if entry != module_record.entry.as_bytes() {
-            return Err(metal_driver(format!(
-                "launch: module has no entry named {}",
-                String::from_utf8_lossy(entry)
-            )));
+            return Err(HostError {
+                code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
+                message: format!(
+                    "launch: module has no entry named {}",
+                    String::from_utf8_lossy(entry)
+                ),
+                retryable: false,
+            });
         }
         if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0
         {

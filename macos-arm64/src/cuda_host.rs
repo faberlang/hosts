@@ -639,10 +639,24 @@ impl CudaDriver for SystemCudaDriver {
             )
         };
         if result != CUDA_SUCCESS {
-            return Err(cuda_driver(format!(
-                "cuModuleGetFunction({}) failed with CUDA result {result}",
-                String::from_utf8_lossy(entry)
-            )));
+            // S1-4 audit P2-2: the real-driver adapter maps an unknown-entry
+            // launch failure to the typed E_DEVICE_ENTRY_MISMATCH (the same
+            // code the fake driver enforces), so host callers and the
+            // composite host's fail-before-launch surface see one stable
+            // spelling for entry mismatches on every driver lane.
+            let code = if result == CUDA_ERROR_NOT_FOUND {
+                crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned()
+            } else {
+                E_CUDA_DRIVER.to_owned()
+            };
+            return Err(HostError {
+                code,
+                message: format!(
+                    "cuModuleGetFunction({}) failed with CUDA result {result}",
+                    String::from_utf8_lossy(entry)
+                ),
+                retryable: false,
+            });
         }
         // kernelParams is a `void**` array whose entries point at each
         // parameter value. Both the array and the `Vec<u64>` device-pointer
@@ -749,6 +763,10 @@ impl SystemCudaDriver {
 
 /// `CUresult` success code (`cudaError_t`); any non-zero value is an error.
 const CUDA_SUCCESS: i32 = 0;
+
+/// `CUresult` for a symbol/entry not found (`CUDA_ERROR_NOT_FOUND`): the
+/// real-driver signal for an unknown kernel entry (`cuModuleGetFunction`).
+const CUDA_ERROR_NOT_FOUND: i32 = 303;
 
 /// Raw CUDA Driver API symbol table, resolved once at load time.
 ///
