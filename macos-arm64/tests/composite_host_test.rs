@@ -528,3 +528,190 @@ fn cross_backend_handle_use_fails_closed() {
     assert_eq!(err.code, E_DEVICE_INVALID_HANDLE);
     runtime.release(&metal_buffer).expect("release");
 }
+
+// ---------------------------------------------------------------------------
+// S2-1: program session sequencing (create → run → run again → teardown)
+// ---------------------------------------------------------------------------
+
+/// The session loads the module once and allocates every buffer once at
+/// creation; repeated `execute` calls on the same session do NOT reload the
+/// module or re-allocate buffers; teardown releases every handle.
+#[test]
+fn program_session_executes_repeatedly_without_reload_or_realloc() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    // Create: module loaded once (1) + 3 PerProgram buffers allocated = 4 handles.
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 4);
+    assert_eq!(session.module_hash(), fnv1a64(MODULE_IMAGE));
+    assert_eq!(session.allocated_buffers(), vec![1, 2, 3]);
+
+    // Execute 1: no new handles (module + buffers reused).
+    let receipt1 = session.execute(&inputs, &[3]).expect("execute 1");
+    assert_eq!(receipt1.launches, 1);
+    assert_eq!(receipt1.copy_ins, 2);
+    assert_eq!(receipt1.outputs.get(&3), Some(&vec![4.0, 6.0]));
+    assert_eq!(session.session_handle_count(), 4); // unchanged
+
+    // Execute 2 on the SAME session: no reload, no realloc.
+    let receipt2 = session
+        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]), &[3])
+        .expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&3), Some(&vec![40.0, 60.0]));
+    assert_eq!(session.session_handle_count(), 4); // still unchanged
+
+    // Teardown: ordered release (buffers then module); every handle gone.
+    session.teardown().expect("teardown");
+    let device = host.device().expect("device present");
+    assert_eq!(device.live_handle_count(), 0);
+}
+
+/// The session proves repeated execution on CUDA too (backend-neutral surface).
+#[test]
+fn program_session_repeated_execution_cuda() {
+    let mut host = cuda_composite("addita").expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 4); // module + 3 buffers
+
+    let r1 = session
+        .execute(&add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]), &[3])
+        .expect("execute 1");
+    assert_eq!(r1.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
+    assert_eq!(session.session_handle_count(), 4);
+
+    let r2 = session
+        .execute(&add_inputs(vec![10.0, 20.0, 30.0], vec![1.0, 2.0, 3.0]), &[3])
+        .expect("execute 2");
+    assert_eq!(r2.outputs.get(&3), Some(&vec![11.0, 22.0, 33.0]));
+    assert_eq!(session.session_handle_count(), 4);
+
+    session.teardown().expect("teardown");
+    assert_eq!(
+        host.device().expect("device").live_handle_count(),
+        0
+    );
+}
+
+/// A two-kernel InOut chain through the session API: the intermediate buffer
+/// stays device-resident across kernels within one step, and the session
+/// reuses it across steps without re-allocation.
+#[test]
+fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = DeviceDescriptor {
+        backend: DeviceBackend::Metal,
+        module_image: MODULE_IMAGE.to_vec(),
+        kernels: vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot(1, "a", DeviceBufferRole::Input, 0, 2),
+                    add_slot(2, "b", DeviceBufferRole::Input, 1, 2),
+                    add_slot(3, "acc", DeviceBufferRole::InOut, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot(3, "acc", DeviceBufferRole::InOut, 0, 2),
+                    add_slot(4, "c", DeviceBufferRole::Input, 1, 2),
+                    add_slot(5, "out", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+    };
+    let mut inputs = BTreeMap::new();
+    inputs.insert(1, vec![1.0, 2.0]);
+    inputs.insert(2, vec![3.0, 4.0]);
+    inputs.insert(4, vec![10.0, 10.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Module + 5 distinct buffers (ids 1-5).
+    assert_eq!(session.session_handle_count(), 6);
+    assert_eq!(session.allocated_buffers(), vec![1, 2, 3, 4, 5]);
+
+    let receipt = session.execute(&inputs, &[5]).expect("execute");
+    assert_eq!(receipt.launches, 2);
+    assert_eq!(receipt.copy_ins, 3); // only Input slots (a, b, c)
+    assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
+    assert_eq!(session.session_handle_count(), 6); // no realloc
+
+    // Second step: same session, same buffers.
+    let receipt2 = session.execute(&inputs, &[5]).expect("execute 2");
+    assert_eq!(receipt2.outputs.get(&5), Some(&vec![14.0, 16.0]));
+    assert_eq!(session.session_handle_count(), 6);
+
+    session.teardown().expect("teardown");
+    assert_eq!(
+        host.device().expect("device").live_handle_count(),
+        0
+    );
+}
+
+/// `execute_descriptor` remains a single-run convenience over the session:
+/// create → execute → teardown in one call, same receipt shape as S1-4.
+#[test]
+fn execute_descriptor_is_single_run_convenience_over_session() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let receipt = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect("execute_descriptor");
+
+    assert_eq!(receipt.backend, DeviceBackend::Metal);
+    assert_eq!(receipt.module_hash, fnv1a64(MODULE_IMAGE));
+    assert_eq!(receipt.launches, 1);
+    assert_eq!(receipt.copy_ins, 2);
+    assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
+    assert_eq!(receipt.allocated_buffers, vec![1, 2, 3]);
+    // Single-run convenience tears down internally.
+    assert_eq!(
+        host.device().expect("device").live_handle_count(),
+        0
+    );
+}
+
+/// A CPU-only host cannot create a program session (same fail-closed surface
+/// as execute_descriptor).
+#[test]
+fn cpu_only_host_rejects_program_session_creation() {
+    let mut host = CompositeHost::new(CompositeHostConfig::cpu()).expect("cpu composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("cpu-only host must refuse session creation");
+    assert_eq!(err.code, E_NO_DEVICE_PROGRAM);
+}
+
+/// Session creation validates the descriptor before any allocation
+/// (fail-before-launch surface preserved through the session API).
+#[test]
+fn program_session_creation_validates_descriptor_before_launch() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.kernels.clear();
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("empty kernels must fail before session creation");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+}

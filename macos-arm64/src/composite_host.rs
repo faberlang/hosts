@@ -121,6 +121,298 @@ pub struct DeviceExecutionReceipt {
     pub allocated_buffers: Vec<u32>,
 }
 
+/// One kernel's launch plan stored by the program session. Cloned from the
+/// descriptor at session creation; the launch order, entry, buffer bindings,
+/// and grid/block shape are fixed for the program's lifetime.
+struct SessionKernel {
+    /// Target-neutral logical entry name.
+    entry: String,
+    /// Typed buffer slots in launch order.
+    slots: Vec<SessionSlot>,
+    /// 3D dispatch grid.
+    grid: [u32; 3],
+    /// 3D block (threadgroup) shape.
+    block: [u32; 3],
+}
+
+/// One buffer slot of a session kernel.
+struct SessionSlot {
+    /// Program-level buffer identity.
+    buffer_id: u32,
+    /// Logical name for diagnostics.
+    buffer_name: String,
+    /// Slot role at this kernel.
+    role: DeviceBufferRole,
+}
+
+/// Per-buffer metadata captured at session creation for input validation.
+struct SessionBufferMeta {
+    /// Element count declared by the descriptor (input size check).
+    element_count: u64,
+}
+
+/// A program-scoped device session that outlives individual launches (S2-1).
+///
+/// Created from one [`DeviceDescriptor`], a `ProgramSession` owns:
+/// - the **module** (loaded once at creation; reused by every execution);
+/// - the **PerProgram buffers** (allocated once at creation; reused by every
+///   execution — in S2-1 every buffer is PerProgram; S2-4 adds PerStep and
+///   ObservationPoint lifetimes).
+///
+/// [`ProgramSession::execute`] runs the ordered launch sequence once (one
+/// step), synchronizes at the step boundary, and reads back declared outputs.
+/// It can be called repeatedly on the same session without reloading the
+/// module or re-allocating buffers. [`ProgramSession::teardown`] performs
+/// the ordered release (buffers then module).
+///
+/// The S1-4 [`CompositeHost::execute_descriptor`] surface is a single-run
+/// convenience over this session (create → execute → teardown).
+pub struct ProgramSession<'host> {
+    runtime: &'host mut DeviceRuntime,
+    backend: DeviceBackend,
+    device_name: String,
+    module_handle: DeviceHandle,
+    module_hash: u64,
+    /// PerProgram buffers: buffer_id → device handle. Allocated once at
+    /// creation, released at teardown.
+    buffers: BTreeMap<u32, DeviceHandle>,
+    /// Per-buffer declared element count (input validation in execute).
+    buffer_meta: BTreeMap<u32, SessionBufferMeta>,
+    /// The ordered launch plan cloned from the descriptor.
+    kernels: Vec<SessionKernel>,
+}
+
+impl<'host> ProgramSession<'host> {
+    /// Create a program session: validate the descriptor, load the module
+    /// once, and allocate every distinct buffer once.
+    ///
+    /// # Errors
+    /// - `E_DEVICE_DESCRIPTOR` — the descriptor targets a different backend
+    ///   than the runtime session, or is structurally invalid;
+    /// - `E_DEVICE_ABI_MISMATCH` / `E_DEVICE_DTYPE_MISMATCH` /
+    ///   `E_DEVICE_SHAPE_MISMATCH` — typed descriptor conflicts (see
+    ///   [`DeviceDescriptor::validate`]);
+    /// - session-level failures (module load, allocation) bubble through.
+    pub fn new(
+        runtime: &'host mut DeviceRuntime,
+        descriptor: &DeviceDescriptor,
+        device_name: String,
+    ) -> HostResult<Self> {
+        if runtime.backend() != descriptor.backend {
+            return Err(HostError {
+                code: E_DEVICE_DESCRIPTOR.to_owned(),
+                message: format!(
+                    "device descriptor targets backend `{}` but the composite host's device session is `{}`",
+                    descriptor.backend.spelling(),
+                    runtime.backend().spelling()
+                ),
+                retryable: false,
+            });
+        }
+        descriptor.validate()?;
+
+        // Load the module once (session-scoped ownership; S2-2 formalizes
+        // the cache policy around this single load).
+        let module_handle = runtime.load_module(&descriptor.module_image)?;
+        let module_hash = fnv1a64(&descriptor.module_image);
+
+        // Allocate every distinct buffer once. In S2-1 every buffer is
+        // PerProgram; S2-4 will split PerStep / ObservationPoint.
+        let mut buffers: BTreeMap<u32, DeviceHandle> = BTreeMap::new();
+        let mut buffer_meta: BTreeMap<u32, SessionBufferMeta> = BTreeMap::new();
+        let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
+
+        for kernel in &descriptor.kernels {
+            let mut slots = Vec::with_capacity(kernel.buffers.len());
+            for slot in &kernel.buffers {
+                buffer_meta
+                    .entry(slot.buffer_id)
+                    .or_insert(SessionBufferMeta {
+                        element_count: slot.element_count,
+                    });
+                if !buffers.contains_key(&slot.buffer_id) {
+                    let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
+                    buffers.insert(slot.buffer_id, handle);
+                }
+                slots.push(SessionSlot {
+                    buffer_id: slot.buffer_id,
+                    buffer_name: slot.buffer_name.clone(),
+                    role: slot.role,
+                });
+            }
+            kernels.push(SessionKernel {
+                entry: kernel.entry.clone(),
+                slots,
+                grid: kernel.grid,
+                block: kernel.block,
+            });
+        }
+
+        Ok(Self {
+            runtime,
+            backend: descriptor.backend,
+            device_name,
+            module_handle,
+            module_hash,
+            buffers,
+            buffer_meta,
+            kernels,
+        })
+    }
+
+    /// Execute the ordered launch sequence once (one step). Reuses the
+    /// session's module and PerProgram buffers — does not reload the module
+    /// or re-allocate buffers. Synchronizes at the step boundary before
+    /// reading back declared outputs.
+    ///
+    /// # Errors
+    /// - `E_DEVICE_ENTRY_MISMATCH` — a kernel entry is unknown to the module;
+    /// - `E_DEVICE_SHAPE_MISMATCH` — a declared input is missing or its size
+    ///   contradicts the declared element count;
+    /// - `E_INVALID_ARGS` — a declared output id was not allocated by the
+    ///   session;
+    /// - session-level failures (copy-in, launch, sync, readback) bubble
+    ///   through unchanged.
+    pub fn execute(
+        &mut self,
+        inputs: &BTreeMap<u32, Vec<f32>>,
+        outputs: &[u32],
+    ) -> HostResult<DeviceExecutionReceipt> {
+        let mut launch_count = 0usize;
+        let mut copy_ins = 0usize;
+
+        for kernel in &self.kernels {
+            // Resolve buffer handles for this kernel's launch (all
+            // pre-allocated at session creation).
+            let mut launch_buffers: Vec<DeviceHandle> = Vec::with_capacity(kernel.slots.len());
+            for slot in &kernel.slots {
+                let handle = self
+                    .buffers
+                    .get(&slot.buffer_id)
+                    .copied()
+                    .ok_or_else(|| HostError::internal("session buffer disappeared during launch"))?;
+                launch_buffers.push(handle);
+            }
+
+            // Copy-in declared inputs for this kernel.
+            for slot in &kernel.slots {
+                if slot.role == DeviceBufferRole::Input {
+                    let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
+                        descriptor_errors::shape_mismatch(format!(
+                            "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
+                            kernel.entry, slot.buffer_name, slot.buffer_id
+                        ))
+                    })?;
+                    let expected = self
+                        .buffer_meta
+                        .get(&slot.buffer_id)
+                        .map(|meta| meta.element_count)
+                        .unwrap_or(0);
+                    if u64::try_from(values.len()).ok() != Some(expected) {
+                        return Err(descriptor_errors::shape_mismatch(format!(
+                            "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
+                            slot.buffer_name,
+                            slot.buffer_id,
+                            values.len(),
+                            kernel.entry,
+                            expected
+                        )));
+                    }
+                    let handle = self
+                        .buffers
+                        .get(&slot.buffer_id)
+                        .copied()
+                        .ok_or_else(|| HostError::internal("session input buffer disappeared"))?;
+                    self.runtime.copy_in_f32(&handle, values)?;
+                    copy_ins += 1;
+                }
+            }
+
+            self.runtime.launch_kernel(
+                &self.module_handle,
+                &kernel.entry,
+                &launch_buffers,
+                kernel.grid,
+                kernel.block,
+            )?;
+            launch_count += 1;
+        }
+
+        // Step-boundary synchronization: every launch in this step has
+        // completed before any readback. The launches also sync internally;
+        // this barrier makes the step boundary explicit and observable.
+        self.runtime.sync()?;
+
+        // Readback declared outputs.
+        let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
+        for output_id in outputs {
+            let handle = self.buffers.get(output_id).copied().ok_or_else(|| {
+                HostError::invalid_args(format!(
+                    "declared output buffer id {output_id} was not allocated by the session"
+                ))
+            })?;
+            readbacks.insert(*output_id, self.runtime.readback_f32(&handle)?);
+        }
+
+        Ok(DeviceExecutionReceipt {
+            backend: self.backend,
+            device_name: self.device_name.clone(),
+            module_hash: self.module_hash,
+            launches: launch_count,
+            copy_ins,
+            outputs: readbacks,
+            allocated_buffers: self.buffers.keys().copied().collect(),
+        })
+    }
+
+    /// Ordered teardown: release every buffer, then the module. After this
+    /// the session is consumed and the device session's handle count returns
+    /// to baseline (every allocated handle is released).
+    ///
+    /// # Errors
+    /// Session-level release failures bubble through. On error, remaining
+    /// handles may not be released; the error-path guard is S2-3.
+    pub fn teardown(self) -> HostResult<()> {
+        let ProgramSession {
+            runtime,
+            buffers,
+            module_handle,
+            ..
+        } = self;
+        for handle in buffers.values() {
+            runtime.release(handle)?;
+        }
+        runtime.release(&module_handle)?;
+        Ok(())
+    }
+
+    /// The program-level buffer ids this session allocated (A9 receipt).
+    #[must_use]
+    pub fn allocated_buffers(&self) -> Vec<u32> {
+        self.buffers.keys().copied().collect()
+    }
+
+    /// Number of live device handles the session currently holds (module +
+    /// buffers). Used by lifecycle tests to prove no reload/realloc between
+    /// executions and full release at teardown.
+    #[must_use]
+    pub fn session_handle_count(&self) -> usize {
+        self.buffers.len() + 1 // buffers + module
+    }
+
+    /// The backend this session speaks for.
+    #[must_use]
+    pub fn backend(&self) -> DeviceBackend {
+        self.backend
+    }
+
+    /// The FNV-1a provenance hash of the loaded module.
+    #[must_use]
+    pub fn module_hash(&self) -> u64 {
+        self.module_hash
+    }
+}
+
 /// Probe the machine for admitted native backends (discovery receipts).
 #[must_use]
 pub fn admitted_backends() -> Vec<DeviceBackend> {
@@ -288,14 +580,38 @@ impl CompositeHost {
         self.kernel.manifest()
     }
 
+    /// Create a program-scoped session for one device program (S2-1).
+    ///
+    /// The session owns the module (loaded once) and every PerProgram buffer
+    /// (allocated once); it survives repeated [`ProgramSession::execute`]
+    /// calls on the same session without reloading or re-allocating. Call
+    /// [`ProgramSession::teardown`] to release every handle in order.
+    ///
+    /// # Errors
+    /// - `E_NO_DEVICE_PROGRAM` — no device session on this host;
+    /// - `E_DEVICE_DESCRIPTOR` — wrong-backend or structurally bad descriptor;
+    /// - `E_DEVICE_ABI_MISMATCH` / `E_DEVICE_DTYPE_MISMATCH` /
+    ///   `E_DEVICE_SHAPE_MISMATCH` — typed descriptor conflicts;
+    /// - session-level failures (module load, allocation) bubble through.
+    pub fn create_program_session(
+        &mut self,
+        descriptor: &DeviceDescriptor,
+    ) -> HostResult<ProgramSession<'_>> {
+        let device_name = self.device_name().to_owned();
+        let runtime = self.device_mut().ok_or_else(|| {
+            descriptor_errors::no_device_program(
+                "composite host has no device session; a device descriptor cannot execute",
+            )
+        })?;
+        ProgramSession::new(runtime, descriptor, device_name)
+    }
+
     /// Execute a typed device descriptor through the device session.
     ///
-    /// Fail-before-launch: a CPU-only host, a descriptor targeting the wrong
-    /// backend, a structurally invalid or ABI/dtype/shape-inconsistent
-    /// descriptor, an unknown kernel entry, or an input that contradicts the
-    /// declared shape all fail with typed diagnostics **before any launch**.
-    /// The lifecycle runs module load → allocation → copy-in → launch (3D) →
-    /// sync → readback → release and returns an A9-style receipt.
+    /// Single-run convenience over the program session (S2-1): creates a
+    /// session, executes the ordered launch sequence once, and tears down
+    /// releasing every handle. Fail-before-launch semantics are unchanged
+    /// from S1-4.
     ///
     /// # Errors
     /// - `E_NO_DEVICE_PROGRAM` — no device session on this host;
@@ -310,110 +626,10 @@ impl CompositeHost {
         inputs: &BTreeMap<u32, Vec<f32>>,
         outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
-        let device_name = self.device_name().to_owned();
-        let runtime = self.device_mut().ok_or_else(|| {
-            descriptor_errors::no_device_program(
-                "composite host has no device session; a device descriptor cannot execute",
-            )
-        })?;
-        if runtime.backend() != descriptor.backend {
-            return Err(HostError {
-                code: E_DEVICE_DESCRIPTOR.to_owned(),
-                message: format!(
-                    "device descriptor targets backend `{}` but the composite host's device session is `{}`",
-                    descriptor.backend.spelling(),
-                    runtime.backend().spelling()
-                ),
-                retryable: false,
-            });
-        }
-        descriptor.validate()?;
-
-        let module_handle = runtime.load_module(&descriptor.module_image)?;
-        let module_hash = fnv1a64(&descriptor.module_image);
-
-        let mut allocations: BTreeMap<u32, DeviceHandle> = BTreeMap::new();
-        let mut launch_count = 0usize;
-        let mut copy_ins = 0usize;
-
-        for kernel in &descriptor.kernels {
-            let mut launch_buffers: Vec<DeviceHandle> = Vec::with_capacity(kernel.buffers.len());
-            for slot in &kernel.buffers {
-                let handle = match allocations.get(&slot.buffer_id) {
-                    Some(handle) => *handle,
-                    None => {
-                        let allocated = runtime.alloc_bytes(slot.byte_length() as usize)?;
-                        allocations.insert(slot.buffer_id, allocated);
-                        allocated
-                    }
-                };
-                launch_buffers.push(handle);
-            }
-
-            for slot in &kernel.buffers {
-                if slot.role == DeviceBufferRole::Input {
-                    let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
-                        descriptor_errors::shape_mismatch(format!(
-                            "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
-                            kernel.entry, slot.buffer_name, slot.buffer_id
-                        ))
-                    })?;
-                    if u64::try_from(values.len()).ok() != Some(slot.element_count) {
-                        return Err(descriptor_errors::shape_mismatch(format!(
-                            "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            values.len(),
-                            kernel.entry,
-                            slot.element_count
-                        )));
-                    }
-                    let handle = allocations
-                        .get(&slot.buffer_id)
-                        .copied()
-                        .ok_or_else(|| HostError::internal("allocated input buffer disappeared"))?;
-                    runtime.copy_in_f32(&handle, values)?;
-                    copy_ins += 1;
-                }
-            }
-
-            runtime.launch_kernel(
-                &module_handle,
-                &kernel.entry,
-                &launch_buffers,
-                kernel.grid,
-                kernel.block,
-            )?;
-            launch_count += 1;
-        }
-
-        let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
-        for output_id in outputs {
-            let handle = allocations.get(output_id).copied().ok_or_else(|| {
-                HostError::invalid_args(format!(
-                    "declared output buffer id {output_id} was not allocated by the descriptor"
-                ))
-            })?;
-            readbacks.insert(*output_id, runtime.readback_f32(&handle)?);
-        }
-
-        // Ordered teardown: every allocated buffer, then the module. A
-        // released buffer can never be read back again (registry removal).
-        let allocated_buffers: Vec<u32> = allocations.keys().copied().collect();
-        for handle in allocations.values() {
-            runtime.release(handle)?;
-        }
-        runtime.release(&module_handle)?;
-
-        Ok(DeviceExecutionReceipt {
-            backend: descriptor.backend,
-            device_name,
-            module_hash,
-            launches: launch_count,
-            copy_ins,
-            outputs: readbacks,
-            allocated_buffers,
-        })
+        let mut session = self.create_program_session(descriptor)?;
+        let receipt = session.execute(inputs, outputs)?;
+        session.teardown()?;
+        Ok(receipt)
     }
 
     fn device_name(&self) -> &str {
