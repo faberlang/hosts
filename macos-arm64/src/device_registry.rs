@@ -107,3 +107,28 @@ pub struct DriverCounters {
     /// Cumulative buffer releases.
     pub buffer_releases: usize,
 }
+
+/// A driver stage the fake drivers can be told to fail (S2-3 error-path
+/// teardown; P2-1).
+///
+/// Each variant maps to one `MetalDriver`/`CudaDriver` method, so a
+/// failure-injection test can force a typed driver error at exactly that
+/// stage and prove the program session's release-on-error leaves
+/// `live_handle_count() == 0`. Sibling of [`DriverCounters`]: both are
+/// fake-driver observability — counters observe the lifecycle, this enum
+/// faults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FakeFailureStage {
+    /// `load_module` fails (the module never enters the session registry).
+    ModuleLoad,
+    /// `alloc` fails (a buffer is never created).
+    Alloc,
+    /// `copy_in` fails (a host→device transfer fails).
+    CopyIn,
+    /// `launch_kernel` fails (dispatch fails).
+    Launch,
+    /// `sync` fails (the synchronization barrier fails).
+    Sync,
+    /// `copy_out`/readback fails (a device→host transfer fails).
+    Readback,
+}

@@ -14,13 +14,16 @@ use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
     resolve_device_selection, CompositeHost, CompositeHostConfig,
 };
+use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
     fnv1a64, DescriptorBuffer, DescriptorKernel, DeviceBufferRole, DeviceDataType,
     DeviceDescriptor, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR,
     E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
+use faber_host_macos_arm64::device_registry::FakeFailureStage;
 use faber_host_macos_arm64::kernel::frame_data;
+use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession, Status,
 };
@@ -77,6 +80,87 @@ fn cuda_composite(entry: &str) -> HostResult<CompositeHost> {
             .expect("fake cuda admit"),
     );
     CompositeHost::with_device(runtime, "fake-cuda-device")
+}
+
+/// A fake-metal composite whose driver fails the `call`-th invocation of
+/// `stage` with a typed `E_METAL_DRIVER` error (S2-3 failure injection).
+fn metal_composite_failing(
+    entry: &str,
+    stage: FakeFailureStage,
+    call: u32,
+) -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(
+            Box::new(
+                FakeMetalDriver::default()
+                    .with_known_entry(entry)
+                    .with_failure_at(stage, call),
+            ),
+        )
+        .expect("fake metal admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-metal-device")
+}
+
+/// A fake-cuda composite whose driver fails the `call`-th invocation of
+/// `stage` with a typed `E_CUDA_DRIVER` error (S2-3 failure injection).
+fn cuda_composite_failing(
+    entry: &str,
+    stage: FakeFailureStage,
+    call: u32,
+) -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(
+            Box::new(
+                FakeCudaDriver::default()
+                    .with_known_entry(entry)
+                    .with_failure_at(stage, call),
+            ),
+        )
+        .expect("fake cuda admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-cuda-device")
+}
+
+/// The two-kernel InOut chain descriptor (kernel 1 writes `acc`, kernel 2
+/// reads it): a, b → acc → out, with c as kernel 2's second input. Shared by
+/// the mid-chain failure-injection test and the S2-1 chaining tests.
+fn two_kernel_inout_descriptor() -> DeviceDescriptor {
+    DeviceDescriptor {
+        backend: DeviceBackend::Metal,
+        module_image: MODULE_IMAGE.to_vec(),
+        kernels: vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot(1, "a", DeviceBufferRole::Input, 0, 2),
+                    add_slot(2, "b", DeviceBufferRole::Input, 1, 2),
+                    add_slot(3, "acc", DeviceBufferRole::InOut, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot(3, "acc", DeviceBufferRole::InOut, 0, 2),
+                    add_slot(4, "c", DeviceBufferRole::Input, 1, 2),
+                    add_slot(5, "out", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+    }
+}
+
+/// Host inputs for [`two_kernel_inout_descriptor`]: a, b, and c.
+fn two_kernel_inputs() -> BTreeMap<u32, Vec<f32>> {
+    let mut inputs = BTreeMap::new();
+    inputs.insert(1, vec![1.0, 2.0]);
+    inputs.insert(2, vec![3.0, 4.0]);
+    inputs.insert(4, vec![10.0, 10.0]);
+    inputs
 }
 
 type HostResult<T> = Result<T, faber_host_macos_arm64::HostError>;
@@ -466,6 +550,8 @@ fn unknown_kernel_entry_fails_before_launch() {
         )
         .expect_err("unknown entry must fail before launch");
     assert_eq!(err.code, E_DEVICE_ENTRY_MISMATCH);
+    // The failed execution released every handle (S2-3 release-on-error).
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 #[test]
@@ -478,6 +564,7 @@ fn missing_input_fails_before_launch() {
         .execute_descriptor(&descriptor, &inputs, &[3])
         .expect_err("missing declared input must fail before launch");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 #[test]
@@ -492,6 +579,7 @@ fn input_size_mismatch_fails_before_launch() {
         )
         .expect_err("input size vs declared shape must fail before launch");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 #[test]
@@ -506,6 +594,7 @@ fn declared_output_not_allocated_fails_closed() {
         )
         .expect_err("output id never allocated must fail closed");
     assert_eq!(err.code, "E_INVALID_ARGS");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 #[test]
@@ -849,5 +938,257 @@ fn execute_descriptor_single_run_releases_module() {
     assert_eq!(counters.buffer_allocs, 3);
     assert_eq!(counters.buffer_releases, 3);
     assert_eq!(counters.module_loads, counters.module_releases);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S2-3: error-path teardown (P2-1) — a failed execution at ANY stage leaves
+// live_handle_count() == 0 (release-on-error designed into the session)
+// ---------------------------------------------------------------------------
+
+// Creation-stage failures (module load, allocation). The fake driver injects
+// the typed driver error; the session's creation guard releases the module
+// and any partially allocated buffers before the error escapes.
+
+#[test]
+fn metal_module_load_failure_releases_every_handle() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::ModuleLoad, 1)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("injected module-load failure must fail session creation");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn metal_allocation_failure_releases_module_and_partial_buffers() {
+    // The module and the first buffer are already registered when the second
+    // allocation fails; the creation guard must release both (P2-1).
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Alloc, 2)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("injected allocation failure must fail session creation");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_module_load_failure_releases_every_handle() {
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::ModuleLoad, 1)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("injected module-load failure must fail session creation");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_allocation_failure_releases_module_and_partial_buffers() {
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::Alloc, 2)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .create_program_session(&descriptor)
+        .err()
+        .expect("injected allocation failure must fail session creation");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// Execution-stage failures (copy-in, launch, sync, readback). Each test runs
+// the full single-kernel program through `execute_descriptor` with the driver
+// failing exactly one stage; the session's release-on-error must release the
+// module + every buffer before the typed error escapes.
+
+#[test]
+fn metal_copy_in_failure_releases_every_handle() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("injected copy-in failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn metal_launch_failure_releases_every_handle() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Launch, 1)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("injected launch failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn metal_sync_failure_releases_every_handle() {
+    // The driver syncs once inside each launch and once at the step boundary;
+    // sync call 2 is the explicit step-boundary barrier in `execute`.
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Sync, 2)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("injected sync failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn metal_readback_failure_releases_every_handle() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Readback, 1)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("injected readback failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_copy_in_failure_releases_every_handle() {
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::CopyIn, 1)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            &[3],
+        )
+        .expect_err("injected copy-in failure must fail the execution");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_launch_failure_releases_every_handle() {
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::Launch, 1)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            &[3],
+        )
+        .expect_err("injected launch failure must fail the execution");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_sync_failure_releases_every_handle() {
+    // Same call sequence as the Metal lane: sync call 2 is the step boundary.
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::Sync, 2)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            &[3],
+        )
+        .expect_err("injected sync failure must fail the execution");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+#[test]
+fn cuda_readback_failure_releases_every_handle() {
+    let mut host = cuda_composite_failing("addita", FakeFailureStage::Readback, 1)
+        .expect("cuda composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            &[3],
+        )
+        .expect_err("injected readback failure must fail the execution");
+    assert_eq!(err.code, E_CUDA_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// Mid-chain failure: kernel 1 fully succeeds, then the second launch fails.
+// This is the exact P2-1 shape — Stage 1's `execute_descriptor` leaked the
+// module + every buffer on a mid-chain `?`-return. The session's
+// release-on-error must release everything.
+
+#[test]
+fn mid_chain_second_launch_failure_releases_every_handle() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::Launch, 2)
+        .expect("metal composite");
+    let descriptor = two_kernel_inout_descriptor();
+    let err = host
+        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .expect_err("injected second-launch failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// A failed execution closes the session: every handle is released, the
+/// session reports 0 handles, and a closed session refuses further execution
+/// instead of reusing stale handles.
+#[test]
+fn failed_execution_closes_session_and_blocks_reuse() {
+    let mut host = metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1)
+        .expect("metal composite");
+    let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 4); // module + 3 buffers
+
+    let err = session
+        .execute(&inputs, &[3])
+        .expect_err("injected copy-in failure must fail the execution");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    // Release-on-error: no handle survives the failed execution at the
+    // session level (the host-level count is checked after the session is
+    // consumed, once the session's borrow of the host has ended).
+    assert_eq!(session.session_handle_count(), 0);
+
+    // A closed session cannot execute again (no stale-handle reuse).
+    let again = session
+        .execute(&inputs, &[3])
+        .expect_err("a closed session must refuse execution");
+    assert_eq!(again.code, "E_INTERNAL");
+
+    // Teardown of an already-closed session is a safe no-op (no double
+    // release).
+    session.teardown().expect("teardown of closed session");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }

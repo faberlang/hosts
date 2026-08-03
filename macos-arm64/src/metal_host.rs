@@ -20,7 +20,7 @@ use metal::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::device_registry::{DriverCounters, HandleRegistry};
+use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
 
@@ -444,6 +444,12 @@ pub struct FakeMetalDriver {
     buffer_allocs: usize,
     /// Cumulative buffer releases.
     buffer_releases: usize,
+    /// Per-stage failure injection (S2-3): stage → 1-based call number whose
+    /// invocation fails with a typed `E_METAL_DRIVER` error. An absent stage
+    /// never fails.
+    fail_at: BTreeMap<FakeFailureStage, u32>,
+    /// Running call count per stage (drives `fail_at`).
+    stage_calls: BTreeMap<FakeFailureStage, u32>,
 }
 
 impl FakeMetalDriver {
@@ -458,6 +464,29 @@ impl FakeMetalDriver {
     pub fn with_known_entry(mut self, entry: impl Into<String>) -> Self {
         self.known_entries.push(entry.into());
         self
+    }
+
+    /// Configure the driver to fail the `call`-th invocation of `stage` with
+    /// a typed `E_METAL_DRIVER` error (S2-3 failure-injection tests). `call`
+    /// is 1-based; an absent entry means the stage never fails.
+    pub fn with_failure_at(mut self, stage: FakeFailureStage, call: u32) -> Self {
+        self.fail_at.insert(stage, call);
+        self
+    }
+
+    /// Inject a typed driver failure when the configured call number of
+    /// `stage` is reached; otherwise record the call and continue. Called at
+    /// the top of every stage method so an injected failure fires before any
+    /// state mutation at that stage.
+    fn maybe_fail(&mut self, stage: FakeFailureStage) -> HostResult<()> {
+        let call = self.stage_calls.entry(stage).or_insert(0);
+        *call += 1;
+        if self.fail_at.get(&stage) == Some(call) {
+            return Err(metal_driver(format!(
+                "injected failure at {stage:?} stage (S2-3 failure-injection test)"
+            )));
+        }
+        Ok(())
     }
 
     /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
@@ -531,6 +560,7 @@ impl MetalDriver for FakeMetalDriver {
     }
 
     fn load_module(&mut self, image: &[u8]) -> HostResult<u64> {
+        self.maybe_fail(FakeFailureStage::ModuleLoad)?;
         self.module_loads += 1;
         let token = self.next_token;
         self.next_token += 1;
@@ -539,6 +569,7 @@ impl MetalDriver for FakeMetalDriver {
     }
 
     fn alloc(&mut self, len_bytes: usize) -> HostResult<u64> {
+        self.maybe_fail(FakeFailureStage::Alloc)?;
         self.buffer_allocs += 1;
         let token = self.next_token;
         self.next_token += 1;
@@ -547,6 +578,7 @@ impl MetalDriver for FakeMetalDriver {
     }
 
     fn copy_in(&mut self, token: u64, bytes: &[u8]) -> HostResult<()> {
+        self.maybe_fail(FakeFailureStage::CopyIn)?;
         let buffer = self
             .buffers
             .get_mut(&token)
@@ -583,6 +615,7 @@ impl MetalDriver for FakeMetalDriver {
         _block_y: u32,
         _block_z: u32,
     ) -> HostResult<()> {
+        self.maybe_fail(FakeFailureStage::Launch)?;
         // When the harness declares the module's function table, an unknown
         // entry fails closed before dispatch (mirrors the compiled-pipeline
         // entry lookup on the real lane).
@@ -613,10 +646,12 @@ impl MetalDriver for FakeMetalDriver {
     }
 
     fn sync(&mut self) -> HostResult<()> {
+        self.maybe_fail(FakeFailureStage::Sync)?;
         Ok(())
     }
 
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>> {
+        self.maybe_fail(FakeFailureStage::Readback)?;
         let buffer = self
             .buffers
             .get(&token)

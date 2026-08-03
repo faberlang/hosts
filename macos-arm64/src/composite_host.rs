@@ -180,6 +180,16 @@ struct SessionBufferMeta {
 /// proven with the fake drivers' lifecycle counters (module load = 1, module
 /// release = 1, nothing persists past teardown) — NOT "module persists
 /// across steps".
+///
+/// # Error-path teardown (S2-3; the absorbed S1-4 audit finding P2-1)
+///
+/// Teardown is designed into the session on every path, not bolted on: a
+/// failed **creation** releases the module and every partially allocated
+/// buffer before the error escapes, and a failed **execution** runs the
+/// ordered release (buffers then module) before the error escapes and closes
+/// the session. A failed execution at any stage (module load, allocation,
+/// copy-in, launch, sync, readback) therefore leaves
+/// `live_handle_count() == 0` and no handle survives a failed execution.
 pub struct ProgramSession<'host> {
     runtime: &'host mut DeviceRuntime,
     backend: DeviceBackend,
@@ -193,6 +203,9 @@ pub struct ProgramSession<'host> {
     buffer_meta: BTreeMap<u32, SessionBufferMeta>,
     /// The ordered launch plan cloned from the descriptor.
     kernels: Vec<SessionKernel>,
+    /// True after an error-path release (S2-3): every handle has been
+    /// released and the session cannot execute again.
+    closed: bool,
 }
 
 impl<'host> ProgramSession<'host> {
@@ -233,35 +246,54 @@ impl<'host> ProgramSession<'host> {
         let module_hash = fnv1a64(&descriptor.module_image);
 
         // Allocate every distinct buffer once. In S2-1 every buffer is
-        // PerProgram; S2-4 will split PerStep / ObservationPoint.
+        // PerProgram; S2-4 will split PerStep / ObservationPoint. A failure
+        // at any allocation runs the error-path teardown first (S2-3
+        // release-on-error): the module and every already-allocated buffer
+        // are released before the error escapes, so a failed creation leaves
+        // `live_handle_count() == 0`.
         let mut buffers: BTreeMap<u32, DeviceHandle> = BTreeMap::new();
         let mut buffer_meta: BTreeMap<u32, SessionBufferMeta> = BTreeMap::new();
         let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
 
-        for kernel in &descriptor.kernels {
-            let mut slots = Vec::with_capacity(kernel.buffers.len());
-            for slot in &kernel.buffers {
-                buffer_meta
-                    .entry(slot.buffer_id)
-                    .or_insert(SessionBufferMeta {
-                        element_count: slot.element_count,
+        let result = (|| {
+            for kernel in &descriptor.kernels {
+                let mut slots = Vec::with_capacity(kernel.buffers.len());
+                for slot in &kernel.buffers {
+                    buffer_meta
+                        .entry(slot.buffer_id)
+                        .or_insert(SessionBufferMeta {
+                            element_count: slot.element_count,
+                        });
+                    if !buffers.contains_key(&slot.buffer_id) {
+                        let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
+                        buffers.insert(slot.buffer_id, handle);
+                    }
+                    slots.push(SessionSlot {
+                        buffer_id: slot.buffer_id,
+                        buffer_name: slot.buffer_name.clone(),
+                        role: slot.role,
                     });
-                if !buffers.contains_key(&slot.buffer_id) {
-                    let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
-                    buffers.insert(slot.buffer_id, handle);
                 }
-                slots.push(SessionSlot {
-                    buffer_id: slot.buffer_id,
-                    buffer_name: slot.buffer_name.clone(),
-                    role: slot.role,
+                kernels.push(SessionKernel {
+                    entry: kernel.entry.clone(),
+                    slots,
+                    grid: kernel.grid,
+                    block: kernel.block,
                 });
             }
-            kernels.push(SessionKernel {
-                entry: kernel.entry.clone(),
-                slots,
-                grid: kernel.grid,
-                block: kernel.block,
-            });
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            // Error-path teardown at creation (S2-3): release every buffer
+            // allocated so far, then the module, before the error escapes.
+            // Release failures are secondary to the creation failure, but
+            // every release is still attempted.
+            for handle in buffers.values() {
+                drop(runtime.release(handle));
+            }
+            drop(runtime.release(&module_handle));
+            return Err(error);
         }
 
         Ok(Self {
@@ -273,6 +305,7 @@ impl<'host> ProgramSession<'host> {
             buffers,
             buffer_meta,
             kernels,
+            closed: false,
         })
     }
 
@@ -280,6 +313,12 @@ impl<'host> ProgramSession<'host> {
     /// session's module and PerProgram buffers — does not reload the module
     /// or re-allocate buffers. Synchronizes at the step boundary before
     /// reading back declared outputs.
+    ///
+    /// **Error-path teardown is designed into this method (S2-3):** a failure
+    /// at any stage runs the ordered release (buffers then module) before the
+    /// error escapes and closes the session, so a failed execution leaves
+    /// `live_handle_count() == 0` and no handle survives. A closed session
+    /// refuses further [`ProgramSession::execute`] calls.
     ///
     /// # Errors
     /// - `E_DEVICE_ENTRY_MISMATCH` — a kernel entry is unknown to the module;
@@ -290,6 +329,31 @@ impl<'host> ProgramSession<'host> {
     /// - session-level failures (copy-in, launch, sync, readback) bubble
     ///   through unchanged.
     pub fn execute(
+        &mut self,
+        inputs: &BTreeMap<u32, Vec<f32>>,
+        outputs: &[u32],
+    ) -> HostResult<DeviceExecutionReceipt> {
+        if self.closed {
+            return Err(HostError::internal(
+                "program session is closed after a failed execution; create a new session",
+            ));
+        }
+        let result = self.execute_inner(inputs, outputs);
+        if result.is_err() {
+            // Release-on-error on all paths (S2-3): the ordered release runs
+            // before the error escapes, then the session is closed so no
+            // stale handle can be used again. Release failures on top of the
+            // stage failure are secondary — every release is still attempted.
+            drop(self.release_all_handles());
+            self.closed = true;
+        }
+        result
+    }
+
+    /// The executable body of [`ProgramSession::execute`]: the ordered launch
+    /// sequence (copy-in → launch → step-boundary sync → readback) without
+    /// the error-path release, which the caller owns.
+    fn execute_inner(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
         outputs: &[u32],
@@ -383,23 +447,43 @@ impl<'host> ProgramSession<'host> {
 
     /// Ordered teardown: release every buffer, then the module. After this
     /// the session is consumed and the device session's handle count returns
-    /// to baseline (every allocated handle is released).
+    /// to baseline (every allocated handle is released). Every release is
+    /// attempted even if one fails, so a partial release failure does not
+    /// leave later handles alive.
+    ///
+    /// A session already closed by an error-path release (S2-3) has nothing
+    /// left to release and returns `Ok`.
     ///
     /// # Errors
-    /// Session-level release failures bubble through. On error, remaining
-    /// handles may not be released; the error-path guard is S2-3.
-    pub fn teardown(self) -> HostResult<()> {
-        let ProgramSession {
-            runtime,
-            buffers,
-            module_handle,
-            ..
-        } = self;
-        for handle in buffers.values() {
-            runtime.release(handle)?;
+    /// The first session-level release failure bubbles through after every
+    /// release has been attempted.
+    pub fn teardown(mut self) -> HostResult<()> {
+        if self.closed {
+            // The error path already released every handle.
+            return Ok(());
         }
-        runtime.release(&module_handle)?;
-        Ok(())
+        self.release_all_handles()
+    }
+
+    /// Ordered teardown shared by the success (`teardown`) and error
+    /// (release-on-error in [`ProgramSession::execute`] and `new`) paths:
+    /// release every buffer, then the module, attempting every release even
+    /// if one fails. Returns the first release failure, if any.
+    fn release_all_handles(&mut self) -> HostResult<()> {
+        let mut first_error: Option<HostError> = None;
+        let buffers: Vec<DeviceHandle> = self.buffers.values().copied().collect();
+        for handle in buffers {
+            if let Err(error) = self.runtime.release(&handle) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.runtime.release(&self.module_handle) {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The program-level buffer ids this session allocated (A9 receipt).
@@ -410,10 +494,15 @@ impl<'host> ProgramSession<'host> {
 
     /// Number of live device handles the session currently holds (module +
     /// buffers). Used by lifecycle tests to prove no reload/realloc between
-    /// executions and full release at teardown.
+    /// executions and full release at teardown. A session closed by an
+    /// error-path release (S2-3) holds no live handles and reports 0.
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
-        self.buffers.len() + 1 // buffers + module
+        if self.closed {
+            0
+        } else {
+            self.buffers.len() + 1 // buffers + module
+        }
     }
 
     /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
@@ -646,6 +735,10 @@ impl CompositeHost {
     ///   `E_DEVICE_SHAPE_MISMATCH` / `E_DEVICE_ENTRY_MISMATCH` — typed
     ///   descriptor/entry/shape conflicts (see [`DeviceDescriptor::validate`]);
     /// - session-level failures bubble through unchanged.
+    ///
+    /// Error-path teardown (S2-3): a failed execution releases every handle
+    /// inside the session before the error escapes; the session is closed and
+    /// is dropped without a second teardown.
     pub fn execute_descriptor(
         &mut self,
         descriptor: &DeviceDescriptor,
@@ -653,9 +746,18 @@ impl CompositeHost {
         outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut session = self.create_program_session(descriptor)?;
-        let receipt = session.execute(inputs, outputs)?;
-        session.teardown()?;
-        Ok(receipt)
+        match session.execute(inputs, outputs) {
+            Ok(receipt) => {
+                session.teardown()?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                // The session's error path already released every handle
+                // (release-on-error, S2-3); tearing down again would double
+                // release. The closed session is dropped as-is.
+                Err(error)
+            }
+        }
     }
 
     fn device_name(&self) -> &str {
