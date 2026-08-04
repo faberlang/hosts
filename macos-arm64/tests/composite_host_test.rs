@@ -141,6 +141,18 @@ fn metal_composite(entry: &str) -> HostResult<CompositeHost> {
     CompositeHost::with_device(runtime, "fake-metal-device")
 }
 
+fn multi_kernel_metal_composite() -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(Box::new(
+            FakeMetalDriver::default()
+                .with_known_entry("kernel_zero")
+                .with_known_entry("kernel_one"),
+        ))
+        .expect("fake metal admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-metal-device")
+}
+
 fn cuda_composite(entry: &str) -> HostResult<CompositeHost> {
     let runtime = DeviceRuntime::Cuda(
         CudaHostSession::with_driver(Box::new(FakeCudaDriver::default().with_known_entry(entry)))
@@ -495,6 +507,185 @@ fn metal_fake_sequences_full_lifecycle_and_receipt() {
 }
 
 #[test]
+fn program_session_executes_reordered_and_repeated_launches_verbatim() {
+    let mut host = multi_kernel_metal_composite().expect("metal composite");
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
+            DescriptorKernel {
+                entry: "kernel_zero".to_owned(),
+                buffers: vec![
+                    add_slot(1, "a0", DeviceBufferRole::Input, 0, 2),
+                    add_slot(2, "b0", DeviceBufferRole::Input, 1, 2),
+                    add_slot(3, "out0", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "kernel_one".to_owned(),
+                buffers: vec![
+                    add_slot(4, "a1", DeviceBufferRole::Input, 0, 2),
+                    add_slot(5, "b1", DeviceBufferRole::Input, 1, 2),
+                    add_slot(6, "out1", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 1,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 3,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
+    let inputs = BTreeMap::from([
+        (1, vec![1.0, 2.0]),
+        (2, vec![3.0, 4.0]),
+        (4, vec![5.0, 6.0]),
+        (5, vec![7.0, 8.0]),
+    ]);
+
+    let receipt = host
+        .execute_descriptor(&descriptor, &inputs, &[6])
+        .expect("reordered repeated launches");
+
+    assert_eq!(receipt.launches, 3);
+    assert_eq!(receipt.launch_ids, vec![1, 2, 3]);
+    assert_eq!(
+        receipt.launch_entries,
+        vec!["kernel_one", "kernel_zero", "kernel_one"]
+    );
+    assert_eq!(receipt.allocated_buffers, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(receipt.outputs.get(&6), Some(&vec![12.0, 14.0]));
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0
+    );
+}
+
+#[test]
+fn program_session_keeps_same_buffer_versions_separate() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot_version(1, "a", DeviceBufferRole::Input, 0, 2, 1),
+                    add_slot_version(2, "b", DeviceBufferRole::Input, 1, 2, 1),
+                    add_slot_version(9, "acc", DeviceBufferRole::InOut, 2, 2, 1),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot_version(9, "acc", DeviceBufferRole::InOut, 0, 4, 2),
+                    add_slot_version(4, "c", DeviceBufferRole::Input, 1, 4, 1),
+                    add_slot_version(5, "out", DeviceBufferRole::Output, 2, 4, 1),
+                ],
+                grid: [1, 1, 1],
+                block: [4, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 21,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 22,
+                kernel_index: 1,
+            },
+            DescriptorLaunch {
+                id: 23,
+                kernel_index: 1,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 21,
+                consumer: 22,
+            },
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 2,
+                producer: 22,
+                consumer: 23,
+            },
+        ],
+    );
+    let inputs = BTreeMap::from([
+        (1, vec![1.0, 2.0]),
+        (2, vec![3.0, 4.0]),
+        (4, vec![10.0, 20.0, 30.0, 40.0]),
+    ]);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("versioned session");
+    assert_eq!(
+        session.allocated_buffer_versions(),
+        vec![(1, 1), (2, 1), (4, 1), (5, 1), (9, 1), (9, 2)]
+    );
+
+    let receipt = session
+        .execute(&inputs, &[5])
+        .expect("versioned chain execution");
+    assert_eq!(receipt.launch_ids, vec![21, 22, 23]);
+    assert_eq!(
+        receipt.allocated_buffer_versions,
+        vec![(1, 1), (2, 1), (4, 1), (5, 1), (9, 1), (9, 2)]
+    );
+    assert_eq!(receipt.per_step_buffer_versions, vec![(9, 1), (9, 2)]);
+
+    let acc_versions: Vec<_> = receipt
+        .resource_graph
+        .iter()
+        .filter(|buffer| buffer.id == 9)
+        .map(|buffer| (buffer.version, buffer.element_count))
+        .collect();
+    assert_eq!(acc_versions, vec![(1, 2), (2, 4)]);
+    assert_eq!(
+        receipt.data_flow_edges,
+        vec![
+            DataFlowEdge {
+                buffer_id: 9,
+                version: 1,
+                producer: 21,
+                consumer: 22,
+            },
+            DataFlowEdge {
+                buffer_id: 9,
+                version: 2,
+                producer: 22,
+                consumer: 23,
+            },
+        ]
+    );
+    session.teardown().expect("teardown");
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0
+    );
+}
+
+#[test]
 fn cuda_fake_sequences_full_lifecycle_and_receipt() {
     let mut host = cuda_composite("addita").expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
@@ -639,6 +830,51 @@ fn same_buffer_versions_bind_by_key_across_launches() {
         element_ty: DeviceDataType::F32,
         element_count: 4,
     }));
+}
+
+#[test]
+fn invalid_launch_reference_fails_before_module_or_driver_launch() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.launches[0].kernel_index = 1;
+
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("unknown launch kernel must fail before session creation");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0
+    );
+}
+
+#[test]
+fn impossible_version_metadata_fails_before_module_or_driver_launch() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.buffer_versions.push(DescriptorBufferVersion {
+        buffer_id: 1,
+        version: 1,
+        element_ty: DeviceDataType::F32,
+        element_count: 4,
+    });
+
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("conflicting version facts must fail before session creation");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0
+    );
 }
 
 #[test]

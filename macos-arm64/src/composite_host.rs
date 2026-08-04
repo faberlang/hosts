@@ -117,22 +117,34 @@ pub struct DeviceExecutionReceipt {
     pub module_hash: u64,
     /// Launches dispatched (each synchronizes internally).
     pub launches: usize,
+    /// Descriptor launch identities dispatched, in exact descriptor order.
+    pub launch_ids: Vec<u32>,
+    /// Kernel entries dispatched, in exact descriptor launch order.
+    pub launch_entries: Vec<String>,
     /// Host→device copy-ins performed for input slots.
     pub copy_ins: usize,
     /// Declared output readbacks (buffer id → f32 values).
     pub outputs: BTreeMap<u32, Vec<f32>>,
     /// Program-level buffer ids allocated during the run (A9 allocations).
     pub allocated_buffers: Vec<u32>,
+    /// Version-keyed buffer allocations carried by the descriptor.
+    pub allocated_buffer_versions: Vec<(u32, u32)>,
     /// Program execution-lifetime regime (S2-4).
     pub program_lifetime: DeviceProgramLifetime,
     /// PerProgram buffer ids: allocated once per session, released at program
     /// end (persist across executions).
     pub per_program_buffers: Vec<u32>,
+    /// Version-keyed PerProgram allocations.
+    pub per_program_buffer_versions: Vec<(u32, u32)>,
     /// PerStep buffer ids: recycled at each step boundary.
     pub per_step_buffers: Vec<u32>,
+    /// Version-keyed PerStep allocations.
+    pub per_step_buffer_versions: Vec<(u32, u32)>,
     /// ObservationPoint buffer ids: read back and released per execution
     /// (read-then-release).
     pub observation_buffers: Vec<u32>,
+    /// Version-keyed ObservationPoint allocations.
+    pub observation_buffer_versions: Vec<(u32, u32)>,
     /// Declared logical resource graph (A10): every buffer identity +
     /// content version, in first-reference order.
     pub resource_graph: Vec<ReceiptBuffer>,
@@ -188,6 +200,14 @@ pub struct DataFlowEdge {
     pub consumer: u32,
 }
 
+type BufferKey = (u32, u32);
+
+/// One descriptor launch record retained by a program session.
+struct SessionLaunch {
+    id: u32,
+    kernel_index: usize,
+}
+
 /// One kernel's launch plan stored by the program session. Cloned from the
 /// descriptor at session creation; the launch order, entry, buffer bindings,
 /// and grid/block shape are fixed for the program's lifetime.
@@ -206,13 +226,15 @@ struct SessionKernel {
 struct SessionSlot {
     /// Program-level buffer identity.
     buffer_id: u32,
+    /// Content version selecting the session buffer allocation.
+    version: u32,
     /// Logical name for diagnostics.
     buffer_name: String,
     /// Slot role at this kernel.
     role: DeviceBufferRole,
 }
 
-/// Per-buffer metadata captured at session creation for input validation,
+/// Per-version metadata captured at session creation for input validation,
 /// lifetime-distinct allocation/release (S2-4), and the A10 declared
 /// resource graph (S2-8).
 struct SessionBufferMeta {
@@ -224,9 +246,6 @@ struct SessionBufferMeta {
     element_ty: DeviceDataType,
     /// Element count declared by the descriptor (input size check).
     element_count: u64,
-    /// Content version carried by the wire (resource-graph fact; R2 — the
-    /// host consumes the version, never hardcodes `1`).
-    version: u32,
     /// Byte length this buffer's storage needs on the device.
     byte_length: u64,
     /// Lifetime class that drives the session's allocation/release policy.
@@ -306,14 +325,16 @@ pub struct ProgramSession<'host> {
     module_hash: u64,
     /// Program execution-lifetime regime (S2-4).
     program_lifetime: DeviceProgramLifetime,
-    /// Currently-live device buffers: buffer_id → device handle. PerProgram
-    /// buffers are live from creation until teardown; PerStep and
+    /// Currently-live device buffers: (buffer_id, version) → device handle.
+    /// PerProgram buffers are live from creation until teardown; PerStep and
     /// ObservationPoint buffers are live only within one execution.
-    buffers: BTreeMap<u32, DeviceHandle>,
-    /// Per-buffer declared element count / byte length / lifetime class.
-    buffer_meta: BTreeMap<u32, SessionBufferMeta>,
-    /// The ordered launch plan cloned from the descriptor.
+    buffers: BTreeMap<BufferKey, DeviceHandle>,
+    /// Per-version declared element count / byte length / lifetime class.
+    buffer_meta: BTreeMap<BufferKey, SessionBufferMeta>,
+    /// Kernel declarations cloned from the descriptor.
     kernels: Vec<SessionKernel>,
+    /// The ordered launch plan cloned from the descriptor.
+    launches: Vec<SessionLaunch>,
     /// Carried inter-kernel data-flow edges (A10/R2): the wire's
     /// producer/consumer facts per buffer version, consumed by
     /// [`ProgramSession::declared_resource_graph`] — never re-derived from
@@ -370,33 +391,32 @@ impl<'host> ProgramSession<'host> {
         // first (S2-3 release-on-error): the module and every already-
         // allocated buffer are released before the error escapes, so a
         // failed creation leaves `live_handle_count() == 0`.
-        let mut buffers: BTreeMap<u32, DeviceHandle> = BTreeMap::new();
-        let mut buffer_meta: BTreeMap<u32, SessionBufferMeta> = BTreeMap::new();
+        let mut buffers: BTreeMap<BufferKey, DeviceHandle> = BTreeMap::new();
+        let mut buffer_meta: BTreeMap<BufferKey, SessionBufferMeta> = BTreeMap::new();
         let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
 
         let result = (|| {
             for kernel in &descriptor.kernels {
                 let mut slots = Vec::with_capacity(kernel.buffers.len());
                 for slot in &kernel.buffers {
-                    buffer_meta
-                        .entry(slot.buffer_id)
-                        .or_insert(SessionBufferMeta {
-                            name: slot.buffer_name.clone(),
-                            role: slot.role,
-                            element_ty: slot.element_ty,
-                            element_count: slot.element_count,
-                            version: slot.version,
-                            byte_length: slot.byte_length(),
-                            lifetime: slot.lifetime,
-                        });
-                    if !buffers.contains_key(&slot.buffer_id)
+                    let key = (slot.buffer_id, slot.version);
+                    buffer_meta.entry(key).or_insert(SessionBufferMeta {
+                        name: slot.buffer_name.clone(),
+                        role: slot.role,
+                        element_ty: slot.element_ty,
+                        element_count: slot.element_count,
+                        byte_length: slot.byte_length(),
+                        lifetime: slot.lifetime,
+                    });
+                    if !buffers.contains_key(&key)
                         && slot.lifetime == DeviceBufferLifetime::PerProgram
                     {
                         let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
-                        buffers.insert(slot.buffer_id, handle);
+                        buffers.insert(key, handle);
                     }
                     slots.push(SessionSlot {
                         buffer_id: slot.buffer_id,
+                        version: slot.version,
                         buffer_name: slot.buffer_name.clone(),
                         role: slot.role,
                     });
@@ -423,6 +443,15 @@ impl<'host> ProgramSession<'host> {
             return Err(error);
         }
 
+        let launches = descriptor
+            .launches
+            .iter()
+            .map(|launch| SessionLaunch {
+                id: launch.id,
+                kernel_index: launch.kernel_index as usize,
+            })
+            .collect();
+
         Ok(Self {
             runtime,
             backend: descriptor.backend,
@@ -433,6 +462,7 @@ impl<'host> ProgramSession<'host> {
             buffers,
             buffer_meta,
             kernels,
+            launches,
             data_flow: descriptor
                 .data_flow
                 .iter()
@@ -502,6 +532,8 @@ impl<'host> ProgramSession<'host> {
         outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut launch_count = 0usize;
+        let mut launch_ids = Vec::with_capacity(self.launches.len());
+        let mut launch_entries = Vec::with_capacity(self.launches.len());
         let mut copy_ins = 0usize;
 
         // Allocate this step's PerStep + ObservationPoint buffers (S2-4).
@@ -509,16 +541,19 @@ impl<'host> ProgramSession<'host> {
         // stay live. A failure here runs the error-path teardown (S2-3).
         self.allocate_step_buffers()?;
 
-        for kernel in &self.kernels {
+        for launch in &self.launches {
+            let kernel = self
+                .kernels
+                .get(launch.kernel_index)
+                .ok_or_else(|| HostError::internal("session launch references missing kernel"))?;
             // Resolve buffer handles for this kernel's launch (PerProgram
             // live from creation; PerStep/ObservationPoint just allocated).
             let mut launch_buffers: Vec<DeviceHandle> = Vec::with_capacity(kernel.slots.len());
             for slot in &kernel.slots {
-                let handle = self
-                    .buffers
-                    .get(&slot.buffer_id)
-                    .copied()
-                    .ok_or_else(|| HostError::internal("session buffer disappeared during launch"))?;
+                let key = (slot.buffer_id, slot.version);
+                let handle = self.buffers.get(&key).copied().ok_or_else(|| {
+                    HostError::internal("session buffer disappeared during launch")
+                })?;
                 launch_buffers.push(handle);
             }
 
@@ -533,7 +568,7 @@ impl<'host> ProgramSession<'host> {
                     })?;
                     let expected = self
                         .buffer_meta
-                        .get(&slot.buffer_id)
+                        .get(&(slot.buffer_id, slot.version))
                         .map(|meta| meta.element_count)
                         .unwrap_or(0);
                     if u64::try_from(values.len()).ok() != Some(expected) {
@@ -548,7 +583,7 @@ impl<'host> ProgramSession<'host> {
                     }
                     let handle = self
                         .buffers
-                        .get(&slot.buffer_id)
+                        .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| HostError::internal("session input buffer disappeared"))?;
                     self.runtime.copy_in_f32(&handle, values)?;
@@ -564,6 +599,8 @@ impl<'host> ProgramSession<'host> {
                 kernel.block,
             )?;
             launch_count += 1;
+            launch_ids.push(launch.id);
+            launch_entries.push(kernel.entry.clone());
         }
 
         // Step-boundary synchronization: every launch in this step has
@@ -581,7 +618,8 @@ impl<'host> ProgramSession<'host> {
             if readbacks.contains_key(output_id) {
                 continue;
             }
-            let meta = self.buffer_meta.get(output_id).ok_or_else(|| {
+            let key = self.unique_buffer_key(*output_id)?;
+            let meta = self.buffer_meta.get(&key).ok_or_else(|| {
                 HostError::invalid_args(format!(
                     "declared output buffer id {output_id} was not allocated by the session"
                 ))
@@ -594,29 +632,29 @@ impl<'host> ProgramSession<'host> {
             }
             let handle = self
                 .buffers
-                .get(output_id)
+                .get(&key)
                 .copied()
                 .ok_or_else(|| HostError::internal("session observation buffer disappeared"))?;
             let values = self.runtime.readback_f32(&handle)?;
             readbacks.insert(*output_id, values);
-            self.release_buffer(*output_id)?;
+            self.release_buffer(key)?;
             release_count += 1;
         }
 
         // Step-boundary recycle (S2-4): PerStep buffers are released at the
         // step boundary and re-allocated for the next execution.
-        let per_step_ids: Vec<u32> = self
+        let per_step_ids: Vec<BufferKey> = self
             .buffers
             .iter()
-            .filter(|(id, _)| {
+            .filter(|(key, _)| {
                 self.buffer_meta
-                    .get(id)
+                    .get(key)
                     .is_some_and(|meta| meta.lifetime == DeviceBufferLifetime::PerStep)
             })
-            .map(|(id, _)| *id)
+            .map(|(key, _)| *key)
             .collect();
-        for id in per_step_ids {
-            self.release_buffer(id)?;
+        for key in per_step_ids {
+            self.release_buffer(key)?;
             release_count += 1;
         }
 
@@ -630,13 +668,22 @@ impl<'host> ProgramSession<'host> {
             device_name: self.device_name.clone(),
             module_hash: self.module_hash,
             launches: launch_count,
+            launch_ids,
+            launch_entries,
             copy_ins,
             outputs: readbacks,
             allocated_buffers: self.allocated_buffers(),
+            allocated_buffer_versions: self.allocated_buffer_versions(),
             program_lifetime: self.program_lifetime,
             per_program_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerProgram),
+            per_program_buffer_versions: self
+                .buffer_versions_by_lifetime(DeviceBufferLifetime::PerProgram),
             per_step_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerStep),
+            per_step_buffer_versions: self
+                .buffer_versions_by_lifetime(DeviceBufferLifetime::PerStep),
             observation_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::ObservationPoint),
+            observation_buffer_versions: self
+                .buffer_versions_by_lifetime(DeviceBufferLifetime::ObservationPoint),
             resource_graph,
             data_flow_edges,
             syncs: 1,
@@ -651,30 +698,29 @@ impl<'host> ProgramSession<'host> {
     /// left live by an interrupted path that has not yet run the error path,
     /// is never double-allocated).
     fn allocate_step_buffers(&mut self) -> HostResult<()> {
-        let to_allocate: Vec<u32> = self
+        let to_allocate: Vec<BufferKey> = self
             .buffer_meta
             .iter()
-            .filter(|(id, meta)| {
-                meta.lifetime != DeviceBufferLifetime::PerProgram
-                    && !self.buffers.contains_key(id)
+            .filter(|(key, meta)| {
+                meta.lifetime != DeviceBufferLifetime::PerProgram && !self.buffers.contains_key(key)
             })
-            .map(|(id, _)| *id)
+            .map(|(key, _)| *key)
             .collect();
-        for id in to_allocate {
+        for key in to_allocate {
             let meta = self
                 .buffer_meta
-                .get(&id)
+                .get(&key)
                 .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
             let handle = self.runtime.alloc_bytes(meta.byte_length as usize)?;
-            self.buffers.insert(id, handle);
+            self.buffers.insert(key, handle);
         }
         Ok(())
     }
 
-    /// Release one live buffer by id (no-op when the id is not live). Used by
+    /// Release one live buffer by key (no-op when the key is not live). Used by
     /// the read-then-release and step-boundary paths.
-    fn release_buffer(&mut self, id: u32) -> HostResult<()> {
-        if let Some(handle) = self.buffers.remove(&id) {
+    fn release_buffer(&mut self, key: BufferKey) -> HostResult<()> {
+        if let Some(handle) = self.buffers.remove(&key) {
             self.runtime.release(&handle)?;
         }
         Ok(())
@@ -682,10 +728,24 @@ impl<'host> ProgramSession<'host> {
 
     /// The program's buffer ids classified by lifetime class (S2-4 receipt).
     fn buffers_by_lifetime(&self, lifetime: DeviceBufferLifetime) -> Vec<u32> {
+        let mut ids = Vec::new();
         self.buffer_meta
             .iter()
             .filter(|(_, meta)| meta.lifetime == lifetime)
-            .map(|(id, _)| *id)
+            .for_each(|((id, _), _)| {
+                if ids.last() != Some(id) {
+                    ids.push(*id);
+                }
+            });
+        ids
+    }
+
+    /// The program's version-keyed buffer metadata classified by lifetime.
+    fn buffer_versions_by_lifetime(&self, lifetime: DeviceBufferLifetime) -> Vec<BufferKey> {
+        self.buffer_meta
+            .iter()
+            .filter(|(_, meta)| meta.lifetime == lifetime)
+            .map(|(key, _)| *key)
             .collect()
     }
 
@@ -706,14 +766,14 @@ impl<'host> ProgramSession<'host> {
         let graph = self
             .buffer_meta
             .iter()
-            .map(|(id, meta)| ReceiptBuffer {
+            .map(|((id, version), meta)| ReceiptBuffer {
                 id: *id,
                 name: meta.name.clone(),
                 role: meta.role,
                 lifetime: meta.lifetime,
                 element_ty: meta.element_ty,
                 element_count: meta.element_count,
-                version: meta.version,
+                version: *version,
             })
             .collect();
         (graph, self.data_flow.clone())
@@ -766,7 +826,39 @@ impl<'host> ProgramSession<'host> {
     /// ObservationPoint ids are live only within one execution (S2-4).
     #[must_use]
     pub fn allocated_buffers(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for (id, _) in self.buffer_meta.keys() {
+            if ids.last() != Some(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    }
+
+    /// The program's version-keyed buffer allocations.
+    #[must_use]
+    pub fn allocated_buffer_versions(&self) -> Vec<(u32, u32)> {
         self.buffer_meta.keys().copied().collect()
+    }
+
+    /// Resolve the legacy output API's buffer id to one unambiguous version.
+    fn unique_buffer_key(&self, buffer_id: u32) -> HostResult<BufferKey> {
+        let mut keys = self
+            .buffer_meta
+            .keys()
+            .filter(|(id, _)| *id == buffer_id)
+            .copied();
+        let Some(key) = keys.next() else {
+            return Err(HostError::invalid_args(format!(
+                "declared output buffer id {buffer_id} was not allocated by the session"
+            )));
+        };
+        if keys.next().is_some() {
+            return Err(HostError::invalid_args(format!(
+                "declared output buffer id {buffer_id} has multiple content versions; the unversioned output API is ambiguous"
+            )));
+        }
+        Ok(key)
     }
 
     /// Number of live device handles the session currently holds (module +
