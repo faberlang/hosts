@@ -244,6 +244,20 @@ pub struct DataFlowEdge {
 
 type BufferKey = (u32, u32);
 
+/// Whether an execution copies host inputs into the declared input slots.
+///
+/// `SingleRun` executions copy per call (the one-shot-with-repeat surface);
+/// `RepeatingStep` executions copy nothing — the HostProvided params were
+/// once-init'd at session creation and stay device-resident (S5-U6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyMode {
+    /// Copy declared host inputs per execution (SingleRun).
+    PerStep,
+    /// No copy-in: params are already device-resident from the once-init at
+    /// session creation (RepeatingStep).
+    OnceInit,
+}
+
 /// One descriptor launch record retained by a program session.
 struct SessionLaunch {
     id: u32,
@@ -350,12 +364,18 @@ struct SessionBufferMeta {
 ///   undeclared readback).
 ///
 /// The [`DeviceProgramLifetime`] regime is carried and consumed as the
-/// declared program fact: `SingleRun` is the Stage 2 fixture regime, where
-/// repeated `execute()` calls are a one-shot-with-repeat surface for the
-/// leak proof (each execution re-runs the whole program; per-step recycling
-/// between executions is not yet meaningful). `RepeatingStep` — where
-/// per-step buffers recycle as a training-iteration pool — is recorded and
-/// reported but its Stage 5 training-loop semantics are out of Stage 2 scope.
+/// declared program fact: `SingleRun` is the one-shot-with-repeat surface
+/// (each [`ProgramSession::execute`] call copies its declared host inputs
+/// and re-runs the whole program). `RepeatingStep` is the training-loop
+/// surface (S5-U6): `HostProvided` params are copied into their PerProgram
+/// buffers exactly once at session creation via [`ProgramSession::init_params`]
+/// and never re-copied; each [`ProgramSession::execute_step`] allocates the
+/// step's PerStep and ObservationPoint buffers, runs the ordered launches
+/// with no copy-in, synchronizes at the step boundary, reads back the
+/// declared observation (the per-step loss trace), and recycles the
+/// per-step buffers. The two regimes never mix: `execute` refuses a
+/// `RepeatingStep` session and `execute_step` refuses a `SingleRun` one
+/// (params once-init + never re-copied is the RepeatingStep contract).
 ///
 /// # Module cache policy (S2-2)
 ///
@@ -407,6 +427,11 @@ pub struct ProgramSession<'host> {
     results: Vec<SessionResult>,
     /// FNV-1a hash of the carried semantic graph the session executes.
     semantic_graph_hash: u64,
+    /// Whether a `RepeatingStep` session's HostProvided params have been
+    /// once-init'd via [`ProgramSession::init_params`] (S5-U6). Steps
+    /// refuse until the once-init has run; a second once-init is refused
+    /// ("copied in exactly once").
+    params_initialized: bool,
     /// True after an error-path release (S2-3): every handle has been
     /// released and the session cannot execute again.
     closed: bool,
@@ -562,18 +587,21 @@ impl<'host> ProgramSession<'host> {
                 })
                 .collect(),
             semantic_graph_hash: descriptor.semantic_graph_hash(),
+            params_initialized: false,
             closed: false,
         })
     }
 
-    /// Execute the ordered launch sequence once (one step). Reuses the
-    /// session's module and PerProgram buffers — does not reload the module
-    /// or re-allocate PerProgram buffers. PerStep buffers are allocated for
-    /// the step and recycled at the step boundary; the declared observation
-    /// point buffers ([`SessionResult`]s projected from the descriptor's
-    /// observation facts — F6) are allocated, read back at their producing
-    /// launch's completion boundary, and released (read-then-release — the
-    /// only readback the session performs, S2-4). Synchronizes at the step
+    /// Execute the ordered launch sequence once (one step) on the SingleRun
+    /// surface: copies the declared host inputs into their input slots for
+    /// this execution, then reuses the session's module and PerProgram
+    /// buffers — does not reload the module or re-allocate PerProgram
+    /// buffers. PerStep buffers are allocated for the step and recycled at
+    /// the step boundary; the declared observation point buffers
+    /// ([`SessionResult`]s projected from the descriptor's observation facts
+    /// — F6) are allocated, read back at their producing launch's
+    /// completion boundary, and released (read-then-release — the only
+    /// readback the session performs, S2-4). Synchronizes at the step
     /// boundary before reading back.
     ///
     /// **Error-path teardown is designed into this method (S2-3):** a failure
@@ -581,6 +609,11 @@ impl<'host> ProgramSession<'host> {
     /// error escapes and closes the session, so a failed execution leaves
     /// `live_handle_count() == 0` and no handle survives. A closed session
     /// refuses further [`ProgramSession::execute`] calls.
+    ///
+    /// A `RepeatingStep` session refuses `execute` (S5-U6): its HostProvided
+    /// params are once-init'd at session creation and never re-copied, so
+    /// per-execution input copy-in is the SingleRun surface. Use
+    /// [`ProgramSession::init_params`] + [`ProgramSession::execute_step`].
     ///
     /// # Errors
     /// - `E_DEVICE_ENTRY_MISMATCH` — a kernel entry is unknown to the module;
@@ -600,7 +633,12 @@ impl<'host> ProgramSession<'host> {
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        let result = self.execute_inner(inputs);
+        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "a RepeatingStep session executes through init_params + execute_step: HostProvided params are copied in exactly once at session creation and never re-copied on later steps; per-execution input copy-in is the SingleRun surface",
+            ));
+        }
+        let result = self.execute_inner(inputs, CopyMode::PerStep);
         if result.is_err() {
             // Release-on-error on all paths (S2-3): the ordered release runs
             // before the error escapes, then the session is closed so no
@@ -612,13 +650,160 @@ impl<'host> ProgramSession<'host> {
         result
     }
 
-    /// The executable body of [`ProgramSession::execute`]: the ordered launch
-    /// sequence (step-buffer allocation → copy-in → launch → step-boundary
-    /// sync → observation readback + release → per-step release) without the
+    /// Once-init the declared `HostProvided` training params of a
+    /// `RepeatingStep` session (S5-U6): each HostProvided PerProgram buffer
+    /// receives its declared values exactly once, at session creation, and
+    /// is never re-copied on later steps. The only buffers this copies are
+    /// PerProgram + HostProvided; every such declared buffer must be present
+    /// with its declared element count. A buffer id carrying more than one
+    /// content version cannot be once-init'd from one value vector and fails
+    /// closed.
+    ///
+    /// **Error-path teardown (S2-3):** a failed once-init runs the ordered
+    /// release (buffers then module) before the error escapes and closes the
+    /// session, so a failed once-init leaves `live_handle_count() == 0`.
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the session is not `RepeatingStep`, the params were
+    ///   already once-init'd, or a param id carries multiple content
+    ///   versions;
+    /// - `E_DEVICE_SHAPE_MISMATCH` — a declared param is missing or its size
+    ///   contradicts the declared element count;
+    /// - session-level copy failures bubble through.
+    pub fn init_params(&mut self, params: &BTreeMap<u32, Vec<f32>>) -> HostResult<()> {
+        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "once-init params are a RepeatingStep contract: a SingleRun session copies its declared host inputs per execution",
+            ));
+        }
+        if self.params_initialized {
+            return Err(HostError::internal(
+                "once-init params were already copied; a RepeatingStep session copies its HostProvided params exactly once at session creation",
+            ));
+        }
+        let result = self.init_params_inner(params);
+        match result {
+            Ok(()) => {
+                self.params_initialized = true;
+                Ok(())
+            }
+            Err(error) => {
+                // Release-on-error on all paths (S2-3).
+                drop(self.release_all_handles());
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// The once-init body of [`ProgramSession::init_params`]: the copy loop
+    /// over the declared HostProvided PerProgram params, without the
     /// error-path release, which the caller owns.
+    fn init_params_inner(&mut self, params: &BTreeMap<u32, Vec<f32>>) -> HostResult<()> {
+        // The declared param set: every distinct buffer id whose storage is
+        // PerProgram and HostProvided (the F5 axis is carried, never
+        // re-derived from role). A second content version of the same id
+        // cannot be once-init'd from one value vector (a shape change is a
+        // new version), so it fails closed.
+        let mut param_ids: Vec<u32> = Vec::new();
+        for ((id, _), meta) in &self.buffer_meta {
+            if meta.lifetime == DeviceBufferLifetime::PerProgram
+                && meta.initialization == DeviceBufferInitialization::HostProvided
+            {
+                if param_ids.contains(id) {
+                    return Err(HostError::internal(format!(
+                        "RepeatingStep param buffer `{}` (id {id}) carries multiple content versions; once-init requires a single param version",
+                        meta.name
+                    )));
+                }
+                param_ids.push(*id);
+            }
+        }
+        for id in param_ids {
+            let key = self
+                .buffer_meta
+                .keys()
+                .find(|(buffer_id, _)| *buffer_id == id)
+                .copied()
+                .ok_or_else(|| HostError::internal("RepeatingStep param metadata disappeared"))?;
+            let meta = &self.buffer_meta[&key];
+            let values = params.get(&id).ok_or_else(|| {
+                descriptor_errors::shape_mismatch(format!(
+                    "RepeatingStep param `{}` (id {id}) is not provided at once-init; every HostProvided PerProgram buffer must receive its declared values exactly once",
+                    meta.name
+                ))
+            })?;
+            let expected = meta.element_count;
+            if u64::try_from(values.len()).ok() != Some(expected) {
+                return Err(descriptor_errors::shape_mismatch(format!(
+                    "RepeatingStep param `{}` (id {id}) has {} f32 elements but its declared storage holds {expected}",
+                    meta.name,
+                    values.len()
+                )));
+            }
+            let handle = self
+                .buffers
+                .get(&key)
+                .copied()
+                .ok_or_else(|| HostError::internal("RepeatingStep param buffer disappeared"))?;
+            self.runtime.copy_in_f32(&handle, values)?;
+        }
+        Ok(())
+    }
+
+    /// Execute one training step on a `RepeatingStep` session whose params
+    /// were once-init'd (S5-U6): allocate the step's PerStep +
+    /// ObservationPoint buffers, run the ordered launch sequence with **no
+    /// copy-in** (the HostProvided params are already device-resident from
+    /// the once-init), synchronize at the step boundary, read back the
+    /// declared observation (the per-step loss trace), and recycle the
+    /// per-step buffers. The receipt counts per-step syncs, transfers
+    /// (readbacks only — copy_ins is 0), readbacks, and releases.
+    ///
+    /// **Error-path teardown is designed into this method (S2-3):** a failure
+    /// at any stage runs the ordered release before the error escapes and
+    /// closes the session, so a failed step leaves
+    /// `live_handle_count() == 0`.
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the session is not `RepeatingStep`, or the params
+    ///   were not once-init'd;
+    /// - session-level failures (launch, sync, readback) bubble through
+    ///   unchanged.
+    pub fn execute_step(&mut self) -> HostResult<DeviceExecutionReceipt> {
+        if self.closed {
+            return Err(HostError::internal(
+                "program session is closed after a failed execution; create a new session",
+            ));
+        }
+        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "execute_step is a RepeatingStep surface: a SingleRun session runs the whole program per execute call",
+            ));
+        }
+        if !self.params_initialized {
+            return Err(HostError::internal(
+                "RepeatingStep params were not once-init'd; call init_params before execute_step",
+            ));
+        }
+        let result = self.execute_inner(&BTreeMap::new(), CopyMode::OnceInit);
+        if result.is_err() {
+            // Release-on-error on all paths (S2-3).
+            drop(self.release_all_handles());
+            self.closed = true;
+        }
+        result
+    }
+
+    /// The executable body shared by [`ProgramSession::execute`] and
+    /// [`ProgramSession::execute_step`]: the ordered launch sequence
+    /// (step-buffer allocation → copy-in (SingleRun only) → launch →
+    /// step-boundary sync → observation readback + release → per-step
+    /// release) without the error-path release, which the caller owns.
     fn execute_inner(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
+        mode: CopyMode,
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut launch_count = 0usize;
         let mut launch_ids = Vec::with_capacity(self.launches.len());
@@ -646,37 +831,44 @@ impl<'host> ProgramSession<'host> {
                 launch_buffers.push(handle);
             }
 
-            // Copy-in declared inputs for this kernel.
-            for slot in &kernel.slots {
-                if slot.role == DeviceBufferRole::Input {
-                    let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
-                        descriptor_errors::shape_mismatch(format!(
-                            "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
-                            kernel.entry, slot.buffer_name, slot.buffer_id
-                        ))
-                    })?;
-                    let expected = self
-                        .buffer_meta
-                        .get(&(slot.buffer_id, slot.version))
-                        .map(|meta| meta.element_count)
-                        .unwrap_or(0);
-                    if u64::try_from(values.len()).ok() != Some(expected) {
-                        return Err(descriptor_errors::shape_mismatch(format!(
-                            "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            values.len(),
-                            kernel.entry,
-                            expected
-                        )));
+            // Copy-in declared inputs for this kernel — SingleRun only
+            // (PerStep mode). A RepeatingStep step (OnceInit mode) copies
+            // nothing: the HostProvided params were once-init'd at session
+            // creation and stay device-resident (S5-U6).
+            if mode == CopyMode::PerStep {
+                for slot in &kernel.slots {
+                    if slot.role == DeviceBufferRole::Input {
+                        let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
+                            descriptor_errors::shape_mismatch(format!(
+                                "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
+                                kernel.entry, slot.buffer_name, slot.buffer_id
+                            ))
+                        })?;
+                        let expected = self
+                            .buffer_meta
+                            .get(&(slot.buffer_id, slot.version))
+                            .map(|meta| meta.element_count)
+                            .unwrap_or(0);
+                        if u64::try_from(values.len()).ok() != Some(expected) {
+                            return Err(descriptor_errors::shape_mismatch(format!(
+                                "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
+                                slot.buffer_name,
+                                slot.buffer_id,
+                                values.len(),
+                                kernel.entry,
+                                expected
+                            )));
+                        }
+                        let handle = self
+                            .buffers
+                            .get(&(slot.buffer_id, slot.version))
+                            .copied()
+                            .ok_or_else(|| {
+                                HostError::internal("session input buffer disappeared")
+                            })?;
+                        self.runtime.copy_in_f32(&handle, values)?;
+                        copy_ins += 1;
                     }
-                    let handle = self
-                        .buffers
-                        .get(&(slot.buffer_id, slot.version))
-                        .copied()
-                        .ok_or_else(|| HostError::internal("session input buffer disappeared"))?;
-                    self.runtime.copy_in_f32(&handle, values)?;
-                    copy_ins += 1;
                 }
             }
 
@@ -1174,9 +1366,14 @@ impl CompositeHost {
     /// (allocated once at creation, persisting across executions); PerStep
     /// and ObservationPoint buffers are allocated per execution and recycled
     /// / read-then-released at each step boundary (S2-4). It survives
-    /// repeated [`ProgramSession::execute`] calls on the same session without
-    /// reloading or re-allocating PerProgram buffers. Call
+    /// repeated executions on the same session without reloading or
+    /// re-allocating PerProgram buffers. Call
     /// [`ProgramSession::teardown`] to release every handle in order.
+    ///
+    /// A `RepeatingStep` session (S5-U6, the training-loop surface) runs
+    /// through [`ProgramSession::init_params`] (once-init HostProvided
+    /// params) + [`ProgramSession::execute_step`]; a `SingleRun` session
+    /// runs through [`ProgramSession::execute`].
     ///
     /// # Errors
     /// - `E_NO_DEVICE_PROGRAM` — no device session on this host;

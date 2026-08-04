@@ -621,6 +621,7 @@ impl DeviceDescriptor {
         let mut identities: Vec<(u32, String, DeviceBufferRole)> = Vec::new();
         let mut semantic_values: Vec<(u32, u32)> = Vec::new();
         let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
+        let mut initializations: Vec<(u32, DeviceBufferInitialization)> = Vec::new();
 
         for kernel in &self.kernels {
             if kernel.entry.trim().is_empty() {
@@ -766,6 +767,58 @@ impl DeviceDescriptor {
                     }
                 } else {
                     lifetimes.push((slot.buffer_id, slot.lifetime));
+                }
+
+                // F5: the initialization axis is also a buffer identity fact
+                // — two references to the same id must agree on how its
+                // storage is brought to its first defined state (the
+                // once-init / per-allocation policy is driven by this single
+                // fact).
+                if let Some((_, first_init)) = initializations
+                    .iter()
+                    .find(|(id, _)| *id == slot.buffer_id)
+                {
+                    if *first_init != slot.initialization {
+                        return Err(abi_error(format!(
+                            "device buffer `{}` (id {}) is referenced with conflicting initialization policies {} and {}",
+                            slot.buffer_name,
+                            slot.buffer_id,
+                            first_init.spelling(),
+                            slot.initialization.spelling()
+                        )));
+                    }
+                } else {
+                    initializations.push((slot.buffer_id, slot.initialization));
+                }
+            }
+        }
+
+        // RepeatingStep once-init contract (S5-U6): a repeating training
+        // step copies its HostProvided params into their PerProgram storage
+        // exactly once at session creation and never re-copies on later
+        // steps — steps copy nothing. A HostProvided buffer outside
+        // per-program storage could never receive its values in step-mode,
+        // so the combination fails closed here, before any launch.
+        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+            for (id, init) in &initializations {
+                if *init == DeviceBufferInitialization::HostProvided {
+                    let lifetime = lifetimes
+                        .iter()
+                        .find(|(buffer_id, _)| buffer_id == id)
+                        .map(|(_, lifetime)| *lifetime);
+                    let name = identities
+                        .iter()
+                        .find(|(buffer_id, _, _)| buffer_id == id)
+                        .map(|(_, name, _)| name.as_str())
+                        .unwrap_or("<unknown>");
+                    if lifetime != Some(DeviceBufferLifetime::PerProgram) {
+                        return Err(descriptor_error(format!(
+                            "RepeatingStep buffer `{name}` (id {id}) is host-provided but has lifetime `{}`; a repeating step once-inits its host-provided params at session creation, which is defined only for per-program storage",
+                            lifetime
+                                .map(DeviceBufferLifetime::spelling)
+                                .unwrap_or("(no declared lifetime)")
+                        )));
+                    }
                 }
             }
         }

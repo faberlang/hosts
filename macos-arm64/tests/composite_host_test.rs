@@ -2194,7 +2194,9 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
 }
 
 /// The A9 receipt reflects the lifetime policy: per-buffer lifetime class
-/// sets and the program-level lifetime regime (S2-4 done-when).
+/// sets and the program-level lifetime regime (S2-4 done-when). A
+/// RepeatingStep session runs through the step-mode surface (S5-U6):
+/// once-init the HostProvided params, then execute steps.
 #[test]
 fn receipt_reports_lifetime_classes_and_program_lifetime() {
     let mut host = metal_composite("add_one").expect("metal composite");
@@ -2204,7 +2206,10 @@ fn receipt_reports_lifetime_classes_and_program_lifetime() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    let receipt = session.execute(&two_kernel_inputs()).expect("execute");
+    session
+        .init_params(&two_kernel_inputs())
+        .expect("once-init params");
+    let receipt = session.execute_step().expect("execute step");
     assert_eq!(
         receipt.program_lifetime,
         DeviceProgramLifetime::RepeatingStep,
@@ -2219,6 +2224,502 @@ fn receipt_reports_lifetime_classes_and_program_lifetime() {
         "allocated_buffers is the union of the three lifetime classes"
     );
     session.teardown().expect("teardown");
+}
+
+// ---------------------------------------------------------------------------
+// S5-U6: RepeatingStep host step-mode — once-init HostProvided params,
+// N-step loop with PerStep recycle, per-step observation (loss trace),
+// per-step receipts, leak-free teardown.
+// ---------------------------------------------------------------------------
+
+/// The S5-U6 training-step fixture as a descriptor: two HostProvided
+/// PerProgram params (w, b) once-init'd at session creation, one PerStep
+/// InOut intermediate (h) recycled at each step boundary, and one
+/// ObservationPoint loss output (l) read back per step. The fake driver
+/// simulates both kernels as elementwise add, so the step semantics are
+/// h = w + b (launch 1), l = h + w (launch 2).
+///
+/// | Buffer | Role → class | Init |
+/// | --- | --- | --- |
+/// | w, b (1, 2) | Input → PerProgram | HostProvided |
+/// | h (3) | InOut → PerStep | KernelInitialized |
+/// | l (4) | Output → ObservationPoint | KernelInitialized |
+fn training_step_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    let mut descriptor = make_descriptor(
+        backend,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    add_slot(1, "w", DeviceBufferRole::Input, 0, 2),
+                    add_slot(2, "b", DeviceBufferRole::Input, 1, 2),
+                    kernel_init_slot(3, "h", 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    kernel_init_slot(3, "h", 0),
+                    add_slot(1, "w", DeviceBufferRole::Input, 1, 2),
+                    add_slot(4, "l", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        // R2: the carried data-flow edge — launch 1 produces the PerStep
+        // intermediate h, launch 2 consumes it.
+        vec![DescriptorDataFlow {
+            buffer_id: 3,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
+        // F6: the declared observation point — the loss l, produced by
+        // launch 2, read back once per step.
+        vec![result(4, 2)],
+    );
+    descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
+    descriptor
+}
+
+/// A PerStep InOut slot that is fully written by a device kernel before any
+/// read (the training-step intermediate `h`): InOut role → PerStep lifetime
+/// (S2-4 mapping), but KernelInitialized initialization — launch 1 writes it
+/// before launch 2 reads it, so the step allocates it without a zero-fill
+/// copy (the once-init copy accounting stays exact: only the params copy).
+fn kernel_init_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
+    DescriptorBuffer {
+        buffer_id: id,
+        buffer_name: name.to_owned(),
+        semantic_value: id,
+        role: DeviceBufferRole::InOut,
+        lifetime: DeviceBufferLifetime::PerStep,
+        initialization: DeviceBufferInitialization::KernelInitialized,
+        binding,
+        element_ty: DeviceDataType::F32,
+        element_count: 2,
+        version: 1,
+    }
+}
+
+/// Host values for the once-init params of [`training_step_descriptor`]:
+/// w = [1, 2], b = [3, 4]. The simulated step then yields h = [4, 6] and the
+/// per-step loss observation l = h + w = [5, 8] — stable across steps only
+/// while the params persist on device.
+fn training_step_params() -> BTreeMap<u32, Vec<f32>> {
+    let mut params = BTreeMap::new();
+    params.insert(1, vec![1.0, 2.0]); // w
+    params.insert(2, vec![3.0, 4.0]); // b
+    params
+}
+
+/// A PerProgram + HostProvided slot for any role — the real U5 training
+/// shape for params (PerProgram InOut ReadWrite buffers with HostProvided
+/// init at session creation, per the Stage 5 delivery architecture). The
+/// step-mode once-init copies these exactly once at session creation,
+/// regardless of slot role, never via the per-step input path.
+fn host_provided_param_slot(
+    id: u32,
+    name: &str,
+    role: DeviceBufferRole,
+    binding: u32,
+    count: u64,
+) -> DescriptorBuffer {
+    DescriptorBuffer {
+        buffer_id: id,
+        buffer_name: name.to_owned(),
+        semantic_value: id,
+        role,
+        lifetime: DeviceBufferLifetime::PerProgram,
+        initialization: DeviceBufferInitialization::HostProvided,
+        binding,
+        element_ty: DeviceDataType::F32,
+        element_count: count,
+        version: 1,
+    }
+}
+
+/// The [`training_step_descriptor`] shape with the params in their real U5
+/// wire form: PerProgram InOut ReadWrite buffers with HostProvided init
+/// (not Input-role slots). Step semantics are unchanged (h = w + b, then
+/// l = h + w).
+fn training_step_inout_param_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    let mut descriptor = make_descriptor(
+        backend,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    host_provided_param_slot(1, "w", DeviceBufferRole::InOut, 0, 2),
+                    host_provided_param_slot(2, "b", DeviceBufferRole::InOut, 1, 2),
+                    kernel_init_slot(3, "h", 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    kernel_init_slot(3, "h", 0),
+                    host_provided_param_slot(1, "w", DeviceBufferRole::InOut, 1, 2),
+                    add_slot(4, "l", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        vec![DescriptorDataFlow {
+            buffer_id: 3,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
+        vec![result(4, 2)],
+    );
+    descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
+    descriptor
+}
+
+/// The S5-U6 done-when fake-driver test: one session runs N steps — params
+/// persist and are copied in exactly once, PerStep buffers recycle per
+/// step, the observation (loss) readback happens exactly once per declared
+/// observation, receipts count per-step syncs/transfers/readbacks/releases,
+/// and teardown returns `live_handle_count() == 0` (leak-free).
+#[test]
+fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = training_step_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Creation: module + the two PerProgram params allocated once; the
+    // PerStep intermediate (h) and the ObservationPoint loss (l) are NOT
+    // allocated until a step. No copy-in has happened yet.
+    assert_eq!(session.session_handle_count(), 3); // module + w + b
+    assert_eq!(session.driver_counters().buffer_allocs, 2);
+    assert_eq!(session.driver_counters().buffer_releases, 0);
+
+    // Once-init: the HostProvided params are copied in exactly once.
+    session.init_params(&training_step_params()).expect("once-init params");
+
+    // N steps on one session: PerStep recycled per step, observation read
+    // back per step, receipts count per-step syncs/transfers/readbacks/
+    // releases, no copy-in during steps, params persisted (stable loss).
+    const STEPS: usize = 5;
+    for _ in 0..STEPS {
+        let receipt = session.execute_step().expect("execute step");
+        assert_eq!(receipt.program_lifetime, DeviceProgramLifetime::RepeatingStep);
+        assert_eq!(receipt.launches, 2);
+        assert_eq!(receipt.launch_ids, vec![1, 2]);
+        assert_eq!(
+            receipt.copy_ins, 0,
+            "steps never re-copy the once-init params"
+        );
+        assert_eq!(
+            receipt.readbacks, 1,
+            "the loss is observed exactly once per declared observation"
+        );
+        assert_eq!(
+            receipt.transfers, 1,
+            "readback-only transfers per step (no copy-ins)"
+        );
+        assert_eq!(
+            receipt.syncs, 3,
+            "2 launches + the explicit step-boundary barrier per step"
+        );
+        assert_eq!(
+            receipt.releases, 2,
+            "loss read-then-release + h step-boundary recycle per step"
+        );
+        // The persisted params keep the loss trace stable across steps.
+        assert_eq!(receipt.outputs.get(&4), Some(&vec![5.0, 8.0]));
+        assert_eq!(receipt.per_program_buffers, vec![1, 2]);
+        assert_eq!(receipt.per_step_buffers, vec![3]);
+        assert_eq!(receipt.observation_buffers, vec![4]);
+        // Between steps the session holds only module + PerProgram params.
+        assert_eq!(session.session_handle_count(), 3);
+    }
+
+    // Driver-level accounting: w + b allocated once at creation; each step
+    // allocates and releases h + l (2 allocs + 2 releases per step). The
+    // module is loaded exactly once.
+    let counters = session.driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 2 * STEPS);
+    assert_eq!(counters.buffer_releases, 2 * STEPS);
+
+    // Teardown after the loop: module + PerProgram params released; every
+    // allocation balances and nothing persists (leak-free).
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 2 * STEPS);
+    assert_eq!(counters.buffer_releases, 2 + 2 * STEPS);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The same N-step step-mode loop on the fake CUDA lane (backend-neutral
+/// surface): once-init, per-step observation, PerStep recycle, leak-free
+/// teardown.
+#[test]
+fn repeating_step_n_step_loop_on_both_fake_backends() {
+    for backend in [DeviceBackend::Metal, DeviceBackend::Cuda] {
+        let mut host = match backend {
+            DeviceBackend::Metal => metal_composite("add_one").expect("metal composite"),
+            DeviceBackend::Cuda => cuda_composite("add_one").expect("cuda composite"),
+        };
+        let descriptor = training_step_descriptor(backend);
+
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+        session
+            .init_params(&training_step_params())
+            .expect("once-init params");
+        for _ in 0..3 {
+            let receipt = session.execute_step().expect("execute step");
+            assert_eq!(receipt.outputs.get(&4), Some(&vec![5.0, 8.0]));
+            assert_eq!(receipt.copy_ins, 0);
+            assert_eq!(receipt.readbacks, 1);
+            assert_eq!(receipt.releases, 2);
+            assert_eq!(session.session_handle_count(), 3);
+        }
+        session.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
+}
+
+/// The real U5 training shape for params (PerProgram InOut ReadWrite with
+/// HostProvided init — the delivery doc's SGD/param classification) works
+/// through the step-mode once-init: params are copied in exactly once at
+/// session creation regardless of slot role, persist across steps, and
+/// steps run without re-copying.
+#[test]
+fn repeating_step_once_init_inout_host_provided_params() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = training_step_inout_param_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    assert_eq!(session.session_handle_count(), 3); // module + w + b (PerProgram)
+    session
+        .init_params(&training_step_params())
+        .expect("once-init InOut params");
+    for _ in 0..3 {
+        let receipt = session.execute_step().expect("execute step");
+        assert_eq!(receipt.outputs.get(&4), Some(&vec![5.0, 8.0]));
+        assert_eq!(receipt.copy_ins, 0);
+        assert_eq!(receipt.per_program_buffers, vec![1, 2]);
+        assert_eq!(receipt.readbacks, 1);
+    }
+    session.teardown().expect("teardown");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The once-init copy accounting is observable at the driver boundary: a
+/// RepeatingStep session copies its HostProvided params exactly once (w is
+/// copy call 1, b is copy call 2) and steps copy nothing. Injecting a
+/// CopyIn failure at call 3 must therefore NOT fire across N steps — a
+/// step that re-copied params would fail.
+#[test]
+fn repeating_step_steps_copy_nothing_and_params_copy_exactly_once() {
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::CopyIn, 3).expect("metal composite");
+    let descriptor = training_step_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    session
+        .init_params(&training_step_params())
+        .expect("once-init consumes copy calls 1 and 2 (w, b)");
+    for _ in 0..3 {
+        session
+            .execute_step()
+            .expect("a step performs no copy-in (the injected call-3 failure never fires)");
+    }
+    session.teardown().expect("teardown");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// A failure during the once-init copy (S2-3 error-path teardown): the
+/// second param copy (b, copy call 2) fails, the session releases every
+/// handle and closes — `live_handle_count() == 0`, and a closed session
+/// refuses further steps.
+#[test]
+fn repeating_step_init_failure_releases_every_handle() {
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::CopyIn, 2).expect("metal composite");
+    let descriptor = training_step_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let err = session
+        .init_params(&training_step_params())
+        .expect_err("the second param copy (b) is injected to fail");
+    assert_eq!(err.code, E_METAL_DRIVER);
+    assert_eq!(
+        session.session_handle_count(),
+        0,
+        "a failed once-init releases every handle (S2-3 error-path teardown)"
+    );
+
+    let err = session
+        .execute_step()
+        .expect_err("a session closed by a failed once-init refuses steps");
+    assert_eq!(err.code, "E_INTERNAL");
+    drop(session);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The step-mode and SingleRun surfaces never mix (S5-U6): `execute` on a
+/// RepeatingStep session, `execute_step` on a SingleRun session, a step
+/// before the once-init, and a second once-init all fail closed with typed
+/// diagnostics — never a silent fallback.
+#[test]
+fn repeating_step_surfaces_fail_closed_on_misuse() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let step_descriptor = training_step_descriptor(DeviceBackend::Metal);
+
+    // SingleRun session: execute_step and init_params are refused (the
+    // step-mode surface is a RepeatingStep contract).
+    let mut single_descriptor = step_descriptor.clone();
+    single_descriptor.program_lifetime = DeviceProgramLifetime::SingleRun;
+    let mut session = host
+        .create_program_session(&single_descriptor)
+        .expect("session create");
+    let err = session
+        .execute_step()
+        .expect_err("execute_step is a RepeatingStep surface");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("RepeatingStep"));
+    let err = session
+        .init_params(&training_step_params())
+        .expect_err("init_params is a RepeatingStep surface");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("RepeatingStep"));
+    session.teardown().expect("teardown");
+
+    // RepeatingStep session: execute (per-execution input copy-in) is
+    // refused — params are once-init'd and never re-copied.
+    let mut session = host
+        .create_program_session(&step_descriptor)
+        .expect("session create");
+    let err = session
+        .execute(&training_step_params())
+        .expect_err("execute is the SingleRun surface");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("SingleRun"));
+
+    // A step before the once-init is refused.
+    let err = session
+        .execute_step()
+        .expect_err("params must be once-init'd first");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("init_params"));
+
+    // The once-init runs exactly once; a second copy is refused.
+    session
+        .init_params(&training_step_params())
+        .expect("once-init");
+    let err = session
+        .init_params(&training_step_params())
+        .expect_err("HostProvided params are copied in exactly once");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("exactly once"));
+    session.teardown().expect("teardown");
+}
+
+/// Once-init validates every declared param: a missing param or a size
+/// that contradicts the declared element count fails with
+/// `E_DEVICE_SHAPE_MISMATCH`, and the failed once-init releases every
+/// handle (S2-3 error-path teardown).
+#[test]
+fn repeating_step_init_requires_every_declared_param() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = training_step_descriptor(DeviceBackend::Metal);
+
+    // Missing b.
+    let mut missing = training_step_params();
+    missing.remove(&2);
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let err = session
+        .init_params(&missing)
+        .expect_err("a missing declared param must fail the once-init");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    assert!(err.message.contains("b"));
+    assert_eq!(
+        session.session_handle_count(),
+        0,
+        "a failed once-init releases every handle (S2-3 error-path teardown)"
+    );
+    drop(session);
+
+    // Wrong size for w.
+    let mut bad_size = training_step_params();
+    bad_size.insert(1, vec![1.0]);
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let err = session
+        .init_params(&bad_size)
+        .expect_err("a param size contradicting the declared element count must fail");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    drop(session);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The descriptor-level RepeatingStep contract (S5-U6): a HostProvided
+/// buffer with a non-PerProgram lifetime could never receive its values in
+/// step-mode (steps copy nothing), so the descriptor fails closed at
+/// validation before any launch.
+#[test]
+fn repeating_step_host_provided_buffer_requires_per_program_lifetime() {
+    let mut invalid = training_step_descriptor(DeviceBackend::Metal);
+    // Relabel the PerStep intermediate h (id 3) as HostProvided: step-mode
+    // cannot once-init it (it is not PerProgram), so validation fails.
+    for kernel in &mut invalid.kernels {
+        for buffer in &mut kernel.buffers {
+            if buffer.buffer_id == 3 {
+                buffer.initialization = DeviceBufferInitialization::HostProvided;
+            }
+        }
+    }
+    let err = invalid
+        .validate()
+        .expect_err("a HostProvided non-PerProgram buffer must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("RepeatingStep"));
+    assert!(err.message.contains("per-program"));
 }
 
 /// ObservationPoint is the only readback: a result naming a PerProgram
