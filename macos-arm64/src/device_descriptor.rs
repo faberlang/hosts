@@ -177,9 +177,9 @@ pub enum DeviceProgramLifetime {
 ///
 /// `buffer_id`/`buffer_name` are the program-level buffer identity repeated
 /// across kernels; validation requires every reference to the same id to
-/// agree on dtype, shape (a shape change must be a new version — the S1-1
-/// contract; hosts reject in-place reinterpretation at the descriptor), and
-/// lifetime (a lifetime is an identity fact, not a per-slot choice).
+/// agree on identity and lifetime, while every `(buffer_id, version)` pair
+/// agrees on dtype and shape. A shape change is a new version — the S1-1
+/// contract; hosts reject in-place reinterpretation at the descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorBuffer {
     /// Program-level buffer identity key.
@@ -224,10 +224,41 @@ pub struct DescriptorKernel {
     pub block: [u32; 3],
 }
 
+/// One entry in the ordered launch sequence.
+///
+/// The launch id is the program identity used by carried data-flow edges;
+/// `kernel_index` names the declaration to launch. A kernel declaration may
+/// therefore occur more than once in the sequence without duplicating or
+/// reinterpreting its typed facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorLaunch {
+    /// Program-unique launch identity.
+    pub id: u32,
+    /// Index into [`DeviceDescriptor::kernels`].
+    pub kernel_index: u32,
+}
+
+/// One version-keyed buffer shape carried by the device-program wire.
+///
+/// The key is `(buffer_id, version)`, not just `buffer_id`: a buffer identity
+/// can carry multiple shape snapshots over a complete program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorBufferVersion {
+    /// Program-level buffer identity key.
+    pub buffer_id: u32,
+    /// Content version within the buffer identity.
+    pub version: u32,
+    /// Element type of this version's shape.
+    pub element_ty: DeviceDataType,
+    /// Element count of this version's shape.
+    pub element_count: u64,
+}
+
 /// Typed runtime device descriptor: the host's contract for one device
-/// program (module image + ordered kernels + program lifetime). The faber
-/// package layer maps the canonical S1-1 payload onto this shape; hosts
-/// validate it before launch.
+/// program (module image + kernel declarations + ordered launches +
+/// version-keyed resource metadata + program lifetime). The faber package
+/// layer maps the canonical S1-1 payload onto this shape; hosts validate it
+/// before launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDescriptor {
     /// Backend the descriptor targets.
@@ -236,6 +267,11 @@ pub struct DeviceDescriptor {
     pub module_image: Vec<u8>,
     /// Ordered kernel declarations.
     pub kernels: Vec<DescriptorKernel>,
+    /// Ordered launch records. The host must not substitute kernel declaration
+    /// order for this sequence.
+    pub launches: Vec<DescriptorLaunch>,
+    /// Complete version-keyed resource shape facts carried by the wire.
+    pub buffer_versions: Vec<DescriptorBufferVersion>,
     /// Program execution-lifetime regime (S2-4): the session consumes it as
     /// the declared program fact (single-run one-shot-with-repeat surface for
     /// the leak proof vs a repeating training step).
@@ -283,16 +319,20 @@ impl DeviceDescriptor {
     ///
     /// Checks, in order:
     /// 1. structural validity: a non-empty module image, at least one kernel,
-    ///    a non-empty entry per kernel, at least one slot per kernel, a
-    ///    non-zero grid/block per kernel, a non-zero element count per slot —
+    ///    at least one launch, non-empty entries, at least one slot per
+    ///    kernel, non-zero grid/block axes, and non-zero element counts —
     ///    failures are `E_DEVICE_DESCRIPTOR`;
-    /// 2. ABI consistency per kernel: unique bindings and role consistency
-    ///    across references to the same buffer id — `E_DEVICE_ABI_MISMATCH`;
-    /// 3. cross-reference dtype/shape consistency: every reference to the
-    ///    same buffer id carries the same element type (`E_DEVICE_DTYPE_MISMATCH`)
-    ///    and the same element count (`E_DEVICE_SHAPE_MISMATCH`) — a shape
-    ///    change must be a new version, never an in-place reinterpretation;
-    /// 4. cross-reference lifetime consistency (S2-4): every reference to the
+    /// 2. launch identity: launch ids are non-zero and unique, kernel
+    ///    references are in range, and carried edge endpoints name launches —
+    ///    failures are `E_DEVICE_DESCRIPTOR`;
+    /// 3. version metadata: `(buffer_id, version)` keys are non-zero and
+    ///    unique, and each key has one shape; slot facts must agree with the
+    ///    keyed metadata — dtype conflicts are `E_DEVICE_DTYPE_MISMATCH` and
+    ///    shape conflicts are `E_DEVICE_SHAPE_MISMATCH`;
+    /// 4. ABI consistency per kernel: unique bindings and role/name
+    ///    consistency across references to the same buffer id —
+    ///    `E_DEVICE_ABI_MISMATCH`;
+    /// 5. cross-reference lifetime consistency (S2-4): every reference to the
     ///    same buffer id carries the same [`DeviceBufferLifetime`] — a
     ///    lifetime is an identity fact of the buffer, not a per-slot choice
     ///    (`E_DEVICE_ABI_MISMATCH`).
@@ -308,9 +348,110 @@ impl DeviceDescriptor {
         if self.kernels.is_empty() {
             return Err(descriptor_error("device descriptor declares no kernels"));
         }
+        if self.launches.is_empty() {
+            return Err(descriptor_error("device descriptor declares no launches"));
+        }
+
+        let mut launch_ids: Vec<u32> = Vec::with_capacity(self.launches.len());
+        for launch in &self.launches {
+            if launch.id == 0 {
+                return Err(descriptor_error(
+                    "device descriptor has a launch with the reserved zero identity",
+                ));
+            }
+            if launch_ids.contains(&launch.id) {
+                return Err(descriptor_error(format!(
+                    "device descriptor repeats launch identity {}",
+                    launch.id
+                )));
+            }
+            if self.kernels.get(launch.kernel_index as usize).is_none() {
+                return Err(descriptor_error(format!(
+                    "device descriptor launch {} references unknown kernel index {}",
+                    launch.id, launch.kernel_index
+                )));
+            }
+            launch_ids.push(launch.id);
+        }
+
+        let mut versions: Vec<DescriptorBufferVersion> =
+            Vec::with_capacity(self.buffer_versions.len());
+        for version in &self.buffer_versions {
+            if version.version == 0 {
+                return Err(descriptor_error(format!(
+                    "device descriptor buffer {} uses the reserved zero version",
+                    version.buffer_id
+                )));
+            }
+            if version.element_count == 0 {
+                return Err(descriptor_error(format!(
+                    "device descriptor buffer {} version {} has a zero element count",
+                    version.buffer_id, version.version
+                )));
+            }
+            if let Some(first) = versions.iter().find(|first| {
+                first.buffer_id == version.buffer_id && first.version == version.version
+            }) {
+                if first.element_ty != version.element_ty {
+                    return Err(dtype_error(format!(
+                        "device buffer {} version {} carries conflicting element types {} and {}",
+                        version.buffer_id,
+                        version.version,
+                        first.element_ty.spelling(),
+                        version.element_ty.spelling()
+                    )));
+                }
+                if first.element_count != version.element_count {
+                    return Err(shape_error(format!(
+                        "device buffer {} version {} carries conflicting element counts {} and {}",
+                        version.buffer_id,
+                        version.version,
+                        first.element_count,
+                        version.element_count
+                    )));
+                }
+                return Err(descriptor_error(format!(
+                    "device descriptor repeats buffer {} version {} metadata",
+                    version.buffer_id, version.version
+                )));
+            }
+            versions.push(*version);
+        }
+        if versions.is_empty() {
+            return Err(descriptor_error(
+                "device descriptor declares no version-keyed buffer metadata",
+            ));
+        }
+
+        for edge in &self.data_flow {
+            if edge.version == 0 || edge.producer == 0 || edge.consumer == 0 {
+                return Err(descriptor_error(
+                    "device descriptor data-flow edge uses a reserved zero identity",
+                ));
+            }
+            if edge.producer == edge.consumer {
+                return Err(descriptor_error(format!(
+                    "device descriptor data-flow edge for buffer {} version {} is self-referential at launch {}",
+                    edge.buffer_id, edge.version, edge.producer
+                )));
+            }
+            if !launch_ids.contains(&edge.producer) || !launch_ids.contains(&edge.consumer) {
+                return Err(descriptor_error(format!(
+                    "device descriptor data-flow edge for buffer {} version {} references an unknown launch",
+                    edge.buffer_id, edge.version
+                )));
+            }
+            if !versions.iter().any(|version| {
+                version.buffer_id == edge.buffer_id && version.version == edge.version
+            }) {
+                return Err(descriptor_error(format!(
+                    "device descriptor data-flow edge references unknown buffer {} version {}",
+                    edge.buffer_id, edge.version
+                )));
+            }
+        }
 
         let mut identities: Vec<(u32, String, DeviceBufferRole)> = Vec::new();
-        let mut shapes: Vec<(u32, DeviceDataType, u64)> = Vec::new();
         let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
 
         for kernel in &self.kernels {
@@ -337,6 +478,12 @@ impl DeviceDescriptor {
                 if slot.element_count == 0 {
                     return Err(descriptor_error(format!(
                         "device descriptor kernel `{}` binds a zero-count buffer `{}`",
+                        kernel.entry, slot.buffer_name
+                    )));
+                }
+                if slot.version == 0 {
+                    return Err(descriptor_error(format!(
+                        "device descriptor kernel `{}` binds buffer `{}` with the reserved zero version",
                         kernel.entry, slot.buffer_name
                     )));
                 }
@@ -370,29 +517,33 @@ impl DeviceDescriptor {
                     identities.push((slot.buffer_id, slot.buffer_name.clone(), slot.role));
                 }
 
-                if let Some((_, first_ty, first_count)) =
-                    shapes.iter().find(|(id, _, _)| *id == slot.buffer_id)
-                {
-                    if *first_ty != slot.element_ty {
-                        return Err(dtype_error(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting element types {} and {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            first_ty.spelling(),
-                            slot.element_ty.spelling()
-                        )));
-                    }
-                    if *first_count != slot.element_count {
-                        return Err(shape_error(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting element counts {} and {} (a shape change must be a new version)",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            first_count,
-                            slot.element_count
-                        )));
-                    }
-                } else {
-                    shapes.push((slot.buffer_id, slot.element_ty, slot.element_count));
+                let Some(version) = versions.iter().find(|version| {
+                    version.buffer_id == slot.buffer_id && version.version == slot.version
+                }) else {
+                    return Err(descriptor_error(format!(
+                        "device buffer `{}` (id {}) version {} has no keyed metadata",
+                        slot.buffer_name, slot.buffer_id, slot.version
+                    )));
+                };
+                if version.element_ty != slot.element_ty {
+                    return Err(dtype_error(format!(
+                        "device buffer `{}` (id {}) version {} is referenced with conflicting element types {} and {}",
+                        slot.buffer_name,
+                        slot.buffer_id,
+                        slot.version,
+                        version.element_ty.spelling(),
+                        slot.element_ty.spelling()
+                    )));
+                }
+                if version.element_count != slot.element_count {
+                    return Err(shape_error(format!(
+                        "device buffer `{}` (id {}) version {} is referenced with conflicting element counts {} and {}",
+                        slot.buffer_name,
+                        slot.buffer_id,
+                        slot.version,
+                        version.element_count,
+                        slot.element_count
+                    )));
                 }
 
                 // S2-4: a lifetime is a buffer identity fact; two references

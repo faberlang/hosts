@@ -16,10 +16,10 @@ use faber_host_macos_arm64::composite_host::{
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorDataFlow, DescriptorKernel, DeviceBufferLifetime,
-    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
-    E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH,
-    E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
+    DescriptorLaunch, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
+    DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR,
+    E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
@@ -64,11 +64,47 @@ fn add_slot(
     }
 }
 
-fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -> DeviceDescriptor {
+fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVersion> {
+    let mut versions = Vec::new();
+    for kernel in kernels {
+        for slot in &kernel.buffers {
+            if versions.iter().any(|version: &DescriptorBufferVersion| {
+                version.buffer_id == slot.buffer_id && version.version == slot.version
+            }) {
+                continue;
+            }
+            versions.push(DescriptorBufferVersion {
+                buffer_id: slot.buffer_id,
+                version: slot.version,
+                element_ty: slot.element_ty,
+                element_count: slot.element_count,
+            });
+        }
+    }
+    versions
+}
+
+fn make_descriptor(
+    backend: DeviceBackend,
+    kernels: Vec<DescriptorKernel>,
+    launches: Vec<DescriptorLaunch>,
+    data_flow: Vec<DescriptorDataFlow>,
+) -> DeviceDescriptor {
     DeviceDescriptor {
         backend,
         module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![DescriptorKernel {
+        buffer_versions: buffer_versions_for(&kernels),
+        kernels,
+        launches,
+        program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow,
+    }
+}
+
+fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -> DeviceDescriptor {
+    make_descriptor(
+        backend,
+        vec![DescriptorKernel {
             entry: entry.to_owned(),
             buffers: vec![
                 add_slot(1, "a", DeviceBufferRole::Input, 0, count),
@@ -78,9 +114,12 @@ fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -
             grid: [1, 1, 1],
             block: [count as u32, 1, 1],
         }],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    }
+        vec![DescriptorLaunch {
+            id: 1,
+            kernel_index: 0,
+        }],
+        Vec::new(),
+    )
 }
 
 fn metal_composite(entry: &str) -> HostResult<CompositeHost> {
@@ -181,10 +220,9 @@ fn cuda_composite_failing(
 /// shape is backend-neutral, so the same mid-chain coverage runs on the fake
 /// Metal and fake CUDA lanes).
 fn two_kernel_inout_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
-    DeviceDescriptor {
+    make_descriptor(
         backend,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+        vec![
             DescriptorKernel {
                 entry: "add_one".to_owned(),
                 buffers: vec![
@@ -206,18 +244,27 @@ fn two_kernel_inout_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
                 block: [2, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
         // R2: the data-flow edge is CARRIED by the wire (buffer 3 `acc`,
         // version 1: launch 1 produces, launch 2 consumes) — the host
         // consumes it; it never re-derives a first-writer edge from launch
         // order.
-        data_flow: vec![DescriptorDataFlow {
+        vec![DescriptorDataFlow {
             buffer_id: 3,
             version: 1,
             producer: 1,
             consumer: 2,
         }],
-    }
+    )
 }
 
 /// Host inputs for [`two_kernel_inout_descriptor`]: a, b, and c.
@@ -252,10 +299,9 @@ fn two_kernel_inputs() -> BTreeMap<u32, Vec<f32>> {
 /// allocation/recycle/release policy: PerProgram allocated once, PerStep
 /// recycled at the step boundary, ObservationPoint read-then-released.
 fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
-    DeviceDescriptor {
+    make_descriptor(
         backend,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+        vec![
             DescriptorKernel {
                 entry: "loss_mul".to_owned(),
                 buffers: vec![
@@ -297,9 +343,14 @@ fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
                 block: [2, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    }
+        (0..4)
+            .map(|kernel_index| DescriptorLaunch {
+                id: kernel_index + 1,
+                kernel_index,
+            })
+            .collect(),
+        Vec::new(),
+    )
 }
 
 /// Host inputs for [`mul_mean_companion_descriptor`]: x and w (PerProgram
@@ -457,10 +508,9 @@ fn inout_buffer_stays_device_resident_across_kernels() {
     // acc buffer is allocated once and never copied back to the host — no
     // host roundtrip per operation (A9).
     let mut host = metal_composite("add_one").expect("metal composite");
-    let descriptor = DeviceDescriptor {
-        backend: DeviceBackend::Metal,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
             DescriptorKernel {
                 entry: "add_one".to_owned(),
                 buffers: vec![
@@ -482,9 +532,18 @@ fn inout_buffer_stays_device_resident_across_kernels() {
                 block: [2, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    };
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
     inputs.insert(2, vec![3.0, 4.0]);
@@ -506,6 +565,128 @@ fn inout_buffer_stays_device_resident_across_kernels() {
 // ---------------------------------------------------------------------------
 // Negative tests: fail before launch (N1.4)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn descriptor_preserves_repeated_launches_and_version_chain() {
+    let mut descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 11,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 12,
+                kernel_index: 0,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 11,
+                consumer: 12,
+            },
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 2,
+                producer: 12,
+                consumer: 11,
+            },
+        ],
+    );
+    descriptor.buffer_versions.push(DescriptorBufferVersion {
+        buffer_id: 9,
+        version: 2,
+        element_ty: DeviceDataType::F32,
+        element_count: 4,
+    });
+
+    descriptor
+        .validate()
+        .expect("repeated launches and versioned metadata are valid");
+    assert_eq!(
+        descriptor.launches,
+        vec![
+            DescriptorLaunch {
+                id: 11,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 12,
+                kernel_index: 0,
+            },
+        ]
+    );
+    assert!(descriptor
+        .buffer_versions
+        .contains(&DescriptorBufferVersion {
+            buffer_id: 9,
+            version: 1,
+            element_ty: DeviceDataType::F32,
+            element_count: 2,
+        }));
+    assert!(descriptor
+        .buffer_versions
+        .contains(&DescriptorBufferVersion {
+            buffer_id: 9,
+            version: 2,
+            element_ty: DeviceDataType::F32,
+            element_count: 4,
+        }));
+    assert_eq!(descriptor.data_flow.len(), 2);
+}
+
+#[test]
+fn unknown_launch_kernel_reference_fails_closed() {
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.launches[0].kernel_index = 1;
+    let err = descriptor
+        .validate()
+        .expect_err("unknown launch kernel reference must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+}
+
+#[test]
+fn invalid_launch_identity_fails_closed() {
+    let mut zero_id = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    zero_id.launches[0].id = 0;
+    let err = zero_id
+        .validate()
+        .expect_err("zero launch identity must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+
+    let mut duplicate_id = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    duplicate_id.launches.push(DescriptorLaunch {
+        id: 1,
+        kernel_index: 0,
+    });
+    let err = duplicate_id
+        .validate()
+        .expect_err("duplicate launch identity must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+}
+
+#[test]
+fn conflicting_version_metadata_fails_closed() {
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.buffer_versions.push(DescriptorBufferVersion {
+        buffer_id: 1,
+        version: 1,
+        element_ty: DeviceDataType::F32,
+        element_count: 4,
+    });
+    let err = descriptor
+        .validate()
+        .expect_err("conflicting version metadata must fail closed");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+}
 
 #[test]
 fn cpu_only_host_rejects_descriptor_execution() {
@@ -586,10 +767,9 @@ fn duplicate_binding_fails_as_abi_mismatch() {
 fn conflicting_buffer_roles_fail_as_abi_mismatch() {
     let mut host = metal_composite("add_one").expect("metal composite");
     // The same buffer id is Input in one kernel and Output in another.
-    let descriptor = DeviceDescriptor {
-        backend: DeviceBackend::Metal,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
             DescriptorKernel {
                 entry: "add_one".to_owned(),
                 buffers: vec![
@@ -611,9 +791,18 @@ fn conflicting_buffer_roles_fail_as_abi_mismatch() {
                 block: [2, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    };
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
         .expect_err("input/output role conflict must fail as an ABI mismatch");
@@ -657,10 +846,9 @@ fn conflicting_shapes_fail_as_shape_mismatch() {
     let mut host = metal_composite("add_one").expect("metal composite");
     // Two kernels reference buffer id 3 with different element counts: a
     // shape change must be a new version, never in-place reinterpretation.
-    let descriptor = DeviceDescriptor {
-        backend: DeviceBackend::Metal,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
             DescriptorKernel {
                 entry: "add_one".to_owned(),
                 buffers: vec![
@@ -682,9 +870,18 @@ fn conflicting_shapes_fail_as_shape_mismatch() {
                 block: [4, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    };
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
         .expect_err("shape conflict must fail before launch");
@@ -854,10 +1051,9 @@ fn program_session_repeated_execution_cuda() {
 #[test]
 fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
     let mut host = metal_composite("add_one").expect("metal composite");
-    let descriptor = DeviceDescriptor {
-        backend: DeviceBackend::Metal,
-        module_image: MODULE_IMAGE.to_vec(),
-        kernels: vec![
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
             DescriptorKernel {
                 entry: "add_one".to_owned(),
                 buffers: vec![
@@ -879,9 +1075,18 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
                 block: [2, 1, 1],
             },
         ],
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow: Vec::new(),
-    };
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
     inputs.insert(2, vec![3.0, 4.0]);
@@ -1797,6 +2002,7 @@ fn receipt_consumes_carried_version_facts_not_coincidence() {
     let mut descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     descriptor.kernels[0].buffers[2].version = 2;
     descriptor.kernels[1].buffers[0].version = 2;
+    descriptor.buffer_versions = buffer_versions_for(&descriptor.kernels);
     descriptor.data_flow = vec![DescriptorDataFlow {
         buffer_id: 3,
         version: 2,
