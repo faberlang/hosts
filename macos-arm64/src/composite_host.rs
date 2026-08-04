@@ -155,14 +155,56 @@ pub struct DeviceExecutionReceipt {
     /// Input/InOut references — equal to `BufferRegistry::data_flow_pairs`
     /// for constructor-valid programs.
     pub data_flow_edges: Vec<DataFlowEdge>,
-    /// Observed step-boundary synchronizations this execution.
+    /// Observed real synchronization operations this execution (R9): one per
+    /// launch (a launch synchronizes internally) plus the explicit
+    /// step-boundary barrier that makes the completion boundary valid.
     pub syncs: usize,
     /// Observed transfers this execution (host→device copy-ins plus
     /// device→host readbacks).
     pub transfers: usize,
+    /// Device→host readbacks actually performed (the declared observation
+    /// points — observation-only readback, F6).
+    pub readbacks: usize,
     /// Observed buffer releases this execution (read-then-release plus the
     /// step-boundary PerStep recycle).
     pub releases: usize,
+    /// The completion boundary this execution guarantees (R9): the explicit
+    /// step-boundary sync after the last launch, at which every declared
+    /// observation is valid. Stated exactly — never beyond the explicit
+    /// synchronization the host actually performed.
+    pub completion_boundary: CompletionBoundary,
+    /// FNV-1a hash of the carried semantic graph (roots + launches +
+    /// dependency edges + buffer semantic identities + observation points),
+    /// computed by the host from the descriptor it consumed — the graph
+    /// identity this execution ran, distinct from the module provenance
+    /// hash.
+    pub semantic_graph_hash: u64,
+}
+
+/// The completion boundary of one execution (R9).
+///
+/// The host states the boundary exactly: completion is guaranteed at the
+/// explicit step-boundary synchronization, after the last launch of the
+/// ordered sequence. Every declared observation (result) is valid at or
+/// after this boundary; the host never claims more than the explicit
+/// synchronization it performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionBoundary {
+    /// Completion is guaranteed at the explicit step-boundary sync after
+    /// launch `after_launch`.
+    StepSync { after_launch: u32 },
+}
+
+impl CompletionBoundary {
+    /// The stable diagnostic statement of the boundary.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            Self::StepSync { after_launch } => format!(
+                "completion guaranteed at the explicit step-boundary sync after launch {after_launch}"
+            ),
+        }
+    }
 }
 
 /// One declared buffer of the program's logical resource graph (A10): the
@@ -232,6 +274,19 @@ struct SessionSlot {
     buffer_name: String,
     /// Slot role at this kernel.
     role: DeviceBufferRole,
+}
+
+/// One declared observation point cloned from the descriptor at session
+/// creation (F6): the result rows the session reads back and releases.
+/// The producing-launch and observation-order facts were validated by
+/// [`DeviceDescriptor::validate`] before the session was created; the
+/// session needs only the observed buffer identity + content version.
+#[derive(Debug, Clone, Copy)]
+struct SessionResult {
+    /// Observed buffer identity.
+    buffer_id: u32,
+    /// Observed content version.
+    version: u32,
 }
 
 /// Per-version metadata captured at session creation for input validation,
@@ -340,6 +395,12 @@ pub struct ProgramSession<'host> {
     /// [`ProgramSession::declared_resource_graph`] — never re-derived from
     /// launch order.
     data_flow: Vec<DataFlowEdge>,
+    /// Declared observation points (F6): the result rows projected from the
+    /// descriptor's observation facts; the only buffers this session reads
+    /// back.
+    results: Vec<SessionResult>,
+    /// FNV-1a hash of the carried semantic graph the session executes.
+    semantic_graph_hash: u64,
     /// True after an error-path release (S2-3): every handle has been
     /// released and the session cannot execute again.
     closed: bool,
@@ -473,6 +534,18 @@ impl<'host> ProgramSession<'host> {
                     consumer: edge.consumer,
                 })
                 .collect(),
+            // Declared observation points (F6): the session reads back exactly
+            // the descriptor's result rows — never a caller-selected subset
+            // and never an undeclared buffer.
+            results: descriptor
+                .results
+                .iter()
+                .map(|result| SessionResult {
+                    buffer_id: result.buffer_id,
+                    version: result.version,
+                })
+                .collect(),
+            semantic_graph_hash: descriptor.semantic_graph_hash(),
             closed: false,
         })
     }
@@ -480,10 +553,12 @@ impl<'host> ProgramSession<'host> {
     /// Execute the ordered launch sequence once (one step). Reuses the
     /// session's module and PerProgram buffers — does not reload the module
     /// or re-allocate PerProgram buffers. PerStep buffers are allocated for
-    /// the step and recycled at the step boundary; ObservationPoint buffers
-    /// are allocated, read back at the declared observation point, and
-    /// released (read-then-release — the only readback the session performs,
-    /// S2-4). Synchronizes at the step boundary before reading back.
+    /// the step and recycled at the step boundary; the declared observation
+    /// point buffers ([`SessionResult`]s projected from the descriptor's
+    /// observation facts — F6) are allocated, read back at their producing
+    /// launch's completion boundary, and released (read-then-release — the
+    /// only readback the session performs, S2-4). Synchronizes at the step
+    /// boundary before reading back.
     ///
     /// **Error-path teardown is designed into this method (S2-3):** a failure
     /// at any stage runs the ordered release (buffers then module) before the
@@ -495,22 +570,21 @@ impl<'host> ProgramSession<'host> {
     /// - `E_DEVICE_ENTRY_MISMATCH` — a kernel entry is unknown to the module;
     /// - `E_DEVICE_SHAPE_MISMATCH` — a declared input is missing or its size
     ///   contradicts the declared element count;
-    /// - `E_INVALID_ARGS` — a declared output id was not allocated by the
-    ///   session, or the id names a buffer whose lifetime is not
-    ///   ObservationPoint (an undeclared readback fails closed, S2-4);
+    /// - `E_INVALID_ARGS` — a declared observation buffer id was not
+    ///   allocated by the session, or the id names a buffer whose lifetime is
+    ///   not ObservationPoint (an undeclared readback fails closed, S2-4);
     /// - session-level failures (copy-in, launch, sync, readback) bubble
     ///   through unchanged.
     pub fn execute(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
-        outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
         if self.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        let result = self.execute_inner(inputs, outputs);
+        let result = self.execute_inner(inputs);
         if result.is_err() {
             // Release-on-error on all paths (S2-3): the ordered release runs
             // before the error escapes, then the session is closed so no
@@ -529,7 +603,6 @@ impl<'host> ProgramSession<'host> {
     fn execute_inner(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
-        outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut launch_count = 0usize;
         let mut launch_ids = Vec::with_capacity(self.launches.len());
@@ -605,28 +678,33 @@ impl<'host> ProgramSession<'host> {
 
         // Step-boundary synchronization: every launch in this step has
         // completed before any readback. The launches also sync internally;
-        // this barrier makes the step boundary explicit and observable.
+        // this barrier makes the step boundary explicit and observable. The
+        // completion boundary is this exact barrier after the last launch
+        // (R9): the receipt counts real synchronization operations and names
+        // where completion is guaranteed.
         self.runtime.sync()?;
 
-        // ObservationPoint read-then-release (S2-4): read back the declared
-        // observation buffers, then release each immediately. Only
-        // ObservationPoint buffers are readable — a readback request for any
-        // other lifetime class is an undeclared readback and fails closed.
+        // Observation-only readback (F6): read back exactly the DECLARED
+        // observation points — the result rows projected from the
+        // descriptor's observation facts at session creation. A buffer with
+        // any other lifetime class is an undeclared readback and fails
+        // closed. Each observation is read-then-released (S2-4).
         let mut release_count = 0usize;
+        let mut readback_count = 0usize;
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
-        for output_id in outputs {
-            if readbacks.contains_key(output_id) {
-                continue;
-            }
-            let key = self.unique_buffer_key(*output_id)?;
+        let observed: Vec<SessionResult> = self.results.clone();
+        for result in &observed {
+            let key = (result.buffer_id, result.version);
             let meta = self.buffer_meta.get(&key).ok_or_else(|| {
                 HostError::invalid_args(format!(
-                    "declared output buffer id {output_id} was not allocated by the session"
+                    "declared observation buffer id {} was not allocated by the session",
+                    result.buffer_id
                 ))
             })?;
             if meta.lifetime != DeviceBufferLifetime::ObservationPoint {
                 return Err(HostError::invalid_args(format!(
-                    "declared output buffer id {output_id} has lifetime `{}`; only observation-point buffers are read back (no undeclared readback)",
+                    "declared observation buffer id {} has lifetime `{}`; only observation-point buffers are read back (no undeclared readback)",
+                    result.buffer_id,
                     meta.lifetime.spelling()
                 )));
             }
@@ -636,7 +714,8 @@ impl<'host> ProgramSession<'host> {
                 .copied()
                 .ok_or_else(|| HostError::internal("session observation buffer disappeared"))?;
             let values = self.runtime.readback_f32(&handle)?;
-            readbacks.insert(*output_id, values);
+            readbacks.insert(result.buffer_id, values);
+            readback_count += 1;
             self.release_buffer(key)?;
             release_count += 1;
         }
@@ -686,9 +765,18 @@ impl<'host> ProgramSession<'host> {
                 .buffer_versions_by_lifetime(DeviceBufferLifetime::ObservationPoint),
             resource_graph,
             data_flow_edges,
-            syncs: 1,
-            transfers: copy_ins + outputs.len(),
+            // R9: real synchronization operations — one per launch (each
+            // launch synchronizes internally) plus the explicit step-boundary
+            // barrier. The completion boundary is that barrier after the last
+            // dispatched launch.
+            syncs: launch_count + 1,
+            transfers: copy_ins + readback_count,
+            readbacks: readback_count,
             releases: release_count,
+            completion_boundary: CompletionBoundary::StepSync {
+                after_launch: self.launches.last().map(|launch| launch.id).unwrap_or(0),
+            },
+            semantic_graph_hash: self.semantic_graph_hash,
         })
     }
 
@@ -841,26 +929,6 @@ impl<'host> ProgramSession<'host> {
         self.buffer_meta.keys().copied().collect()
     }
 
-    /// Resolve the legacy output API's buffer id to one unambiguous version.
-    fn unique_buffer_key(&self, buffer_id: u32) -> HostResult<BufferKey> {
-        let mut keys = self
-            .buffer_meta
-            .keys()
-            .filter(|(id, _)| *id == buffer_id)
-            .copied();
-        let Some(key) = keys.next() else {
-            return Err(HostError::invalid_args(format!(
-                "declared output buffer id {buffer_id} was not allocated by the session"
-            )));
-        };
-        if keys.next().is_some() {
-            return Err(HostError::invalid_args(format!(
-                "declared output buffer id {buffer_id} has multiple content versions; the unversioned output API is ambiguous"
-            )));
-        }
-        Ok(key)
-    }
-
     /// Number of live device handles the session currently holds (module +
     /// currently-live buffers). Used by lifecycle tests to prove no reload /
     /// no PerProgram realloc between executions and full release at teardown.
@@ -897,6 +965,16 @@ impl<'host> ProgramSession<'host> {
     #[must_use]
     pub fn module_hash(&self) -> u64 {
         self.module_hash
+    }
+
+    /// The FNV-1a hash of the carried semantic graph this session executes
+    /// (roots + launches + dependency edges + buffer semantic identities +
+    /// observation points). The graph identity the session consumed —
+    /// distinct from [`ProgramSession::module_hash`], which only names the
+    /// backend blob.
+    #[must_use]
+    pub fn semantic_graph_hash(&self) -> u64 {
+        self.semantic_graph_hash
     }
 }
 
@@ -1118,10 +1196,9 @@ impl CompositeHost {
         &mut self,
         descriptor: &DeviceDescriptor,
         inputs: &BTreeMap<u32, Vec<f32>>,
-        outputs: &[u32],
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut session = self.create_program_session(descriptor)?;
-        match session.execute(inputs, outputs) {
+        match session.execute(inputs) {
             Ok(receipt) => {
                 session.teardown()?;
                 Ok(receipt)

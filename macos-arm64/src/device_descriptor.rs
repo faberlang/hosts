@@ -21,6 +21,8 @@
 //! program refusal (`E_NO_DEVICE_PROGRAM`) live in [`crate::composite_host`]
 //! (they are host-construction failures, not descriptor failures).
 
+use std::collections::BTreeMap;
+
 use faber::device::DeviceBackend;
 
 use crate::kernel::{HostError, HostResult};
@@ -180,12 +182,21 @@ pub enum DeviceProgramLifetime {
 /// agree on identity and lifetime, while every `(buffer_id, version)` pair
 /// agrees on dtype and shape. A shape change is a new version — the S1-1
 /// contract; hosts reject in-place reinterpretation at the descriptor.
+///
+/// `semantic_value` is the stable **semantic value identity** the buffer
+/// holds (F1): the wire's carried value fact — never derived from names,
+/// shapes, binding positions, or declaration coincidence. Two unrelated
+/// same-name/same-shape values are distinct; validation requires the same
+/// buffer id to always carry the same semantic value and two different
+/// buffer ids never to alias one value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorBuffer {
     /// Program-level buffer identity key.
     pub buffer_id: u32,
     /// Logical name for diagnostics.
     pub buffer_name: String,
+    /// The stable semantic value identity this buffer holds (F1).
+    pub semantic_value: u32,
     /// Slot role at this kernel.
     pub role: DeviceBufferRole,
     /// How long this buffer's storage lives (S2-4; consumed by the session's
@@ -238,6 +249,27 @@ pub struct DescriptorLaunch {
     pub kernel_index: u32,
 }
 
+/// One declared observation point (F6): an explicit result row projected
+/// from the wire's carried observation fact.
+///
+/// A result is read back at its producing launch's completion boundary —
+/// writable intermediates and persistent state are results only through
+/// this declared fact, never because they are writable. Validation admits
+/// results only for buffers whose lifetime is [`DeviceBufferLifetime::ObservationPoint`],
+/// so the constructor and the host admission agree on one readback rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorResult {
+    /// The observed buffer's program-level identity.
+    pub buffer_id: u32,
+    /// The observed content version.
+    pub version: u32,
+    /// The launch that produced the observed version.
+    pub produced_by: u32,
+    /// The launch whose completion boundary makes the observation valid
+    /// (F5/F6); the wire carries it as the explicit observation fact.
+    pub at_launch: u32,
+}
+
 /// One version-keyed buffer shape carried by the device-program wire.
 ///
 /// The key is `(buffer_id, version)`, not just `buffer_id`: a buffer identity
@@ -256,9 +288,9 @@ pub struct DescriptorBufferVersion {
 
 /// Typed runtime device descriptor: the host's contract for one device
 /// program (module image + kernel declarations + ordered launches +
-/// version-keyed resource metadata + program lifetime). The faber package
-/// layer maps the canonical S1-1 payload onto this shape; hosts validate it
-/// before launch.
+/// version-keyed resource metadata + program lifetime + carried graph and
+/// observation facts). The faber package layer maps the canonical S1-1
+/// payload onto this shape; hosts validate it before launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDescriptor {
     /// Backend the descriptor targets.
@@ -278,9 +310,17 @@ pub struct DeviceDescriptor {
     pub program_lifetime: DeviceProgramLifetime,
     /// Carried inter-kernel data-flow edges (A10/R2): the wire's
     /// producer/consumer facts per buffer version. The session consumes them
-    /// for the declared resource graph — it never re-derives topology from
-    /// launch order or a first-writer coincidence rule.
+    /// for the declared resource graph and the host schedules the validated
+    /// graph — it never re-derives topology from launch order or a
+    /// first-writer coincidence rule.
     pub data_flow: Vec<DescriptorDataFlow>,
+    /// Declared legal execution roots (F3): the launches the graph may start
+    /// from. Never inferred from kernel declaration order. Validation proves
+    /// every launch is reachable from a root.
+    pub roots: Vec<u32>,
+    /// Declared observation points (F6): the explicit result rows the host
+    /// reads back and releases. Only these buffers are observable.
+    pub results: Vec<DescriptorResult>,
 }
 
 /// One carried inter-kernel data-flow edge (A10): a buffer content version
@@ -374,6 +414,34 @@ impl DeviceDescriptor {
             launch_ids.push(launch.id);
         }
 
+        // Declared legal execution roots (F3): non-zero, unique, real launch
+        // ids. The host schedules the validated graph from these facts; an
+        // empty root set would leave the schedule unanchored.
+        let mut root_ids: Vec<u32> = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            if *root == 0 {
+                return Err(descriptor_error(
+                    "device descriptor has a root with the reserved zero identity",
+                ));
+            }
+            if root_ids.contains(root) {
+                return Err(descriptor_error(format!(
+                    "device descriptor repeats legal execution root {root}"
+                )));
+            }
+            if !launch_ids.contains(root) {
+                return Err(descriptor_error(format!(
+                    "device descriptor root {root} names an unknown launch"
+                )));
+            }
+            root_ids.push(*root);
+        }
+        if root_ids.is_empty() {
+            return Err(descriptor_error(
+                "device descriptor declares no legal execution roots",
+            ));
+        }
+
         let mut versions: Vec<DescriptorBufferVersion> =
             Vec::with_capacity(self.buffer_versions.len());
         for version in &self.buffer_versions {
@@ -451,7 +519,67 @@ impl DeviceDescriptor {
             }
         }
 
+        // Carried graph schedule (F3): the launch sequence is the schedule,
+        // and the carried dependency edges must be consistent with it.
+        //
+        // 1. Single definition per value generation: exactly one launch
+        //    produces a given `(buffer, version)` — a second producer would
+        //    be another writer of the same generation, which the frozen
+        //    contract forbids (F2).
+        // 2. Topological consistency: the carried launch order must place
+        //    every consumer launch after all its producers. A cycle or a
+        //    missing/inverted dependency fails validation before launch.
+        // 3. Complete schedule: every launch is reachable from a declared
+        //    root following the dependency edges forward.
+        let mut producers: Vec<((u32, u32), u32)> = Vec::new();
+        for edge in &self.data_flow {
+            if let Some((_, first_producer)) = producers.iter().find(|((buffer_id, version), _)| {
+                *buffer_id == edge.buffer_id && *version == edge.version
+            }) {
+                return Err(descriptor_error(format!(
+                    "device descriptor defines buffer {} version {} twice (producers {} and {}); one value generation has exactly one producer",
+                    edge.buffer_id, edge.version, first_producer, edge.producer
+                )));
+            }
+            producers.push(((edge.buffer_id, edge.version), edge.producer));
+        }
+        let mut position: BTreeMap<u32, usize> = BTreeMap::new();
+        for (index, launch) in self.launches.iter().enumerate() {
+            position.insert(launch.id, index);
+        }
+        for edge in &self.data_flow {
+            let producer_at = position[&edge.producer];
+            let consumer_at = position[&edge.consumer];
+            if producer_at >= consumer_at {
+                return Err(descriptor_error(format!(
+                    "device descriptor launch order violates the carried dependency graph: launch {} (producer of buffer {} version {}) is not scheduled before launch {} (its consumer)",
+                    edge.producer, edge.buffer_id, edge.version, edge.consumer
+                )));
+            }
+        }
+        let mut reachable: Vec<u32> = Vec::with_capacity(self.launches.len());
+        let mut stack: Vec<u32> = root_ids.clone();
+        while let Some(launch) = stack.pop() {
+            if reachable.contains(&launch) {
+                continue;
+            }
+            reachable.push(launch);
+            for edge in &self.data_flow {
+                if edge.producer == launch && !reachable.contains(&edge.consumer) {
+                    stack.push(edge.consumer);
+                }
+            }
+        }
+        for launch in &launch_ids {
+            if !reachable.contains(launch) {
+                return Err(descriptor_error(format!(
+                    "device descriptor launch {launch} is not reachable from any declared root; the carried graph is incomplete"
+                )));
+            }
+        }
+
         let mut identities: Vec<(u32, String, DeviceBufferRole)> = Vec::new();
+        let mut semantic_values: Vec<(u32, u32)> = Vec::new();
         let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
 
         for kernel in &self.kernels {
@@ -494,6 +622,41 @@ impl DeviceDescriptor {
                     )));
                 }
                 seen_bindings.push(slot.binding);
+
+                // F1: the stable semantic value identity. The same buffer id
+                // always holds the same value, and two different buffer ids
+                // never alias one value (two unrelated same-name/same-shape
+                // values are distinct).
+                if slot.semantic_value == 0 {
+                    return Err(descriptor_error(format!(
+                        "device buffer `{}` (id {}) carries the reserved zero semantic value identity",
+                        slot.buffer_name, slot.buffer_id
+                    )));
+                }
+                if let Some((_, first_semantic)) =
+                    semantic_values.iter().find(|(id, _)| *id == slot.buffer_id)
+                {
+                    if *first_semantic != slot.semantic_value {
+                        return Err(abi_error(format!(
+                            "device buffer `{}` (id {}) is referenced with conflicting semantic value identities {} and {}",
+                            slot.buffer_name,
+                            slot.buffer_id,
+                            first_semantic,
+                            slot.semantic_value
+                        )));
+                    }
+                } else {
+                    if let Some((_, other_id)) = semantic_values
+                        .iter()
+                        .find(|(_, value)| *value == slot.semantic_value)
+                    {
+                        return Err(abi_error(format!(
+                            "device buffers `{}` (id {}) and id {} alias the same semantic value {}; each value is held by exactly one buffer",
+                            slot.buffer_name, slot.buffer_id, other_id, slot.semantic_value
+                        )));
+                    }
+                    semantic_values.push((slot.buffer_id, slot.semantic_value));
+                }
 
                 if let Some((_, name, role)) =
                     identities.iter().find(|(id, _, _)| *id == slot.buffer_id)
@@ -566,8 +729,177 @@ impl DeviceDescriptor {
                 }
             }
         }
+
+        // Observation admission (F6): results are DECLARED observation points.
+        // A result must name a buffer the program allocates, with the
+        // `ObservationPoint` lifetime — the only class the session reads back
+        // (a writable intermediate or persistent state exposed as a result
+        // without an explicit observation fact is rejected, matching the
+        // constructor's rule). Each observation must be anchored at a real
+        // launch that completes at or after the producing launch.
+        let mut result_buffer_ids: Vec<u32> = Vec::with_capacity(self.results.len());
+        for result in &self.results {
+            if result.version == 0 {
+                return Err(descriptor_error(format!(
+                    "device descriptor result for buffer {} uses the reserved zero version",
+                    result.buffer_id
+                )));
+            }
+            if result.produced_by == 0 || result.at_launch == 0 {
+                return Err(descriptor_error(format!(
+                    "device descriptor result for buffer {} uses a reserved zero launch identity",
+                    result.buffer_id
+                )));
+            }
+            if !launch_ids.contains(&result.produced_by) {
+                return Err(descriptor_error(format!(
+                    "device descriptor result for buffer {} names unknown producing launch {}",
+                    result.buffer_id, result.produced_by
+                )));
+            }
+            if !launch_ids.contains(&result.at_launch) {
+                return Err(descriptor_error(format!(
+                    "device descriptor result for buffer {} names unknown observation launch {}",
+                    result.buffer_id, result.at_launch
+                )));
+            }
+            if position[&result.at_launch] < position[&result.produced_by] {
+                return Err(descriptor_error(format!(
+                    "device descriptor result for buffer {} is observed at launch {} before its producing launch {}; an observation is valid only at or after the producer",
+                    result.buffer_id, result.at_launch, result.produced_by
+                )));
+            }
+            if result_buffer_ids.contains(&result.buffer_id) {
+                return Err(descriptor_error(format!(
+                    "device descriptor repeats observation buffer {}; results must be unique in the host receipt",
+                    result.buffer_id
+                )));
+            }
+            result_buffer_ids.push(result.buffer_id);
+
+            let Some((_, lifetime)) = lifetimes.iter().find(|(id, _)| *id == result.buffer_id)
+            else {
+                return Err(descriptor_error(format!(
+                    "device descriptor result names buffer {} which no kernel slot allocates",
+                    result.buffer_id
+                )));
+            };
+            if *lifetime != DeviceBufferLifetime::ObservationPoint {
+                return Err(descriptor_error(format!(
+                    "device descriptor result names buffer {} with lifetime `{}`; only declared observation-point buffers are read back (no undeclared readback)",
+                    result.buffer_id,
+                    lifetime.spelling()
+                )));
+            }
+            let keyed = versions.iter().any(|version| {
+                version.buffer_id == result.buffer_id && version.version == result.version
+            });
+            if !keyed {
+                return Err(descriptor_error(format!(
+                    "device descriptor result names buffer {} version {} which has no keyed metadata",
+                    result.buffer_id, result.version
+                )));
+            }
+        }
         Ok(())
     }
+
+    /// FNV-1a hash of the descriptor's carried **semantic graph** (F3/F6):
+    /// the buffer semantic identities + content versions, the declared
+    /// roots, the ordered launch sequence with the full facts of each
+    /// launched kernel, the carried dependency edges, and the declared
+    /// observation points. This is the graph identity the host executes —
+    /// distinct from the module provenance hash, which only names the
+    /// backend blob.
+    ///
+    /// The byte stream is length-prefixed and deterministic. Kernel facts
+    /// are inlined per launch, so reordering kernel DECLARATIONS (which
+    /// changes neither the launches, the graph, nor the semantic identities)
+    /// produces the same hash — declaration order is never an execution
+    /// authority.
+    ///
+    /// # Panics
+    /// Never panics.
+    #[must_use]
+    pub fn semantic_graph_hash(&self) -> u64 {
+        let mut bytes = Vec::new();
+        let mut buffers: Vec<(&DescriptorBuffer, &u32)> = self
+            .kernels
+            .iter()
+            .flat_map(|kernel| kernel.buffers.iter())
+            .map(|slot| (slot, &slot.version))
+            .collect();
+        // De-duplicate (buffer_id, version) keys and sort so the hash is
+        // declaration-independent.
+        buffers.sort_by(|(left, left_version), (right, right_version)| {
+            (left.buffer_id, *left_version).cmp(&(right.buffer_id, *right_version))
+        });
+        buffers.dedup_by(|(left, left_version), (right, right_version)| {
+            left.buffer_id == right.buffer_id && left_version == right_version
+        });
+        for (slot, version) in buffers {
+            push_u32(&mut bytes, slot.buffer_id);
+            push_u32(&mut bytes, slot.semantic_value);
+            push_u32(&mut bytes, *version);
+            push_u32(&mut bytes, slot.element_ty as u32);
+            bytes.extend_from_slice(&slot.element_count.to_le_bytes());
+        }
+        push_u32(&mut bytes, self.roots.len() as u32);
+        for root in &self.roots {
+            push_u32(&mut bytes, *root);
+        }
+        push_u32(&mut bytes, self.launches.len() as u32);
+        for launch in &self.launches {
+            push_u32(&mut bytes, launch.id);
+            if let Some(kernel) = self.kernels.get(launch.kernel_index as usize) {
+                // Inline the launched kernel's full facts (declaration-order
+                // independent).
+                push_bytes(&mut bytes, kernel.entry.as_bytes());
+                push_u32(&mut bytes, kernel.buffers.len() as u32);
+                for slot in &kernel.buffers {
+                    push_u32(&mut bytes, slot.buffer_id);
+                    push_u32(&mut bytes, slot.semantic_value);
+                    push_u32(&mut bytes, slot.version);
+                    push_u32(&mut bytes, slot.role as u32);
+                    push_u32(&mut bytes, slot.element_ty as u32);
+                    bytes.extend_from_slice(&slot.element_count.to_le_bytes());
+                }
+                for axis in kernel.grid {
+                    push_u32(&mut bytes, axis);
+                }
+                for axis in kernel.block {
+                    push_u32(&mut bytes, axis);
+                }
+            }
+        }
+        push_u32(&mut bytes, self.data_flow.len() as u32);
+        for edge in &self.data_flow {
+            push_u32(&mut bytes, edge.buffer_id);
+            push_u32(&mut bytes, edge.version);
+            push_u32(&mut bytes, edge.producer);
+            push_u32(&mut bytes, edge.consumer);
+        }
+        push_u32(&mut bytes, self.results.len() as u32);
+        for result in &self.results {
+            push_u32(&mut bytes, result.buffer_id);
+            push_u32(&mut bytes, result.version);
+            push_u32(&mut bytes, result.produced_by);
+            push_u32(&mut bytes, result.at_launch);
+        }
+        fnv1a64(&bytes)
+    }
+}
+
+/// Append a `u32` in little-endian to the canonical byte stream (length-free
+/// width — the schema is fixed-field, so no field needs its own length).
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Append a length-prefixed byte slice to the canonical byte stream.
+fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) {
+    push_u32(bytes, value.len() as u32);
+    bytes.extend_from_slice(value);
 }
 
 /// Whether two slot roles contradict at a shared buffer identity.

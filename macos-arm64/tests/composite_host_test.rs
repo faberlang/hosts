@@ -12,14 +12,15 @@ use std::collections::BTreeMap;
 use faber::device::{DeviceBackend, DeviceHandle, DeviceHandleKind, DeviceSelection};
 use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
-    resolve_device_selection, CompositeHost, CompositeHostConfig, DataFlowEdge,
+    resolve_device_selection, CompletionBoundary, CompositeHost, CompositeHostConfig, DataFlowEdge,
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
     fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
-    DescriptorLaunch, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
-    DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR,
-    E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    DescriptorLaunch, DescriptorResult, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
+    DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH,
+    E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
+    E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
@@ -66,12 +67,37 @@ fn add_slot_version(
     DescriptorBuffer {
         buffer_id: id,
         buffer_name: name.to_owned(),
+        // F1: one distinct semantic value per buffer identity (the wire's
+        // carried value fact; the faber constructor mints value id == buffer
+        // id for the first projection).
+        semantic_value: id,
         role,
         lifetime: lifetime_for_role(role),
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
         version,
+    }
+}
+
+/// The constructor rule for legal execution roots (F3): every launch no
+/// dependency edge consumes. Mirrors the faber materializer's root set.
+fn default_roots(launches: &[DescriptorLaunch], data_flow: &[DescriptorDataFlow]) -> Vec<u32> {
+    launches
+        .iter()
+        .filter(|launch| !data_flow.iter().any(|edge| edge.consumer == launch.id))
+        .map(|launch| launch.id)
+        .collect()
+}
+
+/// One declared observation point (F6): the buffer the host reads back at
+/// its producing launch's completion boundary.
+fn result(id: u32, produced_by: u32) -> DescriptorResult {
+    DescriptorResult {
+        buffer_id: id,
+        version: 1,
+        produced_by,
+        at_launch: produced_by,
     }
 }
 
@@ -100,7 +126,9 @@ fn make_descriptor(
     kernels: Vec<DescriptorKernel>,
     launches: Vec<DescriptorLaunch>,
     data_flow: Vec<DescriptorDataFlow>,
+    results: Vec<DescriptorResult>,
 ) -> DeviceDescriptor {
+    let roots = default_roots(&launches, &data_flow);
     DeviceDescriptor {
         backend,
         module_image: MODULE_IMAGE.to_vec(),
@@ -109,6 +137,8 @@ fn make_descriptor(
         launches,
         program_lifetime: DeviceProgramLifetime::SingleRun,
         data_flow,
+        roots,
+        results,
     }
 }
 
@@ -130,6 +160,7 @@ fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -
             kernel_index: 0,
         }],
         Vec::new(),
+        vec![result(3, 1)],
     )
 }
 
@@ -165,15 +196,13 @@ fn cuda_composite(entry: &str) -> HostResult<CompositeHost> {
 /// S3-B3 Mul+Mean companion program (S3-B3 tests launch all four kernels).
 fn mul_mean_metal_composite() -> HostResult<CompositeHost> {
     let runtime = DeviceRuntime::Metal(
-        MetalHostSession::with_driver(
-            Box::new(
-                FakeMetalDriver::default()
-                    .with_known_entry("loss_mul")
-                    .with_known_entry("loss_mean")
-                    .with_known_entry("loss_backward_x")
-                    .with_known_entry("loss_backward_w"),
-            ),
-        )
+        MetalHostSession::with_driver(Box::new(
+            FakeMetalDriver::default()
+                .with_known_entry("loss_mul")
+                .with_known_entry("loss_mean")
+                .with_known_entry("loss_backward_x")
+                .with_known_entry("loss_backward_w"),
+        ))
         .expect("fake metal admit"),
     );
     CompositeHost::with_device(runtime, "fake-metal-device")
@@ -182,15 +211,13 @@ fn mul_mean_metal_composite() -> HostResult<CompositeHost> {
 /// The CUDA lane of [`mul_mean_metal_composite`].
 fn mul_mean_cuda_composite() -> HostResult<CompositeHost> {
     let runtime = DeviceRuntime::Cuda(
-        CudaHostSession::with_driver(
-            Box::new(
-                FakeCudaDriver::default()
-                    .with_known_entry("loss_mul")
-                    .with_known_entry("loss_mean")
-                    .with_known_entry("loss_backward_x")
-                    .with_known_entry("loss_backward_w"),
-            ),
-        )
+        CudaHostSession::with_driver(Box::new(
+            FakeCudaDriver::default()
+                .with_known_entry("loss_mul")
+                .with_known_entry("loss_mean")
+                .with_known_entry("loss_backward_x")
+                .with_known_entry("loss_backward_w"),
+        ))
         .expect("fake cuda admit"),
     );
     CompositeHost::with_device(runtime, "fake-cuda-device")
@@ -204,13 +231,11 @@ fn metal_composite_failing(
     call: u32,
 ) -> HostResult<CompositeHost> {
     let runtime = DeviceRuntime::Metal(
-        MetalHostSession::with_driver(
-            Box::new(
-                FakeMetalDriver::default()
-                    .with_known_entry(entry)
-                    .with_failure_at(stage, call),
-            ),
-        )
+        MetalHostSession::with_driver(Box::new(
+            FakeMetalDriver::default()
+                .with_known_entry(entry)
+                .with_failure_at(stage, call),
+        ))
         .expect("fake metal admit"),
     );
     CompositeHost::with_device(runtime, "fake-metal-device")
@@ -224,13 +249,11 @@ fn cuda_composite_failing(
     call: u32,
 ) -> HostResult<CompositeHost> {
     let runtime = DeviceRuntime::Cuda(
-        CudaHostSession::with_driver(
-            Box::new(
-                FakeCudaDriver::default()
-                    .with_known_entry(entry)
-                    .with_failure_at(stage, call),
-            ),
-        )
+        CudaHostSession::with_driver(Box::new(
+            FakeCudaDriver::default()
+                .with_known_entry(entry)
+                .with_failure_at(stage, call),
+        ))
         .expect("fake cuda admit"),
     );
     CompositeHost::with_device(runtime, "fake-cuda-device")
@@ -287,6 +310,7 @@ fn two_kernel_inout_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
             producer: 1,
             consumer: 2,
         }],
+        vec![result(5, 2)],
     )
 }
 
@@ -373,6 +397,9 @@ fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
             })
             .collect(),
         Vec::new(),
+        // F6: the declared observation points — grad_x (launch 3) and
+        // grad_w (launch 4) are the only readbacks.
+        vec![result(6, 3), result(7, 4)],
     )
 }
 
@@ -486,11 +513,7 @@ fn metal_fake_sequences_full_lifecycle_and_receipt() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let receipt = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect("execute");
 
     assert_eq!(receipt.backend, DeviceBackend::Metal);
@@ -548,6 +571,9 @@ fn program_session_executes_reordered_and_repeated_launches_verbatim() {
             },
         ],
         Vec::new(),
+        // F6: out1 (buffer 6) is the declared observation point, produced by
+        // launch 3.
+        vec![result(6, 3)],
     );
     let inputs = BTreeMap::from([
         (1, vec![1.0, 2.0]),
@@ -557,7 +583,7 @@ fn program_session_executes_reordered_and_repeated_launches_verbatim() {
     ]);
 
     let receipt = host
-        .execute_descriptor(&descriptor, &inputs, &[6])
+        .execute_descriptor(&descriptor, &inputs)
         .expect("reordered repeated launches");
 
     assert_eq!(receipt.launches, 3);
@@ -629,6 +655,14 @@ fn program_session_keeps_same_buffer_versions_separate() {
                 consumer: 23,
             },
         ],
+        // F6: out (buffer 5, version 1) is the declared observation point,
+        // produced by launch 23.
+        vec![DescriptorResult {
+            buffer_id: 5,
+            version: 1,
+            produced_by: 23,
+            at_launch: 23,
+        }],
     );
     let inputs = BTreeMap::from([
         (1, vec![1.0, 2.0]),
@@ -644,9 +678,7 @@ fn program_session_keeps_same_buffer_versions_separate() {
         vec![(1, 1), (2, 1), (4, 1), (5, 1), (9, 1), (9, 2)]
     );
 
-    let receipt = session
-        .execute(&inputs, &[5])
-        .expect("versioned chain execution");
+    let receipt = session.execute(&inputs).expect("versioned chain execution");
     assert_eq!(receipt.launch_ids, vec![21, 22, 23]);
     assert_eq!(
         receipt.allocated_buffer_versions,
@@ -693,7 +725,6 @@ fn cuda_fake_sequences_full_lifecycle_and_receipt() {
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
-            &[3],
         )
         .expect("execute");
 
@@ -745,6 +776,7 @@ fn inout_buffer_stays_device_resident_across_kernels() {
             },
         ],
         Vec::new(),
+        vec![result(5, 2)],
     );
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -752,7 +784,7 @@ fn inout_buffer_stays_device_resident_across_kernels() {
     inputs.insert(4, vec![10.0, 10.0]);
 
     let receipt = host
-        .execute_descriptor(&descriptor, &inputs, &[5])
+        .execute_descriptor(&descriptor, &inputs)
         .expect("two-kernel chain");
 
     assert_eq!(receipt.launches, 2);
@@ -781,14 +813,7 @@ fn same_buffer_versions_bind_by_key_across_launches() {
             },
             DescriptorKernel {
                 entry: "add_one".to_owned(),
-                buffers: vec![add_slot_version(
-                    9,
-                    "acc",
-                    DeviceBufferRole::InOut,
-                    0,
-                    4,
-                    2,
-                )],
+                buffers: vec![add_slot_version(9, "acc", DeviceBufferRole::InOut, 0, 4, 2)],
                 grid: [1, 1, 1],
                 block: [4, 1, 1],
             },
@@ -804,6 +829,7 @@ fn same_buffer_versions_bind_by_key_across_launches() {
             },
         ],
         Vec::new(),
+        Vec::new(),
     );
 
     descriptor
@@ -818,18 +844,22 @@ fn same_buffer_versions_bind_by_key_across_launches() {
             .collect::<Vec<_>>(),
         vec![(9, 1), (9, 2)]
     );
-    assert!(descriptor.buffer_versions.contains(&DescriptorBufferVersion {
-        buffer_id: 9,
-        version: 1,
-        element_ty: DeviceDataType::F32,
-        element_count: 2,
-    }));
-    assert!(descriptor.buffer_versions.contains(&DescriptorBufferVersion {
-        buffer_id: 9,
-        version: 2,
-        element_ty: DeviceDataType::F32,
-        element_count: 4,
-    }));
+    assert!(descriptor
+        .buffer_versions
+        .contains(&DescriptorBufferVersion {
+            buffer_id: 9,
+            version: 1,
+            element_ty: DeviceDataType::F32,
+            element_count: 2,
+        }));
+    assert!(descriptor
+        .buffer_versions
+        .contains(&DescriptorBufferVersion {
+            buffer_id: 9,
+            version: 2,
+            element_ty: DeviceDataType::F32,
+            element_count: 4,
+        }));
 }
 
 #[test]
@@ -839,11 +869,7 @@ fn invalid_launch_reference_fails_before_module_or_driver_launch() {
     descriptor.launches[0].kernel_index = 1;
 
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("unknown launch kernel must fail before session creation");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert_eq!(
@@ -864,11 +890,7 @@ fn impossible_version_metadata_fails_before_module_or_driver_launch() {
     });
 
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("conflicting version facts must fail before session creation");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
     assert_eq!(
@@ -896,6 +918,10 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
                 id: 12,
                 kernel_index: 0,
             },
+            DescriptorLaunch {
+                id: 13,
+                kernel_index: 0,
+            },
         ],
         vec![
             DescriptorDataFlow {
@@ -908,9 +934,10 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
                 buffer_id: 9,
                 version: 2,
                 producer: 12,
-                consumer: 11,
+                consumer: 13,
             },
         ],
+        Vec::new(),
     );
     descriptor.buffer_versions.push(DescriptorBufferVersion {
         buffer_id: 9,
@@ -933,6 +960,10 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
                 id: 12,
                 kernel_index: 0,
             },
+            DescriptorLaunch {
+                id: 13,
+                kernel_index: 0,
+            },
         ]
     );
     assert!(descriptor
@@ -952,6 +983,9 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
             element_count: 4,
         }));
     assert_eq!(descriptor.data_flow.len(), 2);
+    // F3: the carried graph is acyclic and fully reachable from the declared
+    // root (launch 11), so the repeated-launch chain is schedulable.
+    descriptor.validate().expect("acyclic graph admits");
 }
 
 #[test]
@@ -961,11 +995,7 @@ fn slot_without_keyed_version_metadata_fails_before_launch() {
     descriptor.kernels[0].buffers[0].version = 2;
 
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("a slot without keyed metadata must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("no keyed metadata"));
@@ -1022,7 +1052,7 @@ fn cpu_only_host_rejects_descriptor_execution() {
     let mut host = CompositeHost::new(CompositeHostConfig::cpu()).expect("cpu composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("cpu-only host must refuse device execution");
     assert_eq!(err.code, E_NO_DEVICE_PROGRAM);
 }
@@ -1032,7 +1062,7 @@ fn wrong_backend_descriptor_fails_closed() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "add_one", 2);
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("cuda descriptor on a metal session must fail");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
@@ -1043,7 +1073,7 @@ fn empty_module_image_is_a_bad_descriptor() {
     let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     descriptor.module_image.clear();
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("empty module image must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
@@ -1054,7 +1084,7 @@ fn descriptor_with_no_kernels_fails_closed() {
     let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     descriptor.kernels.clear();
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("no kernels must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
@@ -1065,7 +1095,7 @@ fn empty_kernel_entry_fails_closed() {
     let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     descriptor.kernels[0].entry.clear();
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("empty entry must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
@@ -1076,7 +1106,7 @@ fn zero_grid_axis_fails_closed() {
     let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     descriptor.kernels[0].grid[1] = 0;
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("zero grid must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
@@ -1087,7 +1117,7 @@ fn duplicate_binding_fails_as_abi_mismatch() {
     let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     descriptor.kernels[0].buffers[2].binding = 0; // collides with slot `a`
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("duplicate binding must fail as an ABI mismatch");
     assert_eq!(err.code, E_DEVICE_ABI_MISMATCH);
 }
@@ -1131,9 +1161,10 @@ fn conflicting_buffer_roles_fail_as_abi_mismatch() {
             },
         ],
         Vec::new(),
+        Vec::new(),
     );
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("input/output role conflict must fail as an ABI mismatch");
     assert_eq!(err.code, E_DEVICE_ABI_MISMATCH);
 }
@@ -1165,7 +1196,7 @@ fn conflicting_dtypes_fail_as_dtype_mismatch() {
     // conflict, no shape conflict).
     descriptor.kernels[1].buffers[0].element_ty = DeviceDataType::I32;
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("dtype conflict must fail before launch");
     assert_eq!(err.code, E_DEVICE_DTYPE_MISMATCH);
 }
@@ -1210,9 +1241,10 @@ fn conflicting_shapes_fail_as_shape_mismatch() {
             },
         ],
         Vec::new(),
+        Vec::new(),
     );
     let err = host
-        .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
+        .execute_descriptor(&descriptor, &BTreeMap::new())
         .expect_err("shape conflict must fail before launch");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
 }
@@ -1223,11 +1255,7 @@ fn unknown_kernel_entry_fails_before_launch() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_two", 2);
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("unknown entry must fail before launch");
     assert_eq!(err.code, E_DEVICE_ENTRY_MISMATCH);
     // The failed execution released every handle (S2-3 release-on-error).
@@ -1241,7 +1269,7 @@ fn missing_input_fails_before_launch() {
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]); // buffer 2 missing
     let err = host
-        .execute_descriptor(&descriptor, &inputs, &[3])
+        .execute_descriptor(&descriptor, &inputs)
         .expect_err("missing declared input must fail before launch");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1255,7 +1283,6 @@ fn input_size_mismatch_fails_before_launch() {
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0]),
-            &[3],
         )
         .expect_err("input size vs declared shape must fail before launch");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
@@ -1263,17 +1290,54 @@ fn input_size_mismatch_fails_before_launch() {
 }
 
 #[test]
-fn declared_output_not_allocated_fails_closed() {
+fn undeclared_observation_point_fails_closed() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+
+    // A result naming a buffer no kernel slot allocates is an undeclared
+    // observation and fails host admission before launch.
+    let mut phantom = descriptor.clone();
+    phantom.results = vec![DescriptorResult {
+        buffer_id: 99,
+        version: 1,
+        produced_by: 1,
+        at_launch: 1,
+    }];
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[99],
-        )
-        .expect_err("output id never allocated must fail closed");
-    assert_eq!(err.code, "E_INVALID_ARGS");
+        .create_program_session(&phantom)
+        .err()
+        .expect("a result for an unallocated buffer must fail admission");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("no kernel slot allocates"));
+
+    // A writable intermediate (PerStep InOut) exposed as a result without an
+    // explicit observation fact is the F6 observation mismatch: the host
+    // rejects it exactly as the constructor would (constructor + host
+    // admission agree).
+    let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
+    let mut intermediate_result = descriptor.clone();
+    intermediate_result.results = vec![DescriptorResult {
+        buffer_id: 3, // acc — a PerStep InOut intermediate
+        version: 1,
+        produced_by: 1,
+        at_launch: 1,
+    }];
+    let err = host
+        .create_program_session(&intermediate_result)
+        .err()
+        .expect("a writable intermediate as a result must fail host admission");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("observation-point"));
+
+    // The valid descriptor reads back exactly its declared observation
+    // points — nothing else is observable.
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let receipt = host
+        .execute_descriptor(&descriptor, &two_kernel_inputs())
+        .expect("declared observations only");
+    assert_eq!(receipt.outputs.len(), 1);
+    assert_eq!(receipt.readbacks, 1);
+    assert!(receipt.outputs.contains_key(&5));
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
@@ -1325,7 +1389,7 @@ fn program_session_executes_repeatedly_without_reload_or_realloc() {
 
     // Execute 1: no new persistent handles (module + PerProgram reused; the
     // observation buffer is allocated, read back, released).
-    let receipt1 = session.execute(&inputs, &[3]).expect("execute 1");
+    let receipt1 = session.execute(&inputs).expect("execute 1");
     assert_eq!(receipt1.launches, 1);
     assert_eq!(receipt1.copy_ins, 2);
     assert_eq!(receipt1.outputs.get(&3), Some(&vec![4.0, 6.0]));
@@ -1333,7 +1397,7 @@ fn program_session_executes_repeatedly_without_reload_or_realloc() {
 
     // Execute 2 on the SAME session: no reload, no PerProgram realloc.
     let receipt2 = session
-        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]), &[3])
+        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]))
         .expect("execute 2");
     assert_eq!(receipt2.outputs.get(&3), Some(&vec![40.0, 60.0]));
     assert_eq!(session.session_handle_count(), 3); // still unchanged
@@ -1356,22 +1420,19 @@ fn program_session_repeated_execution_cuda() {
     assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
 
     let r1 = session
-        .execute(&add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]), &[3])
+        .execute(&add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]))
         .expect("execute 1");
     assert_eq!(r1.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
     assert_eq!(session.session_handle_count(), 3);
 
     let r2 = session
-        .execute(&add_inputs(vec![10.0, 20.0, 30.0], vec![1.0, 2.0, 3.0]), &[3])
+        .execute(&add_inputs(vec![10.0, 20.0, 30.0], vec![1.0, 2.0, 3.0]))
         .expect("execute 2");
     assert_eq!(r2.outputs.get(&3), Some(&vec![11.0, 22.0, 33.0]));
     assert_eq!(session.session_handle_count(), 3);
 
     session.teardown().expect("teardown");
-    assert_eq!(
-        host.device().expect("device").live_handle_count(),
-        0
-    );
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 /// A two-kernel InOut chain through the session API: the intermediate buffer
@@ -1415,6 +1476,7 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
             },
         ],
         Vec::new(),
+        vec![result(5, 2)],
     );
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -1430,7 +1492,7 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
     assert_eq!(session.session_handle_count(), 4);
     assert_eq!(session.allocated_buffers(), vec![1, 2, 3, 4, 5]);
 
-    let receipt = session.execute(&inputs, &[5]).expect("execute");
+    let receipt = session.execute(&inputs).expect("execute");
     assert_eq!(receipt.launches, 2);
     assert_eq!(receipt.copy_ins, 3); // only Input slots (a, b, c)
     assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
@@ -1438,15 +1500,12 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
 
     // Second step: same session, same PerProgram buffers, fresh per-step /
     // observation allocations (recycled at the step boundary).
-    let receipt2 = session.execute(&inputs, &[5]).expect("execute 2");
+    let receipt2 = session.execute(&inputs).expect("execute 2");
     assert_eq!(receipt2.outputs.get(&5), Some(&vec![14.0, 16.0]));
     assert_eq!(session.session_handle_count(), 4);
 
     session.teardown().expect("teardown");
-    assert_eq!(
-        host.device().expect("device").live_handle_count(),
-        0
-    );
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 /// `execute_descriptor` remains a single-run convenience over the session:
@@ -1456,11 +1515,7 @@ fn execute_descriptor_is_single_run_convenience_over_session() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let receipt = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect("execute_descriptor");
 
     assert_eq!(receipt.backend, DeviceBackend::Metal);
@@ -1470,10 +1525,7 @@ fn execute_descriptor_is_single_run_convenience_over_session() {
     assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
     assert_eq!(receipt.allocated_buffers, vec![1, 2, 3]);
     // Single-run convenience tears down internally.
-    assert_eq!(
-        host.device().expect("device").live_handle_count(),
-        0
-    );
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 /// A CPU-only host cannot create a program session (same fail-closed surface
@@ -1539,7 +1591,7 @@ fn module_cache_loads_once_and_releases_on_teardown() {
     // allocates the ObservationPoint output, reads it back, and releases it
     // (read-then-release, S2-4) — exactly one alloc + one release per run.
     for step in 0..5usize {
-        let receipt = session.execute(&inputs, &[3]).expect("execute");
+        let receipt = session.execute(&inputs).expect("execute");
         assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
         let counters = session.driver_counters();
         assert_eq!(counters.module_loads, 1);
@@ -1575,7 +1627,7 @@ fn module_cache_loads_once_and_releases_on_teardown_cuda() {
     assert_eq!(session.driver_counters().buffer_allocs, 2);
 
     for step in 0..5usize {
-        let receipt = session.execute(&inputs, &[3]).expect("execute");
+        let receipt = session.execute(&inputs).expect("execute");
         assert_eq!(receipt.outputs.get(&3), Some(&vec![5.0, 7.0, 9.0]));
         let counters = session.driver_counters();
         assert_eq!(counters.module_loads, 1);
@@ -1609,7 +1661,7 @@ fn second_session_reloads_module_independently() {
         .expect("session 1 create");
     assert_eq!(session1.module_hash(), fnv1a64(MODULE_IMAGE));
     assert_eq!(session1.driver_counters().module_loads, 1);
-    session1.execute(&inputs, &[3]).expect("session 1 execute");
+    session1.execute(&inputs).expect("session 1 execute");
     assert_eq!(session1.driver_counters().module_loads, 1);
     session1.teardown().expect("session 1 teardown");
     let counters = host.device().expect("device").driver_counters();
@@ -1623,7 +1675,7 @@ fn second_session_reloads_module_independently() {
         .expect("session 2 create");
     assert_eq!(session2.module_hash(), fnv1a64(MODULE_IMAGE));
     assert_eq!(session2.driver_counters().module_loads, 2);
-    session2.execute(&inputs, &[3]).expect("session 2 execute");
+    session2.execute(&inputs).expect("session 2 execute");
     assert_eq!(session2.driver_counters().module_loads, 2);
     session2.teardown().expect("session 2 teardown");
     let counters = host.device().expect("device").driver_counters();
@@ -1639,12 +1691,8 @@ fn second_session_reloads_module_independently() {
 fn execute_descriptor_single_run_releases_module() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
-    host.execute_descriptor(
-        &descriptor,
-        &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-        &[3],
-    )
-    .expect("execute_descriptor");
+    host.execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
+        .expect("execute_descriptor");
     let counters = host.device().expect("device").driver_counters();
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.module_releases, 1);
@@ -1680,8 +1728,8 @@ fn metal_module_load_failure_releases_every_handle() {
 fn metal_allocation_failure_releases_module_and_partial_buffers() {
     // The module and the first buffer are already registered when the second
     // allocation fails; the creation guard must release both (P2-1).
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Alloc, 2)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Alloc, 2).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
         .create_program_session(&descriptor)
@@ -1693,8 +1741,8 @@ fn metal_allocation_failure_releases_module_and_partial_buffers() {
 
 #[test]
 fn cuda_module_load_failure_releases_every_handle() {
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::ModuleLoad, 1)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::ModuleLoad, 1).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .create_program_session(&descriptor)
@@ -1706,8 +1754,8 @@ fn cuda_module_load_failure_releases_every_handle() {
 
 #[test]
 fn cuda_allocation_failure_releases_module_and_partial_buffers() {
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::Alloc, 2)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::Alloc, 2).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .create_program_session(&descriptor)
@@ -1724,15 +1772,11 @@ fn cuda_allocation_failure_releases_module_and_partial_buffers() {
 
 #[test]
 fn metal_copy_in_failure_releases_every_handle() {
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("injected copy-in failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1740,15 +1784,11 @@ fn metal_copy_in_failure_releases_every_handle() {
 
 #[test]
 fn metal_launch_failure_releases_every_handle() {
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Launch, 1)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Launch, 1).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("injected launch failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1758,15 +1798,11 @@ fn metal_launch_failure_releases_every_handle() {
 fn metal_sync_failure_releases_every_handle() {
     // The driver syncs once inside each launch and once at the step boundary;
     // sync call 2 is the explicit step-boundary barrier in `execute`.
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Sync, 2)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Sync, 2).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("injected sync failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1774,15 +1810,11 @@ fn metal_sync_failure_releases_every_handle() {
 
 #[test]
 fn metal_readback_failure_releases_every_handle() {
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Readback, 1)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Readback, 1).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
-        .execute_descriptor(
-            &descriptor,
-            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
-            &[3],
-        )
+        .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
         .expect_err("injected readback failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1790,14 +1822,13 @@ fn metal_readback_failure_releases_every_handle() {
 
 #[test]
 fn cuda_copy_in_failure_releases_every_handle() {
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::CopyIn, 1)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::CopyIn, 1).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
-            &[3],
         )
         .expect_err("injected copy-in failure must fail the execution");
     assert_eq!(err.code, E_CUDA_DRIVER);
@@ -1806,14 +1837,13 @@ fn cuda_copy_in_failure_releases_every_handle() {
 
 #[test]
 fn cuda_launch_failure_releases_every_handle() {
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::Launch, 1)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::Launch, 1).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
-            &[3],
         )
         .expect_err("injected launch failure must fail the execution");
     assert_eq!(err.code, E_CUDA_DRIVER);
@@ -1823,14 +1853,13 @@ fn cuda_launch_failure_releases_every_handle() {
 #[test]
 fn cuda_sync_failure_releases_every_handle() {
     // Same call sequence as the Metal lane: sync call 2 is the step boundary.
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::Sync, 2)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::Sync, 2).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
-            &[3],
         )
         .expect_err("injected sync failure must fail the execution");
     assert_eq!(err.code, E_CUDA_DRIVER);
@@ -1839,14 +1868,13 @@ fn cuda_sync_failure_releases_every_handle() {
 
 #[test]
 fn cuda_readback_failure_releases_every_handle() {
-    let mut host = cuda_composite_failing("addita", FakeFailureStage::Readback, 1)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("addita", FakeFailureStage::Readback, 1).expect("cuda composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Cuda, "addita", 3);
     let err = host
         .execute_descriptor(
             &descriptor,
             &add_inputs(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
-            &[3],
         )
         .expect_err("injected readback failure must fail the execution");
     assert_eq!(err.code, E_CUDA_DRIVER);
@@ -1860,11 +1888,11 @@ fn cuda_readback_failure_releases_every_handle() {
 
 #[test]
 fn mid_chain_second_launch_failure_releases_every_handle() {
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Launch, 2)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Launch, 2).expect("metal composite");
     let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     let err = host
-        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .execute_descriptor(&descriptor, &two_kernel_inputs())
         .expect_err("injected second-launch failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1877,11 +1905,11 @@ fn mid_chain_second_launch_failure_releases_every_handle() {
 /// mid-chain shape, not just single-launch failure stages.
 #[test]
 fn cuda_mid_chain_second_launch_failure_releases_every_handle() {
-    let mut host = cuda_composite_failing("add_one", FakeFailureStage::Launch, 2)
-        .expect("cuda composite");
+    let mut host =
+        cuda_composite_failing("add_one", FakeFailureStage::Launch, 2).expect("cuda composite");
     let descriptor = two_kernel_inout_descriptor(DeviceBackend::Cuda);
     let err = host
-        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .execute_descriptor(&descriptor, &two_kernel_inputs())
         .expect_err("injected second-launch failure must fail the execution");
     assert_eq!(err.code, E_CUDA_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -1897,7 +1925,7 @@ fn cuda_two_kernel_chain_executes_end_to_end() {
     let mut host = cuda_composite("add_one").expect("cuda composite");
     let descriptor = two_kernel_inout_descriptor(DeviceBackend::Cuda);
     let receipt = host
-        .execute_descriptor(&descriptor, &two_kernel_inputs(), &[5])
+        .execute_descriptor(&descriptor, &two_kernel_inputs())
         .expect("two-kernel chain must execute");
     assert_eq!(receipt.backend, DeviceBackend::Cuda);
     assert_eq!(receipt.launches, 2);
@@ -1911,8 +1939,8 @@ fn cuda_two_kernel_chain_executes_end_to_end() {
 /// instead of reusing stale handles.
 #[test]
 fn failed_execution_closes_session_and_blocks_reuse() {
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::CopyIn, 1).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
 
@@ -1922,7 +1950,7 @@ fn failed_execution_closes_session_and_blocks_reuse() {
     assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
 
     let err = session
-        .execute(&inputs, &[3])
+        .execute(&inputs)
         .expect_err("injected copy-in failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     // Release-on-error: no handle survives the failed execution at the
@@ -1932,7 +1960,7 @@ fn failed_execution_closes_session_and_blocks_reuse() {
 
     // A closed session cannot execute again (no stale-handle reuse).
     let again = session
-        .execute(&inputs, &[3])
+        .execute(&inputs)
         .expect_err("a closed session must refuse execution");
     assert_eq!(again.code, "E_INTERNAL");
 
@@ -1967,7 +1995,7 @@ fn per_program_persists_while_observation_read_then_releases() {
 
     // Execute 1: observation buffer allocated (allocs 3), read back, released
     // (releases 1). PerProgram inputs stay live; no realloc.
-    let receipt = session.execute(&inputs, &[3]).expect("execute 1");
+    let receipt = session.execute(&inputs).expect("execute 1");
     assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
     assert_eq!(receipt.per_program_buffers, vec![1, 2]);
     assert_eq!(receipt.observation_buffers, vec![3]);
@@ -1980,7 +2008,7 @@ fn per_program_persists_while_observation_read_then_releases() {
     // Execute 2: the observation buffer is re-allocated, read back, released
     // again; the PerProgram inputs were never re-allocated (allocs stay 4).
     let receipt2 = session
-        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]), &[3])
+        .execute(&add_inputs(vec![10.0, 20.0], vec![30.0, 40.0]))
         .expect("execute 2");
     assert_eq!(receipt2.outputs.get(&3), Some(&vec![40.0, 60.0]));
     let counters = session.driver_counters();
@@ -2015,7 +2043,7 @@ fn per_step_buffers_recycle_at_step_boundary() {
     // Execute 1 allocates the PerStep intermediate (id 3) and the
     // ObservationPoint output (id 5), then releases both at the step
     // boundary / after readback: allocs 3 → 5, releases 0 → 2.
-    let receipt = session.execute(&inputs, &[5]).expect("execute 1");
+    let receipt = session.execute(&inputs).expect("execute 1");
     assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
     assert_eq!(receipt.per_program_buffers, vec![1, 2, 4]);
     assert_eq!(receipt.per_step_buffers, vec![3]);
@@ -2026,7 +2054,7 @@ fn per_step_buffers_recycle_at_step_boundary() {
 
     // Execute 2: the PerStep intermediate and the observation output are
     // allocated fresh and released again — recycled at each step boundary.
-    let receipt2 = session.execute(&inputs, &[5]).expect("execute 2");
+    let receipt2 = session.execute(&inputs).expect("execute 2");
     assert_eq!(receipt2.outputs.get(&5), Some(&vec![14.0, 16.0]));
     let counters = session.driver_counters();
     assert_eq!(counters.buffer_allocs, 7);
@@ -2077,7 +2105,7 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy() {
     // loss_backward_x, w in loss_backward_w = 4); grad_x/grad_w read back
     // and released; the PerStep intermediates recycled at the step
     // boundary.
-    let receipt = session.execute(&inputs, &[6, 7]).expect("execute 1");
+    let receipt = session.execute(&inputs).expect("execute 1");
     assert_eq!(receipt.launches, 4);
     assert_eq!(receipt.copy_ins, 4);
     assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0])); // grad_x
@@ -2096,7 +2124,7 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy() {
     // Execute 2 on the SAME session: no reload, no PerProgram realloc; the
     // PerStep and ObservationPoint buffers are allocated fresh and released
     // again (recycled at each step boundary, read-then-released after).
-    let receipt2 = session.execute(&inputs, &[6, 7]).expect("execute 2");
+    let receipt2 = session.execute(&inputs).expect("execute 2");
     assert_eq!(receipt2.outputs.get(&6), Some(&vec![5.0, 8.0]));
     assert_eq!(receipt2.outputs.get(&7), Some(&vec![7.0, 10.0]));
     assert_eq!(session.session_handle_count(), 3);
@@ -2130,7 +2158,7 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
     assert_eq!(session.session_handle_count(), 3); // module + 2 PerProgram
     assert_eq!(session.driver_counters().buffer_allocs, 2);
 
-    let receipt = session.execute(&inputs, &[6, 7]).expect("execute 1");
+    let receipt = session.execute(&inputs).expect("execute 1");
     assert_eq!(receipt.launches, 4);
     assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0]));
     assert_eq!(receipt.outputs.get(&7), Some(&vec![7.0, 10.0]));
@@ -2139,7 +2167,7 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
     assert_eq!(receipt.observation_buffers, vec![6, 7]);
     assert_eq!(session.session_handle_count(), 3);
 
-    let receipt2 = session.execute(&inputs, &[6, 7]).expect("execute 2");
+    let receipt2 = session.execute(&inputs).expect("execute 2");
     assert_eq!(receipt2.outputs.get(&6), Some(&vec![5.0, 8.0]));
     assert_eq!(receipt2.outputs.get(&7), Some(&vec![7.0, 10.0]));
     assert_eq!(session.session_handle_count(), 3);
@@ -2159,9 +2187,7 @@ fn receipt_reports_lifetime_classes_and_program_lifetime() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    let receipt = session
-        .execute(&two_kernel_inputs(), &[5])
-        .expect("execute");
+    let receipt = session.execute(&two_kernel_inputs()).expect("execute");
     assert_eq!(
         receipt.program_lifetime,
         DeviceProgramLifetime::RepeatingStep,
@@ -2178,27 +2204,30 @@ fn receipt_reports_lifetime_classes_and_program_lifetime() {
     session.teardown().expect("teardown");
 }
 
-/// ObservationPoint is the only readback: requesting a readback of a
-/// PerProgram buffer is an undeclared readback and fails closed with
-/// `E_INVALID_ARGS` before any copy-out, releasing every handle (S2-3).
+/// ObservationPoint is the only readback: a result naming a PerProgram
+/// buffer is an undeclared readback and fails closed at host admission with
+/// `E_DEVICE_DESCRIPTOR` before any launch (F6 — the constructor and host
+/// admission agree).
 #[test]
 fn non_observation_readback_fails_closed() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
-    let inputs = add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]);
 
-    let mut session = host
-        .create_program_session(&descriptor)
-        .expect("session create");
-    // Buffer 1 is a PerProgram input; reading it back is not a declared
-    // observation point and must fail closed.
-    let err = session
-        .execute(&inputs, &[1])
-        .expect_err("reading back a PerProgram buffer is an undeclared readback");
-    assert_eq!(err.code, "E_INVALID_ARGS");
+    // Buffer 1 is a PerProgram input; declaring it as a result is not a
+    // declared observation point and must fail closed before any launch.
+    let mut per_program_result = descriptor.clone();
+    per_program_result.results = vec![DescriptorResult {
+        buffer_id: 1,
+        version: 1,
+        produced_by: 1,
+        at_launch: 1,
+    }];
+    let err = host
+        .create_program_session(&per_program_result)
+        .err()
+        .expect("reading back a PerProgram buffer is an undeclared readback");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("observation-point"));
-    // The failed execution released every handle (S2-3 release-on-error).
-    assert_eq!(session.session_handle_count(), 0);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
@@ -2240,13 +2269,13 @@ fn conflicting_buffer_lifetimes_fail_as_abi_mismatch() {
 fn per_step_allocation_failure_releases_every_handle() {
     // Creation allocates PerProgram ids 1, 2, 4 (alloc calls 1-3); the first
     // per-step allocation (id 3) is alloc call 4.
-    let mut host = metal_composite_failing("add_one", FakeFailureStage::Alloc, 4)
-        .expect("metal composite");
+    let mut host =
+        metal_composite_failing("add_one", FakeFailureStage::Alloc, 4).expect("metal composite");
     let descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
     let err = host
         .create_program_session(&descriptor)
         .expect("session create")
-        .execute(&two_kernel_inputs(), &[5])
+        .execute(&two_kernel_inputs())
         .expect_err("injected per-step allocation failure must fail the execution");
     assert_eq!(err.code, E_METAL_DRIVER);
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -2266,9 +2295,7 @@ fn receipt_declares_resource_graph_and_observed_events() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    let receipt = session
-        .execute(&two_kernel_inputs(), &[5])
-        .expect("execute");
+    let receipt = session.execute(&two_kernel_inputs()).expect("execute");
 
     // Declared resource graph (A10), buffer-id order: identity facts +
     // content version 1 for all five buffers.
@@ -2304,15 +2331,40 @@ fn receipt_declares_resource_graph_and_observed_events() {
         }]
     );
 
-    // Observed lifecycle events (A9): 2 launches, 1 step-boundary sync, 3
-    // copy-ins + 1 readback = 4 transfers, 1 readback, and 2 releases
-    // (read-then-release of `out` + step-boundary recycle of `acc`).
+    // Observed lifecycle events (A9): 2 launches, 3 real synchronization
+    // operations (one per launch's internal sync + the explicit step-boundary
+    // barrier), 3 copy-ins + 1 readback = 4 transfers, 1 readback, and 2
+    // releases (read-then-release of `out` + step-boundary recycle of `acc`).
     assert_eq!(receipt.launches, 2);
-    assert_eq!(receipt.syncs, 1);
+    assert_eq!(receipt.syncs, 3);
     assert_eq!(receipt.copy_ins, 3);
     assert_eq!(receipt.transfers, 4);
+    assert_eq!(receipt.readbacks, 1);
     assert_eq!(receipt.outputs.len(), 1);
     assert_eq!(receipt.releases, 2);
+
+    // R9: the completion boundary is the explicit step-boundary sync after
+    // the last launch (2) — stated exactly, never beyond the synchronization
+    // the host actually performed.
+    assert_eq!(
+        receipt.completion_boundary,
+        CompletionBoundary::StepSync { after_launch: 2 }
+    );
+    assert_eq!(
+        receipt.completion_boundary.spelling(),
+        "completion guaranteed at the explicit step-boundary sync after launch 2"
+    );
+
+    // The receipt carries the semantic graph hash the host computed from the
+    // descriptor it consumed (the graph identity of this execution).
+    assert_eq!(
+        receipt.semantic_graph_hash,
+        descriptor.semantic_graph_hash()
+    );
+    assert_eq!(
+        session.semantic_graph_hash(),
+        descriptor.semantic_graph_hash()
+    );
 
     session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -2342,9 +2394,7 @@ fn receipt_consumes_carried_version_facts_not_coincidence() {
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    let receipt = session
-        .execute(&two_kernel_inputs(), &[5])
-        .expect("execute");
+    let receipt = session.execute(&two_kernel_inputs()).expect("execute");
 
     // The rendered graph consumes the carried version (2), not a hardcoded 1.
     let acc = receipt
@@ -2367,4 +2417,294 @@ fn receipt_consumes_carried_version_facts_not_coincidence() {
 
     session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3R U5: coherent host execution — graph-ordered scheduling (F3/G1),
+// observation-only readback (F6), honest receipts (R9), semantic graph hash
+// ---------------------------------------------------------------------------
+
+/// The declaration-reorder red test (G1 host side): reordering the kernel
+/// DECLARATIONS — the host never infers execution from declaration order —
+/// does not change the executed launch sequence, the results, or the
+/// semantic graph hash. The host schedules the carried launches + graph,
+/// so the same launches with differently-ordered declarations are one
+/// program.
+#[test]
+fn declaration_reorder_does_not_change_execution_or_graph_hash() {
+    let mut host = multi_kernel_metal_composite().expect("metal composite");
+
+    let kernel_zero = DescriptorKernel {
+        entry: "kernel_zero".to_owned(),
+        buffers: vec![
+            add_slot(1, "a0", DeviceBufferRole::Input, 0, 2),
+            add_slot(2, "b0", DeviceBufferRole::Input, 1, 2),
+            add_slot(3, "out0", DeviceBufferRole::Output, 2, 2),
+        ],
+        grid: [1, 1, 1],
+        block: [2, 1, 1],
+    };
+    let kernel_one = DescriptorKernel {
+        entry: "kernel_one".to_owned(),
+        buffers: vec![
+            add_slot(4, "a1", DeviceBufferRole::Input, 0, 2),
+            add_slot(5, "b1", DeviceBufferRole::Input, 1, 2),
+            add_slot(6, "out1", DeviceBufferRole::Output, 2, 2),
+        ],
+        grid: [1, 1, 1],
+        block: [2, 1, 1],
+    };
+
+    // The semantic program: launch order kernel_one, kernel_zero, kernel_one
+    // with out1 (buffer 6) the declared observation point. Declaration order
+    // is NOT part of the program — the two descriptors differ only in how
+    // the kernels are declared (and the launch indices remapped to match).
+    let build = |kernels: Vec<DescriptorKernel>, one: u32, zero: u32| DeviceDescriptor {
+        backend: DeviceBackend::Metal,
+        module_image: MODULE_IMAGE.to_vec(),
+        buffer_versions: buffer_versions_for(&kernels),
+        kernels,
+        launches: vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: one,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: zero,
+            },
+            DescriptorLaunch {
+                id: 3,
+                kernel_index: one,
+            },
+        ],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
+        roots: vec![1, 2, 3],
+        results: vec![result(6, 3)],
+    };
+    let declared_zero_first = build(vec![kernel_zero.clone(), kernel_one.clone()], 1, 0);
+    let declared_one_first = build(vec![kernel_one.clone(), kernel_zero.clone()], 0, 1);
+
+    let inputs = BTreeMap::from([
+        (1, vec![1.0, 2.0]),
+        (2, vec![3.0, 4.0]),
+        (4, vec![5.0, 6.0]),
+        (5, vec![7.0, 8.0]),
+    ]);
+
+    let receipt_a = host
+        .execute_descriptor(&declared_zero_first, &inputs)
+        .expect("declaration order A");
+    let receipt_b = host
+        .execute_descriptor(&declared_one_first, &inputs)
+        .expect("declaration order B");
+
+    // Execution order + results are declaration-independent.
+    assert_eq!(
+        receipt_a.launch_entries,
+        vec!["kernel_one", "kernel_zero", "kernel_one"]
+    );
+    assert_eq!(receipt_b.launch_entries, receipt_a.launch_entries);
+    assert_eq!(receipt_b.launch_ids, receipt_a.launch_ids);
+    assert_eq!(receipt_b.outputs, receipt_a.outputs);
+    assert_eq!(receipt_b.outputs.get(&6), Some(&vec![12.0, 14.0]));
+
+    // The semantic graph hash is declaration-independent too: both
+    // descriptors name the same launches, graph, semantic identities, and
+    // observation points.
+    assert_eq!(
+        declared_zero_first.semantic_graph_hash(),
+        declared_one_first.semantic_graph_hash()
+    );
+    assert_eq!(
+        receipt_a.semantic_graph_hash,
+        declared_zero_first.semantic_graph_hash()
+    );
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0
+    );
+}
+
+/// F3 red test: a dependency cycle fails validation before launch — the host
+/// never schedules an acyclic graph that isn't there.
+#[test]
+fn dependency_cycle_fails_validation_before_launch() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![
+                add_slot(8, "x", DeviceBufferRole::InOut, 0, 2),
+                add_slot(9, "acc", DeviceBufferRole::InOut, 1, 2),
+            ],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 1,
+                consumer: 2,
+            },
+            DescriptorDataFlow {
+                buffer_id: 8,
+                version: 1,
+                producer: 2,
+                consumer: 1,
+            },
+        ],
+        Vec::new(),
+    );
+    let mut descriptor = descriptor;
+    // Anchor the schedule at a root so the graph checks (not the root set)
+    // decide this descriptor's fate.
+    descriptor.roots = vec![1];
+    let err = descriptor
+        .validate()
+        .expect_err("a dependency cycle must fail before launch");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("dependency graph"));
+}
+
+/// F2 red test: two launches defining the same value generation (same
+/// buffer, same content version) is a duplicate definition and fails
+/// validation before launch — one generation has exactly one producer.
+#[test]
+fn duplicate_value_generation_producer_fails_validation() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 1,
+                consumer: 2,
+            },
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 2,
+                consumer: 1,
+            },
+        ],
+        Vec::new(),
+    );
+    let mut descriptor = descriptor;
+    // Anchor the schedule at a root so the graph checks (not the root set)
+    // decide this descriptor's fate.
+    descriptor.roots = vec![1];
+    let err = descriptor
+        .validate()
+        .expect_err("a second producer of the same value generation must fail");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("producer"));
+}
+
+/// F3 red test: a consumer scheduled before its producer is a missing
+/// dependency and fails validation before launch.
+#[test]
+fn consumer_before_producer_fails_validation() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+        ],
+        vec![DescriptorDataFlow {
+            buffer_id: 9,
+            version: 1,
+            producer: 2,
+            consumer: 1,
+        }],
+        Vec::new(),
+    );
+    let err = descriptor
+        .validate()
+        .expect_err("a consumer before its producer must fail before launch");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("dependency graph"));
+}
+
+/// F3 red test: a launch the declared roots cannot reach is an incomplete
+/// schedule and fails validation before launch.
+#[test]
+fn unreachable_launch_fails_validation() {
+    let mut descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 3,
+                kernel_index: 0,
+            },
+        ],
+        vec![DescriptorDataFlow {
+            buffer_id: 9,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
+        Vec::new(),
+    );
+    // Declare only launch 1 as a root: launch 3 is unreachable.
+    descriptor.roots = vec![1];
+    let err = descriptor
+        .validate()
+        .expect_err("an unreachable launch must fail before launch");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("not reachable"));
 }
