@@ -157,7 +157,9 @@ pub struct DeviceExecutionReceipt {
     pub data_flow_edges: Vec<DataFlowEdge>,
     /// Observed real synchronization operations this execution (R9): one per
     /// launch (a launch synchronizes internally) plus the explicit
-    /// step-boundary barrier that makes the completion boundary valid.
+    /// step-boundary barrier, counted only where the backend's `sync()`
+    /// actually performs a device synchronization (a no-op step sync is not
+    /// an actual synchronization event and is not counted).
     pub syncs: usize,
     /// Observed transfers this execution (host→device copy-ins plus
     /// device→host readbacks).
@@ -950,6 +952,21 @@ impl<'host> ProgramSession<'host> {
         // program).
         let (resource_graph, data_flow_edges) = self.declared_resource_graph();
 
+        // R9 real-synchronization accounting (P1-4): one synchronization per
+        // launch — the session launch contract synchronizes internally (Metal
+        // waits per launch; CUDA syncs per launch) — plus the explicit
+        // step-boundary barrier, which is an actual device synchronization
+        // only where the backend's `sync()` performs one. On Metal, `sync()`
+        // is a no-op because every launch already called `wait_until_completed`,
+        // so the step barrier is NOT an actual synchronization event and is
+        // not counted; on CUDA, `sync()` performs `cuCtxSynchronize`, so it
+        // is additive. The completion boundary is that barrier after the last
+        // dispatched launch.
+        let step_boundary_syncs: usize = match self.backend {
+            DeviceBackend::Metal => 0,
+            DeviceBackend::Cuda => 1,
+        };
+
         Ok(DeviceExecutionReceipt {
             backend: self.backend,
             device_name: self.device_name.clone(),
@@ -973,11 +990,7 @@ impl<'host> ProgramSession<'host> {
                 .buffer_versions_by_lifetime(DeviceBufferLifetime::ObservationPoint),
             resource_graph,
             data_flow_edges,
-            // R9: real synchronization operations — one per launch (each
-            // launch synchronizes internally) plus the explicit step-boundary
-            // barrier. The completion boundary is that barrier after the last
-            // dispatched launch.
-            syncs: launch_count + 1,
+            syncs: launch_count + step_boundary_syncs,
             transfers: copy_ins + readback_count,
             readbacks: readback_count,
             releases: release_count,

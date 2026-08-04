@@ -2424,7 +2424,9 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
     assert_eq!(session.driver_counters().buffer_releases, 0);
 
     // Once-init: the HostProvided params are copied in exactly once.
-    session.init_params(&training_step_params()).expect("once-init params");
+    session
+        .init_params(&training_step_params())
+        .expect("once-init params");
 
     // N steps on one session: PerStep recycled per step, observation read
     // back per step, receipts count per-step syncs/transfers/readbacks/
@@ -2432,7 +2434,10 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
     const STEPS: usize = 5;
     for _ in 0..STEPS {
         let receipt = session.execute_step().expect("execute step");
-        assert_eq!(receipt.program_lifetime, DeviceProgramLifetime::RepeatingStep);
+        assert_eq!(
+            receipt.program_lifetime,
+            DeviceProgramLifetime::RepeatingStep
+        );
         assert_eq!(receipt.launches, 2);
         assert_eq!(receipt.launch_ids, vec![1, 2]);
         assert_eq!(
@@ -2448,8 +2453,8 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
             "readback-only transfers per step (no copy-ins)"
         );
         assert_eq!(
-            receipt.syncs, 3,
-            "2 launches + the explicit step-boundary barrier per step"
+            receipt.syncs, 2,
+            "2 launches each sync internally; the Metal step-boundary sync() is a no-op and is not counted"
         );
         assert_eq!(
             receipt.releases, 2,
@@ -2849,12 +2854,14 @@ fn receipt_declares_resource_graph_and_observed_events() {
         }]
     );
 
-    // Observed lifecycle events (A9): 2 launches, 3 real synchronization
-    // operations (one per launch's internal sync + the explicit step-boundary
-    // barrier), 3 copy-ins + 1 readback = 4 transfers, 1 readback, and 2
-    // releases (read-then-release of `out` + step-boundary recycle of `acc`).
+    // Observed lifecycle events (A9): 2 launches, 2 real synchronization
+    // operations (one per launch's internal wait — the Metal step-boundary
+    // `sync()` is a no-op because every launch already waited, so it is NOT
+    // an actual synchronization event and is not counted), 3 copy-ins + 1
+    // readback = 4 transfers, 1 readback, and 2 releases (read-then-release
+    // of `out` + step-boundary recycle of `acc`).
     assert_eq!(receipt.launches, 2);
-    assert_eq!(receipt.syncs, 3);
+    assert_eq!(receipt.syncs, 2);
     assert_eq!(receipt.copy_ins, 3);
     assert_eq!(receipt.transfers, 4);
     assert_eq!(receipt.readbacks, 1);
@@ -2886,6 +2893,49 @@ fn receipt_declares_resource_graph_and_observed_events() {
 
     session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// P1-4 (A9 evidence honesty): a receipt counts only ACTUAL device
+/// synchronization events. Every launch synchronizes internally on both
+/// backends (Metal waits per launch; CUDA syncs per launch) — counted. The
+/// explicit step-boundary `sync()` is counted only where it performs a real
+/// synchronization: CUDA issues `cuCtxSynchronize` (additive), while Metal is
+/// a no-op because every launch already waited (NOT counted). For the
+/// identical two-launch descriptor, the Metal receipt reports 2 syncs and the
+/// CUDA receipt reports 3.
+#[test]
+fn receipt_syncs_count_only_real_synchronizations_per_backend() {
+    for (backend, composite) in [
+        (DeviceBackend::Metal, metal_composite("add_one")),
+        (DeviceBackend::Cuda, cuda_composite("add_one")),
+    ] {
+        let mut host = composite.expect("composite");
+        let descriptor = two_kernel_inout_descriptor(backend);
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+        let receipt = session.execute(&two_kernel_inputs()).expect("execute");
+
+        assert_eq!(receipt.launches, 2);
+        let expected_syncs = match backend {
+            // One real sync per launch's internal wait; the step-boundary
+            // sync() is a no-op on Metal and must not be counted.
+            DeviceBackend::Metal => 2,
+            // One real sync per launch's cuCtxSynchronize plus the additive
+            // step-boundary cuCtxSynchronize.
+            DeviceBackend::Cuda => 3,
+        };
+        assert_eq!(receipt.syncs, expected_syncs);
+        // The completion boundary stays the step-boundary barrier after the
+        // last launch on both lanes.
+        assert_eq!(
+            receipt.completion_boundary,
+            CompletionBoundary::StepSync { after_launch: 2 }
+        );
+
+        session.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
 }
 
 /// R2 (S3-A8): the A10 resource graph consumes the WIRE'S carried version
