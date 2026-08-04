@@ -1,3 +1,7 @@
++++
+locale = "la"
++++
+
 @ nucleum
 functio add_one(fractus<f32> x) → fractus<f32> {
     redde x + 1.0
