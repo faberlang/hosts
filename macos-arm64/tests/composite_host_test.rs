@@ -16,10 +16,10 @@ use faber_host_macos_arm64::composite_host::{
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorKernel, DeviceBufferLifetime, DeviceBufferRole,
-    DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE,
-    E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH,
-    E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    fnv1a64, DescriptorBuffer, DescriptorDataFlow, DescriptorKernel, DeviceBufferLifetime,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
+    E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH,
+    E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
@@ -60,6 +60,7 @@ fn add_slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
+        version: 1,
     }
 }
 
@@ -78,6 +79,7 @@ fn elementwise_add_descriptor(backend: DeviceBackend, entry: &str, count: u64) -
             block: [count as u32, 1, 1],
         }],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     }
 }
 
@@ -205,6 +207,16 @@ fn two_kernel_inout_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        // R2: the data-flow edge is CARRIED by the wire (buffer 3 `acc`,
+        // version 1: launch 1 produces, launch 2 consumes) — the host
+        // consumes it; it never re-derives a first-writer edge from launch
+        // order.
+        data_flow: vec![DescriptorDataFlow {
+            buffer_id: 3,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
     }
 }
 
@@ -286,6 +298,7 @@ fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     }
 }
 
@@ -470,6 +483,7 @@ fn inout_buffer_stays_device_resident_across_kernels() {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     };
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -598,6 +612,7 @@ fn conflicting_buffer_roles_fail_as_abi_mismatch() {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     };
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
@@ -668,6 +683,7 @@ fn conflicting_shapes_fail_as_shape_mismatch() {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     };
     let err = host
         .execute_descriptor(&descriptor, &BTreeMap::new(), &[])
@@ -864,6 +880,7 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
     };
     let mut inputs = BTreeMap::new();
     inputs.insert(1, vec![1.0, 2.0]);
@@ -1762,6 +1779,56 @@ fn receipt_declares_resource_graph_and_observed_events() {
     assert_eq!(receipt.transfers, 4);
     assert_eq!(receipt.outputs.len(), 1);
     assert_eq!(receipt.releases, 2);
+
+    session.teardown().expect("teardown");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// R2 (S3-A8): the A10 resource graph consumes the WIRE'S carried version
+/// facts — a buffer carrying version 2 and a carried producer/consumer edge
+/// render AS-IS, never hardcoded `version: 1` and never re-derived from a
+/// first-writer launch-order coincidence rule.
+#[test]
+fn receipt_consumes_carried_version_facts_not_coincidence() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    // The two-kernel chain (the same shape the S2-8 receipt test drives):
+    // `acc` is an accumulation buffer whose slots carry version 2 (the S2-5
+    // `version > 1` accumulation pattern). The wire carries the edge for it.
+    let mut descriptor = two_kernel_inout_descriptor(DeviceBackend::Metal);
+    descriptor.kernels[0].buffers[2].version = 2;
+    descriptor.kernels[1].buffers[0].version = 2;
+    descriptor.data_flow = vec![DescriptorDataFlow {
+        buffer_id: 3,
+        version: 2,
+        producer: 1,
+        consumer: 2,
+    }];
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    let receipt = session
+        .execute(&two_kernel_inputs(), &[5])
+        .expect("execute");
+
+    // The rendered graph consumes the carried version (2), not a hardcoded 1.
+    let acc = receipt
+        .resource_graph
+        .iter()
+        .find(|buffer| buffer.id == 3)
+        .expect("acc in graph");
+    assert_eq!(acc.version, 2, "the host must consume the carried version");
+
+    // The rendered edges are the carried facts, not a first-writer derivation.
+    assert_eq!(
+        receipt.data_flow_edges,
+        vec![DataFlowEdge {
+            buffer_id: 3,
+            version: 2,
+            producer: 1,
+            consumer: 2,
+        }]
+    );
 
     session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);

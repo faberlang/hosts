@@ -224,6 +224,9 @@ struct SessionBufferMeta {
     element_ty: DeviceDataType,
     /// Element count declared by the descriptor (input size check).
     element_count: u64,
+    /// Content version carried by the wire (resource-graph fact; R2 — the
+    /// host consumes the version, never hardcodes `1`).
+    version: u32,
     /// Byte length this buffer's storage needs on the device.
     byte_length: u64,
     /// Lifetime class that drives the session's allocation/release policy.
@@ -311,6 +314,11 @@ pub struct ProgramSession<'host> {
     buffer_meta: BTreeMap<u32, SessionBufferMeta>,
     /// The ordered launch plan cloned from the descriptor.
     kernels: Vec<SessionKernel>,
+    /// Carried inter-kernel data-flow edges (A10/R2): the wire's
+    /// producer/consumer facts per buffer version, consumed by
+    /// [`ProgramSession::declared_resource_graph`] — never re-derived from
+    /// launch order.
+    data_flow: Vec<DataFlowEdge>,
     /// True after an error-path release (S2-3): every handle has been
     /// released and the session cannot execute again.
     closed: bool,
@@ -377,6 +385,7 @@ impl<'host> ProgramSession<'host> {
                             role: slot.role,
                             element_ty: slot.element_ty,
                             element_count: slot.element_count,
+                            version: slot.version,
                             byte_length: slot.byte_length(),
                             lifetime: slot.lifetime,
                         });
@@ -424,6 +433,16 @@ impl<'host> ProgramSession<'host> {
             buffers,
             buffer_meta,
             kernels,
+            data_flow: descriptor
+                .data_flow
+                .iter()
+                .map(|edge| DataFlowEdge {
+                    buffer_id: edge.buffer_id,
+                    version: edge.version,
+                    producer: edge.producer,
+                    consumer: edge.consumer,
+                })
+                .collect(),
             closed: false,
         })
     }
@@ -671,16 +690,16 @@ impl<'host> ProgramSession<'host> {
     }
 
     /// The declared logical resource graph (A10): every buffer identity +
-    /// content version plus the inter-kernel data-flow edges derived from
-    /// the launch sequence.
+    /// carried content version plus the carried inter-kernel data-flow
+    /// edges.
     ///
     /// Graph order is buffer-id ascending, which equals first-reference
     /// order for constructor-built programs (buffer ids are minted in
-    /// reference order). Edge derivation matches the schema's
-    /// `BufferRegistry::data_flow_pairs` rule for constructor-valid
-    /// programs: a buffer's producing launch is its FIRST Output/InOut
-    /// reference (the earliest writer); consuming launches are the later
-    /// Input/InOut references. Self-edges are excluded. This is the declared
+    /// reference order). The content versions and the producer/consumer
+    /// edges are the WIRE'S carried facts (R2): the session consumes the
+    /// descriptor's per-buffer version and data-flow list verbatim — it
+    /// never hardcodes `version: 1` and never re-derives an edge from a
+    /// first-writer launch-order coincidence rule. This is the declared
     /// (payload-derived) graph — the session never observes the intermediate
     /// (S2-4/S2-5: no undeclared readback).
     fn declared_resource_graph(&self) -> (Vec<ReceiptBuffer>, Vec<DataFlowEdge>) {
@@ -694,51 +713,10 @@ impl<'host> ProgramSession<'host> {
                 lifetime: meta.lifetime,
                 element_ty: meta.element_ty,
                 element_count: meta.element_count,
-                version: 1,
+                version: meta.version,
             })
             .collect();
-
-        let mut first_writer: Vec<(u32, u32)> = Vec::new();
-        let mut read_refs: Vec<(u32, u32)> = Vec::new();
-        for (kernel_index, kernel) in self.kernels.iter().enumerate() {
-            let launch = u32::try_from(kernel_index + 1).unwrap_or(u32::MAX);
-            for slot in &kernel.slots {
-                match slot.role {
-                    DeviceBufferRole::Output | DeviceBufferRole::InOut => {
-                        if !first_writer.iter().any(|(id, _)| *id == slot.buffer_id) {
-                            first_writer.push((slot.buffer_id, launch));
-                        }
-                    }
-                    DeviceBufferRole::Input => {}
-                }
-                match slot.role {
-                    DeviceBufferRole::Input | DeviceBufferRole::InOut => {
-                        read_refs.push((slot.buffer_id, launch));
-                    }
-                    DeviceBufferRole::Output => {}
-                }
-            }
-        }
-
-        let mut edges = Vec::new();
-        for (buffer, producer) in first_writer {
-            let mut consumers: Vec<u32> = read_refs
-                .iter()
-                .filter(|(id, launch)| *id == buffer && *launch != producer)
-                .map(|(_, launch)| *launch)
-                .collect();
-            consumers.sort_unstable();
-            consumers.dedup();
-            for consumer in consumers {
-                edges.push(DataFlowEdge {
-                    buffer_id: buffer,
-                    version: 1,
-                    producer,
-                    consumer,
-                });
-            }
-        }
-        (graph, edges)
+        (graph, self.data_flow.clone())
     }
 
     /// Ordered teardown: release every buffer, then the module. After this

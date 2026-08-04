@@ -197,6 +197,10 @@ pub struct DescriptorBuffer {
     pub element_ty: DeviceDataType,
     /// Element count of this buffer version.
     pub element_count: u64,
+    /// Content version of this buffer shape (the wire's carried
+    /// `BufferVersion.version` — R2: the host consumes the version fact; it
+    /// never re-derives or hardcodes `1`).
+    pub version: u32,
 }
 
 impl DescriptorBuffer {
@@ -236,6 +240,27 @@ pub struct DeviceDescriptor {
     /// the declared program fact (single-run one-shot-with-repeat surface for
     /// the leak proof vs a repeating training step).
     pub program_lifetime: DeviceProgramLifetime,
+    /// Carried inter-kernel data-flow edges (A10/R2): the wire's
+    /// producer/consumer facts per buffer version. The session consumes them
+    /// for the declared resource graph — it never re-derives topology from
+    /// launch order or a first-writer coincidence rule.
+    pub data_flow: Vec<DescriptorDataFlow>,
+}
+
+/// One carried inter-kernel data-flow edge (A10): a buffer content version
+/// produced by launch `producer` and consumed by launch `consumer`. Mirrors
+/// the radix-mir `BufferRegistry::data_flow_pairs` fact; the host renders it
+/// as-is from the descriptor (R2 consume — no re-derivation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorDataFlow {
+    /// Buffer whose content flows.
+    pub buffer_id: u32,
+    /// Content version that flows (the wire's `RegistryVersion.version`).
+    pub version: u32,
+    /// Producing launch id (1-based).
+    pub producer: u32,
+    /// Consuming launch id (1-based).
+    pub consumer: u32,
 }
 
 /// FNV-1a 64-bit provenance hash (the campaign's per-blob provenance
