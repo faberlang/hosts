@@ -992,6 +992,68 @@ impl FakeCudaDriver {
         }
         Ok(())
     }
+
+    /// Simulate the accumulation kernel (G4): `acc[i] += a[i]` — the emitted
+    /// elementwise accumulation into a persistent buffer. Repeated launches
+    /// accumulate onto the previous device contents (the host's ZeroFill
+    /// initialization defines the first state exactly once).
+    fn simulate_accumulate(&mut self, module: u64, a: u64, acc: u64) -> HostResult<()> {
+        if !self.modules.contains_key(&module) {
+            return Err(HostError::internal("fake accumulate missing module"));
+        }
+        let a_bytes = self
+            .buffers
+            .get(&a)
+            .ok_or_else(|| HostError::internal("fake accumulate missing a"))?
+            .clone();
+        let acc_buf = self
+            .buffers
+            .get_mut(&acc)
+            .ok_or_else(|| HostError::internal("fake accumulate missing acc"))?;
+        if a_bytes.len() != acc_buf.len() {
+            return Err(HostError::invalid_args("fake accumulate length mismatch"));
+        }
+        let len = a_bytes.len() / 4;
+        for i in 0..len {
+            let ai = f32::from_le_bytes([
+                a_bytes[i * 4],
+                a_bytes[i * 4 + 1],
+                a_bytes[i * 4 + 2],
+                a_bytes[i * 4 + 3],
+            ]);
+            let acc_i = f32::from_le_bytes([
+                acc_buf[i * 4],
+                acc_buf[i * 4 + 1],
+                acc_buf[i * 4 + 2],
+                acc_buf[i * 4 + 3],
+            ]);
+            let sum = (acc_i + ai).to_le_bytes();
+            acc_buf[i * 4..i * 4 + 4].copy_from_slice(&sum);
+        }
+        Ok(())
+    }
+
+    /// Simulate a copy kernel: `out[i] = src[i]` — the observation kernel
+    /// that reads a persistent accumulation buffer into a readback slot.
+    fn simulate_copy(&mut self, module: u64, src: u64, out: u64) -> HostResult<()> {
+        if !self.modules.contains_key(&module) {
+            return Err(HostError::internal("fake copy missing module"));
+        }
+        let src_bytes = self
+            .buffers
+            .get(&src)
+            .ok_or_else(|| HostError::internal("fake copy missing src"))?
+            .clone();
+        let out_buf = self
+            .buffers
+            .get_mut(&out)
+            .ok_or_else(|| HostError::internal("fake copy missing out"))?;
+        if src_bytes.len() != out_buf.len() {
+            return Err(HostError::invalid_args("fake copy length mismatch"));
+        }
+        out_buf.copy_from_slice(&src_bytes);
+        Ok(())
+    }
 }
 
 impl CudaDriver for FakeCudaDriver {
@@ -1087,8 +1149,26 @@ impl CudaDriver for FakeCudaDriver {
                 retryable: false,
             });
         }
-        // The emitted `addita` kernel takes exactly three buffers (a, b, out).
-        // Anything else fails closed in the fake just as it would on device.
+        // The emitted `addita` kernel takes exactly three buffers (a, b, out);
+        // the simulated accumulation kernel takes two (a, acc) and adds a
+        // into acc in place (G4). Anything else fails closed in the fake
+        // just as it would on device.
+        if entry == b"accumulate" {
+            if buffers.len() != 2 {
+                return Err(HostError::invalid_args(
+                    "fake launch_kernel 'accumulate' simulates the 2-buffer kernel (a, acc)",
+                ));
+            }
+            return self.simulate_accumulate(module, buffers[0], buffers[1]);
+        }
+        if entry == b"observa" {
+            if buffers.len() != 2 {
+                return Err(HostError::invalid_args(
+                    "fake launch_kernel 'observa' simulates the 2-buffer kernel (src, out)",
+                ));
+            }
+            return self.simulate_copy(module, buffers[0], buffers[1]);
+        }
         if buffers.len() != 3 {
             return Err(HostError::invalid_args(
                 "fake launch_kernel simulates the 3-buffer elementwise-add kernel (a, b, out)",

@@ -335,3 +335,57 @@ fn system_driver_loads_multi_entry_module_and_dispatches_both_entries() {
     assert_eq!(err.code, E_DEVICE_ENTRY_MISMATCH);
     assert!(err.message.contains("nope"));
 }
+
+/// MSL kernel for the G4 real-device repeated-write accumulation proof: an
+/// in-place `acc[id] = acc[id] + a[id]` kernel — the emitted elementwise
+/// accumulation shape over a persistent device buffer.
+const ACCUMULATE_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void accumulate(
+    device const float* a [[buffer(0)]],
+    device float* acc [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+  acc[id] = acc[id] + a[id];
+}
+"#;
+
+#[test]
+fn system_driver_accumulates_persistent_buffer_across_repeated_launches() {
+    // G4 (P2) real-device proof: a persistent device buffer accumulates
+    // across repeated launches WITHOUT re-initialization — the production
+    // repeated-write lifecycle. The host zero-fills the buffer once (ZeroFill
+    // policy), then every launch adds the input into it. Environment-gated
+    // like the other real-binding proofs.
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    assert!(session.is_admitted());
+    let module = session
+        .load_module(ACCUMULATE_MSL.as_bytes())
+        .expect("runtime MSL compile");
+    let a = session.alloc_bytes(4 * 4).expect("alloc a");
+    let acc = session.alloc_bytes(4 * 4).expect("alloc acc");
+
+    // ZeroFill initialization: the accumulation buffer starts defined at zero.
+    session
+        .copy_in_f32(acc, &[0.0, 0.0, 0.0, 0.0])
+        .expect("zero-fill acc");
+    let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    session.copy_in_f32(a, &input).expect("copy in a");
+
+    // Repeated-write: two launches WITHOUT re-initializing acc.
+    for _ in 0..2 {
+        session
+            .launch_kernel(module, "accumulate", &[a, acc], 1, 4)
+            .expect("accumulate launch");
+        session.sync().expect("session sync barrier");
+    }
+    let values = session.readback_f32(acc).expect("readback acc");
+    assert_eq!(
+        values,
+        vec![2.0, 4.0, 6.0, 8.0],
+        "two launches accumulate 2a"
+    );
+}

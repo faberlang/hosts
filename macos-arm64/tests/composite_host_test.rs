@@ -17,10 +17,10 @@ use faber_host_macos_arm64::composite_host::{
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
     fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
-    DescriptorLaunch, DescriptorResult, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
-    DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH,
-    E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
-    E_NO_DEVICE_PROGRAM,
+    DescriptorLaunch, DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
+    E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH,
+    E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
@@ -73,10 +73,27 @@ fn add_slot_version(
         semantic_value: id,
         role,
         lifetime: lifetime_for_role(role),
+        // F5: the initialization axis is a carried fact, decided from the
+        // role for hand-built descriptors (HostProvided inputs, ZeroFill
+        // InOut state, KernelInitialized outputs) — the same classification
+        // the faber constructor projects from the wire.
+        initialization: initialization_for_role(role),
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
         version,
+    }
+}
+
+/// The constructor's role-consistent initialization classification (F5) for
+/// hand-built test descriptors: inputs are uploaded, InOut state is
+/// zero-filled, outputs are kernel-initialized. Mirrors the faber
+/// constructor's carried initialization facts.
+fn initialization_for_role(role: DeviceBufferRole) -> DeviceBufferInitialization {
+    match role {
+        DeviceBufferRole::Input => DeviceBufferInitialization::HostProvided,
+        DeviceBufferRole::InOut => DeviceBufferInitialization::ZeroFill,
+        DeviceBufferRole::Output => DeviceBufferInitialization::KernelInitialized,
     }
 }
 
@@ -2707,4 +2724,147 @@ fn unreachable_launch_fails_validation() {
         .expect_err("an unreachable launch must fail before launch");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("not reachable"));
+}
+
+/// A fake-metal composite whose module declares the G4 accumulation chain
+/// entries (`accumulate` + `observa`).
+fn accumulation_metal_composite() -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(Box::new(
+            FakeMetalDriver::default()
+                .with_known_entry("accumulate")
+                .with_known_entry("observa"),
+        ))
+        .expect("fake metal admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-metal-device")
+}
+
+/// The CUDA lane of [`accumulation_metal_composite`].
+fn accumulation_cuda_composite() -> HostResult<CompositeHost> {
+    let runtime = DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(Box::new(
+            FakeCudaDriver::default()
+                .with_known_entry("accumulate")
+                .with_known_entry("observa"),
+        ))
+        .expect("fake cuda admit"),
+    );
+    CompositeHost::with_device(runtime, "fake-cuda-device")
+}
+
+/// A PerProgram + ZeroFill accumulation slot (the constructor's G4
+/// classification for in-place ReadWrite state): allocated once at session
+/// creation, zero-filled once, persistent across executions — never recycled
+/// at a step boundary.
+fn accumulation_slot(id: u32, name: &str, binding: u32, count: u64) -> DescriptorBuffer {
+    DescriptorBuffer {
+        buffer_id: id,
+        buffer_name: name.to_owned(),
+        semantic_value: id,
+        role: DeviceBufferRole::InOut,
+        lifetime: DeviceBufferLifetime::PerProgram,
+        initialization: DeviceBufferInitialization::ZeroFill,
+        binding,
+        element_ty: DeviceDataType::F32,
+        element_count: count,
+        version: 1,
+    }
+}
+
+/// G4 production accumulation descriptor: the two-kernel accumulate chain —
+/// kernel `accumulate` adds the input `a` (id 1) into the persistent
+/// ZeroFill accumulation buffer `acc` (id 2, PerProgram) in place; kernel
+/// `observa` copies `acc` into the observation slot `out` (id 3,
+/// ObservationPoint) so the repeated-write test reads the accumulated value
+/// back. The data-flow edge (acc, launch 1 -> launch 2) is the carried
+/// dependency; the accumulation buffer itself persists across executions.
+fn accumulation_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    make_descriptor(
+        backend,
+        vec![
+            DescriptorKernel {
+                entry: "accumulate".to_owned(),
+                buffers: vec![
+                    add_slot(1, "a", DeviceBufferRole::Input, 0, 4),
+                    accumulation_slot(2, "acc", 1, 4),
+                ],
+                grid: [1, 1, 1],
+                block: [4, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "observa".to_owned(),
+                buffers: vec![
+                    // The program-level InOut role of the shared accumulation
+                    // buffer repeats here with the same PerProgram lifetime
+                    // and ZeroFill initialization (device-resident, never a
+                    // host input — the host copies only Input-role slots).
+                    accumulation_slot(2, "acc", 0, 4),
+                    add_slot(3, "out", DeviceBufferRole::Output, 1, 4),
+                ],
+                grid: [1, 1, 1],
+                block: [4, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        vec![DescriptorDataFlow {
+            buffer_id: 2,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
+        vec![result(3, 2)],
+    )
+}
+
+/// G4 (P2): the production accumulation lifecycle — a persistent ZeroFill
+/// accumulation buffer is initialized EXACTLY ONCE at session creation,
+/// updated by every launch (`acc[i] += a[i]`), and read back only through a
+/// declared observation slot. Two executions on one session produce twice
+/// the single-run value (repeated-write proof through the production host
+/// path, both backends).
+#[test]
+fn accumulation_buffer_initialized_once_and_accumulates_across_executions() {
+    for backend in [DeviceBackend::Metal, DeviceBackend::Cuda] {
+        let mut host = match backend {
+            DeviceBackend::Metal => accumulation_metal_composite().expect("metal composite"),
+            DeviceBackend::Cuda => accumulation_cuda_composite().expect("cuda composite"),
+        };
+        let descriptor = accumulation_descriptor(backend);
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+
+        let mut inputs = BTreeMap::new();
+        inputs.insert(1, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Execution 1: acc = zero-fill + a = a; out = acc = a.
+        let receipt_one = session.execute(&inputs).expect("first execute");
+        assert_eq!(
+            receipt_one.outputs.get(&3).map(Vec::as_slice),
+            Some([1.0, 2.0, 3.0, 4.0].as_slice()),
+            "first execution must read back a (acc initialized once, zero-filled)"
+        );
+
+        // Execution 2: acc persists (never re-initialized) -> acc = 2a;
+        // out = 2a. The repeated-write proof.
+        let receipt_two = session.execute(&inputs).expect("second execute");
+        assert_eq!(
+            receipt_two.outputs.get(&3).map(Vec::as_slice),
+            Some([2.0, 4.0, 6.0, 8.0].as_slice()),
+            "second execution must read back 2a (persistent accumulation buffer)"
+        );
+
+        session.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
 }

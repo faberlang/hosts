@@ -50,8 +50,8 @@ use std::collections::BTreeMap;
 use faber::device::{DeviceBackend, DeviceHandle, DeviceSelection};
 
 use crate::device_descriptor::{
-    errors as descriptor_errors, fnv1a64, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
-    DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
+    errors as descriptor_errors, fnv1a64, DeviceBufferInitialization, DeviceBufferLifetime,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
@@ -305,6 +305,12 @@ struct SessionBufferMeta {
     byte_length: u64,
     /// Lifetime class that drives the session's allocation/release policy.
     lifetime: DeviceBufferLifetime,
+    /// Independent initialization axis (F5): how this buffer's storage is
+    /// brought to its first defined state. The session honors `ZeroFill` by
+    /// zeroing the buffer at allocation; `HostProvided` buffers receive the
+    /// declared input at launch; `KernelInitialized` buffers are written by
+    /// a kernel before any read. Never re-derived from role or lifetime.
+    initialization: DeviceBufferInitialization,
 }
 
 /// A program-scoped device session that outlives individual launches (S2-1).
@@ -468,11 +474,21 @@ impl<'host> ProgramSession<'host> {
                         element_count: slot.element_count,
                         byte_length: slot.byte_length(),
                         lifetime: slot.lifetime,
+                        initialization: slot.initialization,
                     });
                     if !buffers.contains_key(&key)
                         && slot.lifetime == DeviceBufferLifetime::PerProgram
                     {
                         let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
+                        // G4 (F5): honor the carried initialization axis —
+                        // ZeroFill persistent state (accumulation buffers,
+                        // optimizer state) is zeroed EXACTLY ONCE at
+                        // allocation so repeated executions accumulate onto
+                        // a defined initial state.
+                        if slot.initialization == DeviceBufferInitialization::ZeroFill {
+                            runtime
+                                .copy_in_f32(&handle, &vec![0.0; slot.element_count as usize])?;
+                        }
                         buffers.insert(key, handle);
                     }
                     slots.push(SessionSlot {
@@ -800,6 +816,13 @@ impl<'host> ProgramSession<'host> {
                 .get(&key)
                 .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
             let handle = self.runtime.alloc_bytes(meta.byte_length as usize)?;
+            // G4 (F5): honor the carried initialization axis at every
+            // allocation — a ZeroFill step buffer (per-step accumulation
+            // state) is zeroed when it comes live.
+            if meta.initialization == DeviceBufferInitialization::ZeroFill {
+                self.runtime
+                    .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
+            }
             self.buffers.insert(key, handle);
         }
         Ok(())

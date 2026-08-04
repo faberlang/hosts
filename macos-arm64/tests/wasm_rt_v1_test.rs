@@ -147,9 +147,8 @@ fn salve_munde_wasm_rt_v1_matches_expected_stdout() {
 #[test]
 fn functio_wasm_rt_v1_matches_expected_stdout() {
     let source = radix_root().join("corpus/functio/functio.fab");
-    let expected =
-        std::fs::read_to_string(radix_root().join("corpus/functio/functio.expected"))
-            .expect("expected file");
+    let expected = std::fs::read_to_string(radix_root().join("corpus/functio/functio.expected"))
+        .expect("expected file");
     let wat = emit_wasm_text(&source);
 
     assert!(

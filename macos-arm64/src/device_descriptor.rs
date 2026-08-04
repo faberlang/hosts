@@ -160,6 +160,41 @@ impl DeviceBufferLifetime {
     }
 }
 
+/// Independent initialization axis (F5): how a buffer's storage is brought
+/// to its first defined state. Mirrors the wire's
+/// [`WireInitializationPolicy`]: **zero-fill** storage is zeroed at
+/// allocation (persistent accumulation state, optimizer state); **host-
+/// provided** storage is uploaded from host inputs; **kernel-initialized**
+/// storage is fully defined by a device kernel before any read.
+///
+/// The host honors this fact at allocation — it never re-derives an
+/// initialization policy from role or lifetime (that would couple the F5
+/// axes).
+///
+/// [`WireInitializationPolicy`]: https://docs.rs/radix-mir-fmir/latest/radix_mir_fmir/enum.WireInitializationPolicy.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DeviceBufferInitialization {
+    /// Storage is zero-filled at allocation.
+    #[default]
+    ZeroFill,
+    /// Storage is uploaded from host-provided values.
+    HostProvided,
+    /// Storage is fully written by a device kernel before any read.
+    KernelInitialized,
+}
+
+impl DeviceBufferInitialization {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Self::ZeroFill => "zero-fill",
+            Self::HostProvided => "host-provided",
+            Self::KernelInitialized => "kernel-initialized",
+        }
+    }
+}
+
 /// Program execution-lifetime regime (S2-4), mirroring the radix S1-1
 /// [`DeviceProgramLifetime`]: whether the program runs once (a one-shot-with-
 /// repeat surface for the leak proof) or repeats as a training step (when
@@ -202,6 +237,11 @@ pub struct DescriptorBuffer {
     /// How long this buffer's storage lives (S2-4; consumed by the session's
     /// lifetime-distinct allocation/release policy).
     pub lifetime: DeviceBufferLifetime,
+    /// Independent initialization axis (F5): how this buffer's storage is
+    /// brought to its first defined state — the wire's carried policy,
+    /// projected verbatim. The host zero-fills `ZeroFill` buffers at
+    /// allocation; never re-derived from role or lifetime.
+    pub initialization: DeviceBufferInitialization,
     /// Target-neutral binding index (backends map it to their binding syntax).
     pub binding: u32,
     /// Element type of this buffer version.
