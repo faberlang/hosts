@@ -52,6 +52,17 @@ fn add_slot(
     binding: u32,
     count: u64,
 ) -> DescriptorBuffer {
+    add_slot_version(id, name, role, binding, count, 1)
+}
+
+fn add_slot_version(
+    id: u32,
+    name: &str,
+    role: DeviceBufferRole,
+    binding: u32,
+    count: u64,
+    version: u32,
+) -> DescriptorBuffer {
     DescriptorBuffer {
         buffer_id: id,
         buffer_name: name.to_owned(),
@@ -60,7 +71,7 @@ fn add_slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
-        version: 1,
+        version,
     }
 }
 
@@ -567,6 +578,70 @@ fn inout_buffer_stays_device_resident_across_kernels() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn same_buffer_versions_bind_by_key_across_launches() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![add_slot_version(
+                    9,
+                    "acc",
+                    DeviceBufferRole::InOut,
+                    0,
+                    4,
+                    2,
+                )],
+                grid: [1, 1, 1],
+                block: [4, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 11,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 12,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+    );
+
+    descriptor
+        .validate()
+        .expect("same-buffer v1/v2 slot chain must bind both keyed versions");
+    assert_eq!(
+        descriptor
+            .kernels
+            .iter()
+            .flat_map(|kernel| kernel.buffers.iter())
+            .map(|slot| (slot.buffer_id, slot.version))
+            .collect::<Vec<_>>(),
+        vec![(9, 1), (9, 2)]
+    );
+    assert!(descriptor.buffer_versions.contains(&DescriptorBufferVersion {
+        buffer_id: 9,
+        version: 1,
+        element_ty: DeviceDataType::F32,
+        element_count: 2,
+    }));
+    assert!(descriptor.buffer_versions.contains(&DescriptorBufferVersion {
+        buffer_id: 9,
+        version: 2,
+        element_ty: DeviceDataType::F32,
+        element_count: 4,
+    }));
+}
+
+#[test]
 fn descriptor_preserves_repeated_launches_and_version_chain() {
     let mut descriptor = make_descriptor(
         DeviceBackend::Metal,
@@ -641,6 +716,24 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
             element_count: 4,
         }));
     assert_eq!(descriptor.data_flow.len(), 2);
+}
+
+#[test]
+fn slot_without_keyed_version_metadata_fails_before_launch() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
+    descriptor.kernels[0].buffers[0].version = 2;
+
+    let err = host
+        .execute_descriptor(
+            &descriptor,
+            &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]),
+            &[3],
+        )
+        .expect_err("a slot without keyed metadata must fail before launch");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("no keyed metadata"));
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 #[test]
