@@ -16,15 +16,16 @@ use faber_host_macos_arm64::composite_host::{
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
-    DescriptorLaunch, DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime,
-    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
-    E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH,
-    E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
+    DescriptorEndOfRunResult, DescriptorKernel, DescriptorLaunch, DescriptorResult,
+    DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
+    DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH,
+    E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
+    E_NO_DEVICE_PROGRAM,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
-use faber_host_macos_arm64::kernel::frame_data;
+use faber_host_macos_arm64::kernel::{frame_data, HostError};
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession, Status,
@@ -2725,6 +2726,465 @@ fn repeating_step_host_provided_buffer_requires_per_program_lifetime() {
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("RepeatingStep"));
     assert!(err.message.contains("per-program"));
+}
+
+// ---------------------------------------------------------------------------
+// U8/U9 repair: host end-of-run VALUES readback seam — the declared
+// end-of-run observation set (final forward, final gradients, final params)
+// is read back ONCE after the step loop at the declared completion boundary;
+// per-step readbacks stay loss-only; PerProgram params stay PerProgram
+// (once-init persistence intact; read only at the end).
+// ---------------------------------------------------------------------------
+
+/// A PerStep written final slot (U8/U9 end-of-run): written by a kernel,
+/// never a per-step observation — read back once at the end.
+fn step_final_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
+    DescriptorBuffer {
+        buffer_id: id,
+        buffer_name: name.to_owned(),
+        semantic_value: id,
+        role: DeviceBufferRole::Output,
+        lifetime: DeviceBufferLifetime::PerStep,
+        initialization: DeviceBufferInitialization::KernelInitialized,
+        binding,
+        element_ty: DeviceDataType::F32,
+        element_count: 2,
+        version: 1,
+    }
+}
+
+/// The U8/U9 end-of-run readback fixture: the training-step shape plus two
+/// PerStep finals and their declared end-of-run set. The fake driver
+/// simulates every 3-buffer kernel as elementwise add:
+///   launch 1: h = w + b   (h: PerStep InOut intermediate)
+///   launch 2: l = h + w   (l: ObservationPoint loss — the per-step readback)
+///   launch 3: f = w + b   (f: PerStep Output final — end-of-run forward)
+///   launch 4: g = b + b   (g: PerStep Output final — end-of-run gradient)
+///
+/// | Buffer | Role → class | Init | Readback |
+/// | --- | --- | --- | --- |
+/// | w, b (1, 2) | InOut → PerProgram | HostProvided | end-of-run only |
+/// | h (3) | InOut → PerStep | KernelInitialized | never |
+/// | f (4) | Output → PerStep | KernelInitialized | end-of-run only |
+/// | g (5) | Output → PerStep | KernelInitialized | end-of-run only |
+/// | l (6) | Output → ObservationPoint | KernelInitialized | per-step |
+fn end_of_run_training_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    let mut descriptor = make_descriptor(
+        backend,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    host_provided_param_slot(1, "w", DeviceBufferRole::InOut, 0, 2),
+                    host_provided_param_slot(2, "b", DeviceBufferRole::InOut, 1, 2),
+                    kernel_init_slot(3, "h", 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    kernel_init_slot(3, "h", 0),
+                    host_provided_param_slot(1, "w", DeviceBufferRole::InOut, 1, 2),
+                    add_slot(6, "l", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    host_provided_param_slot(1, "w", DeviceBufferRole::InOut, 0, 2),
+                    host_provided_param_slot(2, "b", DeviceBufferRole::InOut, 1, 2),
+                    step_final_slot(4, "f", 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    host_provided_param_slot(2, "b", DeviceBufferRole::InOut, 0, 2),
+                    host_provided_param_slot(2, "b", DeviceBufferRole::InOut, 1, 2),
+                    step_final_slot(5, "g", 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+            DescriptorLaunch {
+                id: 3,
+                kernel_index: 2,
+            },
+            DescriptorLaunch {
+                id: 4,
+                kernel_index: 3,
+            },
+        ],
+        // R2: the carried data-flow edge — launch 1 produces the PerStep
+        // intermediate h, launch 2 consumes it. The PerStep finals f and g
+        // are written and never consumed (end-of-run observations).
+        vec![DescriptorDataFlow {
+            buffer_id: 3,
+            version: 1,
+            producer: 1,
+            consumer: 2,
+        }],
+        // F6: the per-step observation — the loss l, produced by launch 2.
+        vec![result(6, 2)],
+    );
+    descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
+    descriptor
+}
+
+/// The declared end-of-run set of [`end_of_run_training_descriptor`]: the
+/// final forward f, the final gradient g, and the final params w, b —
+/// read back once at the declared completion boundary.
+fn end_of_run_declaration() -> Vec<DescriptorEndOfRunResult> {
+    vec![
+        DescriptorEndOfRunResult {
+            buffer_id: 4,
+            version: 1,
+        },
+        DescriptorEndOfRunResult {
+            buffer_id: 5,
+            version: 1,
+        },
+        DescriptorEndOfRunResult {
+            buffer_id: 1,
+            version: 1,
+        },
+        DescriptorEndOfRunResult {
+            buffer_id: 2,
+            version: 1,
+        },
+    ]
+}
+
+/// The U8/U9 done-when fake-driver test: N steps on one session read the
+/// per-step loss ONLY within each step, the FINAL step keeps the declared
+/// end-of-run PerStep buffers live, and the declared end-of-run set (final
+/// forward f, final gradient g, final params w, b) is read back exactly
+/// ONCE after the loop — PerStep finals read-then-released, PerProgram
+/// params read and kept live until teardown. Residency: transfers =
+/// per-step loss readbacks + the single end-of-run value readback, zero
+/// per-step copy-in; teardown leak-free (`live_handle_count() == 0`).
+#[test]
+fn repeating_step_end_of_run_readback_once_after_loop() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
+
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    // Creation: module + the two PerProgram params allocated once; the
+    // PerStep/PerProgram end-of-run buffers are not read back during steps.
+    assert_eq!(session.session_handle_count(), 3); // module + w + b
+    // U8/U9: declare the end-of-run set before the step loop (validated
+    // fail-closed before any launch).
+    session
+        .declare_end_of_run(&end_of_run_declaration())
+        .expect("declare end-of-run set");
+    session
+        .init_params(&training_step_params())
+        .expect("once-init params");
+
+    const STEPS: usize = 3;
+    let mut total_step_transfers = 0usize;
+    let mut total_step_readbacks = 0usize;
+    for index in 0..STEPS {
+        let receipt = if index + 1 == STEPS {
+            session.execute_final_step().expect("execute final step")
+        } else {
+            session.execute_step().expect("execute step")
+        };
+        // Per-step readback = the loss ONLY (the U8 expectation: 1
+        // readback/step); the end-of-run set is never read within a step.
+        assert_eq!(
+            receipt.readbacks, 1,
+            "per-step readback is the loss observation only"
+        );
+        assert_eq!(receipt.outputs.len(), 1);
+        assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0]));
+        assert_eq!(receipt.copy_ins, 0, "zero per-step copy-in");
+        assert_eq!(receipt.transfers, 1, "readback-only transfers per step");
+        assert_eq!(receipt.syncs, 4, "4 launches each sync internally");
+        total_step_transfers += receipt.transfers;
+        total_step_readbacks += receipt.readbacks;
+    }
+
+    // After the FINAL step the declared end-of-run PerStep finals (f, g)
+    // are still live alongside the PerProgram params (module + w + b + f +
+    // g): the final step kept them past the boundary so the one-shot
+    // readback can observe them.
+    assert_eq!(session.session_handle_count(), 5);
+
+    // The declared end-of-run set is read back exactly ONCE, after the loop.
+    let end_of_run = session.read_end_of_run().expect("end-of-run readback");
+    assert_eq!(
+        end_of_run.values.get(&4),
+        Some(&vec![4.0, 6.0]),
+        "final forward f = w + b"
+    );
+    assert_eq!(
+        end_of_run.values.get(&5),
+        Some(&vec![6.0, 8.0]),
+        "final gradient g = b + b"
+    );
+    assert_eq!(
+        end_of_run.values.get(&1),
+        Some(&vec![1.0, 2.0]),
+        "final param w — read only at the end"
+    );
+    assert_eq!(
+        end_of_run.values.get(&2),
+        Some(&vec![3.0, 4.0]),
+        "final param b — read only at the end"
+    );
+    assert_eq!(
+        end_of_run.readbacks, 4,
+        "the whole declared end-of-run set, once"
+    );
+    assert_eq!(
+        end_of_run.transfers, 4,
+        "end-of-run transfers are readbacks only — zero copy-in"
+    );
+    // The PerStep finals were read-then-released; the PerProgram params stay
+    // live until teardown (per-program persistence undisturbed).
+    assert_eq!(session.session_handle_count(), 3); // module + w + b
+
+    // Residency: transfers = per-step loss readbacks + the single end-of-run
+    // value readback; zero copy-ins across the whole run.
+    assert_eq!(total_step_transfers, STEPS);
+    assert_eq!(total_step_readbacks, STEPS);
+    assert_eq!(
+        total_step_transfers + end_of_run.readbacks,
+        STEPS + 4,
+        "transfers = per-step loss readbacks + the single end-of-run readback"
+    );
+
+    // A second end-of-run readback is refused (read exactly once).
+    let err = session
+        .read_end_of_run()
+        .expect_err("the end-of-run set is read back exactly once");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("already read back"));
+
+    // Driver-level accounting: w + b allocated once at creation; each step
+    // allocates h + f + g + l (4 allocs); ordinary steps release h + f + g +
+    // l (4 releases), the final step releases only h + l (f, g kept), the
+    // end-of-run readback releases f + g, and teardown releases w + b +
+    // module. Everything balances and nothing persists.
+    let counters = session.driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 4 * STEPS);
+
+    session.teardown().expect("teardown");
+    let counters = host.device().expect("device").driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.buffer_allocs, 2 + 4 * STEPS);
+    assert_eq!(counters.buffer_releases, 2 + 4 * STEPS);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The same end-of-run loop on the fake CUDA lane (backend-neutral surface):
+/// per-step loss-only readback, the final step keeps the end-of-run set,
+/// the one-shot readback returns the real values, leak-free teardown.
+#[test]
+fn repeating_step_end_of_run_on_both_fake_backends() {
+    for backend in [DeviceBackend::Metal, DeviceBackend::Cuda] {
+        let mut host = match backend {
+            DeviceBackend::Metal => metal_composite("add_one").expect("metal composite"),
+            DeviceBackend::Cuda => cuda_composite("add_one").expect("cuda composite"),
+        };
+        let descriptor = end_of_run_training_descriptor(backend);
+
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+        session
+            .declare_end_of_run(&end_of_run_declaration())
+            .expect("declare end-of-run set");
+        session
+            .init_params(&training_step_params())
+            .expect("once-init params");
+        for index in 0..3 {
+            let receipt = if index == 2 {
+                session.execute_final_step().expect("execute final step")
+            } else {
+                session.execute_step().expect("execute step")
+            };
+            assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0]));
+            assert_eq!(receipt.copy_ins, 0);
+            assert_eq!(receipt.readbacks, 1, "per-step readback = loss only");
+        }
+        let end_of_run = session.read_end_of_run().expect("end-of-run readback");
+        assert_eq!(end_of_run.values.get(&4), Some(&vec![4.0, 6.0]));
+        assert_eq!(end_of_run.values.get(&5), Some(&vec![6.0, 8.0]));
+        assert_eq!(end_of_run.values.get(&1), Some(&vec![1.0, 2.0]));
+        assert_eq!(end_of_run.values.get(&2), Some(&vec![3.0, 4.0]));
+        assert_eq!(end_of_run.readbacks, 4);
+        session.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
+}
+
+/// End-of-run misuse fails closed (U8/U9): declaring or reading the set on a
+/// SingleRun session, declaring it twice, reading it before the final step
+/// (no completion boundary yet), and reading it twice all refuse with typed
+/// diagnostics; a `RepeatingStep` session with an end-of-run set never reads
+/// it within a step.
+#[test]
+fn repeating_step_end_of_run_surfaces_fail_closed_on_misuse() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
+
+    // Declaring the set twice is refused (declared exactly once, before the
+    // step loop).
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("session create");
+    session
+        .declare_end_of_run(&end_of_run_declaration())
+        .expect("declare end-of-run set");
+    let err = session
+        .declare_end_of_run(&end_of_run_declaration())
+        .expect_err("the end-of-run set is declared exactly once");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("already declared"));
+
+    // read_end_of_run before any final step refuses: the end-of-run set is
+    // observable only at the declared completion boundary after the loop.
+    session
+        .init_params(&training_step_params())
+        .expect("once-init params");
+    let err = session
+        .read_end_of_run()
+        .expect_err("the end-of-run set is observable only after the final step");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("final step"));
+    session.teardown().expect("teardown");
+
+    // A SingleRun session refuses both ends of the surface (no step loop, no
+    // end-of-run boundary).
+    let mut single = descriptor.clone();
+    single.program_lifetime = DeviceProgramLifetime::SingleRun;
+    let mut session = host
+        .create_program_session(&single)
+        .expect("session create");
+    let err = session
+        .declare_end_of_run(&end_of_run_declaration())
+        .expect_err("end-of-run observations are a RepeatingStep contract");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("RepeatingStep"));
+    let err = session
+        .read_end_of_run()
+        .expect_err("end-of-run readback is a RepeatingStep contract");
+    assert_eq!(err.code, "E_INTERNAL");
+    assert!(err.message.contains("RepeatingStep"));
+    session.teardown().expect("teardown");
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
+
+/// The end-of-run declaration admission (U8/U9): an end-of-run observation
+/// must name a WRITTEN PerStep or PerProgram buffer the session allocates —
+/// never a buffer also read per step, never an ObservationPoint buffer
+/// (those are the per-step results), never a read-only Input buffer, and
+/// never a repeated id. A bad declaration fails closed at declare time,
+/// before any launch.
+#[test]
+fn end_of_run_observations_fail_closed_on_invalid_declarations() {
+    let host_declare = |declared: Vec<DescriptorEndOfRunResult>| -> HostError {
+        let mut host = metal_composite("add_one").expect("metal composite");
+        let descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+        let error = session
+            .declare_end_of_run(&declared)
+            .expect_err("an invalid end-of-run declaration must fail closed before any launch");
+        session.teardown().expect("teardown");
+        error
+    };
+
+    // (a) A per-step result (the loss l) also declared as end-of-run: a
+    // buffer is never read both per step and at the end.
+    let err = host_declare(vec![DescriptorEndOfRunResult {
+        buffer_id: 6,
+        version: 1,
+    }]);
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("never read both per step and at the end"));
+
+    // (b) An ObservationPoint buffer that is NOT a per-step result: the
+    // only readback class the session reads within a step — rejected for
+    // the end-of-run set. Relabel the PerStep intermediate h as
+    // ObservationPoint (consistently across both references), then declare
+    // it end-of-run.
+    let mut wrong_lifetime = end_of_run_training_descriptor(DeviceBackend::Metal);
+    for kernel in &mut wrong_lifetime.kernels {
+        for buffer in &mut kernel.buffers {
+            if buffer.buffer_id == 3 {
+                buffer.lifetime = DeviceBufferLifetime::ObservationPoint;
+            }
+        }
+    }
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut session = host
+        .create_program_session(&wrong_lifetime)
+        .expect("session create");
+    let err = session
+        .declare_end_of_run(&[DescriptorEndOfRunResult {
+            buffer_id: 3,
+            version: 1,
+        }])
+        .expect_err("an observation-point buffer is a per-step result class, never an end-of-run observation");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("only per-step and per-program buffers"));
+    session.teardown().expect("teardown");
+
+    // (c) A read-only Input buffer (never written by the program) cannot be
+    // a FINAL value. The legacy training-step fixture's params are
+    // Input-role PerProgram buffers.
+    let input_final = training_step_descriptor(DeviceBackend::Metal);
+    let mut session = host
+        .create_program_session(&input_final)
+        .expect("session create");
+    let err = session
+        .declare_end_of_run(&[DescriptorEndOfRunResult {
+            buffer_id: 1,
+            version: 1,
+        }])
+        .expect_err("an input buffer is never a final value");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("written by the program"));
+    session.teardown().expect("teardown");
+
+    // (d) A repeated end-of-run id fails closed.
+    let err = host_declare(vec![
+        DescriptorEndOfRunResult {
+            buffer_id: 4,
+            version: 1,
+        },
+        DescriptorEndOfRunResult {
+            buffer_id: 4,
+            version: 1,
+        },
+    ]);
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(err.message.contains("repeats buffer"));
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 /// ObservationPoint is the only readback: a result naming a PerProgram

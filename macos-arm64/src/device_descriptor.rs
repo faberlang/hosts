@@ -310,6 +310,32 @@ pub struct DescriptorResult {
     pub at_launch: u32,
 }
 
+/// One declared end-of-run observation (U8/U9 repair): a buffer whose FINAL
+/// value is read back exactly once at the declared completion boundary —
+/// after the step loop of a `RepeatingStep` session — and returned to the
+/// caller.
+///
+/// Distinct from [`DescriptorResult`] (the per-step observations, read back
+/// every step): an end-of-run observation may name a **PerStep** buffer
+/// (the final forward activations, the final gradients) or a **PerProgram**
+/// buffer (the final trainable params). The params MUST stay PerProgram —
+/// once-init persistence across steps — so their only readback is this
+/// one-shot end-of-run readback; they are never read within a step. The
+/// session's one-shot end-of-run readback ([`ProgramSession::declare_end_of_run`]
+/// + [`ProgramSession::read_end_of_run`]) admits only these two lifetime
+/// classes (an [`DeviceBufferLifetime::ObservationPoint`] buffer is a
+/// per-step result and is never read both per step and at the end).
+///
+/// [`ProgramSession::declare_end_of_run`]: crate::composite_host::ProgramSession::declare_end_of_run
+/// [`ProgramSession::read_end_of_run`]: crate::composite_host::ProgramSession::read_end_of_run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorEndOfRunResult {
+    /// The observed buffer's program-level identity.
+    pub buffer_id: u32,
+    /// The observed content version.
+    pub version: u32,
+}
+
 /// One version-keyed buffer shape carried by the device-program wire.
 ///
 /// The key is `(buffer_id, version)`, not just `buffer_id`: a buffer identity
@@ -1073,6 +1099,14 @@ pub(crate) mod errors {
     pub(crate) fn shape_mismatch(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_SHAPE_MISMATCH.to_owned(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub(crate) fn descriptor(message: impl Into<String>) -> HostError {
+        HostError {
+            code: super::E_DEVICE_DESCRIPTOR.to_owned(),
             message: message.into(),
             retryable: false,
         }
