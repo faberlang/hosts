@@ -190,3 +190,140 @@ fn text_handle_call_produces_typed_runtime_failure() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// W4B provider text surface: solum + consolum rows the emitter now emits
+// ---------------------------------------------------------------------------
+
+/// All six W4B provider symbols are admitted by preflight and bound at link
+/// with the exact signatures the radix Wasm emitter emits. A module that
+/// declares them but never invokes them runs to success — proof that the
+/// closed-set surface is accepted, not rejected as unknown (W13).
+#[test]
+fn w4b_provider_surface_accepted_by_preflight_and_link() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_lines" (func $read_lines (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_bytes" (func $read_bytes (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_write_text" (func $write_text (param i32 i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_text" (func $mone_text (param i32)))
+  (func (export "incipit") (nop))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success { stdout: String::new() },
+        "declared-only W4B provider surface must pass preflight and link, got: {outcome:?}"
+    );
+}
+
+/// Solum fixture: `lege<textus>` (read_text) is admitted but has no host
+/// implementation in this stage (no filesystem capability; W15
+/// deny-by-default), so invoking it is a typed unsupported outcome naming the
+/// symbol — never a silent no-op or a synthesized result handle.
+#[test]
+fn w4b_solum_fixture_read_produces_typed_unsupported() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
+  (func (export "incipit") (drop (call $read_text (i32.const 3))))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "solum read_text without a filesystem capability must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("__faber_rt_v1_solum_read_text"),
+            "message must name the solum symbol: {message}"
+        );
+        assert!(
+            message.contains("typed unsupported"),
+            "message must declare the typed-unsupported outcome: {message}"
+        );
+    }
+}
+
+/// The full solum fixture surface (read_text/read_lines/read_bytes/write_text,
+/// the exact emitter signatures) links and then produces one typed unsupported
+/// outcome on first invocation.
+#[test]
+fn w4b_solum_fixture_full_surface_links_then_typed_unsupported() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_lines" (func $read_lines (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_bytes" (func $read_bytes (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_solum_write_text" (func $write_text (param i32 i32)))
+  (func (export "incipit")
+    (call $write_text (i32.const 3) (i32.const 4))
+    (drop (call $read_text (i32.const 3)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "solum invoke without a filesystem capability must be RuntimeFailure, got: {outcome:?}"
+    );
+}
+
+/// Consolum fixture: `scribe` (nota_text) and `mone` (mone_text) close-overlap
+/// the v1 diagnostic text rows. The operand is an opaque text handle the
+/// runner cannot materialize, so invoking either is a typed unsupported
+/// outcome naming the symbol and its oracle stream.
+#[test]
+fn w4b_consolum_fixture_produces_typed_unsupported() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_text" (func $mone_text (param i32)))
+  (func (export "incipit")
+    (call $nota_text (i32.const 5))
+    (call $mone_text (i32.const 6))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "consolum diagnostic text without literal materialization must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("__faber_rt_v1_diagnostic_nota_text"),
+            "message must name the consolum symbol: {message}"
+        );
+        assert!(
+            message.contains("nota/stdout"),
+            "message must record the oracle stream semantics: {message}"
+        );
+    }
+}
+
+/// A declared signature that conflicts with an admitted W4B binding fails at
+/// link time with a typed link outcome (the binding is signature-checked, not
+/// permissive).
+#[test]
+fn w4b_provider_signature_mismatch_fails_link() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32)))
+  (func (export "incipit") (call $read_text (i32.const 3)))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::LinkFailed,
+        "declared signature conflicting with the admitted solum binding must be LinkFailed, got: {outcome:?}"
+    );
+}
