@@ -51,8 +51,7 @@ use faber::device::{DeviceBackend, DeviceHandle, DeviceSelection};
 
 use crate::device_descriptor::{
     errors as descriptor_errors, fnv1a64, DeviceBufferInitialization, DeviceBufferLifetime,
-    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DescriptorEndOfRunResult,
-    DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
@@ -132,19 +131,19 @@ pub struct DeviceExecutionReceipt {
     pub allocated_buffer_versions: Vec<(u32, u32)>,
     /// Program execution-lifetime regime (S2-4).
     pub program_lifetime: DeviceProgramLifetime,
-    /// PerProgram buffer ids: allocated once per session, released at program
+    /// `PerProgram` buffer ids: allocated once per session, released at program
     /// end (persist across executions).
     pub per_program_buffers: Vec<u32>,
-    /// Version-keyed PerProgram allocations.
+    /// Version-keyed `PerProgram` allocations.
     pub per_program_buffer_versions: Vec<(u32, u32)>,
-    /// PerStep buffer ids: recycled at each step boundary.
+    /// `PerStep` buffer ids: recycled at each step boundary.
     pub per_step_buffers: Vec<u32>,
-    /// Version-keyed PerStep allocations.
+    /// Version-keyed `PerStep` allocations.
     pub per_step_buffer_versions: Vec<(u32, u32)>,
-    /// ObservationPoint buffer ids: read back and released per execution
+    /// `ObservationPoint` buffer ids: read back and released per execution
     /// (read-then-release).
     pub observation_buffers: Vec<u32>,
-    /// Version-keyed ObservationPoint allocations.
+    /// Version-keyed `ObservationPoint` allocations.
     pub observation_buffer_versions: Vec<(u32, u32)>,
     /// Declared logical resource graph (A10): every buffer identity +
     /// content version, in first-reference order.
@@ -169,7 +168,7 @@ pub struct DeviceExecutionReceipt {
     /// points — observation-only readback, F6).
     pub readbacks: usize,
     /// Observed buffer releases this execution (read-then-release plus the
-    /// step-boundary PerStep recycle).
+    /// step-boundary `PerStep` recycle).
     pub releases: usize,
     /// The completion boundary this execution guarantees (R9): the explicit
     /// step-boundary sync after the last launch, at which every declared
@@ -275,10 +274,10 @@ type BufferKey = (u32, u32);
 /// once-init'd at session creation and stay device-resident (S5-U6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyMode {
-    /// Copy declared host inputs per execution (SingleRun).
+    /// Copy declared host inputs per execution (`SingleRun`).
     PerStep,
     /// No copy-in: params are already device-resident from the once-init at
-    /// session creation (RepeatingStep).
+    /// session creation (`RepeatingStep`).
     OnceInit,
 }
 
@@ -331,7 +330,7 @@ struct SessionResult {
 /// session creation (U8/U9 repair): a buffer whose FINAL value is read back
 /// exactly once at the declared completion boundary after the step loop —
 /// never within a step. The descriptor-level admission validated the
-/// lifetime class (PerStep forward/gradients, PerProgram params); the
+/// lifetime class (`PerStep` forward/gradients, `PerProgram` params); the
 /// session needs only the observed buffer identity + content version.
 #[derive(Debug, Clone, Copy)]
 struct SessionEndOfRunResult {
@@ -369,19 +368,19 @@ struct SessionBufferMeta {
 ///
 /// Created from one [`DeviceDescriptor`], a `ProgramSession` owns:
 /// - the **module** (loaded once at creation; reused by every execution);
-/// - the **PerProgram buffers** (allocated once at creation; persist across
+/// - the **`PerProgram` buffers** (allocated once at creation; persist across
 ///   executions; released at program end);
-/// - the **PerStep buffers** (allocated per execution, recycled at the step
+/// - the **`PerStep` buffers** (allocated per execution, recycled at the step
 ///   boundary — released at the end of each execution and re-allocated for
 ///   the next);
-/// - the **ObservationPoint buffers** (allocated per execution, read back at
+/// - the **`ObservationPoint` buffers** (allocated per execution, read back at
 ///   the declared observation point, then released — read-then-release).
 ///
 /// [`ProgramSession::execute`] runs the ordered launch sequence once (one
 /// step), synchronizes at the step boundary, reads back the declared
 /// observation buffers, and releases the per-step + observation buffers.
 /// It can be called repeatedly on the same session without reloading the
-/// module or re-allocating PerProgram buffers. [`ProgramSession::teardown`]
+/// module or re-allocating `PerProgram` buffers. [`ProgramSession::teardown`]
 /// performs the ordered release (remaining buffers then module).
 ///
 /// The S1-4 [`CompositeHost::execute_descriptor`] surface is a single-run
@@ -392,11 +391,11 @@ struct SessionBufferMeta {
 /// The session consumes the descriptor's typed [`DeviceBufferLifetime`]
 /// facts — it never derives a lifetime from slot role alone (that would be
 /// coincidence, council 3):
-/// - **PerProgram** — allocated once at session creation, released at program
+/// - **`PerProgram`** — allocated once at session creation, released at program
 ///   end (persists across steps);
-/// - **PerStep** — live within one step, recycled at the step boundary
+/// - **`PerStep`** — live within one step, recycled at the step boundary
 ///   (released between executions, re-allocated for the next);
-/// - **ObservationPoint** — read back at the declared observation point, then
+/// - **`ObservationPoint`** — read back at the declared observation point, then
 ///   released (read-then-release); it is the only class the session reads
 ///   back, so a readback request for any other class fails closed (no
 ///   undeclared readback).
@@ -405,29 +404,29 @@ struct SessionBufferMeta {
 /// declared program fact: `SingleRun` is the one-shot-with-repeat surface
 /// (each [`ProgramSession::execute`] call copies its declared host inputs
 /// and re-runs the whole program). `RepeatingStep` is the training-loop
-/// surface (S5-U6): `HostProvided` params are copied into their PerProgram
+/// surface (S5-U6): `HostProvided` params are copied into their `PerProgram`
 /// buffers exactly once at session creation via [`ProgramSession::init_params`]
 /// and never re-copied; each [`ProgramSession::execute_step`] allocates the
-/// step's PerStep and ObservationPoint buffers, runs the ordered launches
+/// step's `PerStep` and `ObservationPoint` buffers, runs the ordered launches
 /// with no copy-in, synchronizes at the step boundary, reads back the
 /// declared observation (the per-step loss trace), and recycles the
 /// per-step buffers. The two regimes never mix: `execute` refuses a
 /// `RepeatingStep` session and `execute_step` refuses a `SingleRun` one
-/// (params once-init + never re-copied is the RepeatingStep contract).
+/// (params once-init + never re-copied is the `RepeatingStep` contract).
 ///
-/// # End-of-run readback (U8/U9 repair)
+/// # End-of-run readback (S5A-U1)
 ///
-/// A `RepeatingStep` run reads the declared **end-of-run observation set**
+/// A `RepeatingStep` run reads the DECLARED **end-of-run observation set**
 /// (the final forward activations, the final gradients, the final trainable
-/// params) back exactly ONCE at the declared completion boundary — the
-/// final step's step-boundary sync — via [`ProgramSession::declare_end_of_run`]
-/// (declared and validated before the step loop, so a bad declaration fails
-/// before any launch) + [`ProgramSession::execute_final_step`] (the final
-/// step keeps the declared end-of-run PerStep buffers live past the step
-/// boundary) + [`ProgramSession::read_end_of_run`] (the one-shot readback;
-/// PerStep buffers are read-then-released, PerProgram params stay live until
-/// teardown). Within a step the only readback is still the loss
-/// observation; the params stay PerProgram (once-init persistence across
+/// params — the wire's `EndOfRun` cadence rows, carried by the descriptor
+/// and validated fail-closed at [`DeviceDescriptor::validate`] before any
+/// launch) back exactly ONCE at the declared completion boundary — the
+/// final step's step-boundary sync — via [`ProgramSession::execute_final_step`]
+/// (the final step keeps the declared end-of-run `PerStep` buffers live past
+/// the step boundary) + [`ProgramSession::read_end_of_run`] (the one-shot
+/// readback; `PerStep` buffers are read-then-released, `PerProgram` params stay
+/// live until teardown). Within a step the only readback is still the loss
+/// observation; the params stay `PerProgram` (once-init persistence across
 /// steps is never disturbed by the observation). Residency: transfers =
 /// per-step loss readbacks + the single end-of-run value readback, zero
 /// per-step copy-in, no per-op readback.
@@ -462,8 +461,8 @@ pub struct ProgramSession<'host> {
     /// Program execution-lifetime regime (S2-4).
     program_lifetime: DeviceProgramLifetime,
     /// Currently-live device buffers: (buffer_id, version) → device handle.
-    /// PerProgram buffers are live from creation until teardown; PerStep and
-    /// ObservationPoint buffers are live only within one execution.
+    /// `PerProgram` buffers are live from creation until teardown; `PerStep` and
+    /// `ObservationPoint` buffers are live only within one execution.
     buffers: BTreeMap<BufferKey, DeviceHandle>,
     /// Per-version declared element count / byte length / lifetime class.
     buffer_meta: BTreeMap<BufferKey, SessionBufferMeta>,
@@ -480,15 +479,16 @@ pub struct ProgramSession<'host> {
     /// descriptor's observation facts; the only buffers this session reads
     /// back **within a step**.
     results: Vec<SessionResult>,
-    /// Declared end-of-run observations (U8/U9 repair): the result set the
+    /// Declared end-of-run observations (S5A-U1): the result set the
     /// session reads back ONCE at the declared completion boundary after the
-    /// step loop — never within a step. Declared before the loop via
-    /// [`ProgramSession::declare_end_of_run`]; may name PerStep buffers
-    /// (final forward activations, final gradients) and PerProgram buffers
-    /// (final trainable params, read only at the end).
+    /// step loop — never within a step. Carried by the descriptor from the
+    /// wire's `EndOfRun` cadence rows (validated before any launch); may
+    /// name `PerStep` buffers (final forward activations, final gradients)
+    /// and `PerProgram` buffers (final trainable params, read only at the
+    /// end).
     end_of_run_results: Vec<SessionEndOfRunResult>,
     /// The version-keyed keys of [`ProgramSession::end_of_run_results`]
-    /// (the PerStep subset of the set stays live past the final step's
+    /// (the `PerStep` subset of the set stays live past the final step's
     /// boundary so the one-shot readback can observe it).
     end_of_run_keys: BTreeSet<BufferKey>,
     /// Whether the declared end-of-run set has been read back (read exactly
@@ -512,8 +512,8 @@ pub struct ProgramSession<'host> {
 
 impl<'host> ProgramSession<'host> {
     /// Create a program session: validate the descriptor, load the module
-    /// once, and allocate every distinct **PerProgram** buffer once (PerStep
-    /// and ObservationPoint buffers are allocated per execution — S2-4).
+    /// once, and allocate every distinct **`PerProgram`** buffer once (`PerStep`
+    /// and `ObservationPoint` buffers are allocated per execution — S2-4).
     ///
     /// # Errors
     /// - `E_DEVICE_DESCRIPTOR` — the descriptor targets a different backend
@@ -659,12 +659,25 @@ impl<'host> ProgramSession<'host> {
                     version: result.version,
                 })
                 .collect(),
-            // Declared end-of-run observations (U8/U9 repair): declared via
-            // [`ProgramSession::declare_end_of_run`] before the step loop;
-            // the session reads the set back exactly once at the declared
-            // completion boundary after the final step.
-            end_of_run_results: Vec::new(),
-            end_of_run_keys: BTreeSet::new(),
+            // Declared end-of-run observations (S5A-U1): the wire's `EndOfRun`
+            // cadence set, carried by the descriptor and cloned at session
+            // creation (validated fail-closed at [`DeviceDescriptor::validate`]
+            // before any launch). The session reads the set back exactly once
+            // at the declared completion boundary after the final step; the
+            // final step keeps the PerStep subset live past the boundary.
+            end_of_run_results: descriptor
+                .end_of_run_results
+                .iter()
+                .map(|end_of_run| SessionEndOfRunResult {
+                    buffer_id: end_of_run.buffer_id,
+                    version: end_of_run.version,
+                })
+                .collect(),
+            end_of_run_keys: descriptor
+                .end_of_run_results
+                .iter()
+                .map(|end_of_run| (end_of_run.buffer_id, end_of_run.version))
+                .collect(),
             end_of_run_read: false,
             final_step_completed: false,
             semantic_graph_hash: descriptor.semantic_graph_hash(),
@@ -673,11 +686,11 @@ impl<'host> ProgramSession<'host> {
         })
     }
 
-    /// Execute the ordered launch sequence once (one step) on the SingleRun
+    /// Execute the ordered launch sequence once (one step) on the `SingleRun`
     /// surface: copies the declared host inputs into their input slots for
-    /// this execution, then reuses the session's module and PerProgram
-    /// buffers — does not reload the module or re-allocate PerProgram
-    /// buffers. PerStep buffers are allocated for the step and recycled at
+    /// this execution, then reuses the session's module and `PerProgram`
+    /// buffers — does not reload the module or re-allocate `PerProgram`
+    /// buffers. `PerStep` buffers are allocated for the step and recycled at
     /// the step boundary; the declared observation point buffers
     /// ([`SessionResult`]s projected from the descriptor's observation facts
     /// — F6) are allocated, read back at their producing launch's
@@ -693,7 +706,7 @@ impl<'host> ProgramSession<'host> {
     ///
     /// A `RepeatingStep` session refuses `execute` (S5-U6): its HostProvided
     /// params are once-init'd at session creation and never re-copied, so
-    /// per-execution input copy-in is the SingleRun surface. Use
+    /// per-execution input copy-in is the `SingleRun` surface. Use
     /// [`ProgramSession::init_params`] + [`ProgramSession::execute_step`].
     ///
     /// # Errors
@@ -702,7 +715,7 @@ impl<'host> ProgramSession<'host> {
     ///   contradicts the declared element count;
     /// - `E_INVALID_ARGS` — a declared observation buffer id was not
     ///   allocated by the session, or the id names a buffer whose lifetime is
-    ///   not ObservationPoint (an undeclared readback fails closed, S2-4);
+    ///   not `ObservationPoint` (an undeclared readback fails closed, S2-4);
     /// - session-level failures (copy-in, launch, sync, readback) bubble
     ///   through unchanged.
     pub fn execute(
@@ -732,10 +745,10 @@ impl<'host> ProgramSession<'host> {
     }
 
     /// Once-init the declared `HostProvided` training params of a
-    /// `RepeatingStep` session (S5-U6): each HostProvided PerProgram buffer
+    /// `RepeatingStep` session (S5-U6): each HostProvided `PerProgram` buffer
     /// receives its declared values exactly once, at session creation, and
     /// is never re-copied on later steps. The only buffers this copies are
-    /// PerProgram + HostProvided; every such declared buffer must be present
+    /// `PerProgram` + HostProvided; every such declared buffer must be present
     /// with its declared element count. A buffer id carrying more than one
     /// content version cannot be once-init'd from one value vector and fails
     /// closed.
@@ -778,7 +791,7 @@ impl<'host> ProgramSession<'host> {
     }
 
     /// The once-init body of [`ProgramSession::init_params`]: the copy loop
-    /// over the declared HostProvided PerProgram params, without the
+    /// over the declared HostProvided `PerProgram` params, without the
     /// error-path release, which the caller owns.
     fn init_params_inner(&mut self, params: &BTreeMap<u32, Vec<f32>>) -> HostResult<()> {
         // The declared param set: every distinct buffer id whose storage is
@@ -832,117 +845,9 @@ impl<'host> ProgramSession<'host> {
         Ok(())
     }
 
-    /// Declare the end-of-run observation set of a `RepeatingStep` session
-    /// (U8/U9 repair): the buffers whose FINAL values the host reads back
-    /// exactly ONCE at the declared completion boundary — after the step
-    /// loop — and returns to the caller (the final forward activations, the
-    /// final gradients, the final trainable params). The declaration is
-    /// validated fail-closed **before any launch**: every entry must name a
-    /// written PerStep or PerProgram buffer the session allocates — never an
-    /// ObservationPoint buffer (those are the per-step results), never a
-    /// read-only Input buffer, never a per-step result, and never a repeated
-    /// id. The PerProgram params stay PerProgram (once-init persistence
-    /// across steps is never disturbed; they are read only at the end).
-    ///
-    /// After declaration, [`ProgramSession::execute_final_step`] keeps the
-    /// declared PerStep end-of-run buffers live past the step boundary and
-    /// [`ProgramSession::read_end_of_run`] reads the whole set back once.
-    ///
-    /// # Errors
-    /// - `E_INTERNAL` — the session is not `RepeatingStep`, the set was
-    ///   already declared, or the set was already read back;
-    /// - `E_DEVICE_DESCRIPTOR` — a declared entry names a buffer the session
-    ///   does not allocate, an ObservationPoint or Input buffer, a per-step
-    ///   result, a repeated id, or a zero version.
-    pub fn declare_end_of_run(&mut self, declared: &[DescriptorEndOfRunResult]) -> HostResult<()> {
-        if self.closed {
-            return Err(HostError::internal(
-                "program session is closed after a failed execution; create a new session",
-            ));
-        }
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
-            return Err(HostError::internal(
-                "end-of-run observations are a RepeatingStep contract: a SingleRun session has no step loop and no end-of-run boundary",
-            ));
-        }
-        if self.end_of_run_read {
-            return Err(HostError::internal(
-                "the declared end-of-run set was already read back; the end-of-run readback runs exactly once after the final step",
-            ));
-        }
-        if !self.end_of_run_results.is_empty() {
-            return Err(HostError::internal(
-                "the end-of-run set was already declared; declare it exactly once before the step loop",
-            ));
-        }
-
-        let mut end_of_run_results: Vec<SessionEndOfRunResult> = Vec::with_capacity(declared.len());
-        let mut end_of_run_keys: BTreeSet<BufferKey> = BTreeSet::new();
-        let mut end_of_run_buffer_ids: Vec<u32> = Vec::with_capacity(declared.len());
-        for entry in declared {
-            if entry.version == 0 {
-                return Err(descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation for buffer {} uses the reserved zero version",
-                    entry.buffer_id
-                )));
-            }
-            if self
-                .results
-                .iter()
-                .any(|result| result.buffer_id == entry.buffer_id)
-            {
-                return Err(descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation names per-step observation buffer {}; a buffer is never read both per step and at the end",
-                    entry.buffer_id
-                )));
-            }
-            if end_of_run_buffer_ids.contains(&entry.buffer_id) {
-                return Err(descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation repeats buffer {}; the set must be unique in the host receipt",
-                    entry.buffer_id
-                )));
-            }
-            end_of_run_buffer_ids.push(entry.buffer_id);
-
-            let key = (entry.buffer_id, entry.version);
-            let meta = self.buffer_meta.get(&key).ok_or_else(|| {
-                descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation names buffer {} version {} which no kernel slot allocates",
-                    entry.buffer_id, entry.version
-                ))
-            })?;
-            // A FINAL value must be written by the program: a read-only
-            // input buffer is never a final observation (reading it back
-            // would surface an uploaded value, not a program result).
-            if meta.role == DeviceBufferRole::Input {
-                return Err(descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation names input buffer {}; a final value must be written by the program",
-                    entry.buffer_id
-                )));
-            }
-            if meta.lifetime != DeviceBufferLifetime::PerStep
-                && meta.lifetime != DeviceBufferLifetime::PerProgram
-            {
-                return Err(descriptor_errors::descriptor(format!(
-                    "declared end-of-run observation names buffer {} with lifetime `{}`; only per-step and per-program buffers are read back once at the end (observation-point buffers are the per-step results)",
-                    entry.buffer_id,
-                    meta.lifetime.spelling()
-                )));
-            }
-            end_of_run_results.push(SessionEndOfRunResult {
-                buffer_id: entry.buffer_id,
-                version: entry.version,
-            });
-            end_of_run_keys.insert(key);
-        }
-        self.end_of_run_results = end_of_run_results;
-        self.end_of_run_keys = end_of_run_keys;
-        Ok(())
-    }
-
     /// Execute one training step on a `RepeatingStep` session whose params
-    /// were once-init'd (S5-U6): allocate the step's PerStep +
-    /// ObservationPoint buffers, run the ordered launch sequence with **no
+    /// were once-init'd (S5-U6): allocate the step's `PerStep` +
+    /// `ObservationPoint` buffers, run the ordered launch sequence with **no
     /// copy-in** (the HostProvided params are already device-resident from
     /// the once-init), synchronize at the step boundary, read back the
     /// declared observation (the per-step loss trace), and recycle the
@@ -965,11 +870,11 @@ impl<'host> ProgramSession<'host> {
 
     /// Execute the FINAL training step of a `RepeatingStep` session (U8/U9
     /// repair): identical to [`ProgramSession::execute_step`] — allocate the
-    /// step's PerStep + ObservationPoint buffers, run the ordered launches
+    /// step's `PerStep` + `ObservationPoint` buffers, run the ordered launches
     /// with no copy-in, synchronize at the step boundary, read back the
     /// per-step loss observation — except that the declared **end-of-run**
-    /// PerStep buffers (the final forward activations and final gradients)
-    /// stay live past the step boundary instead of recycling. The PerProgram
+    /// `PerStep` buffers (the final forward activations and final gradients)
+    /// stay live past the step boundary instead of recycling. The `PerProgram`
     /// params are already live (once-init at session creation). The session
     /// then reads the whole declared end-of-run set back once via
     /// [`ProgramSession::read_end_of_run`] at this step's completion
@@ -991,8 +896,8 @@ impl<'host> ProgramSession<'host> {
 
     /// The shared body of [`ProgramSession::execute_step`] and
     /// [`ProgramSession::execute_final_step`]: `keep_end_of_run` decides
-    /// whether the declared end-of-run PerStep buffers stay live past the
-    /// step boundary (the final step) or recycle like every other PerStep
+    /// whether the declared end-of-run `PerStep` buffers stay live past the
+    /// step boundary (the final step) or recycle like every other `PerStep`
     /// buffer (ordinary steps).
     fn execute_step_impl(&mut self, keep_end_of_run: bool) -> HostResult<DeviceExecutionReceipt> {
         if self.closed {
@@ -1035,10 +940,10 @@ impl<'host> ProgramSession<'host> {
     /// the final forward activations, the final gradients, and the final
     /// trainable params — **once**, after the step loop, at the declared
     /// completion boundary (the final step's step-boundary sync). The
-    /// PerStep end-of-run buffers were kept live by the final step
-    /// ([`ProgramSession::execute_final_step`]); the PerProgram params are
-    /// live since session creation (once-init). The PerStep end-of-run
-    /// buffers are read-then-released; the PerProgram params stay live
+    /// `PerStep` end-of-run buffers were kept live by the final step
+    /// ([`ProgramSession::execute_final_step`]); the `PerProgram` params are
+    /// live since session creation (once-init). The `PerStep` end-of-run
+    /// buffers are read-then-released; the `PerProgram` params stay live
     /// until [`ProgramSession::teardown`] (per-program persistence is never
     /// disturbed by the observation). Within a step the only readback is
     /// still the loss observation — the end-of-run set is never read per
@@ -1051,7 +956,7 @@ impl<'host> ProgramSession<'host> {
     ///
     /// # Errors
     /// - `E_INTERNAL` — the session is not `RepeatingStep`, the set was
-    ///   already read back, the final step has not completed (the PerStep
+    ///   already read back, the final step has not completed (the `PerStep`
     ///   end-of-run buffers are not live), or a declared end-of-run buffer
     ///   is not live;
     /// - session-level readback failures bubble through unchanged.
@@ -1088,8 +993,8 @@ impl<'host> ProgramSession<'host> {
     }
 
     /// The end-of-run readback body of [`ProgramSession::read_end_of_run`]:
-    /// the read loop over the declared end-of-run set (PerStep buffers
-    /// read-then-released; PerProgram params read and kept live), without
+    /// the read loop over the declared end-of-run set (`PerStep` buffers
+    /// read-then-released; `PerProgram` params read and kept live), without
     /// the error-path release, which the caller owns.
     fn read_end_of_run_inner(&mut self) -> HostResult<EndOfRunReadback> {
         let mut values: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
@@ -1140,10 +1045,10 @@ impl<'host> ProgramSession<'host> {
     /// The executable body shared by [`ProgramSession::execute`] and
     /// [`ProgramSession::execute_step`] / [`ProgramSession::execute_final_step`]:
     /// the ordered launch sequence (step-buffer allocation → copy-in
-    /// (SingleRun only) → launch → step-boundary sync → observation
+    /// (`SingleRun` only) → launch → step-boundary sync → observation
     /// readback + release → per-step release) without the error-path
     /// release, which the caller owns. `keep_end_of_run` (final-step only)
-    /// keeps the declared end-of-run PerStep buffers live past the step
+    /// keeps the declared end-of-run `PerStep` buffers live past the step
     /// boundary so the one-shot end-of-run readback can observe them.
     fn execute_inner(
         &mut self,
@@ -1353,9 +1258,9 @@ impl<'host> ProgramSession<'host> {
         })
     }
 
-    /// Allocate this step's PerStep and ObservationPoint buffers (S2-4);
-    /// PerProgram buffers are already live from session creation. Buffer ids
-    /// already live are left untouched (a PerProgram buffer, or a step buffer
+    /// Allocate this step's `PerStep` and `ObservationPoint` buffers (S2-4);
+    /// `PerProgram` buffers are already live from session creation. Buffer ids
+    /// already live are left untouched (a `PerProgram` buffer, or a step buffer
     /// left live by an interrupted path that has not yet run the error path,
     /// is never double-allocated).
     fn allocate_step_buffers(&mut self) -> HostResult<()> {
@@ -1490,8 +1395,8 @@ impl<'host> ProgramSession<'host> {
 
     /// The program-level buffer ids this session manages (A9 receipt): every
     /// distinct buffer id the descriptor declares, classified by lifetime.
-    /// PerProgram ids are live for the program's lifetime; PerStep and
-    /// ObservationPoint ids are live only within one execution (S2-4).
+    /// `PerProgram` ids are live for the program's lifetime; `PerStep` and
+    /// `ObservationPoint` ids are live only within one execution (S2-4).
     #[must_use]
     pub fn allocated_buffers(&self) -> Vec<u32> {
         let mut ids = Vec::new();
@@ -1511,10 +1416,10 @@ impl<'host> ProgramSession<'host> {
 
     /// Number of live device handles the session currently holds (module +
     /// currently-live buffers). Used by lifecycle tests to prove no reload /
-    /// no PerProgram realloc between executions and full release at teardown.
-    /// PerStep and ObservationPoint buffers are released at the step boundary
+    /// no `PerProgram` realloc between executions and full release at teardown.
+    /// `PerStep` and `ObservationPoint` buffers are released at the step boundary
     /// / after readback (S2-4), so between executions the session holds the
-    /// module + PerProgram buffers only. A session closed by an error-path
+    /// module + `PerProgram` buffers only. A session closed by an error-path
     /// release (S2-3) holds no live handles and reports 0.
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
@@ -1727,12 +1632,12 @@ impl CompositeHost {
 
     /// Create a program-scoped session for one device program (S2-1).
     ///
-    /// The session owns the module (loaded once) and every PerProgram buffer
-    /// (allocated once at creation, persisting across executions); PerStep
-    /// and ObservationPoint buffers are allocated per execution and recycled
+    /// The session owns the module (loaded once) and every `PerProgram` buffer
+    /// (allocated once at creation, persisting across executions); `PerStep`
+    /// and `ObservationPoint` buffers are allocated per execution and recycled
     /// / read-then-released at each step boundary (S2-4). It survives
     /// repeated executions on the same session without reloading or
-    /// re-allocating PerProgram buffers. Call
+    /// re-allocating `PerProgram` buffers. Call
     /// [`ProgramSession::teardown`] to release every handle in order.
     ///
     /// A `RepeatingStep` session (S5-U6, the training-loop surface) runs

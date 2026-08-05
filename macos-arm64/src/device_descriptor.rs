@@ -310,24 +310,23 @@ pub struct DescriptorResult {
     pub at_launch: u32,
 }
 
-/// One declared end-of-run observation (U8/U9 repair): a buffer whose FINAL
-/// value is read back exactly once at the declared completion boundary —
-/// after the step loop of a `RepeatingStep` session — and returned to the
-/// caller.
+/// One declared end-of-run observation (S5A-U1): a buffer whose FINAL value
+/// is read back exactly once at the declared completion boundary — after the
+/// step loop of a `RepeatingStep` session — and returned to the caller.
 ///
 /// Distinct from [`DescriptorResult`] (the per-step observations, read back
-/// every step): an end-of-run observation may name a **PerStep** buffer
-/// (the final forward activations, the final gradients) or a **PerProgram**
-/// buffer (the final trainable params). The params MUST stay PerProgram —
+/// every step): an end-of-run observation may name a **`PerStep`** buffer (the
+/// final forward activations, the final gradients) or a **`PerProgram`**
+/// buffer (the final trainable params). The params MUST stay `PerProgram` —
 /// once-init persistence across steps — so their only readback is this
 /// one-shot end-of-run readback; they are never read within a step. The
-/// session's one-shot end-of-run readback ([`ProgramSession::declare_end_of_run`]
-/// + [`ProgramSession::read_end_of_run`]) admits only these two lifetime
-/// classes (an [`DeviceBufferLifetime::ObservationPoint`] buffer is a
-/// per-step result and is never read both per step and at the end).
-///
-/// [`ProgramSession::declare_end_of_run`]: crate::composite_host::ProgramSession::declare_end_of_run
-/// [`ProgramSession::read_end_of_run`]: crate::composite_host::ProgramSession::read_end_of_run
+/// descriptor's validation admits only these two lifetime classes (an
+/// [`DeviceBufferLifetime::ObservationPoint`] buffer is a per-step result
+/// and is never read both per step and at the end). The set is the wire's
+/// DECLARED `EndOfRun` cadence set, carried verbatim by the descriptor —
+/// the session reads it back via
+/// [`ProgramSession::read_end_of_run`](crate::composite_host::ProgramSession::read_end_of_run)
+/// exactly once after the final step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescriptorEndOfRunResult {
     /// The observed buffer's program-level identity.
@@ -384,9 +383,19 @@ pub struct DeviceDescriptor {
     /// from. Never inferred from kernel declaration order. Validation proves
     /// every launch is reachable from a root.
     pub roots: Vec<u32>,
-    /// Declared observation points (F6): the explicit result rows the host
-    /// reads back and releases. Only these buffers are observable.
+    /// Declared per-step observation points (F6 + S5A-U1): the explicit
+    /// result rows the host reads back and releases within every step. Only
+    /// these buffers are observable per step — each is an
+    /// `ObservationPoint`-lifetime buffer (the loss).
     pub results: Vec<DescriptorResult>,
+    /// Declared end-of-run observations (S5A-U1): the result rows the host
+    /// reads back exactly ONCE after the step loop of a `RepeatingStep`
+    /// session — the final forward, final gradients, final params. Each is a
+    /// `PerStep` or `PerProgram` buffer (never read per step, never read-only
+    /// input state). This is the wire's declared `EndOfRun` cadence set,
+    /// carried by the descriptor — the host never derives it and there is no
+    /// runtime declaration seam.
+    pub end_of_run_results: Vec<DescriptorEndOfRunResult>,
 }
 
 /// One carried inter-kernel data-flow edge (A10): a buffer content version
@@ -810,9 +819,8 @@ impl DeviceDescriptor {
                 // storage is brought to its first defined state (the
                 // once-init / per-allocation policy is driven by this single
                 // fact).
-                if let Some((_, first_init)) = initializations
-                    .iter()
-                    .find(|(id, _)| *id == slot.buffer_id)
+                if let Some((_, first_init)) =
+                    initializations.iter().find(|(id, _)| *id == slot.buffer_id)
                 {
                     if *first_init != slot.initialization {
                         return Err(abi_error(format!(
@@ -930,16 +938,86 @@ impl DeviceDescriptor {
                 )));
             }
         }
+
+        // End-of-run observation admission (S5A-U1): the DECLARED cadence set
+        // — the wire's `EndOfRun` result rows — is read back exactly once
+        // after the step loop. Each entry must name a buffer the program
+        // writes (never read-only input state) with a PerStep or PerProgram
+        // lifetime (an ObservationPoint buffer is a per-step result and is
+        // never read both per step and at the end), must be unique, must not
+        // overlap the per-step results, and must carry keyed version
+        // metadata. An UNDECLARED readback — a buffer read back without a
+        // declared cadence — fails closed here, before any launch.
+        let mut end_of_run_buffer_ids: Vec<u32> = Vec::with_capacity(self.end_of_run_results.len());
+        for end_of_run in &self.end_of_run_results {
+            if end_of_run.version == 0 {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation for buffer {} uses the reserved zero version",
+                    end_of_run.buffer_id
+                )));
+            }
+            if result_buffer_ids.contains(&end_of_run.buffer_id) {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation names per-step observation buffer {}; a buffer is never read both per step and at the end",
+                    end_of_run.buffer_id
+                )));
+            }
+            if end_of_run_buffer_ids.contains(&end_of_run.buffer_id) {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation repeats buffer {}; the set must be unique in the host receipt",
+                    end_of_run.buffer_id
+                )));
+            }
+            end_of_run_buffer_ids.push(end_of_run.buffer_id);
+
+            let Some(meta) = self
+                .kernels
+                .iter()
+                .flat_map(|kernel| kernel.buffers.iter())
+                .find(|slot| {
+                    slot.buffer_id == end_of_run.buffer_id && slot.version == end_of_run.version
+                })
+            else {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation names buffer {} version {} which no kernel slot allocates",
+                    end_of_run.buffer_id, end_of_run.version
+                )));
+            };
+            if meta.role == DeviceBufferRole::Input {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation names input buffer {}; a final value must be written by the program",
+                    end_of_run.buffer_id
+                )));
+            }
+            if meta.lifetime != DeviceBufferLifetime::PerStep
+                && meta.lifetime != DeviceBufferLifetime::PerProgram
+            {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation names buffer {} with lifetime `{}`; only per-step and per-program buffers are read back once at the end (observation-point buffers are the per-step results)",
+                    end_of_run.buffer_id,
+                    meta.lifetime.spelling()
+                )));
+            }
+            let keyed = versions.iter().any(|version| {
+                version.buffer_id == end_of_run.buffer_id && version.version == end_of_run.version
+            });
+            if !keyed {
+                return Err(descriptor_error(format!(
+                    "device descriptor end-of-run observation names buffer {} version {} which has no keyed metadata",
+                    end_of_run.buffer_id, end_of_run.version
+                )));
+            }
+        }
         Ok(())
     }
 
     /// FNV-1a hash of the descriptor's carried **semantic graph** (F3/F6):
     /// the buffer semantic identities + content versions, the declared
     /// roots, the ordered launch sequence with the full facts of each
-    /// launched kernel, the carried dependency edges, and the declared
-    /// observation points. This is the graph identity the host executes —
-    /// distinct from the module provenance hash, which only names the
-    /// backend blob.
+    /// launched kernel, the carried dependency edges, the declared per-step
+    /// observation points, and the declared end-of-run observations (S5A-U1).
+    /// This is the graph identity the host executes — distinct from the
+    /// module provenance hash, which only names the backend blob.
     ///
     /// The byte stream is length-prefixed and deterministic. Kernel facts
     /// are inlined per launch, so reordering kernel DECLARATIONS (which
@@ -1014,6 +1092,13 @@ impl DeviceDescriptor {
             push_u32(&mut bytes, result.version);
             push_u32(&mut bytes, result.produced_by);
             push_u32(&mut bytes, result.at_launch);
+        }
+        // S5A-U1: the declared end-of-run observations are part of the graph
+        // the host executes — the one-shot readback after the step loop.
+        push_u32(&mut bytes, self.end_of_run_results.len() as u32);
+        for end_of_run in &self.end_of_run_results {
+            push_u32(&mut bytes, end_of_run.buffer_id);
+            push_u32(&mut bytes, end_of_run.version);
         }
         fnv1a64(&bytes)
     }
@@ -1099,14 +1184,6 @@ pub(crate) mod errors {
     pub(crate) fn shape_mismatch(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_SHAPE_MISMATCH.to_owned(),
-            message: message.into(),
-            retryable: false,
-        }
-    }
-
-    pub(crate) fn descriptor(message: impl Into<String>) -> HostError {
-        HostError {
-            code: super::E_DEVICE_DESCRIPTOR.to_owned(),
             message: message.into(),
             retryable: false,
         }

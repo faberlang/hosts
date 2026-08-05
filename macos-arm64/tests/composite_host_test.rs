@@ -36,7 +36,7 @@ const MODULE_IMAGE: &[u8] = b"// fake compiler-owned module image";
 /// One elementwise-add kernel: `out = a + b` over `count` f32 elements.
 /// Matches the simulated `addita` / `add_one` kernel shape (3 buffers).
 /// The S2-4 lifetime mapping the faber constructor derives from ABI facts:
-/// Input → PerProgram, Output → ObservationPoint, InOut → PerStep. Test
+/// Input → `PerProgram`, Output → `ObservationPoint`, InOut → `PerStep`. Test
 /// descriptors mirror that mapping so the fake-driver sequencing proves the
 /// constructor-derived payload path.
 fn lifetime_for_role(role: DeviceBufferRole) -> DeviceBufferLifetime {
@@ -157,6 +157,7 @@ fn make_descriptor(
         data_flow,
         roots,
         results,
+        end_of_run_results: Vec::new(),
     }
 }
 
@@ -344,15 +345,15 @@ fn two_kernel_inputs() -> BTreeMap<u32, Vec<f32>> {
 /// The S3-B3 Mul+Mean companion fixture (S3-B1 shape) as a descriptor: the
 /// forward kernels (`loss_mul` elementwise mul, `loss_mean` mean reduction)
 /// plus the generated backward companion, whose tuple gradient outputs
-/// `grad_x`/`grad_w` are ObservationPoint and whose accumulation/partial
-/// intermediates are PerStep. The buffer inventory mirrors the S3-B3
+/// `grad_x`/`grad_w` are `ObservationPoint` and whose accumulation/partial
+/// intermediates are `PerStep`. The buffer inventory mirrors the S3-B3
 /// evidence-note classification:
 ///
 /// | Buffer | Role → class |
 /// | --- | --- |
-/// | x, w (1, 2) | Input → PerProgram |
-/// | product, partial, acc (3, 4, 5) | InOut → PerStep |
-/// | grad_x, grad_w (6, 7) | Output → ObservationPoint |
+/// | x, w (1, 2) | Input → `PerProgram` |
+/// | product, partial, acc (3, 4, 5) | InOut → `PerStep` |
+/// | grad_x, grad_w (6, 7) | Output → `ObservationPoint` |
 ///
 /// The fake driver simulates the 3-buffer elementwise-add kernel only, so
 /// the companion's `(grad_x, grad_w)` tuple is modeled as two companion
@@ -361,8 +362,8 @@ fn two_kernel_inputs() -> BTreeMap<u32, Vec<f32>> {
 /// multi-output ABI). Every slot's lifetime is derived by the same
 /// `lifetime_for_role` mapping the faber constructor uses (S2-4), so the
 /// fake-driver sequencing proves the constructor-derived classification's
-/// allocation/recycle/release policy: PerProgram allocated once, PerStep
-/// recycled at the step boundary, ObservationPoint read-then-released.
+/// allocation/recycle/release policy: `PerProgram` allocated once, `PerStep`
+/// recycled at the step boundary, `ObservationPoint` read-then-released.
 fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     make_descriptor(
         backend,
@@ -421,7 +422,7 @@ fn mul_mean_companion_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     )
 }
 
-/// Host inputs for [`mul_mean_companion_descriptor`]: x and w (PerProgram
+/// Host inputs for [`mul_mean_companion_descriptor`]: x and w (`PerProgram`
 /// inputs read by the forward `loss_mul` kernel and the companion kernels).
 fn mul_mean_inputs() -> BTreeMap<u32, Vec<f32>> {
     let mut inputs = BTreeMap::new();
@@ -1384,9 +1385,9 @@ fn cross_backend_handle_use_fails_closed() {
 // S2-1: program session sequencing (create → run → run again → teardown)
 // ---------------------------------------------------------------------------
 
-/// The session loads the module once and allocates every PerProgram buffer
+/// The session loads the module once and allocates every `PerProgram` buffer
 /// once at creation; repeated `execute` calls on the same session do NOT
-/// reload the module or re-allocate PerProgram buffers; the ObservationPoint
+/// reload the module or re-allocate `PerProgram` buffers; the `ObservationPoint`
 /// output is allocated per execution, read back, and released (S2-4);
 /// teardown releases every handle.
 #[test]
@@ -1582,8 +1583,8 @@ fn program_session_creation_validates_descriptor_before_launch() {
 /// 1); nothing persists past teardown (loads == releases, live handles == 0).
 /// This is the S2-2 leak-free bar: repeated execution does not leak — not
 /// "module persists across steps". With the S2-4 lifetime policy the two
-/// PerProgram input buffers are allocated once at creation while the
-/// ObservationPoint output is allocated/read/released per execution, so the
+/// `PerProgram` input buffers are allocated once at creation while the
+/// `ObservationPoint` output is allocated/read/released per execution, so the
 /// buffer counters climb exactly one alloc + one release per execution and
 /// still return to balance at teardown.
 #[test]
@@ -1630,7 +1631,7 @@ fn module_cache_loads_once_and_releases_on_teardown() {
 }
 
 /// The same leak-free bar on CUDA (backend-neutral surface): one module
-/// load, one release, no module persists past teardown; the ObservationPoint
+/// load, one release, no module persists past teardown; the `ObservationPoint`
 /// output is read-then-released per execution.
 #[test]
 fn module_cache_loads_once_and_releases_on_teardown_cuda() {
@@ -1992,9 +1993,9 @@ fn failed_execution_closes_session_and_blocks_reuse() {
 // S2-4: BufferLifetime host-interpretation (council 3)
 // ---------------------------------------------------------------------------
 
-/// The two-lifetime fixture from the S2-4 done-when: a PerProgram input is
+/// The two-lifetime fixture from the S2-4 done-when: a `PerProgram` input is
 /// allocated once at session creation and persists across executions (no
-/// realloc), while an ObservationPoint output is allocated, read back, and
+/// realloc), while an `ObservationPoint` output is allocated, read back, and
 /// released on every execution (read-then-release). The fake-driver counters
 /// make the lifetime-distinct allocation/release events observable.
 #[test]
@@ -2041,10 +2042,10 @@ fn per_program_persists_while_observation_read_then_releases() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// PerStep buffers are recycled at the step boundary: allocated per
+/// `PerStep` buffers are recycled at the step boundary: allocated per
 /// execution, released at the end of each execution (so a second execution
 /// re-allocates them), and never persist past teardown. The InOut
-/// intermediate (id 3) of the two-kernel chain is the PerStep buffer.
+/// intermediate (id 3) of the two-kernel chain is the `PerStep` buffer.
 #[test]
 fn per_step_buffers_recycle_at_step_boundary() {
     let mut host = metal_composite("add_one").expect("metal composite");
@@ -2094,9 +2095,9 @@ fn per_step_buffers_recycle_at_step_boundary() {
 // ---------------------------------------------------------------------------
 
 /// The S3-B3 classified-buffer policy over the Mul+Mean companion program:
-/// the session allocates the PerProgram inputs (x, w) exactly once at
-/// creation, recycles the PerStep intermediates (product, partial, acc) at
-/// the step boundary, and read-then-releases the ObservationPoint tuple
+/// the session allocates the `PerProgram` inputs (x, w) exactly once at
+/// creation, recycles the `PerStep` intermediates (product, partial, acc) at
+/// the step boundary, and read-then-releases the `ObservationPoint` tuple
 /// gradient outputs (grad_x, grad_w). Same-shaped grad_x/grad_w stay
 /// distinct buffer ids (6 vs 7) in the session's declared resource graph.
 #[test]
@@ -2162,8 +2163,8 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy() {
 }
 
 /// The same classified-buffer policy on the CUDA fake-driver lane
-/// (backend-neutral surface): PerProgram once, PerStep recycled,
-/// ObservationPoint read-then-released, grad_x/grad_w distinct ids.
+/// (backend-neutral surface): `PerProgram` once, `PerStep` recycled,
+/// `ObservationPoint` read-then-released, grad_x/grad_w distinct ids.
 #[test]
 fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
     let mut host = mul_mean_cuda_composite().expect("cuda composite");
@@ -2196,7 +2197,7 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy_cuda() {
 
 /// The A9 receipt reflects the lifetime policy: per-buffer lifetime class
 /// sets and the program-level lifetime regime (S2-4 done-when). A
-/// RepeatingStep session runs through the step-mode surface (S5-U6):
+/// `RepeatingStep` session runs through the step-mode surface (S5-U6):
 /// once-init the HostProvided params, then execute steps.
 #[test]
 fn receipt_reports_lifetime_classes_and_program_lifetime() {
@@ -2234,17 +2235,17 @@ fn receipt_reports_lifetime_classes_and_program_lifetime() {
 // ---------------------------------------------------------------------------
 
 /// The S5-U6 training-step fixture as a descriptor: two HostProvided
-/// PerProgram params (w, b) once-init'd at session creation, one PerStep
+/// `PerProgram` params (w, b) once-init'd at session creation, one `PerStep`
 /// InOut intermediate (h) recycled at each step boundary, and one
-/// ObservationPoint loss output (l) read back per step. The fake driver
+/// `ObservationPoint` loss output (l) read back per step. The fake driver
 /// simulates both kernels as elementwise add, so the step semantics are
 /// h = w + b (launch 1), l = h + w (launch 2).
 ///
 /// | Buffer | Role → class | Init |
 /// | --- | --- | --- |
-/// | w, b (1, 2) | Input → PerProgram | HostProvided |
-/// | h (3) | InOut → PerStep | KernelInitialized |
-/// | l (4) | Output → ObservationPoint | KernelInitialized |
+/// | w, b (1, 2) | Input → `PerProgram` | HostProvided |
+/// | h (3) | InOut → `PerStep` | KernelInitialized |
+/// | l (4) | Output → `ObservationPoint` | KernelInitialized |
 fn training_step_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     let mut descriptor = make_descriptor(
         backend,
@@ -2296,8 +2297,8 @@ fn training_step_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     descriptor
 }
 
-/// A PerStep InOut slot that is fully written by a device kernel before any
-/// read (the training-step intermediate `h`): InOut role → PerStep lifetime
+/// A `PerStep` InOut slot that is fully written by a device kernel before any
+/// read (the training-step intermediate `h`): InOut role → `PerStep` lifetime
 /// (S2-4 mapping), but KernelInitialized initialization — launch 1 writes it
 /// before launch 2 reads it, so the step allocates it without a zero-fill
 /// copy (the once-init copy accounting stays exact: only the params copy).
@@ -2327,8 +2328,8 @@ fn training_step_params() -> BTreeMap<u32, Vec<f32>> {
     params
 }
 
-/// A PerProgram + HostProvided slot for any role — the real U5 training
-/// shape for params (PerProgram InOut ReadWrite buffers with HostProvided
+/// A `PerProgram` + HostProvided slot for any role — the real U5 training
+/// shape for params (`PerProgram` InOut ReadWrite buffers with HostProvided
 /// init at session creation, per the Stage 5 delivery architecture). The
 /// step-mode once-init copies these exactly once at session creation,
 /// regardless of slot role, never via the per-step input path.
@@ -2354,7 +2355,7 @@ fn host_provided_param_slot(
 }
 
 /// The [`training_step_descriptor`] shape with the params in their real U5
-/// wire form: PerProgram InOut ReadWrite buffers with HostProvided init
+/// wire form: `PerProgram` InOut ReadWrite buffers with HostProvided init
 /// (not Input-role slots). Step semantics are unchanged (h = w + b, then
 /// l = h + w).
 fn training_step_inout_param_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
@@ -2405,7 +2406,7 @@ fn training_step_inout_param_descriptor(backend: DeviceBackend) -> DeviceDescrip
 }
 
 /// The S5-U6 done-when fake-driver test: one session runs N steps — params
-/// persist and are copied in exactly once, PerStep buffers recycle per
+/// persist and are copied in exactly once, `PerStep` buffers recycle per
 /// step, the observation (loss) readback happens exactly once per declared
 /// observation, receipts count per-step syncs/transfers/readbacks/releases,
 /// and teardown returns `live_handle_count() == 0` (leak-free).
@@ -2490,7 +2491,7 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
 }
 
 /// The same N-step step-mode loop on the fake CUDA lane (backend-neutral
-/// surface): once-init, per-step observation, PerStep recycle, leak-free
+/// surface): once-init, per-step observation, `PerStep` recycle, leak-free
 /// teardown.
 #[test]
 fn repeating_step_n_step_loop_on_both_fake_backends() {
@@ -2520,7 +2521,7 @@ fn repeating_step_n_step_loop_on_both_fake_backends() {
     }
 }
 
-/// The real U5 training shape for params (PerProgram InOut ReadWrite with
+/// The real U5 training shape for params (`PerProgram` InOut ReadWrite with
 /// HostProvided init — the delivery doc's SGD/param classification) works
 /// through the step-mode once-init: params are copied in exactly once at
 /// session creation regardless of slot role, persist across steps, and
@@ -2549,7 +2550,7 @@ fn repeating_step_once_init_inout_host_provided_params() {
 }
 
 /// The once-init copy accounting is observable at the driver boundary: a
-/// RepeatingStep session copies its HostProvided params exactly once (w is
+/// `RepeatingStep` session copies its HostProvided params exactly once (w is
 /// copy call 1, b is copy call 2) and steps copy nothing. Injecting a
 /// CopyIn failure at call 3 must therefore NOT fire across N steps — a
 /// step that re-copied params would fail.
@@ -2605,8 +2606,8 @@ fn repeating_step_init_failure_releases_every_handle() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// The step-mode and SingleRun surfaces never mix (S5-U6): `execute` on a
-/// RepeatingStep session, `execute_step` on a SingleRun session, a step
+/// The step-mode and `SingleRun` surfaces never mix (S5-U6): `execute` on a
+/// `RepeatingStep` session, `execute_step` on a `SingleRun` session, a step
 /// before the once-init, and a second once-init all fail closed with typed
 /// diagnostics — never a silent fallback.
 #[test]
@@ -2704,8 +2705,8 @@ fn repeating_step_init_requires_every_declared_param() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// The descriptor-level RepeatingStep contract (S5-U6): a HostProvided
-/// buffer with a non-PerProgram lifetime could never receive its values in
+/// The descriptor-level `RepeatingStep` contract (S5-U6): a HostProvided
+/// buffer with a non-`PerProgram` lifetime could never receive its values in
 /// step-mode (steps copy nothing), so the descriptor fails closed at
 /// validation before any launch.
 #[test]
@@ -2736,7 +2737,7 @@ fn repeating_step_host_provided_buffer_requires_per_program_lifetime() {
 // (once-init persistence intact; read only at the end).
 // ---------------------------------------------------------------------------
 
-/// A PerStep written final slot (U8/U9 end-of-run): written by a kernel,
+/// A `PerStep` written final slot (U8/U9 end-of-run): written by a kernel,
 /// never a per-step observation — read back once at the end.
 fn step_final_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
     DescriptorBuffer {
@@ -2754,20 +2755,20 @@ fn step_final_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
 }
 
 /// The U8/U9 end-of-run readback fixture: the training-step shape plus two
-/// PerStep finals and their declared end-of-run set. The fake driver
+/// `PerStep` finals and their declared end-of-run set. The fake driver
 /// simulates every 3-buffer kernel as elementwise add:
-///   launch 1: h = w + b   (h: PerStep InOut intermediate)
-///   launch 2: l = h + w   (l: ObservationPoint loss — the per-step readback)
-///   launch 3: f = w + b   (f: PerStep Output final — end-of-run forward)
-///   launch 4: g = b + b   (g: PerStep Output final — end-of-run gradient)
+///   launch 1: h = w + b   (h: `PerStep` InOut intermediate)
+///   launch 2: l = h + w   (l: `ObservationPoint` loss — the per-step readback)
+///   launch 3: f = w + b   (f: `PerStep` Output final — end-of-run forward)
+///   launch 4: g = b + b   (g: `PerStep` Output final — end-of-run gradient)
 ///
 /// | Buffer | Role → class | Init | Readback |
 /// | --- | --- | --- | --- |
-/// | w, b (1, 2) | InOut → PerProgram | HostProvided | end-of-run only |
-/// | h (3) | InOut → PerStep | KernelInitialized | never |
-/// | f (4) | Output → PerStep | KernelInitialized | end-of-run only |
-/// | g (5) | Output → PerStep | KernelInitialized | end-of-run only |
-/// | l (6) | Output → ObservationPoint | KernelInitialized | per-step |
+/// | w, b (1, 2) | InOut → `PerProgram` | HostProvided | end-of-run only |
+/// | h (3) | InOut → `PerStep` | KernelInitialized | never |
+/// | f (4) | Output → `PerStep` | KernelInitialized | end-of-run only |
+/// | g (5) | Output → `PerStep` | KernelInitialized | end-of-run only |
+/// | l (6) | Output → `ObservationPoint` | KernelInitialized | per-step |
 fn end_of_run_training_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
     let mut descriptor = make_descriptor(
         backend,
@@ -2844,6 +2845,10 @@ fn end_of_run_training_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
         vec![result(6, 2)],
     );
     descriptor.program_lifetime = DeviceProgramLifetime::RepeatingStep;
+    // S5A-U1: the declared end-of-run cadence set (the wire's `EndOfRun`
+    // rows) is carried by the descriptor — the session reads it back exactly
+    // once after the final step; there is no runtime declaration seam.
+    descriptor.end_of_run_results = end_of_run_declaration();
     descriptor
 }
 
@@ -2873,9 +2878,9 @@ fn end_of_run_declaration() -> Vec<DescriptorEndOfRunResult> {
 
 /// The U8/U9 done-when fake-driver test: N steps on one session read the
 /// per-step loss ONLY within each step, the FINAL step keeps the declared
-/// end-of-run PerStep buffers live, and the declared end-of-run set (final
+/// end-of-run `PerStep` buffers live, and the declared end-of-run set (final
 /// forward f, final gradient g, final params w, b) is read back exactly
-/// ONCE after the loop — PerStep finals read-then-released, PerProgram
+/// ONCE after the loop — `PerStep` finals read-then-released, `PerProgram`
 /// params read and kept live until teardown. Residency: transfers =
 /// per-step loss readbacks + the single end-of-run value readback, zero
 /// per-step copy-in; teardown leak-free (`live_handle_count() == 0`).
@@ -2890,11 +2895,8 @@ fn repeating_step_end_of_run_readback_once_after_loop() {
     // Creation: module + the two PerProgram params allocated once; the
     // PerStep/PerProgram end-of-run buffers are not read back during steps.
     assert_eq!(session.session_handle_count(), 3); // module + w + b
-    // U8/U9: declare the end-of-run set before the step loop (validated
-    // fail-closed before any launch).
-    session
-        .declare_end_of_run(&end_of_run_declaration())
-        .expect("declare end-of-run set");
+                                                   // S5A-U1: the declared end-of-run set rides the descriptor (validated
+                                                   // fail-closed before any launch).
     session
         .init_params(&training_step_params())
         .expect("once-init params");
@@ -3014,9 +3016,6 @@ fn repeating_step_end_of_run_on_both_fake_backends() {
             .create_program_session(&descriptor)
             .expect("session create");
         session
-            .declare_end_of_run(&end_of_run_declaration())
-            .expect("declare end-of-run set");
-        session
             .init_params(&training_step_params())
             .expect("once-init params");
         for index in 0..3 {
@@ -3040,32 +3039,20 @@ fn repeating_step_end_of_run_on_both_fake_backends() {
     }
 }
 
-/// End-of-run misuse fails closed (U8/U9): declaring or reading the set on a
-/// SingleRun session, declaring it twice, reading it before the final step
-/// (no completion boundary yet), and reading it twice all refuse with typed
-/// diagnostics; a `RepeatingStep` session with an end-of-run set never reads
-/// it within a step.
+/// End-of-run misuse fails closed (S5A-U1): reading the set on a `SingleRun`
+/// session, reading it before the final step (no completion boundary yet),
+/// and reading it twice all refuse with typed diagnostics; a `RepeatingStep`
+/// session with an end-of-run set never reads it within a step.
 #[test]
 fn repeating_step_end_of_run_surfaces_fail_closed_on_misuse() {
     let mut host = metal_composite("add_one").expect("metal composite");
     let descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
 
-    // Declaring the set twice is refused (declared exactly once, before the
-    // step loop).
+    // read_end_of_run before any final step refuses: the end-of-run set is
+    // observable only at the declared completion boundary after the loop.
     let mut session = host
         .create_program_session(&descriptor)
         .expect("session create");
-    session
-        .declare_end_of_run(&end_of_run_declaration())
-        .expect("declare end-of-run set");
-    let err = session
-        .declare_end_of_run(&end_of_run_declaration())
-        .expect_err("the end-of-run set is declared exactly once");
-    assert_eq!(err.code, "E_INTERNAL");
-    assert!(err.message.contains("already declared"));
-
-    // read_end_of_run before any final step refuses: the end-of-run set is
-    // observable only at the declared completion boundary after the loop.
     session
         .init_params(&training_step_params())
         .expect("once-init params");
@@ -3076,18 +3063,13 @@ fn repeating_step_end_of_run_surfaces_fail_closed_on_misuse() {
     assert!(err.message.contains("final step"));
     session.teardown().expect("teardown");
 
-    // A SingleRun session refuses both ends of the surface (no step loop, no
+    // A SingleRun session refuses the readback surface (no step loop, no
     // end-of-run boundary).
     let mut single = descriptor.clone();
     single.program_lifetime = DeviceProgramLifetime::SingleRun;
     let mut session = host
         .create_program_session(&single)
         .expect("session create");
-    let err = session
-        .declare_end_of_run(&end_of_run_declaration())
-        .expect_err("end-of-run observations are a RepeatingStep contract");
-    assert_eq!(err.code, "E_INTERNAL");
-    assert!(err.message.contains("RepeatingStep"));
     let err = session
         .read_end_of_run()
         .expect_err("end-of-run readback is a RepeatingStep contract");
@@ -3097,35 +3079,34 @@ fn repeating_step_end_of_run_surfaces_fail_closed_on_misuse() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// The end-of-run declaration admission (U8/U9): an end-of-run observation
-/// must name a WRITTEN PerStep or PerProgram buffer the session allocates —
-/// never a buffer also read per step, never an ObservationPoint buffer
+/// The end-of-run cadence admission (S5A-U1): an end-of-run observation
+/// must name a WRITTEN `PerStep` or `PerProgram` buffer the program allocates —
+/// never a buffer also read per step, never an `ObservationPoint` buffer
 /// (those are the per-step results), never a read-only Input buffer, and
-/// never a repeated id. A bad declaration fails closed at declare time,
-/// before any launch.
+/// never a repeated id. The set is the wire's DECLARED cadence rows, carried
+/// by the descriptor; a bad declaration fails closed at descriptor
+/// validation, before any launch.
 #[test]
 fn end_of_run_observations_fail_closed_on_invalid_declarations() {
-    let host_declare = |declared: Vec<DescriptorEndOfRunResult>| -> HostError {
-        let mut host = metal_composite("add_one").expect("metal composite");
-        let descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
-        let mut session = host
-            .create_program_session(&descriptor)
-            .expect("session create");
-        let error = session
-            .declare_end_of_run(&declared)
+    let host_validate = |declared: Vec<DescriptorEndOfRunResult>| -> HostError {
+        let mut descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
+        descriptor.end_of_run_results = declared;
+        let error = descriptor
+            .validate()
             .expect_err("an invalid end-of-run declaration must fail closed before any launch");
-        session.teardown().expect("teardown");
         error
     };
 
     // (a) A per-step result (the loss l) also declared as end-of-run: a
     // buffer is never read both per step and at the end.
-    let err = host_declare(vec![DescriptorEndOfRunResult {
+    let err = host_validate(vec![DescriptorEndOfRunResult {
         buffer_id: 6,
         version: 1,
     }]);
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(err.message.contains("never read both per step and at the end"));
+    assert!(err
+        .message
+        .contains("never read both per step and at the end"));
 
     // (b) An ObservationPoint buffer that is NOT a per-step result: the
     // only readback class the session reads within a step — rejected for
@@ -3140,39 +3121,34 @@ fn end_of_run_observations_fail_closed_on_invalid_declarations() {
             }
         }
     }
-    let mut host = metal_composite("add_one").expect("metal composite");
-    let mut session = host
-        .create_program_session(&wrong_lifetime)
-        .expect("session create");
-    let err = session
-        .declare_end_of_run(&[DescriptorEndOfRunResult {
-            buffer_id: 3,
-            version: 1,
-        }])
-        .expect_err("an observation-point buffer is a per-step result class, never an end-of-run observation");
+    wrong_lifetime.end_of_run_results = vec![DescriptorEndOfRunResult {
+        buffer_id: 3,
+        version: 1,
+    }];
+    let err = wrong_lifetime.validate().expect_err(
+        "an observation-point buffer is a per-step result class, never an end-of-run observation",
+    );
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(err.message.contains("only per-step and per-program buffers"));
-    session.teardown().expect("teardown");
+    assert!(err
+        .message
+        .contains("only per-step and per-program buffers"));
 
     // (c) A read-only Input buffer (never written by the program) cannot be
     // a FINAL value. The legacy training-step fixture's params are
     // Input-role PerProgram buffers.
-    let input_final = training_step_descriptor(DeviceBackend::Metal);
-    let mut session = host
-        .create_program_session(&input_final)
-        .expect("session create");
-    let err = session
-        .declare_end_of_run(&[DescriptorEndOfRunResult {
-            buffer_id: 1,
-            version: 1,
-        }])
+    let mut input_final = training_step_descriptor(DeviceBackend::Metal);
+    input_final.end_of_run_results = vec![DescriptorEndOfRunResult {
+        buffer_id: 1,
+        version: 1,
+    }];
+    let err = input_final
+        .validate()
         .expect_err("an input buffer is never a final value");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("written by the program"));
-    session.teardown().expect("teardown");
 
     // (d) A repeated end-of-run id fails closed.
-    let err = host_declare(vec![
+    let err = host_validate(vec![
         DescriptorEndOfRunResult {
             buffer_id: 4,
             version: 1,
@@ -3184,10 +3160,9 @@ fn end_of_run_observations_fail_closed_on_invalid_declarations() {
     ]);
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("repeats buffer"));
-    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// ObservationPoint is the only readback: a result naming a PerProgram
+/// `ObservationPoint` is the only readback: a result naming a `PerProgram`
 /// buffer is an undeclared readback and fails closed at host admission with
 /// `E_DEVICE_DESCRIPTOR` before any launch (F6 — the constructor and host
 /// admission agree).
@@ -3245,7 +3220,7 @@ fn conflicting_buffer_lifetimes_fail_as_abi_mismatch() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// A failure while allocating a PerStep buffer (a new allocation point
+/// A failure while allocating a `PerStep` buffer (a new allocation point
 /// introduced by S2-4) leaves live_handle_count() == 0 — the S2-3 error-path
 /// teardown covers the per-step allocation stage too.
 #[test]
@@ -3510,6 +3485,7 @@ fn declaration_reorder_does_not_change_execution_or_graph_hash() {
         data_flow: Vec::new(),
         roots: vec![1, 2, 3],
         results: vec![result(6, 3)],
+        end_of_run_results: Vec::new(),
     };
     let declared_zero_first = build(vec![kernel_zero.clone(), kernel_one.clone()], 1, 0);
     let declared_one_first = build(vec![kernel_one.clone(), kernel_zero.clone()], 0, 1);
@@ -3771,10 +3747,9 @@ fn fan_out_does_not_mask_a_different_producer() {
         .validate()
         .expect_err("a different producer must still fail after admitted fan-out");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(
-        err.message
-            .contains("one value generation has exactly one producer")
-    );
+    assert!(err
+        .message
+        .contains("one value generation has exactly one producer"));
 }
 
 /// F3 red test: a consumer scheduled before its producer is a missing
@@ -3884,7 +3859,7 @@ fn accumulation_cuda_composite() -> HostResult<CompositeHost> {
     CompositeHost::with_device(runtime, "fake-cuda-device")
 }
 
-/// A PerProgram + ZeroFill accumulation slot (the constructor's G4
+/// A `PerProgram` + ZeroFill accumulation slot (the constructor's G4
 /// classification for in-place ReadWrite state): allocated once at session
 /// creation, zero-filled once, persistent across executions — never recycled
 /// at a step boundary.
@@ -3905,9 +3880,9 @@ fn accumulation_slot(id: u32, name: &str, binding: u32, count: u64) -> Descripto
 
 /// G4 production accumulation descriptor: the two-kernel accumulate chain —
 /// kernel `accumulate` adds the input `a` (id 1) into the persistent
-/// ZeroFill accumulation buffer `acc` (id 2, PerProgram) in place; kernel
+/// ZeroFill accumulation buffer `acc` (id 2, `PerProgram`) in place; kernel
 /// `observa` copies `acc` into the observation slot `out` (id 3,
-/// ObservationPoint) so the repeated-write test reads the accumulated value
+/// `ObservationPoint`) so the repeated-write test reads the accumulated value
 /// back. The data-flow edge (acc, launch 1 -> launch 2) is the carried
 /// dependency; the accumulation buffer itself persists across executions.
 fn accumulation_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
