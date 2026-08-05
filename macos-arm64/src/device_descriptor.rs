@@ -1011,13 +1011,22 @@ impl DeviceDescriptor {
         Ok(())
     }
 
-    /// FNV-1a hash of the descriptor's carried **semantic graph** (F3/F6):
-    /// the buffer semantic identities + content versions, the declared
-    /// roots, the ordered launch sequence with the full facts of each
-    /// launched kernel, the carried dependency edges, the declared per-step
+    /// FNV-1a hash of the descriptor's carried **execution-descriptor** facts
+    /// (F3/F6): the buffer semantic identities + content versions, the
+    /// declared roots, the ordered launch sequence with the full facts of
+    /// each launched kernel **including the backend entry-name bytes**
+    /// (`kernel.entry`), the carried dependency edges, the declared per-step
     /// observation points, and the declared end-of-run observations (S5A-U1).
-    /// This is the graph identity the host executes — distinct from the
-    /// module provenance hash, which only names the backend blob.
+    ///
+    /// This is the **execution-descriptor hash** (S5A-U3): the execution
+    /// identity the host runs — distinct from the module provenance hash,
+    /// which only names the backend blob. It is backend-entry-inclusive: the
+    /// same program compiled to differently-named backend entries (Metal
+    /// `mlp_loss__0` vs CUDA `mlp_loss__t60_…`) yields different hashes. It
+    /// is NOT a semantic-identity claim — the backend-neutral semantic
+    /// identity of a program is the complete-program SHA
+    /// (`radix_mir_fmir::device_identity_hash`, the A10 identity), computed
+    /// from the canonical wire bytes without backend symbols.
     ///
     /// The byte stream is length-prefixed and deterministic. Kernel facts
     /// are inlined per launch, so reordering kernel DECLARATIONS (which
@@ -1028,7 +1037,7 @@ impl DeviceDescriptor {
     /// # Panics
     /// Never panics.
     #[must_use]
-    pub fn semantic_graph_hash(&self) -> u64 {
+    pub fn execution_descriptor_hash(&self) -> u64 {
         let mut bytes = Vec::new();
         let mut buffers: Vec<(&DescriptorBuffer, &u32)> = self
             .kernels

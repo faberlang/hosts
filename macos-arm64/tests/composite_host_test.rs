@@ -3315,15 +3315,16 @@ fn receipt_declares_resource_graph_and_observed_events() {
         "completion guaranteed at the explicit step-boundary sync after launch 2"
     );
 
-    // The receipt carries the semantic graph hash the host computed from the
-    // descriptor it consumed (the graph identity of this execution).
+    // The receipt carries the execution-descriptor hash the host computed
+    // from the descriptor it consumed (the execution identity of this run;
+    // backend-entry-inclusive, S5A-U3).
     assert_eq!(
-        receipt.semantic_graph_hash,
-        descriptor.semantic_graph_hash()
+        receipt.execution_descriptor_hash,
+        descriptor.execution_descriptor_hash()
     );
     assert_eq!(
-        session.semantic_graph_hash(),
-        descriptor.semantic_graph_hash()
+        session.execution_descriptor_hash(),
+        descriptor.execution_descriptor_hash()
     );
 
     session.teardown().expect("teardown");
@@ -3424,17 +3425,18 @@ fn receipt_consumes_carried_version_facts_not_coincidence() {
 
 // ---------------------------------------------------------------------------
 // Stage 3R U5: coherent host execution — graph-ordered scheduling (F3/G1),
-// observation-only readback (F6), honest receipts (R9), semantic graph hash
+// observation-only readback (F6), honest receipts (R9), execution descriptor
+// hash
 // ---------------------------------------------------------------------------
 
 /// The declaration-reorder red test (G1 host side): reordering the kernel
 /// DECLARATIONS — the host never infers execution from declaration order —
 /// does not change the executed launch sequence, the results, or the
-/// semantic graph hash. The host schedules the carried launches + graph,
-/// so the same launches with differently-ordered declarations are one
-/// program.
+/// execution-descriptor hash. The host schedules the carried launches +
+/// graph, so the same launches with differently-ordered declarations are
+/// one program.
 #[test]
-fn declaration_reorder_does_not_change_execution_or_graph_hash() {
+fn declaration_reorder_does_not_change_execution_or_descriptor_hash() {
     let mut host = multi_kernel_metal_composite().expect("metal composite");
 
     let kernel_zero = DescriptorKernel {
@@ -3514,16 +3516,16 @@ fn declaration_reorder_does_not_change_execution_or_graph_hash() {
     assert_eq!(receipt_b.outputs, receipt_a.outputs);
     assert_eq!(receipt_b.outputs.get(&6), Some(&vec![12.0, 14.0]));
 
-    // The semantic graph hash is declaration-independent too: both
+    // The execution-descriptor hash is declaration-independent too: both
     // descriptors name the same launches, graph, semantic identities, and
     // observation points.
     assert_eq!(
-        declared_zero_first.semantic_graph_hash(),
-        declared_one_first.semantic_graph_hash()
+        declared_zero_first.execution_descriptor_hash(),
+        declared_one_first.execution_descriptor_hash()
     );
     assert_eq!(
-        receipt_a.semantic_graph_hash,
-        declared_zero_first.semantic_graph_hash()
+        receipt_a.execution_descriptor_hash,
+        declared_zero_first.execution_descriptor_hash()
     );
     assert_eq!(
         host.device().expect("device present").live_handle_count(),
