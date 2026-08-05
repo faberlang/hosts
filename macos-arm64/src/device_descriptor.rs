@@ -563,9 +563,13 @@ impl DeviceDescriptor {
         // and the carried dependency edges must be consistent with it.
         //
         // 1. Single definition per value generation: exactly one launch
-        //    produces a given `(buffer, version)` — a second producer would
-        //    be another writer of the same generation, which the frozen
-        //    contract forbids (F2).
+        //    produces a given `(buffer, version)`. The wire carries one edge
+        //    per (producer, consumer) pair (DescriptorDataFlow mirrors
+        //    `BufferRegistry::data_flow_pairs`), so a version consumed by
+        //    several launches legitimately repeats the same producer — that
+        //    fan-out is not a second definition. Only a DIFFERENT producer
+        //    for the same `(buffer, version)` is another writer of the same
+        //    generation, which the frozen contract forbids (F2).
         // 2. Topological consistency: the carried launch order must place
         //    every consumer launch after all its producers. A cycle or a
         //    missing/inverted dependency fails validation before launch.
@@ -576,6 +580,12 @@ impl DeviceDescriptor {
             if let Some((_, first_producer)) = producers.iter().find(|((buffer_id, version), _)| {
                 *buffer_id == edge.buffer_id && *version == edge.version
             }) {
+                if *first_producer == edge.producer {
+                    // Fan-out: the same value generation feeds several
+                    // consumers, one carried edge per consumer. The producer
+                    // is unique — admit the repeated edge.
+                    continue;
+                }
                 return Err(descriptor_error(format!(
                     "device descriptor defines buffer {} version {} twice (producers {} and {}); one value generation has exactly one producer",
                     edge.buffer_id, edge.version, first_producer, edge.producer

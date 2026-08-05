@@ -3197,6 +3197,126 @@ fn duplicate_value_generation_producer_fails_validation() {
     assert!(err.message.contains("producer"));
 }
 
+/// U7 regression: one producer feeding several consumers is a legitimate
+/// fan-out. The wire carries one data-flow edge per (producer, consumer)
+/// pair (DescriptorDataFlow mirrors `BufferRegistry::data_flow_pairs`), so
+/// the producer repeats across edges; the check asserts producer-uniqueness,
+/// not edge-uniqueness. Mirrors the MLP buffer 14 v1 shape (producer launch
+/// 4, consumers 5 and 8).
+#[test]
+fn single_producer_multi_consumer_fan_out_passes_validation() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(
+                14,
+                "companion_grad",
+                DeviceBufferRole::InOut,
+                0,
+                2,
+            )],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 4,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 5,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 8,
+                kernel_index: 0,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 14,
+                version: 1,
+                producer: 4,
+                consumer: 5,
+            },
+            DescriptorDataFlow {
+                buffer_id: 14,
+                version: 1,
+                producer: 4,
+                consumer: 8,
+            },
+        ],
+        Vec::new(),
+    );
+    descriptor
+        .validate()
+        .expect("one producer with several consumers is a legitimate fan-out");
+}
+
+/// U7 guard: admitting repeated edges with the same producer (fan-out) must
+/// not mask a later DIFFERENT producer of the same value generation — the
+/// "one value generation has exactly one producer" invariant still holds.
+#[test]
+fn fan_out_does_not_mask_a_different_producer() {
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![DescriptorKernel {
+            entry: "add_one".to_owned(),
+            buffers: vec![add_slot(9, "acc", DeviceBufferRole::InOut, 0, 2)],
+            grid: [1, 1, 1],
+            block: [2, 1, 1],
+        }],
+        vec![
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 4,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 5,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 8,
+                kernel_index: 0,
+            },
+        ],
+        vec![
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 4,
+                consumer: 5,
+            },
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 4,
+                consumer: 8,
+            },
+            DescriptorDataFlow {
+                buffer_id: 9,
+                version: 1,
+                producer: 2,
+                consumer: 5,
+            },
+        ],
+        Vec::new(),
+    );
+    let err = descriptor
+        .validate()
+        .expect_err("a different producer must still fail after admitted fan-out");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        err.message
+            .contains("one value generation has exactly one producer")
+    );
+}
+
 /// F3 red test: a consumer scheduled before its producer is a missing
 /// dependency and fails validation before launch.
 #[test]
