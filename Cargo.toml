@@ -10,6 +10,7 @@ members = [
     "crates/solum",
     "crates/tempus",
     "macos-arm64",
+    "wasm",
 ]
 resolver = "2"
 

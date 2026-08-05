@@ -17,7 +17,6 @@ pub mod manifest;
 pub mod metal_host;
 pub mod syscall_import;
 pub mod wasm;
-pub mod wasm_rt_v1;
 
 pub use cuda_host::{
     probe_cuda_environment, CudaEnvReport, CudaHandleId, CudaHostSession, FakeCudaDriver,
@@ -29,4 +28,3 @@ pub use metal_host::{
     probe_metal_environment, FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession,
     E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };
-pub use wasm_rt_v1::{WasmRtV1Host, WasmRtV1RunResult, WASM_IMPORT_MODULE_V1};

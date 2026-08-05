@@ -1,0 +1,13 @@
+[package]
+name = "faber-host-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Portable core-Wasm product host for the Faber faber_rt_v1 surface"
+license = "MIT"
+publish = false
+
+[dependencies]
+wasmtime = "45"
+
+[dev-dependencies]
+wat = "1"

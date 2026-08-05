@@ -17,6 +17,7 @@ hosts/
     aleator/ consolum/ http/ processus/ solum/ tempus/
     provider-contracts/
   macos-arm64/         product: Wasm/component host for macOS arm64
+  wasm/                product: portable core-Wasm v1 host (`faber-host-wasm`)
   webgpu-browser/      product: browser WebGPU host (JS/static; not a Cargo member)
   scripta/             host-local helpers
 ```
