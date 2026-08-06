@@ -1,16 +1,19 @@
 //! Portable product runner proofs and typed reject cases.
 //!
 //! The success proofs use real compiler artifacts emitted by the radix Wasm
-//! target from Stage 1 ledger fixtures (`sic/sic.fab`, `per/per.fab`) and
-//! checked into `fixtures/`. Both modules import only scalar
-//! `__faber_rt_v1_diagnostic_*` functions, so their execution needs no
-//! externally reconstructed opaque-handle table. Reject cases assert the
-//! typed validation/import/link/entry/trap/runtime distinctions.
+//! target from Stage 1 ledger fixtures (`sic/sic.fab`, `per/per.fab`,
+//! `salve-munde/salve-munde.fab`) and checked into `fixtures/`. The scalar
+//! fixtures (`sic`/`per`) need no opaque-handle table; `salve-munde` proves
+//! the W11 literal-table contract (a text literal lives in module linear
+//! memory, the host interns it at generated initialization, and the program's
+//! literal reference is the arena handle). Reject cases assert the typed
+//! validation/import/link/initialization/entry/trap/runtime distinctions.
 
 use faber_host_wasm::{OutcomeCategory, RunConfig, RunOutcome, WasmRtV1Host, WASM_IMPORT_MODULE_V1};
 
 const SIC_WASM: &[u8] = include_bytes!("fixtures/sic.wasm");
 const PER_WASM: &[u8] = include_bytes!("fixtures/per.wasm");
+const SALVE_MUNDE_WASM: &[u8] = include_bytes!("fixtures/salve-munde.wasm");
 
 fn host() -> WasmRtV1Host {
     WasmRtV1Host::new().expect("host init")
@@ -401,5 +404,129 @@ fn we6_json_signature_mismatch_fails_link() {
         outcome.category(),
         OutcomeCategory::LinkFailed,
         "declared signature conflicting with the admitted json binding must be LinkFailed, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W11 literal table: text literals in linear memory, interned at init
+// ---------------------------------------------------------------------------
+
+/// `salve-munde/salve-munde.fab` (canonical hello-world): module-scope
+/// `nota "Salve, Munde!"` — a text literal the radix Wasm emitter puts in
+/// module linear memory under the W11 literal-table contract. The product
+/// host reads the declared table at generated initialization, interns the
+/// literal into its text arena, and renders the nota line from the interned
+/// text. The Rust oracle outcome is `Salve, Munde!\n`.
+#[test]
+fn salve_munde_renders_literal_through_the_host_text_arena() {
+    let outcome = host().run(SALVE_MUNDE_WASM, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "Salve, Munde!\n".to_owned()
+        },
+        "salve-munde must render its literal through the host arena, got: {outcome:?}"
+    );
+    assert_eq!(outcome.category(), OutcomeCategory::Success);
+}
+
+/// A synthetic module declaring the W11 literal table exactly as the emitter
+/// generates it (payload data + table rows + exported globals): the host
+/// interns the literal at init and the nota_text call renders it. This is the
+/// emitter's contract shape, not a host-side reconstruction of an interner
+/// table from WAT.
+#[test]
+fn declared_literal_table_interning_renders_text() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "Salve, Munde!")
+  (data (i32.const 13) "\00\00\00\00\0D\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 13))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit")
+    (call $nota_text (i32.const 0))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "Salve, Munde!\n".to_owned()
+        },
+        "the interned literal must render through the nota text row, got: {outcome:?}"
+    );
+}
+
+/// A module declaring only one of the two literal-table globals fails
+/// generated initialization with a typed outcome — entry never runs.
+#[test]
+fn partial_literal_table_declaration_fails_initialization() {
+    let bytes = wat_bytes(r#"
+(module
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 0))
+  (func (export "incipit") (return))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::InitializationFailed,
+        "a half-declared literal table must be InitializationFailed, got: {outcome:?}"
+    );
+    if let RunOutcome::InitializationFailed { message } = &outcome {
+        assert!(
+            message.contains("__faber_rt_v1_literal_table_count"),
+            "message must name the missing table global: {message}"
+        );
+    }
+}
+
+/// A literal table whose rows extend past linear memory fails generated
+/// initialization with a typed outcome — the host never reads past the
+/// module's memory and never synthesizes a handle table.
+#[test]
+fn literal_table_out_of_bounds_fails_initialization() {
+    let bytes = wat_bytes(r#"
+(module
+  (memory (export "memory") 1)
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 65532))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit") (return))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::InitializationFailed,
+        "an out-of-bounds literal table must be InitializationFailed, got: {outcome:?}"
+    );
+}
+
+/// A literal-table handle with no interned row still produces a typed runtime
+/// failure (never a plausible default), even when the module does declare a
+/// table.
+#[test]
+fn uninterned_handle_produces_typed_runtime_failure() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "Salve, Munde!")
+  (data (i32.const 13) "\00\00\00\00\0D\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 13))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit")
+    (call $nota_text (i32.const 1))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "a handle outside the interned table must be RuntimeFailure, got: {outcome:?}"
     );
 }

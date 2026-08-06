@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod host;
 pub mod imports;
+mod literal_table;
 pub mod outcome;
 
 pub use config::RunConfig;

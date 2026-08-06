@@ -39,10 +39,12 @@ pub(crate) const V1_DIAGNOSTIC_FIELDS: &[&str] = &[
 /// `__faber_rt_v1_diagnostic_nota_text`, mone onto
 /// `__faber_rt_v1_diagnostic_mone_text`). Every row carries text-handle i32
 /// operands; the product host never accepts an externally reconstructed
-/// handle table, and text materialization requires linear-memory literal data
-/// (Stage 4 literal initialization). Invoking one is a typed unsupported
-/// outcome (W13: declared-but-unimplemented -> typed unsupported, never a
-/// silent no-op or a plausible default).
+/// handle table. W11 literal initialization made consolum `scribe` (nota)
+/// renderable through the host text arena; solum reads/writes remain typed
+/// unsupported for the W15 deny-by-default filesystem reason and mone stays
+/// unsupported because this stage's host captures stdout only (W13:
+/// declared-but-unimplemented -> typed unsupported, never a silent no-op or a
+/// plausible default).
 pub(crate) const V1_PROVIDER_TEXT_FIELDS: &[&str] = &[
     "__faber_rt_v1_solum_read_text",
     "__faber_rt_v1_solum_read_lines",
@@ -74,13 +76,21 @@ fn is_admitted_field(field: &str) -> bool {
         || V1_JSON_FIELDS.contains(&field)
 }
 
-/// Per-run host state: captured stdout, capture bound, and the typed
-/// unsupported-symbol record for admitted-but-unfinished behavior.
+/// Per-run host state: captured stdout, capture bound, the typed
+/// unsupported-symbol record for admitted-but-unfinished behavior, and the
+/// W11 text arena of interned literals.
 #[derive(Debug)]
 pub(crate) struct HostState {
     pub(crate) stdout: String,
     pub(crate) max_stdout_bytes: usize,
     pub(crate) unsupported: Option<String>,
+    /// Interned literal payloads (W11). One entry per distinct literal; the
+    /// interning dedup map guarantees content-unique entries.
+    text_arena: Vec<String>,
+    /// Table row -> arena handle. The program's literal operands are table
+    /// row indices; this map resolves them to interned arena entries. Empty
+    /// when the module declares no literal table.
+    row_handles: Vec<i32>,
 }
 
 impl HostState {
@@ -89,7 +99,41 @@ impl HostState {
             stdout: String::new(),
             max_stdout_bytes,
             unsupported: None,
+            text_arena: Vec::new(),
+            row_handles: Vec::new(),
         }
+    }
+
+    /// Intern the declared literal-table rows into the text arena and record
+    /// the per-row arena handles the program references.
+    ///
+    /// Interning dedups by content (identical payloads share one arena entry)
+    /// while each table row keeps its own handle slot. The emitter already
+    /// deduplicates rows by unescaped payload, so row handles normally equal
+    /// their row index; the indirection keeps the contract honest if a future
+    /// emitter emits duplicate payloads.
+    pub(crate) fn intern_literal_table(&mut self, rows: &[String]) {
+        let mut content_to_handle = std::collections::HashMap::<&str, i32>::default();
+        for row in rows {
+            let handle = if let Some(handle) = content_to_handle.get(row.as_str()) {
+                *handle
+            } else {
+                let handle =
+                    i32::try_from(self.text_arena.len()).expect("text arena handle fits i32");
+                self.text_arena.push(row.clone());
+                content_to_handle.insert(row.as_str(), handle);
+                handle
+            };
+            self.row_handles.push(handle);
+        }
+    }
+
+    /// Resolve a program text-handle operand to its interned literal.
+    pub(crate) fn resolve_text(&self, handle: i32) -> Option<&str> {
+        let row = usize::try_from(handle).ok()?;
+        let arena_handle = *self.row_handles.get(row)?;
+        let index = usize::try_from(arena_handle).ok()?;
+        self.text_arena.get(index).map(String::as_str)
     }
 
     /// Append one diagnostic line (terminated by `\n`), bounded by the run
@@ -150,28 +194,26 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_scalar_i32(linker, "__faber_rt_v1_diagnostic_nota_i1")?;
     bind_scalar_f64(linker, "__faber_rt_v1_diagnostic_nota_f64")?;
     bind_scalar_f64(linker, "__faber_rt_v1_diagnostic_nota_f32")?;
-    bind_text_handle(linker, "__faber_rt_v1_diagnostic_nota_ptr")?;
-    bind_text_handle(linker, "__faber_rt_v1_diagnostic_mone_ptr")?;
-    bind_text_handle(linker, "__faber_rt_v1_diagnostic_vide_ptr")?;
+    // W11: `nota`/`vide` text diagnostics resolve the interned literal (the
+    // operand is a literal-table row) and write it to the captured stdout
+    // line — the wasm outcome unblocker. `mone` streams to stderr, which this
+    // stage's product host does not capture, so it stays a typed unsupported
+    // outcome (never a silent redirect to stdout).
+    bind_stdout_text(linker, "__faber_rt_v1_diagnostic_nota_ptr", "nota/stdout")?;
+    bind_mone_text(linker, "__faber_rt_v1_diagnostic_mone_ptr")?;
+    bind_stdout_text(linker, "__faber_rt_v1_diagnostic_vide_ptr", "vide/stdout")?;
     // W4B provider text surface: bound with the exact signatures the radix
-    // Wasm emitter emits. No host implementation exists in this stage (no fs
-    // capability in RunConfig per W15 deny-by-default; text handles cannot be
-    // materialized without linear-memory literal data), so invoking one is a
-    // typed unsupported outcome — never a silent no-op (W13).
+    // Wasm emitter emits. Solum reads/writes stay typed unsupported (no fs
+    // capability in RunConfig per W15 deny-by-default); consolum
+    // scribe/nota_text close-overlap the nota stdout renderer above, and
+    // mone_text stays a typed unsupported stderr stream (W13 — never a
+    // silent no-op).
     bind_solum_read_handle(linker, "__faber_rt_v1_solum_read_text")?;
     bind_solum_read_handle(linker, "__faber_rt_v1_solum_read_lines")?;
     bind_solum_read_handle(linker, "__faber_rt_v1_solum_read_bytes")?;
     bind_solum_write_text(linker)?;
-    bind_consolum_diagnostic_text(
-        linker,
-        "__faber_rt_v1_diagnostic_nota_text",
-        "scribe -> nota/stdout",
-    )?;
-    bind_consolum_diagnostic_text(
-        linker,
-        "__faber_rt_v1_diagnostic_mone_text",
-        "mone -> stderr",
-    )?;
+    bind_stdout_text(linker, "__faber_rt_v1_diagnostic_nota_text", "nota/stdout (scribe)")?;
+    bind_mone_text(linker, "__faber_rt_v1_diagnostic_mone_text")?;
     // WE6 json surface: bound with the exact `(param i32) (result i32)`
     // handle signatures the radix Wasm emitter emits. No json host
     // implementation exists in this stage, so invoking one is a typed
@@ -218,22 +260,58 @@ fn bind_scalar_f64(linker: &mut Linker<HostState>, field: &str) -> Result<(), wa
     Ok(())
 }
 
-/// Text/aggregate handle carriers are admitted symbols whose behavior is not
-/// implemented until Stage 4 literal initialization puts text in module
-/// memory. Invoking one is a typed runtime failure — the product runner never
+/// Stdout-stream text diagnostics (`nota`, `vide`, consolum `scribe`): W11
+/// materializes the interned literal — the operand is a literal-table row
+/// resolved through the host text arena — into the captured stdout line. An
+/// unresolvable handle is a typed runtime failure; the product runner never
 /// accepts an externally reconstructed handle table.
-fn bind_text_handle(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+fn bind_stdout_text(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+    stream: &'static str,
+) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+            let text = caller.data().resolve_text(handle).map(str::to_owned);
+            match text {
+                Some(text) => {
+                    caller.data_mut().write_line(&text);
+                    Ok(())
+                }
+                None => {
+                    caller.data_mut().unsupported = Some(format!(
+                        "`{field}` handle {handle}: unknown text handle ({stream} oracle stream \
+                         needs an interned literal; Stage 4 literal initialization); the product \
+                         runner accepts no external handle table"
+                    ));
+                    Err(wasmtime::Error::msg(
+                        "unsupported v1 text materialization (unknown literal-table handle)",
+                    ))
+                }
+            }
+        },
+    )?;
+    Ok(())
+}
+
+/// Mone text (`mone_ptr`/`mone_text`) streams to stderr, which this stage's
+/// product host does not capture (stdout only). Invoking one is a typed
+/// runtime failure naming the oracle stream — never a silent redirect to
+/// stdout and never a plausible default (W13).
+fn bind_mone_text(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
         move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
             caller.data_mut().unsupported = Some(format!(
-                "`{field}` handle {handle}: text materialization requires linear-memory \
-                 literal data (Stage 4 literal initialization); the product runner accepts \
-                 no external handle table"
+                "`{field}` handle {handle}: mone/stderr oracle stream is not captured by this \
+                 stage's product host (stdout capture only); typed unsupported until stderr \
+                 capture lands — never a silent redirect to stdout"
             ));
             Err(wasmtime::Error::msg(
-                "unsupported v1 text materialization (admitted symbol, unfinished behavior)",
+                "unsupported v1 mone text (admitted symbol, stderr not captured)",
             ))
         },
     )?;
@@ -284,34 +362,6 @@ fn bind_solum_write_text(linker: &mut Linker<HostState>) -> Result<(), wasmtime:
             ));
             Err(wasmtime::Error::msg(
                 "unsupported v1 solum write (admitted symbol, unfinished behavior)",
-            ))
-        },
-    )?;
-    Ok(())
-}
-
-/// Consolum scribe/mone close-overlap the v1 diagnostic text rows. The
-/// emitted operand is an opaque text handle and the runner never accepts an
-/// external handle table, so the oracle stream semantics (`stream` — scribe
-/// -> nota/stdout, mone -> stderr) cannot be realized until linear-memory
-/// literal initialization lands. Invoking one is a typed runtime failure.
-fn bind_consolum_diagnostic_text(
-    linker: &mut Linker<HostState>,
-    field: &'static str,
-    stream: &'static str,
-) -> Result<(), wasmtime::Error> {
-    linker.func_wrap(
-        WASM_IMPORT_MODULE_V1,
-        field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
-            caller.data_mut().unsupported = Some(format!(
-                "`{field}` handle {handle}: consolum diagnostic text materialization requires \
-                 linear-memory literal data (Stage 4 literal initialization); the product runner \
-                 accepts no external handle table ({stream} oracle stream parity lands with it); \
-                 declared-but-unimplemented -> typed unsupported"
-            ));
-            Err(wasmtime::Error::msg(
-                "unsupported v1 consolum diagnostic text (admitted symbol, unfinished behavior)",
             ))
         },
     )?;

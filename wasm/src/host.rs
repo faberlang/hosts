@@ -68,6 +68,16 @@ impl WasmRtV1Host {
             }
         };
 
+        // W11 generated initialization: read the declared literal table from
+        // linear memory and intern each literal into the host arena. A
+        // malformed or missing declaration fails initialization — entry never
+        // runs (architecture lifecycle: host calls generated init exactly
+        // once, before invoking the entry).
+        if let Err(outcome) = crate::literal_table::initialize_literal_table(&instance, &mut store)
+        {
+            return outcome;
+        }
+
         let entry = config.entry.clone();
         let Some(func) = instance.get_func(&mut store, &entry) else {
             return RunOutcome::EntryMissing { entry };
