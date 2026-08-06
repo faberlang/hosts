@@ -7,8 +7,16 @@
 //! runtime failure when invoked — never a plausible default (architecture.md:
 //! "must not return a plausible default").
 
+use crate::collections::{
+    display_fractus, runtime_value_eq, value_from_i64, value_to_i64, CollectionValue, MapValue,
+    OptionValue, RuntimeValue,
+};
 use crate::outcome::RunOutcome;
-use std::collections::HashMap;
+use radix_host_abi::{
+    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I32,
+    VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+};
+use std::collections::{BTreeMap, HashMap};
 use wasmtime::{Linker, Module};
 
 /// Import module for the closed CPU host ABI v1 surface.
@@ -119,6 +127,69 @@ pub(crate) const V1_REGEX_FIELDS: &[&str] = &[
     "__faber_rt_v1_regex_from_ascii",
 ];
 
+/// W13 collection surface: the closed-set v1 rows the radix Wasm emitter now
+/// emits for the collection/scalar display family. Every value/key argument
+/// crosses the normalized `i64` value carrier (wasm has no pointer carriers);
+/// the host interprets each value per the collection's declared `VALUE_KIND`.
+/// `array_push` returns the collection handle so literal construction can
+/// chain `(local.set $t (call push ...))`.
+pub(crate) const V1_COLLECTION_FIELDS: &[&str] = &[
+    "__faber_rt_v1_array_new",
+    "__faber_rt_v1_array_push",
+    "__faber_rt_v1_array_extend",
+    "__faber_rt_v1_array_length",
+    "__faber_rt_v1_array_get",
+    "__faber_rt_v1_array_option",
+    "__faber_rt_v1_array_contains",
+    "__faber_rt_v1_array_is_empty",
+    "__faber_rt_v1_array_reverse",
+    "__faber_rt_v1_array_sort",
+    "__faber_rt_v1_array_sum",
+    "__faber_rt_v1_map_new",
+    "__faber_rt_v1_map_put",
+    "__faber_rt_v1_map_delete",
+    "__faber_rt_v1_map_keys",
+    "__faber_rt_v1_map_values",
+    "__faber_rt_v1_set_new",
+    "__faber_rt_v1_set_from_array",
+    "__faber_rt_v1_array_from_set",
+    "__faber_rt_v1_set_union",
+    "__faber_rt_v1_set_intersection",
+    "__faber_rt_v1_set_difference",
+    "__faber_rt_v1_set_symmetric_difference",
+    "__faber_rt_v1_set_is_subset",
+    "__faber_rt_v1_set_is_superset",
+];
+
+/// W13 option surface: the closed-set v1 rows for the null-encoded/arena
+/// option model. `none`/`some` carry the payload kind; `get`/`get_or` cross
+/// the payload widened to `i64`.
+pub(crate) const V1_OPTION_FIELDS: &[&str] = &[
+    "__faber_rt_v1_option_none",
+    "__faber_rt_v1_option_some",
+    "__faber_rt_v1_option_get",
+    "__faber_rt_v1_option_get_or",
+    "__faber_rt_v1_option_is_present",
+];
+
+/// W13 scalar conversion surface: the closed-set v1 rows for scalar/format
+/// display and text↦scalar conversion the corpus fixtures route through.
+pub(crate) const V1_SCALAR_FIELDS: &[&str] = &[
+    "__faber_rt_v1_diagnostic_nota_i1",
+    "__faber_rt_v1_assert",
+    "__faber_rt_v1_assert_message",
+    "__faber_rt_v1_text_i64",
+    "__faber_rt_v1_text_f64",
+    "__faber_rt_v1_text_i1",
+    "__faber_rt_v1_text_truthy",
+    "__faber_rt_v1_ascii_truthy",
+    "__faber_rt_v1_text_parse_integer",
+    "__faber_rt_v1_text_parse_integer_or",
+    "__faber_rt_v1_text_parse_float",
+    "__faber_rt_v1_text_parse_float_or",
+    "__faber_rt_v1_read_line_0_to_ptr",
+];
+
 /// True when `field` is admitted by the closed v1 registry.
 fn is_admitted_field(field: &str) -> bool {
     V1_DIAGNOSTIC_FIELDS.contains(&field)
@@ -127,6 +198,9 @@ fn is_admitted_field(field: &str) -> bool {
         || V1_FORMAT_FIELDS.contains(&field)
         || V1_TEXT_FIELDS.contains(&field)
         || V1_REGEX_FIELDS.contains(&field)
+        || V1_COLLECTION_FIELDS.contains(&field)
+        || V1_OPTION_FIELDS.contains(&field)
+        || V1_SCALAR_FIELDS.contains(&field)
 }
 
 /// Kind of one interned literal-table row (W12).
@@ -157,18 +231,29 @@ pub(crate) struct RegexValue {
     pub(crate) flags: Option<String>,
 }
 
-/// A host-allocated dynamic value (format results, conversion results). The
-/// handle space starts after the last declared literal-table row, so dynamic
-/// handles never collide with row indices.
+/// A host-allocated dynamic value (format results, conversion results, and
+/// the W13 collection/scalar display arenas). The handle space starts after
+/// the last declared literal-table row, so dynamic handles never collide with
+/// row indices.
 #[derive(Debug)]
 enum DynamicValue {
     Text(String),
     Regex(RegexValue),
+    Collection {
+        index: usize,
+    },
+    Map {
+        index: usize,
+    },
+    Option {
+        index: usize,
+    },
 }
 
 /// Per-run host state: captured stdout/stderr, capture bound, the typed
 /// unsupported-symbol record for admitted-but-unfinished behavior, the W12
-/// typed arenas of interned literals, and the dynamic-handle space.
+/// typed arenas of interned literals, the W13 collection/map/option arenas,
+/// and the dynamic-handle space.
 #[derive(Debug)]
 pub(crate) struct HostState {
     pub(crate) stdout: String,
@@ -184,6 +269,12 @@ pub(crate) struct HostState {
     octeti_arena: Vec<Vec<u8>>,
     /// Regex values: interned regex rows plus dynamic regexes.
     regex_arena: Vec<RegexValue>,
+    /// W13 — collection arena (`lista`/`copia` entries).
+    collections: Vec<CollectionValue>,
+    /// W13 — map arena (`tabula` entries).
+    maps: Vec<MapValue>,
+    /// W13 — option arena (payload entries).
+    options: Vec<OptionValue>,
     /// Dynamic-handle allocator: starts after the last declared row.
     next_dynamic: i32,
     /// Host-allocated dynamic values by handle.
@@ -201,6 +292,9 @@ impl HostState {
             text_arena: Vec::new(),
             octeti_arena: Vec::new(),
             regex_arena: Vec::new(),
+            collections: Vec::new(),
+            maps: Vec::new(),
+            options: Vec::new(),
             next_dynamic: 0,
             dynamic: HashMap::new(),
         }
@@ -380,6 +474,22 @@ impl HostState {
         None
     }
 
+    /// Resolve an octeti literal row mutably (an `octeti` unifies with
+    /// `lista<u8>`: `appende`/`longitudo`/`accipe` run on the interned byte
+    /// payload — W13).
+    pub(crate) fn resolve_octeti_mut(&mut self, handle: i32) -> Option<&mut Vec<u8>> {
+        let index = usize::try_from(handle).ok()?;
+        if index < self.rows.len() {
+            let row = &self.rows[index];
+            if !matches!(row.kind, InternedRowKind::Octeti) {
+                return None;
+            }
+            let arena = usize::try_from(row.arena).ok()?;
+            return self.octeti_arena.get_mut(arena);
+        }
+        None
+    }
+
     /// Resolve a regex handle: an interned regex row, else a dynamic regex.
     pub(crate) fn resolve_regex(&self, handle: i32) -> Option<&RegexValue> {
         let index = usize::try_from(handle).ok()?;
@@ -397,10 +507,112 @@ impl HostState {
         None
     }
 
+    // -----------------------------------------------------------------------
+    // W13 collection/scalar display arenas
+    // -----------------------------------------------------------------------
+
+    /// Allocate one collection (`lista`/`copia`) and return its handle.
+    pub(crate) fn alloc_collection(
+        &mut self,
+        set: bool,
+        kind: u32,
+        values: Vec<RuntimeValue>,
+    ) -> i32 {
+        let index = self.collections.len();
+        self.collections.push(CollectionValue { set, kind, values });
+        self.alloc_dynamic(DynamicValue::Collection { index })
+    }
+
+    /// Allocate one map (`tabula`) and return its handle.
+    pub(crate) fn alloc_map(
+        &mut self,
+        key_kind: u32,
+        value_kind: u32,
+        entries: Vec<(RuntimeValue, RuntimeValue)>,
+    ) -> i32 {
+        let index = self.maps.len();
+        self.maps.push(MapValue {
+            key_kind,
+            value_kind,
+            entries,
+        });
+        self.alloc_dynamic(DynamicValue::Map { index })
+    }
+
+    /// Allocate one option and return its handle.
+    pub(crate) fn alloc_option(&mut self, kind: u32, payload: Option<RuntimeValue>) -> i32 {
+        let index = self.options.len();
+        self.options.push(OptionValue { kind, payload });
+        self.alloc_dynamic(DynamicValue::Option { index })
+    }
+
+    /// Encode one index-read option result. i64/f64 payloads cannot fit a
+    /// null-encoded i32 handle, so they wrap in the option arena (nota renders
+    /// the payload, `option_get_or` unwraps it); i32-carrying payloads
+    /// null-encode — the payload value IS the handle (0 = absent), matching
+    /// the emitter's inline select coalesce.
+    pub(crate) fn option_result(&mut self, kind: u32, payload: Option<RuntimeValue>) -> i32 {
+        let scalar_kind = matches!(
+            kind,
+            VALUE_KIND_I64 | VALUE_KIND_U64 | VALUE_KIND_F32 | VALUE_KIND_F64
+        );
+        if scalar_kind {
+            self.alloc_option(kind, payload)
+        } else {
+            match payload {
+                Some(payload) => value_to_i64(payload) as i32,
+                None => 0,
+            }
+        }
+    }
+
+    /// Resolve a collection (`lista`/`copia`) handle.
+    pub(crate) fn find_collection(&self, handle: i32) -> Option<&CollectionValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Collection { index }) => self.collections.get(*index),
+            _ => None,
+        }
+    }
+
+    /// Resolve a collection handle mutably.
+    pub(crate) fn find_collection_mut(&mut self, handle: i32) -> Option<&mut CollectionValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Collection { index }) => self.collections.get_mut(*index),
+            _ => None,
+        }
+    }
+
+    /// Resolve a map (`tabula`) handle.
+    pub(crate) fn find_map(&self, handle: i32) -> Option<&MapValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Map { index }) => self.maps.get(*index),
+            _ => None,
+        }
+    }
+
+    /// Resolve a map handle mutably.
+    pub(crate) fn find_map_mut(&mut self, handle: i32) -> Option<&mut MapValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Map { index }) => self.maps.get_mut(*index),
+            _ => None,
+        }
+    }
+
+    /// Resolve an option handle.
+    pub(crate) fn find_option(&self, handle: i32) -> Option<&OptionValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Option { index }) => self.options.get(*index),
+            _ => None,
+        }
+    }
+
     /// Resolve a diagnostic handle to its rendered line: text rows and
-    /// dynamic texts render as-is, regex handles render their pattern, and
-    /// octeti handles render the byte-list Debug shape (mirroring the LLVM
-    /// host's opaque display).
+    /// dynamic texts render as-is, regex handles render their pattern,
+    /// octeti handles render the byte-list Debug shape, and the W13
+    /// collection/scalar arenas render in the Rust-oracle Debug shapes
+    /// (`[1, 2, 3]` / `["prima", "secunda"]` / `{1, 2}` /
+    /// `Json(Tabula({...}))` / payload-or-`nihil`) — mirroring the LLVM
+    /// host's opaque display.
     pub(crate) fn resolve_diagnostic(&self, handle: i32) -> Option<String> {
         if let Some(text) = self.resolve_text(handle) {
             return Some(text.to_owned());
@@ -411,7 +623,192 @@ impl HostState {
         if let Some(bytes) = self.resolve_octeti(handle) {
             return Some(format!("{bytes:?}"));
         }
+        if let Some(collection) = self.find_collection(handle) {
+            return self.render_collection(collection);
+        }
+        if let Some(map) = self.find_map(handle) {
+            return self.render_map(map);
+        }
+        if let Some(option) = self.find_option(handle) {
+            return match option.payload {
+                Some(payload) => self.render_option_payload(option.kind, payload),
+                None => Some("nihil".to_owned()),
+            };
+        }
+        // Null-encoded option: handle 0 is `nihil`.
+        if handle == 0 {
+            return Some("nihil".to_owned());
+        }
         None
+    }
+
+    /// Render one collection element in the Rust-oracle Debug shape. Text
+    /// elements quote (`"prima"`, matching `Vec<String>` Debug), bivalens
+    /// elements render `true`/`false`, and nested aggregate handles resolve
+    /// recursively.
+    fn render_element(&self, kind: u32, value: RuntimeValue) -> Option<String> {
+        Some(match (kind, value) {
+            (VALUE_KIND_I1, RuntimeValue::I1(value)) => {
+                format!("{value}")
+            }
+            (_, RuntimeValue::I1(value)) => format!("{value}"),
+            (_, RuntimeValue::I32(value)) => format!("{value}"),
+            (_, RuntimeValue::I64(value)) => format!("{value}"),
+            (_, RuntimeValue::F64(value)) => display_fractus(value),
+            (VALUE_KIND_TEXT | VALUE_KIND_ASCII, RuntimeValue::Handle(handle)) => {
+                format!("{:?}", self.resolve_text(handle)?)
+            }
+            (VALUE_KIND_PTR | VALUE_KIND_VALOR, RuntimeValue::Handle(handle)) => {
+                self.render_handle_display(handle)?
+            }
+            _ => return None,
+        })
+    }
+
+    /// Render a `[a, b, c]` / `{a, b, c}` collection in the Rust-oracle Debug
+    /// shape (stored order for sets, matching the L10 LLVM host).
+    fn render_collection(&self, collection: &CollectionValue) -> Option<String> {
+        let mut rendered = Vec::with_capacity(collection.values.len());
+        for element in &collection.values {
+            rendered.push(self.render_element(collection.kind, *element)?);
+        }
+        let body = rendered.join(", ");
+        if collection.set {
+            Some(format!("{{{body}}}"))
+        } else {
+            Some(format!("[{body}]"))
+        }
+    }
+
+    /// Render a `tabula` handle in the Rust-oracle derived
+    /// `Json(Tabula({...}))` Debug shape (keys sorted like the LLVM host's
+    /// BTreeMap; non-text keys fail closed).
+    fn render_map(&self, map: &MapValue) -> Option<String> {
+        let mut entries = BTreeMap::new();
+        for (key, value) in &map.entries {
+            let RuntimeValue::Handle(key_handle) = key else {
+                return None;
+            };
+            let key = self.resolve_text(*key_handle)?;
+            let value = self.render_valor_value(map.value_kind, *value)?;
+            entries.insert(key.to_owned(), value);
+        }
+        Some(format!("Json({})", render_valor_tabula(&entries)))
+    }
+
+    /// Render a value in the `Valor` Debug shape (`Numerus(10)` /
+    /// `Textus("x")` / `Fractus(1.0)` / `Bivalens(true)` / `Nihil` /
+    /// nested `Tabula({...})` / `Lista([...])`).
+    fn render_valor_value(&self, kind: u32, value: RuntimeValue) -> Option<String> {
+        Some(match (kind, value) {
+            (VALUE_KIND_I1, RuntimeValue::I1(value)) => format!("Bivalens({value})"),
+            (VALUE_KIND_I32 | VALUE_KIND_I64, RuntimeValue::I32(value)) => {
+                format!("Numerus({value})")
+            }
+            (VALUE_KIND_I64, RuntimeValue::I64(value)) => format!("Numerus({value})"),
+            (VALUE_KIND_F64, RuntimeValue::F64(value)) => format!("Fractus({value:?})"),
+            (VALUE_KIND_TEXT | VALUE_KIND_ASCII, RuntimeValue::Handle(handle)) => {
+                format!("Textus({:?})", self.resolve_text(handle)?)
+            }
+            (VALUE_KIND_PTR | VALUE_KIND_VALOR, RuntimeValue::Handle(handle)) => {
+                self.render_handle_valor(handle)?
+            }
+            _ => return None,
+        })
+    }
+
+    /// Render a handle as a nested `Valor` Debug value.
+    fn render_handle_valor(&self, handle: i32) -> Option<String> {
+        if let Some(text) = self.resolve_text(handle) {
+            return Some(format!("Textus({text:?})"));
+        }
+        if let Some(bytes) = self.resolve_octeti(handle) {
+            return Some(format!("Octeti({bytes:?})"));
+        }
+        if let Some(map) = self.find_map(handle) {
+            let mut entries = BTreeMap::new();
+            for (key, value) in &map.entries {
+                let RuntimeValue::Handle(key_handle) = key else {
+                    return None;
+                };
+                let key = self.resolve_text(*key_handle)?;
+                let value = self.render_valor_value(map.value_kind, *value)?;
+                entries.insert(key.to_owned(), value);
+            }
+            return Some(render_valor_tabula(&entries));
+        }
+        if let Some(collection) = self.find_collection(handle) {
+            let mut items = Vec::with_capacity(collection.values.len());
+            for element in &collection.values {
+                items.push(self.render_valor_value(collection.kind, *element)?);
+            }
+            return Some(format!("Lista({items:?})"));
+        }
+        if let Some(option) = self.find_option(handle) {
+            return match option.payload {
+                Some(payload) => self.render_valor_value(option.kind, payload),
+                None => Some("Nihil".to_owned()),
+            };
+        }
+        if handle == 0 {
+            return Some("Nihil".to_owned());
+        }
+        None
+    }
+
+    /// Render an opaque handle for collection-element/option display: text
+    /// renders plain, collections/maps/options render recursively.
+    fn render_handle_display(&self, handle: i32) -> Option<String> {
+        if let Some(text) = self.resolve_text(handle) {
+            return Some(text.to_owned());
+        }
+        if let Some(regex) = self.resolve_regex(handle) {
+            return Some(regex.pattern.clone());
+        }
+        if let Some(bytes) = self.resolve_octeti(handle) {
+            return Some(format!("{bytes:?}"));
+        }
+        if let Some(collection) = self.find_collection(handle) {
+            return self.render_collection(collection);
+        }
+        if let Some(map) = self.find_map(handle) {
+            return self.render_map(map);
+        }
+        if let Some(option) = self.find_option(handle) {
+            return match option.payload {
+                Some(payload) => self.render_option_payload(option.kind, payload),
+                None => Some("nihil".to_owned()),
+            };
+        }
+        if handle == 0 {
+            return Some("nihil".to_owned());
+        }
+        None
+    }
+
+    /// Render an option payload in the nota/option Debug shape: text payloads
+    /// render plain, numeric payloads render decimal, nested handles render
+    /// recursively (the L10 opaque display contract).
+    fn render_option_payload(&self, kind: u32, payload: RuntimeValue) -> Option<String> {
+        Some(match (kind, payload) {
+            (VALUE_KIND_I1, RuntimeValue::I1(value)) => {
+                if value {
+                    "verum".to_owned()
+                } else {
+                    "falsum".to_owned()
+                }
+            }
+            (VALUE_KIND_I32, RuntimeValue::I32(value)) => format!("{value}"),
+            (VALUE_KIND_I64, RuntimeValue::I64(value)) => format!("{value}"),
+            (VALUE_KIND_F64, RuntimeValue::F64(value)) => display_fractus(value),
+            (VALUE_KIND_TEXT | VALUE_KIND_ASCII, RuntimeValue::Handle(handle)) => {
+                self.resolve_text(handle)?.to_owned()
+            }
+            (VALUE_KIND_PTR | VALUE_KIND_VALOR, RuntimeValue::Handle(handle)) => {
+                self.render_handle_display(handle)?
+            }
+            _ => return None,
+        })
     }
 
     /// Append one diagnostic line (terminated by `\n`) to stdout, bounded by
@@ -425,6 +822,17 @@ impl HostState {
     pub(crate) fn write_stderr_line(&mut self, text: &str) {
         write_capped(&mut self.stderr, text, self.max_stdout_bytes);
     }
+}
+
+/// Render the `Valor::Tabula` Debug body: `Tabula({})` /
+/// `Tabula({"x": Numerus(10), "y": Numerus(20)})` in sorted key order.
+fn render_valor_tabula(entries: &BTreeMap<String, String>) -> String {
+    let body = entries
+        .iter()
+        .map(|(key, value)| format!("{key:?}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Tabula({{{body}}})")
 }
 
 fn write_capped(out: &mut String, text: &str, max_bytes: usize) {
@@ -479,7 +887,9 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_scalar_i64(linker, "__faber_rt_v1_diagnostic_vide_i64")?;
     bind_scalar_i32(linker, "__faber_rt_v1_diagnostic_nota_i32")?;
     bind_scalar_i32(linker, "__faber_rt_v1_diagnostic_nota_i8")?;
-    bind_scalar_i32(linker, "__faber_rt_v1_diagnostic_nota_i1")?;
+    // W13 — bivalens diagnostics render `verum`/`falsum` (never the integer
+    // shape); the emitter routes bivalens args to the closed-set `i1` row.
+    bind_scalar_i1(linker, "__faber_rt_v1_diagnostic_nota_i1")?;
     bind_scalar_f64(linker, "__faber_rt_v1_diagnostic_nota_f64")?;
     bind_scalar_f64(linker, "__faber_rt_v1_diagnostic_nota_f32")?;
     // W11/W12: `nota`/`vide` text diagnostics resolve the interned literal
@@ -539,6 +949,51 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     // W12 regex conversion rows.
     bind_regex_from_text(linker, "__faber_rt_v1_regex_from_text")?;
     bind_regex_from_text(linker, "__faber_rt_v1_regex_from_ascii")?;
+    // W13 scalar display rows.
+    bind_assert(linker, "__faber_rt_v1_assert")?;
+    bind_assert_message(linker)?;
+    bind_text_i64(linker)?;
+    bind_text_f64(linker)?;
+    bind_text_i1(linker)?;
+    bind_text_truthy(linker, "__faber_rt_v1_text_truthy")?;
+    bind_text_truthy(linker, "__faber_rt_v1_ascii_truthy")?;
+    bind_text_parse_integer(linker)?;
+    bind_text_parse_integer_or(linker)?;
+    bind_text_parse_float(linker)?;
+    bind_text_parse_float_or(linker)?;
+    bind_read_line(linker)?;
+    // W13 collection display rows.
+    bind_array_new(linker)?;
+    bind_array_push(linker)?;
+    bind_array_extend(linker)?;
+    bind_array_length(linker)?;
+    bind_array_get(linker)?;
+    bind_array_option(linker)?;
+    bind_array_contains(linker)?;
+    bind_array_is_empty(linker)?;
+    bind_array_reverse(linker)?;
+    bind_array_sort(linker)?;
+    bind_array_sum(linker)?;
+    bind_map_new(linker)?;
+    bind_map_put(linker)?;
+    bind_map_delete(linker)?;
+    bind_map_keys(linker)?;
+    bind_map_values(linker)?;
+    bind_set_new(linker)?;
+    bind_set_from_array(linker)?;
+    bind_array_from_set(linker)?;
+    bind_set_union(linker)?;
+    bind_set_intersection(linker)?;
+    bind_set_difference(linker)?;
+    bind_set_symmetric_difference(linker)?;
+    bind_set_is_subset(linker)?;
+    bind_set_is_superset(linker)?;
+    // W13 option rows.
+    bind_option_none(linker)?;
+    bind_option_some(linker)?;
+    bind_option_get(linker)?;
+    bind_option_get_or(linker)?;
+    bind_option_is_present(linker)?;
     Ok(())
 }
 
@@ -1055,14 +1510,6 @@ fn bind_format_1_ptr_to_ptr(linker: &mut Linker<HostState>) -> Result<(), wasmti
     Ok(())
 }
 
-fn display_fractus(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
-    }
-}
-
 fn display_bivalens(value: i32) -> &'static str {
     if value != 0 {
         "verum"
@@ -1327,4 +1774,1040 @@ fn format_float(value: f64) -> String {
     } else {
         value.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// W13 collection/scalar display rows
+// ---------------------------------------------------------------------------
+
+/// `array_new (param i32) (result i32)`: kind → empty `lista`.
+fn bind_array_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_new",
+        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller
+                .data_mut()
+                .alloc_collection(false, kind as u32, Vec::new()))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_push (param i32 i64) (result i32)`: append one element (interpreted
+/// per the collection's declared kind) and return the collection handle.
+fn bind_array_push(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_push",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: i64| -> Result<i32, wasmtime::Error> {
+            let collection = caller.data().find_collection(handle).map(|c| c.kind);
+            if let Some(kind) = collection {
+                let Some(value) = value_from_i64(kind, value) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("array_push handle {handle}: unknown element kind {kind}"),
+                    ));
+                };
+                let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("array_push handle {handle}: unknown collection handle"),
+                    ));
+                };
+                collection.values.push(value);
+                return Ok(handle);
+            }
+            // An `octeti` unifies with `lista<u8>`: `appende` mutates the
+            // interned byte payload.
+            if let Some(bytes) = caller.data_mut().resolve_octeti_mut(handle) {
+                bytes.push(value as u8);
+                return Ok(handle);
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("array_push handle {handle}: unknown collection handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_extend (param i32 i32) (result i32)`: splice one collection into
+/// another (`[sparge src, ...]`) and return the destination handle.
+fn bind_array_extend(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_extend",
+        move |mut caller: wasmtime::Caller<'_, HostState>, destination: i32, source: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let dest_kind = state.find_collection(destination).map(|c| c.kind);
+            let source_values = state.find_collection(source).map(|c| c.values.clone());
+            let (Some(dest_kind), Some(source_values)) = (dest_kind, source_values) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_extend {destination} <- {source}: unknown collection handle"),
+                ));
+            };
+            let Some(collection) = caller.data_mut().find_collection_mut(destination) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_extend {destination}: unknown collection handle"),
+                ));
+            };
+            if collection.kind != dest_kind {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "array_extend element-kind mismatch",
+                ));
+            }
+            collection.values.extend(source_values);
+            Ok(destination)
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_length (param i32) (result i64)`.
+fn bind_array_length(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_length",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+            if let Some(collection) = caller.data().find_collection(handle) {
+                return Ok(i64::try_from(collection.values.len()).expect("length fits i64"));
+            }
+            if let Some(map) = caller.data().find_map(handle) {
+                return Ok(i64::try_from(map.entries.len()).expect("length fits i64"));
+            }
+            // An `octeti` unifies with `lista<u8>`: length reads the payload.
+            if let Some(bytes) = caller.data().resolve_octeti(handle) {
+                return Ok(i64::try_from(bytes.len()).expect("length fits i64"));
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("array_length handle {handle}: unknown collection handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_get (param i32 i64) (result i64)`: read one element as an i64
+/// carrier. Out-of-range reads return `0` (the null-encoded option handle for
+/// `?[` chains; direct out-of-range subscripts do not panic in this stage).
+fn bind_array_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_get",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i64| -> Result<i64, wasmtime::Error> {
+            let state = caller.data();
+            if let Some(collection) = state.find_collection(handle) {
+                let Ok(index) = usize::try_from(index) else {
+                    return Ok(0);
+                };
+                return Ok(match collection.values.get(index) {
+                    Some(value) => value_to_i64(*value),
+                    None => 0,
+                });
+            }
+            // `octeti` unifies with `lista<u8>`: reads return the byte.
+            if let Some(bytes) = state.resolve_octeti(handle) {
+                let Ok(index) = usize::try_from(index) else {
+                    return Ok(0);
+                };
+                return Ok(bytes.get(index).copied().map(i64::from).unwrap_or(0));
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("array_get handle {handle}: unknown collection handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_option (param i32 i64) (result i32)`: index/key lookup returning an
+/// option result. The emitter normalizes `first`/`last`/`remove_first`/
+/// `remove_last`/`index` onto this row and discriminates the op by a negative
+/// key sentinel (`-1`..`-4`; indices and text-key handles are never
+/// negative). `remove_first`/`remove_last` also mutate the collection.
+fn bind_array_option(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_option",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i64| -> Result<i32, wasmtime::Error> {
+            // Resolve `(kind, payload)` under a scoped borrow, then encode the
+            // option result mutably.
+            let kind_payload = {
+                let state = caller.data();
+                if let Some(collection) = state.find_collection(handle) {
+                    let kind = collection.kind;
+                    let index = match key {
+                        -1 => 0,
+                        -2 => collection.values.len().saturating_sub(1),
+                        _ => usize::try_from(key).unwrap_or(usize::MAX),
+                    };
+                    let remove = matches!(key, -3 | -4);
+                    let last = key == -4 || key == -2;
+                    let payload = if remove {
+                        None
+                    } else {
+                        collection.values.get(index).copied()
+                    };
+                    Some((kind, payload, remove, last))
+                } else if let Some(map) = state.find_map(handle) {
+                    let key_handle = key as i32;
+                    let payload = map
+                        .entries
+                        .iter()
+                        .find(|(k, _)| *k == RuntimeValue::Handle(key_handle))
+                        .map(|(_, v)| *v);
+                    Some((map.value_kind, payload, false, false))
+                } else if let Some(bytes) = state.resolve_octeti(handle) {
+                    let Ok(index) = usize::try_from(key) else {
+                        return Ok(0);
+                    };
+                    let payload =
+                        bytes.get(index).copied().map(|b| RuntimeValue::I32(b as i32));
+                    Some((VALUE_KIND_U8, payload, false, false))
+                } else {
+                    None
+                }
+            };
+            let Some((kind, payload, remove, last)) = kind_payload else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_option handle {handle}: unknown collection handle"),
+                ));
+            };
+            let payload = if remove {
+                if last {
+                    caller
+                        .data_mut()
+                        .find_collection_mut(handle)
+                        .and_then(|c| c.values.pop())
+                } else {
+                    caller.data_mut().find_collection_mut(handle).and_then(|c| {
+                        if c.values.is_empty() {
+                            None
+                        } else {
+                            Some(c.values.remove(0))
+                        }
+                    })
+                }
+            } else {
+                payload
+            };
+            Ok(caller.data_mut().option_result(kind, payload))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_contains (param i32 i64) (result i32)`: element/value present?
+fn bind_array_contains(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_contains",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: i64| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            if let Some(collection) = state.find_collection(handle) {
+                let Some(value) = value_from_i64(collection.kind, value) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("array_contains handle {handle}: unknown element kind"),
+                    ));
+                };
+                return Ok(i32::from(
+                    collection.values.iter().any(|v| runtime_value_eq(*v, value)),
+                ));
+            }
+            if let Some(map) = state.find_map(handle) {
+                let key_handle = value as i32;
+                return Ok(i32::from(
+                    map.entries
+                        .iter()
+                        .any(|(k, _)| *k == RuntimeValue::Handle(key_handle)),
+                ));
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("array_contains handle {handle}: unknown collection handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_is_empty (param i32) (result i32)`.
+fn bind_array_is_empty(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_is_empty",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            if let Some(collection) = state.find_collection(handle) {
+                return Ok(i32::from(collection.values.is_empty()));
+            }
+            if let Some(map) = state.find_map(handle) {
+                return Ok(i32::from(map.entries.is_empty()));
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("array_is_empty handle {handle}: unknown collection handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_reverse (param i32)`: in-place reversal.
+fn bind_array_reverse(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_reverse",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+            let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_reverse handle {handle}: unknown collection handle"),
+                ));
+            };
+            collection.values.reverse();
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_sort (param i32) (result i32)`: sort the collection (in place) and
+/// return its handle.
+fn bind_array_sort(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_sort",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let kind = caller.data().find_collection(handle).map(|c| c.kind);
+            let Some(kind) = kind else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_sort handle {handle}: unknown collection handle"),
+                ));
+            };
+            let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_sort handle {handle}: unknown collection handle"),
+                ));
+            };
+            collection.values.sort_by_key(|value| value_to_i64(*value));
+            let _ = kind;
+            Ok(handle)
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_sum (param i32) (result i64)`: sum of the collection's elements
+/// (i64 interpretation; the f64-sum shape stays a separate cluster).
+fn bind_array_sum(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_sum",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+            let state = caller.data();
+            let Some(collection) = state.find_collection(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_sum handle {handle}: unknown collection handle"),
+                ));
+            };
+            let mut sum = 0i64;
+            for value in &collection.values {
+                sum = sum.wrapping_add(value_to_i64(*value));
+            }
+            Ok(sum)
+        },
+    )?;
+    Ok(())
+}
+
+/// `map_new (param i32 i32) (result i32)`: (key kind, value kind) → empty
+/// `tabula`.
+fn bind_map_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_map_new",
+        move |mut caller: wasmtime::Caller<'_, HostState>, key_kind: i32, value_kind: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller
+                .data_mut()
+                .alloc_map(key_kind as u32, value_kind as u32, Vec::new()))
+        },
+    )?;
+    Ok(())
+}
+
+/// `map_put (param i32 i32 i64)`: (map, key-handle, value-as-i64). The value
+/// is interpreted per the map's declared value kind.
+fn bind_map_put(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_map_put",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i32, value: i64| -> Result<(), wasmtime::Error> {
+            let state = caller.data();
+            let (value_kind, key_kind) = match state.find_map(handle) {
+                Some(map) => (map.value_kind, map.key_kind),
+                None => {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("map_put handle {handle}: unknown map handle"),
+                    ));
+                }
+            };
+            let Some(value) = value_from_i64(value_kind, value) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("map_put handle {handle}: unknown value kind {value_kind}"),
+                ));
+            };
+            let Some(map) = caller.data_mut().find_map_mut(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("map_put handle {handle}: unknown map handle"),
+                ));
+            };
+            let key_value = value_from_i64(key_kind, i64::from(key)).unwrap_or(RuntimeValue::Handle(key));
+            // Insert or replace by key identity.
+            if let Some(entry) = map
+                .entries
+                .iter_mut()
+                .find(|(k, _)| runtime_value_eq(*k, key_value))
+            {
+                entry.1 = value;
+            } else {
+                map.entries.push((key_value, value));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `map_delete (param i32 i64) (result i32)`: remove the key (as i64 carrier;
+/// text keys widen their handle) and return whether it was present. A `copia`
+/// handle is a set: delete removes the element value.
+fn bind_map_delete(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_map_delete",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i64| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            if let Some(map) = state.find_map(handle) {
+                let key_kind = map.key_kind;
+                let key_value =
+                    value_from_i64(key_kind, key).unwrap_or(RuntimeValue::Handle(key as i32));
+                let Some(map) = caller.data_mut().find_map_mut(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("map_delete handle {handle}: unknown map handle"),
+                    ));
+                };
+                let before = map.entries.len();
+                map.entries
+                    .retain(|(k, _)| !runtime_value_eq(*k, key_value));
+                return Ok(i32::from(map.entries.len() != before));
+            }
+            // `copia.dele(x)` deletes the element value (sets route the delete
+            // op through the closed map_delete row).
+            if let Some(collection) = state.find_collection(handle) {
+                let kind = collection.kind;
+                let Some(value) = value_from_i64(kind, key) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("map_delete handle {handle}: unknown element kind {kind}"),
+                    ));
+                };
+                let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("map_delete handle {handle}: unknown collection handle"),
+                    ));
+                };
+                let before = collection.values.len();
+                collection
+                    .values
+                    .retain(|existing| !runtime_value_eq(*existing, value));
+                return Ok(i32::from(collection.values.len() != before));
+            }
+            Err(typed_unsupported(
+                &mut caller,
+                format!("map_delete handle {handle}: unknown map handle"),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `map_keys (param i32) (result i32)`: a `lista<textus>` of the map's keys.
+fn bind_map_keys(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_map_keys",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(map) = state.find_map(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("map_keys handle {handle}: unknown map handle"),
+                ));
+            };
+            let mut keys = Vec::with_capacity(map.entries.len());
+            for (key, _) in &map.entries {
+                keys.push(*key);
+            }
+            Ok(caller.data_mut().alloc_collection(false, VALUE_KIND_TEXT, keys))
+        },
+    )?;
+    Ok(())
+}
+
+/// `map_values (param i32) (result i32)`: a `lista` of the map's values.
+fn bind_map_values(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_map_values",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(map) = state.find_map(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("map_values handle {handle}: unknown map handle"),
+                ));
+            };
+            let kind = map.value_kind;
+            let mut values = Vec::with_capacity(map.entries.len());
+            for (_, value) in &map.entries {
+                values.push(*value);
+            }
+            Ok(caller.data_mut().alloc_collection(false, kind, values))
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_new (param i32) (result i32)`: kind → empty `copia`.
+fn bind_set_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_new",
+        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller
+                .data_mut()
+                .alloc_collection(true, kind as u32, Vec::new()))
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_from_array (param i32) (result i32)`: build a `copia` from a `lista`
+/// (dedup, first-seen order).
+fn bind_set_from_array(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_from_array",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(collection) = state.find_collection(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("set_from_array handle {handle}: unknown collection handle"),
+                ));
+            };
+            let kind = collection.kind;
+            let mut unique = Vec::new();
+            for value in &collection.values {
+                if !unique.iter().any(|existing| runtime_value_eq(*existing, *value)) {
+                    unique.push(*value);
+                }
+            }
+            Ok(caller.data_mut().alloc_collection(true, kind, unique))
+        },
+    )?;
+    Ok(())
+}
+
+/// `array_from_set (param i32) (result i32)`: a `lista` copy of a `copia`.
+fn bind_array_from_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_array_from_set",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(collection) = state.find_collection(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("array_from_set handle {handle}: unknown collection handle"),
+                ));
+            };
+            let kind = collection.kind;
+            let values = collection.values.clone();
+            Ok(caller.data_mut().alloc_collection(false, kind, values))
+        },
+    )?;
+    Ok(())
+}
+
+/// One set algebra op shared by the `set_union`/`intersection`/`difference`/
+/// `symmetric_difference`/`is_subset`/`is_superset` rows. Returns a result
+/// handle or a bivalens.
+fn set_algebra<F>(
+    caller: &mut wasmtime::Caller<'_, HostState>,
+    left: i32,
+    right: i32,
+    reduce: F,
+) -> Result<i32, wasmtime::Error>
+where
+    F: Fn(&CollectionValue, &CollectionValue) -> Result<Vec<RuntimeValue>, ()>,
+{
+    let state = caller.data();
+    let (Some(left), Some(right)) = (state.find_collection(left), state.find_collection(right))
+    else {
+        return Err(typed_unsupported(
+            caller,
+            "set algebra received an unknown collection handle",
+        ));
+    };
+    let kind = left.kind;
+    let values = reduce(left, right).map_err(|()| {
+        typed_unsupported(caller, "set algebra element-kind mismatch")
+    })?;
+    Ok(caller.data_mut().alloc_collection(true, kind, values))
+}
+
+/// `set_union (param i32 i32) (result i32)`.
+fn bind_set_union(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_union",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            set_algebra(&mut caller, left, right, |l, r| {
+                let mut values = l.values.clone();
+                for value in &r.values {
+                    if !values.iter().any(|v| runtime_value_eq(*v, *value)) {
+                        values.push(*value);
+                    }
+                }
+                Ok(values)
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_intersection (param i32 i32) (result i32)`.
+fn bind_set_intersection(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_intersection",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            set_algebra(&mut caller, left, right, |l, r| {
+                Ok(l.values
+                    .iter()
+                    .copied()
+                    .filter(|value| r.values.iter().any(|v| runtime_value_eq(*v, *value)))
+                    .collect())
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_difference (param i32 i32) (result i32)`.
+fn bind_set_difference(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_difference",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            set_algebra(&mut caller, left, right, |l, r| {
+                Ok(l.values
+                    .iter()
+                    .copied()
+                    .filter(|value| !r.values.iter().any(|v| runtime_value_eq(*v, *value)))
+                    .collect())
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_symmetric_difference (param i32 i32) (result i32)`.
+fn bind_set_symmetric_difference(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_symmetric_difference",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            set_algebra(&mut caller, left, right, |l, r| {
+                let mut values = Vec::new();
+                for value in &l.values {
+                    if !r.values.iter().any(|v| runtime_value_eq(*v, *value)) {
+                        values.push(*value);
+                    }
+                }
+                for value in &r.values {
+                    if !l.values.iter().any(|v| runtime_value_eq(*v, *value)) {
+                        values.push(*value);
+                    }
+                }
+                Ok(values)
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_is_subset (param i32 i32) (result i32)`.
+fn bind_set_is_subset(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_is_subset",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let (Some(left), Some(right)) = (state.find_collection(left), state.find_collection(right))
+            else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "set_is_subset received an unknown collection handle",
+                ));
+            };
+            Ok(i32::from(
+                left.values
+                    .iter()
+                    .all(|value| right.values.iter().any(|v| runtime_value_eq(*v, *value))),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_is_superset (param i32 i32) (result i32)`.
+fn bind_set_is_superset(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_is_superset",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let (Some(left), Some(right)) = (state.find_collection(left), state.find_collection(right))
+            else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "set_is_superset received an unknown collection handle",
+                ));
+            };
+            Ok(i32::from(
+                right
+                    .values
+                    .iter()
+                    .all(|value| left.values.iter().any(|v| runtime_value_eq(*v, *value))),
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W13 option rows
+// ---------------------------------------------------------------------------
+
+/// `option_none (param i32) (result i32)`: kind → absent option handle.
+fn bind_option_none(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_option_none",
+        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller.data_mut().alloc_option(kind as u32, None))
+        },
+    )?;
+    Ok(())
+}
+
+/// `option_some (param i64 i32) (result i32)`: (payload-as-i64, kind) →
+/// present option handle.
+fn bind_option_some(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_option_some",
+        move |mut caller: wasmtime::Caller<'_, HostState>, value: i64, kind: i32| -> Result<i32, wasmtime::Error> {
+            let Some(payload) = value_from_i64(kind as u32, value) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("option_some received an unknown payload kind {kind}"),
+                ));
+            };
+            Ok(caller.data_mut().alloc_option(kind as u32, Some(payload)))
+        },
+    )?;
+    Ok(())
+}
+
+/// `option_get (param i32) (result i64)`: payload as i64 (0 for absent).
+fn bind_option_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_option_get",
+        move |caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+            let state = caller.data();
+            match state.find_option(handle) {
+                Some(option) => match option.payload {
+                    Some(payload) => Ok(value_to_i64(payload)),
+                    None => Ok(0),
+                },
+                None => Ok(i64::from(handle)),
+            }
+        },
+    )?;
+    Ok(())
+}
+
+/// `option_get_or (param i32 i64) (result i64)`: present → payload, absent →
+/// fallback (both as i64 carriers).
+fn bind_option_get_or(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_option_get_or",
+        move |caller: wasmtime::Caller<'_, HostState>, handle: i32, fallback: i64| -> Result<i64, wasmtime::Error> {
+            let state = caller.data();
+            match state.find_option(handle) {
+                Some(option) => match option.payload {
+                    Some(payload) => Ok(value_to_i64(payload)),
+                    None => Ok(fallback),
+                },
+                None => Ok(fallback),
+            }
+        },
+    )?;
+    Ok(())
+}
+
+/// `option_is_present (param i32) (result i32)`: arena option present, or a
+/// raw null-encoded handle being non-zero.
+fn bind_option_is_present(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_option_is_present",
+        move |caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            Ok(match state.find_option(handle) {
+                Some(option) => i32::from(option.payload.is_some()),
+                None => i32::from(handle != 0),
+            })
+        },
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W13 scalar display + conversion rows
+// ---------------------------------------------------------------------------
+
+/// `nota_i1 (param i32)`: bivalens diagnostics render `verum`/`falsum`.
+fn bind_scalar_i1(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>, value: i32| {
+            caller.data_mut().write_line(if value != 0 {
+                "verum"
+            } else {
+                "falsum"
+            });
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `assert (param i32)` / `assert_message (param i32 i32)`: an `adfirma` that
+/// fails aborts the run with a typed runtime failure (never a silent no-op).
+fn bind_assert(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>, condition: i32| -> Result<(), wasmtime::Error> {
+            if condition == 0 {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("`{field}` assertion failed"),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `assert_message (param i32 i32)`: assert with a message handle.
+fn bind_assert_message(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_assert_message",
+        move |mut caller: wasmtime::Caller<'_, HostState>, condition: i32, message: i32| -> Result<(), wasmtime::Error> {
+            if condition == 0 {
+                let message = caller
+                    .data()
+                    .resolve_text(message)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "<unknown>".to_owned());
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("assertion failed: {message}"),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_i64 (param i64) (result i32)`: scalar → text conversion.
+fn bind_text_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_i64",
+        move |mut caller: wasmtime::Caller<'_, HostState>, value: i64| -> Result<i32, wasmtime::Error> {
+            Ok(caller.data_mut().alloc_text(value.to_string()))
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_f64 (param f64) (result i32)`.
+fn bind_text_f64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_f64",
+        move |mut caller: wasmtime::Caller<'_, HostState>, value: f64| -> Result<i32, wasmtime::Error> {
+            Ok(caller.data_mut().alloc_text(display_fractus(value)))
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_i1 (param i32) (result i32)`.
+fn bind_text_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_i1",
+        move |mut caller: wasmtime::Caller<'_, HostState>, value: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller.data_mut().alloc_text(if value != 0 {
+                "verum".to_owned()
+            } else {
+                "falsum".to_owned()
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_truthy (param i32) (result i32)` / `ascii_truthy (param i32)
+/// (result i32)`: text/ascii → bivalens carrier (non-empty text is verum).
+fn bind_text_truthy(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i32, wasmtime::Error> {
+            let truthy = caller
+                .data()
+                .resolve_text(text)
+                .map(|text| !text.is_empty())
+                .unwrap_or(false);
+            Ok(i32::from(truthy))
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_parse_integer (param i32) (result i64)`: `textus ↦ numerus` (0 on
+/// parse failure, mirroring the shared oracle's fallback).
+fn bind_text_parse_integer(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_parse_integer",
+        move |caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i64, wasmtime::Error> {
+            let parsed = caller
+                .data()
+                .resolve_text(text)
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            Ok(parsed)
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_parse_integer_or (param i32 i64) (result i64)`: parse with a
+/// fallback value.
+fn bind_text_parse_integer_or(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_parse_integer_or",
+        move |caller: wasmtime::Caller<'_, HostState>, text: i32, fallback: i64| -> Result<i64, wasmtime::Error> {
+            let parsed = caller
+                .data()
+                .resolve_text(text)
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .unwrap_or(fallback);
+            Ok(parsed)
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_parse_float (param i32) (result f64)`.
+fn bind_text_parse_float(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_parse_float",
+        move |caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<f64, wasmtime::Error> {
+            let parsed = caller
+                .data()
+                .resolve_text(text)
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            Ok(parsed)
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_parse_float_or (param i32 f64) (result f64)`.
+fn bind_text_parse_float_or(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_text_parse_float_or",
+        move |caller: wasmtime::Caller<'_, HostState>, text: i32, fallback: f64| -> Result<f64, wasmtime::Error> {
+            let parsed = caller
+                .data()
+                .resolve_text(text)
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .unwrap_or(fallback);
+            Ok(parsed)
+        },
+    )?;
+    Ok(())
+}
+
+/// `read_line_0_to_ptr (result i32)`: `lege` reads one stdin line as
+/// `option<textus>`. The product host `RunConfig` carries no stdin adapter, so
+/// the honest outcome is an absent option (typed; never a synthesized text).
+fn bind_read_line(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_read_line_0_to_ptr",
+        move |mut caller: wasmtime::Caller<'_, HostState>| -> Result<i32, wasmtime::Error> {
+            let kind = VALUE_KIND_TEXT as i32;
+            Ok(caller.data_mut().alloc_option(kind as u32, None))
+        },
+    )?;
+    Ok(())
 }

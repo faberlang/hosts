@@ -8,6 +8,10 @@ publish = false
 
 [dependencies]
 wasmtime = "45"
+# Shared CPU host ABI v1 constants (`VALUE_KIND_*`, symbol rows). Read-only
+# surface; the W13 wasm host interprets the emitter's kind-coded collection
+# elements with the same semantic identities the LLVM host uses.
+radix-host-abi = { path = "../../radix/crates/radix-host-abi" }
 
 [dev-dependencies]
 wat = "1"

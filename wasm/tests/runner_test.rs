@@ -87,13 +87,13 @@ fn legacy_import_module_rejects_with_typed_outcome() {
     assert_eq!(outcome.category(), OutcomeCategory::ImportRejected);
 }
 
-/// A known v1 symbol outside the admitted Stage 2 registry rejects during
+/// A known v1 symbol outside the admitted Stage 2/5 registry rejects during
 /// preflight with a typed import outcome naming the field.
 #[test]
 fn unknown_v1_field_rejects_with_typed_outcome() {
     let bytes = wat_bytes(r#"
 (module
-  (import "faber_rt_v1" "__faber_rt_v1_array_length" (func $len (param i32) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_tensor_shape" (func $len (param i32) (result i32)))
   (func (export "incipit") (drop (call $len (i32.const 0))))
 )
 "#);
@@ -102,7 +102,7 @@ fn unknown_v1_field_rejects_with_typed_outcome() {
         matches!(
             &outcome,
             RunOutcome::ImportRejected { module, field, .. }
-                if module == WASM_IMPORT_MODULE_V1 && field == "__faber_rt_v1_array_length"
+                if module == WASM_IMPORT_MODULE_V1 && field == "__faber_rt_v1_tensor_shape"
         ),
         "unbound v1 field must reject with ImportRejected, got: {outcome:?}"
     );
@@ -902,5 +902,257 @@ fn regex_from_text_converts_a_text_handle_to_a_renderable_regex() {
             stderr: String::new(),
         },
         "regex_from_text must produce a regex the pointer diagnostic renders, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W13 collection/scalar display rows
+// ---------------------------------------------------------------------------
+
+/// An array literal constructed through `array_new(kind)` + `array_push`
+/// renders in the Rust-oracle `[1, 2, 3]` Debug shape when a pointer
+/// diagnostic resolves the handle.
+#[test]
+fn array_literal_renders_bracket_debug_shape() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_array_new" (func $array_new (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (func (export "incipit")
+    (local $t i32)
+    (local.set $t (call $array_new (i32.const 4)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 1)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 2)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 3)))
+    (call $nota_ptr (local.get $t))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[1, 2, 3]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "array handles must render in the lista Debug shape, got: {outcome:?}"
+    );
+}
+
+/// A text-element array renders the quoted `["prima", "secunda"]` shape and
+/// `array_get` reads elements back as i64 carriers.
+#[test]
+fn text_array_renders_quoted_elements_and_array_get_reads_elements() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_array_new" (func $array_new (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_get" (func $array_get (param i32 i64) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota_i64 (param i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "prima")
+  (data (i32.const 5) "secunda")
+  (data (i32.const 12) "\00\00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\05\00\00\00\07\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 12))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (local $t i32)
+    (local.set $t (call $array_new (i32.const 14)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 0)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 1)))
+    (call $nota_ptr (local.get $t))
+    (call $nota_i64 (call $array_get (local.get $t) (i64.const 1)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[\"prima\", \"secunda\"]\n1\n".to_owned(),
+            stderr: String::new(),
+        },
+        "text arrays must quote elements and array_get must read them back, got: {outcome:?}"
+    );
+}
+
+/// A map literal constructed through `map_new(kinds)` + `map_put` renders in
+/// the Rust-oracle derived `Json(Tabula({...}))` Debug shape.
+#[test]
+fn map_literal_renders_json_tabula_debug_shape() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "alpha")
+  (data (i32.const 5) "beta")
+  (data (i32.const 9) "\00\00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\05\00\00\00\04\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 9))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (local $t i32)
+    (local.set $t (call $map_new (i32.const 14) (i32.const 4)))
+    (call $map_put (local.get $t) (i32.const 1) (i64.const 20))
+    (call $map_put (local.get $t) (i32.const 0) (i64.const 10))
+    (call $nota_ptr (local.get $t))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "Json(Tabula({\"alpha\": Numerus(10), \"beta\": Numerus(20)}))\n".to_owned(),
+            stderr: String::new(),
+        },
+        "map handles must render in the Json(Tabula(...)) Debug shape, got: {outcome:?}"
+    );
+}
+
+/// A `copia` (`set_new` + `array_push`) renders the `{1, 2, 3}` shape and
+/// `array_contains`/`array_length` read back set facts.
+#[test]
+fn set_renders_brace_shape_and_reads_back_facts() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_set_new" (func $set_new (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_contains" (func $contains (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_length" (func $length (param i32) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i32" (func $nota_i32 (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota_i64 (param i64)))
+  (func (export "incipit")
+    (local $t i32)
+    (local.set $t (call $set_new (i32.const 4)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 1)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 2)))
+    (local.set $t (call $array_push (local.get $t) (i64.const 3)))
+    (call $nota_ptr (local.get $t))
+    (call $nota_i32 (call $contains (local.get $t) (i64.const 2)))
+    (call $nota_i64 (call $length (local.get $t)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "{1, 2, 3}\n1\n3\n".to_owned(),
+            stderr: String::new(),
+        },
+        "set handles must render braces and read back contains/length, got: {outcome:?}"
+    );
+}
+
+/// A map index lookup (`array_option`) returns an option handle that `nota`
+/// renders as the payload (present) or `nihil` (absent); `option_get_or`
+/// unwraps with a fallback.
+#[test]
+fn map_index_returns_option_rendered_as_payload_or_nihil() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_array_option" (func $array_option (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_option_get_or" (func $get_or (param i32 i64) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota_i64 (param i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "aelia")
+  (data (i32.const 5) "balbus")
+  (data (i32.const 11) "\00\00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\05\00\00\00\06\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 11))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (local $map i32)
+    (local $opt i32)
+    (local.set $map (call $map_new (i32.const 14) (i32.const 4)))
+    (call $map_put (local.get $map) (i32.const 0) (i64.const 95))
+    (local.set $opt (call $array_option (local.get $map) (i64.const 0)))
+    (call $nota_ptr (local.get $opt))
+    (local.set $opt (call $array_option (local.get $map) (i64.const 1)))
+    (call $nota_ptr (local.get $opt))
+    (local.set $opt (call $array_option (local.get $map) (i64.const 1)))
+    (call $nota_i64 (call $get_or (local.get $opt) (i64.const 0)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "95\nnihil\n0\n".to_owned(),
+            stderr: String::new(),
+        },
+        "map index options must render payload or nihil and get_or must fall back, got: {outcome:?}"
+    );
+}
+
+/// `nota_i1` renders bivalens diagnostics as `verum`/`falsum` (the scalar
+/// display half of the cluster).
+#[test]
+fn bivalens_diagnostics_render_verum_falsum() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i1" (func $nota_i1 (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i32" (func $nota_i32 (param i32)))
+  (func (export "incipit")
+    (call $nota_i1 (i32.const 1))
+    (call $nota_i1 (i32.const 0))
+    (call $nota_i32 (i32.const 1))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "verum\nfalsum\n1\n".to_owned(),
+            stderr: String::new(),
+        },
+        "bivalens diagnostics must render verum/falsum while i32 stays integer, got: {outcome:?}"
+    );
+}
+
+/// `map_keys`/`map_values` project a map into `lista` handles that render in
+/// the `["aelia", "balbus"]` / `[95, 87]` shapes.
+#[test]
+fn map_keys_and_values_project_lista_handles() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_map_keys" (func $map_keys (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_map_values" (func $map_values (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "aelia")
+  (data (i32.const 5) "balbus")
+  (data (i32.const 11) "\00\00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\05\00\00\00\06\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 11))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (local $map i32)
+    (local.set $map (call $map_new (i32.const 14) (i32.const 4)))
+    (call $map_put (local.get $map) (i32.const 0) (i64.const 95))
+    (call $map_put (local.get $map) (i32.const 1) (i64.const 87))
+    (call $nota_ptr (call $map_keys (local.get $map)))
+    (call $nota_ptr (call $map_values (local.get $map)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[\"aelia\", \"balbus\"]\n[95, 87]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "map_keys/map_values must project renderable lista handles, got: {outcome:?}"
     );
 }
