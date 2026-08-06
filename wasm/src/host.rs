@@ -84,9 +84,13 @@ impl WasmRtV1Host {
         };
 
         match func.call(&mut store, &[], &mut []) {
-            Ok(()) => RunOutcome::Success {
-                stdout: store.into_data().stdout,
-            },
+            Ok(()) => {
+                let state = store.into_data();
+                RunOutcome::Success {
+                    stdout: state.stdout,
+                    stderr: state.stderr,
+                }
+            }
             Err(error) => {
                 let state = store.into_data();
                 if let Some(message) = state.unsupported {

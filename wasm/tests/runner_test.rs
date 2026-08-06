@@ -37,7 +37,8 @@ fn sic_compiler_artifact_matches_rust_outcome() {
     assert_eq!(
         outcome,
         RunOutcome::Success {
-            stdout: "9\n".to_owned()
+            stdout: "9\n".to_owned(),
+            stderr: String::new(),
         },
         "sic must run without any opaque-handle table"
     );
@@ -52,7 +53,8 @@ fn per_compiler_artifact_matches_rust_outcome() {
     assert_eq!(
         outcome,
         RunOutcome::Success {
-            stdout: "0\n2\n4\n6\n".to_owned()
+            stdout: "0\n2\n4\n6\n".to_owned(),
+            stderr: String::new(),
         },
         "per must run without any opaque-handle table"
     );
@@ -188,8 +190,8 @@ fn text_handle_call_produces_typed_runtime_failure() {
     );
     if let RunOutcome::RuntimeFailure { message } = &outcome {
         assert!(
-            message.contains("Stage 4"),
-            "message must name the Stage 4 literal-initialization boundary: {message}"
+            message.contains("W11/W12"),
+            "message must name the W11/W12 literal-initialization boundary: {message}"
         );
     }
 }
@@ -218,7 +220,10 @@ fn w4b_provider_surface_accepted_by_preflight_and_link() {
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
-        RunOutcome::Success { stdout: String::new() },
+        RunOutcome::Success {
+            stdout: String::new(),
+            stderr: String::new(),
+        },
         "declared-only W4B provider surface must pass preflight and link, got: {outcome:?}"
     );
 }
@@ -353,7 +358,10 @@ fn we6_json_provider_surface_accepted_by_preflight_and_link() {
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
-        RunOutcome::Success { stdout: String::new() },
+        RunOutcome::Success {
+            stdout: String::new(),
+            stderr: String::new(),
+        },
         "declared-only WE6 json surface must pass preflight and link, got: {outcome:?}"
     );
 }
@@ -423,18 +431,19 @@ fn salve_munde_renders_literal_through_the_host_text_arena() {
     assert_eq!(
         outcome,
         RunOutcome::Success {
-            stdout: "Salve, Munde!\n".to_owned()
+            stdout: "Salve, Munde!\n".to_owned(),
+            stderr: String::new(),
         },
         "salve-munde must render its literal through the host arena, got: {outcome:?}"
     );
     assert_eq!(outcome.category(), OutcomeCategory::Success);
 }
 
-/// A synthetic module declaring the W11 literal table exactly as the emitter
-/// generates it (payload data + table rows + exported globals): the host
-/// interns the literal at init and the nota_text call renders it. This is the
-/// emitter's contract shape, not a host-side reconstruction of an interner
-/// table from WAT.
+/// A synthetic module declaring the W12 literal table exactly as the emitter
+/// generates it (payload data + `(kind, offset, length)` rows + exported
+/// globals): the host interns the literal at init and the nota_text call
+/// renders it. This is the emitter's contract shape, not a host-side
+/// reconstruction of an interner table from WAT.
 #[test]
 fn declared_literal_table_interning_renders_text() {
     let bytes = wat_bytes(r#"
@@ -442,7 +451,7 @@ fn declared_literal_table_interning_renders_text() {
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "Salve, Munde!")
-  (data (i32.const 13) "\00\00\00\00\0D\00\00\00")
+  (data (i32.const 13) "\00\00\00\00\00\00\00\00\0D\00\00\00")
   (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 13))
   (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
   (func (export "incipit")
@@ -454,7 +463,8 @@ fn declared_literal_table_interning_renders_text() {
     assert_eq!(
         outcome,
         RunOutcome::Success {
-            stdout: "Salve, Munde!\n".to_owned()
+            stdout: "Salve, Munde!\n".to_owned(),
+            stderr: String::new(),
         },
         "the interned literal must render through the nota text row, got: {outcome:?}"
     );
@@ -515,7 +525,7 @@ fn uninterned_handle_produces_typed_runtime_failure() {
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "Salve, Munde!")
-  (data (i32.const 13) "\00\00\00\00\0D\00\00\00")
+  (data (i32.const 13) "\00\00\00\00\00\00\00\00\0D\00\00\00")
   (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 13))
   (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
   (func (export "incipit")
@@ -528,5 +538,369 @@ fn uninterned_handle_produces_typed_runtime_failure() {
         outcome.category(),
         OutcomeCategory::RuntimeFailure,
         "a handle outside the interned table must be RuntimeFailure, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W12 kind-tagged literal table: octeti + regex rows
+// ---------------------------------------------------------------------------
+
+/// A synthetic module declaring octeti rows (kind 1) exactly as the emitter
+/// generates them: the host interns the byte payloads at init, and the
+/// `nota_ptr` pointer diagnostic renders an octeti handle in the byte-list
+/// Debug shape (`[104, 105]`), mirroring the LLVM host's opaque display.
+#[test]
+fn octeti_rows_intern_and_render_byte_list_through_nota() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "hi")
+  (data (i32.const 2) "\DE\AD\BE\EF")
+  (data (i32.const 6) "\01\00\00\00\00\00\00\00\02\00\00\00")
+  (data (i32.const 18) "\01\00\00\00\02\00\00\00\04\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 6))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (call $nota_ptr (i32.const 0))
+    (call $nota_ptr (i32.const 1))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[104, 105]\n[222, 173, 190, 239]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "interned octeti rows must render through the pointer diagnostic, got: {outcome:?}"
+    );
+}
+
+/// A synthetic module declaring a regex pattern row (kind 2) plus its flags
+/// row (kind 3): the host pairs them into one regex value at init, and
+/// `nota_ptr` renders the pattern text — the shared oracle's regex display.
+#[test]
+fn regex_rows_pair_flags_and_render_pattern_through_nota() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\5Cd+")
+  (data (i32.const 3) "i")
+  (data (i32.const 4) "\02\00\00\00\00\00\00\00\03\00\00\00")
+  (data (i32.const 16) "\03\00\00\00\03\00\00\00\01\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 4))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (call $nota_ptr (i32.const 0))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "\\d+\n".to_owned(),
+            stderr: String::new(),
+        },
+        "the interned regex pattern must render through the pointer diagnostic, got: {outcome:?}"
+    );
+}
+
+/// A regex literal without a flags row (pattern row only) also resolves.
+#[test]
+fn regex_row_without_flags_render_pattern_through_nota() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "(?i)\5Cw+")
+  (data (i32.const 7) "\02\00\00\00\00\00\00\00\07\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 7))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit")
+    (call $nota_ptr (i32.const 0))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "(?i)\\w+\n".to_owned(),
+            stderr: String::new(),
+        },
+        "a flagless regex row must render its pattern, got: {outcome:?}"
+    );
+}
+
+/// A literal table declaring an unknown row kind fails generated
+/// initialization with a typed outcome — entry never runs.
+#[test]
+fn unknown_literal_row_kind_fails_initialization() {
+    let bytes = wat_bytes(r#"
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (data (i32.const 1) "\63\00\00\00\00\00\00\00\01\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 1))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit") (return))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::InitializationFailed,
+        "an unknown literal row kind must be InitializationFailed, got: {outcome:?}"
+    );
+}
+
+/// A flags-carrying regex followed by another literal keeps later rows at
+/// their raw indices (the flags row is a continuation row, not a handle).
+#[test]
+fn regex_flags_row_keeps_later_rows_at_raw_indices() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\5Cd+")
+  (data (i32.const 3) "i")
+  (data (i32.const 4) "post")
+  (data (i32.const 8) "\02\00\00\00\00\00\00\00\03\00\00\00")
+  (data (i32.const 20) "\03\00\00\00\03\00\00\00\01\00\00\00")
+  (data (i32.const 32) "\00\00\00\00\04\00\00\00\04\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 8))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 3))
+  (func (export "incipit")
+    (call $nota_ptr (i32.const 0))
+    (call $nota_ptr (i32.const 2))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "\\d+\npost\n".to_owned(),
+            stderr: String::new(),
+        },
+        "the flags continuation row must keep the following text row at raw index 2, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W12 text-format surface: `§`-template application
+// ---------------------------------------------------------------------------
+
+/// A synthetic `format_text` call: the template and its text arg are table
+/// rows; the returned dynamic text handle feeds a later `nota_ptr`.
+#[test]
+fn format_text_renders_template_into_a_new_text_handle() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_format_text" (func $format_text (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "Mundus")
+  (data (i32.const 6) "Salve, \C2\A7!")
+  (data (i32.const 16) "\00\00\00\00\00\00\00\00\06\00\00\00")
+  (data (i32.const 28) "\00\00\00\00\06\00\00\00\0A\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 16))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (drop (call $format_text (i32.const 1) (i32.const 0)))
+    (call $nota_ptr (i32.const 2))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "Salve, Mundus!\n".to_owned(),
+            stderr: String::new(),
+        },
+        "format_text must substitute the § template arg into a new text handle, got: {outcome:?}"
+    );
+}
+
+/// `format_i64` substitutes the decimal rendering of a scalar arg, and a
+/// numbered `§1` placeholder selects the second arg (mirrors the shared
+/// oracle template policy).
+#[test]
+fn format_i64_renders_scalar_and_numbered_placeholders() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_format_i64_i64" (func $format_i64_i64 (param i32 i64 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_format_i64" (func $format_i64 (param i32 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "aetas: \C2\A7")
+  (data (i32.const 9) "coordinata: \C2\A7 \C2\A7")
+  (data (i32.const 26) "\00\00\00\00\00\00\00\00\09\00\00\00")
+  (data (i32.const 38) "\00\00\00\00\09\00\00\00\11\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 26))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (drop (call $format_i64 (i32.const 0) (i64.const 30)))
+    (call $nota_ptr (i32.const 2))
+    (drop (call $format_i64_i64 (i32.const 1) (i64.const 10) (i64.const 20)))
+    (call $nota_ptr (i32.const 3))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "aetas: 30\ncoordinata: 10 20\n".to_owned(),
+            stderr: String::new(),
+        },
+        "scalar template args must render as the shared oracle formats them, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W12 text arena surface: concat, equality, queries, transforms
+// ---------------------------------------------------------------------------
+
+/// `text_concat` produces a new text handle and `text_eq`/`text_ne` compare
+/// interned literals directly on the arena.
+#[test]
+fn text_concat_and_eq_operate_on_the_host_text_arena() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_text_concat" (func $concat (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_text_eq" (func $eq (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_text_ne" (func $ne (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i32" (func $nota_i32 (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "Sa")
+  (data (i32.const 2) "lve")
+  (data (i32.const 5) "\00\00\00\00\00\00\00\00\02\00\00\00\00\00\00\00\02\00\00\00\03\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 5))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (drop (call $concat (i32.const 0) (i32.const 1)))
+    (call $nota_ptr (i32.const 2))
+    (call $nota_i32 (call $eq (i32.const 2) (i32.const 2)))
+    (call $nota_i32 (call $ne (i32.const 0) (i32.const 1)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "Salve\n1\n1\n".to_owned(),
+            stderr: String::new(),
+        },
+        "concat and text equality must resolve through the host text arena, got: {outcome:?}"
+    );
+}
+
+/// The first-order text arena ops (`length`, `contains`, `uppercase`,
+/// `slice`) mirror the LLVM host semantics against the interned literals.
+#[test]
+fn text_query_and_transform_rows_operate_on_the_host_text_arena() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_text_length" (func $len (param i32) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_text_contains" (func $contains (param i32 i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_text_uppercase" (func $up (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_text_slice" (func $slice (param i32 i64 i64) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota_i64 (param i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i32" (func $nota_i32 (param i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) " Ave Roma ")
+  (data (i32.const 10) "Roma")
+  (data (i32.const 14) "\00\00\00\00\00\00\00\00\0A\00\00\00\00\00\00\00\0A\00\00\00\04\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 14))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 2))
+  (func (export "incipit")
+    (call $nota_i64 (call $len (i32.const 0)))
+    (call $nota_ptr (call $up (i32.const 0)))
+    (call $nota_i32 (call $contains (i32.const 0) (i32.const 1)))
+    (call $nota_ptr (call $slice (i32.const 0) (i64.const 1) (i64.const 4)))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "10\n AVE ROMA \n1\nAve\n".to_owned(),
+            stderr: String::new(),
+        },
+        "text query/transform rows must mirror the LLVM host semantics, got: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W12 stderr capture + regex conversion rows
+// ---------------------------------------------------------------------------
+
+/// `mone` (mone_ptr) streams to stderr: the W12 product host captures it into
+/// `Success::stderr` — never a silent redirect to stdout.
+#[test]
+fn mone_streams_to_captured_stderr() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_ptr" (func $mone_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "cave")
+  (data (i32.const 4) "\00\00\00\00\00\00\00\00\04\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 4))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit")
+    (call $mone_ptr (i32.const 0))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: String::new(),
+            stderr: "cave\n".to_owned(),
+        },
+        "mone must stream to the captured stderr, got: {outcome:?}"
+    );
+    assert_eq!(outcome.category(), OutcomeCategory::Success);
+}
+
+/// `regex_from_text` (the `textus ↦ regex` conversion the emitter does not
+/// constant-fold) returns a regex handle the pointer diagnostic renders as
+/// the pattern text.
+#[test]
+fn regex_from_text_converts_a_text_handle_to_a_renderable_regex() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_regex_from_text" (func $from_text (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "/home/acme/.*")
+  (data (i32.const 13) "\00\00\00\00\00\00\00\00\0D\00\00\00")
+  (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 13))
+  (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
+  (func (export "incipit")
+    (drop (call $from_text (i32.const 0)))
+    (call $nota_ptr (i32.const 1))
+  )
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "/home/acme/.*\n".to_owned(),
+            stderr: String::new(),
+        },
+        "regex_from_text must produce a regex the pointer diagnostic renders, got: {outcome:?}"
     );
 }

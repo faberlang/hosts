@@ -40,9 +40,12 @@ pub enum OutcomeCategory {
 /// Full typed outcome of one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// Entry completed; `stdout` holds the captured program output.
+    /// Entry completed; `stdout` holds the captured program output and
+    /// `stderr` the captured diagnostic stream (W12: mone lines are captured,
+    /// never dropped or redirected to stdout).
     Success {
         stdout: String,
+        stderr: String,
     },
     /// Module bytes failed Wasm validation.
     ValidationFailed {
@@ -108,7 +111,7 @@ impl RunOutcome {
     #[must_use]
     pub fn stdout(&self) -> &str {
         match self {
-            Self::Success { stdout } | Self::Exited { stdout, .. } => stdout,
+            Self::Success { stdout, .. } | Self::Exited { stdout, .. } => stdout,
             Self::ValidationFailed { .. }
             | Self::ImportRejected { .. }
             | Self::LinkFailed { .. }
