@@ -9,8 +9,8 @@
 //! Exempla's product-runner adapter calls [`WasmRtV1Host::run`] directly and
 //! maps results to ledger outcomes; later Faber packaging reuses the same API.
 
-pub mod config;
 mod collections;
+pub mod config;
 pub mod error;
 pub mod host;
 pub mod imports;

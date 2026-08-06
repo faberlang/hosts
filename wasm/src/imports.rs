@@ -14,9 +14,9 @@ use crate::collections::{
 };
 use crate::outcome::RunOutcome;
 use radix_host_abi::{
-    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32,
-    VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U16, VALUE_KIND_U32,
-    VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16,
+    VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U16,
+    VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
 };
 use std::collections::{BTreeMap, HashMap};
 use wasmtime::{Linker, Module};
@@ -365,20 +365,18 @@ impl HostState {
             match raw.kind {
                 crate::literal_table::ROW_KIND_TEXT => {
                     let payload = std::str::from_utf8(&raw.payload)
-                        .map_err(|_| {
-                            RunOutcome::InitializationFailed {
-                                message: format!(
-                                    "literal-table initialization failed: text row {index} \
+                        .map_err(|_| RunOutcome::InitializationFailed {
+                            message: format!(
+                                "literal-table initialization failed: text row {index} \
                                      payload is not valid UTF-8"
-                                ),
-                            }
+                            ),
                         })?
                         .to_owned();
                     let handle = if let Some(handle) = content_to_handle.get(&payload) {
                         *handle
                     } else {
-                        let handle =
-                            i32::try_from(self.text_arena.len()).expect("text arena handle fits i32");
+                        let handle = i32::try_from(self.text_arena.len())
+                            .expect("text arena handle fits i32");
                         self.text_arena.push(payload.clone());
                         content_to_handle.insert(payload, handle);
                         handle
@@ -426,8 +424,8 @@ impl HostState {
                     } else {
                         None
                     };
-                    let handle = i32::try_from(self.regex_arena.len())
-                        .expect("regex arena handle fits i32");
+                    let handle =
+                        i32::try_from(self.regex_arena.len()).expect("regex arena handle fits i32");
                     self.regex_arena.push(RegexValue {
                         pattern: pattern.clone(),
                         flags: flags.clone(),
@@ -973,7 +971,11 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_solum_read_handle(linker, "__faber_rt_v1_solum_read_lines")?;
     bind_solum_read_handle(linker, "__faber_rt_v1_solum_read_bytes")?;
     bind_solum_write_text(linker)?;
-    bind_stdout_text(linker, "__faber_rt_v1_diagnostic_nota_text", "nota/stdout (scribe)")?;
+    bind_stdout_text(
+        linker,
+        "__faber_rt_v1_diagnostic_nota_text",
+        "nota/stdout (scribe)",
+    )?;
     bind_stderr_text(linker, "__faber_rt_v1_diagnostic_mone_text")?;
     // WE6 json surface: bound with the exact `(param i32) (result i32)`
     // handle signatures the radix Wasm emitter emits. No json host
@@ -1000,12 +1002,36 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_text_eq_ne(linker, "__faber_rt_v1_text_eq", true)?;
     bind_text_eq_ne(linker, "__faber_rt_v1_text_ne", false)?;
     bind_text_length(linker)?;
-    bind_text_predicate1(linker, "__faber_rt_v1_text_is_empty", TextPredicate1::IsEmpty)?;
-    bind_text_predicate2(linker, "__faber_rt_v1_text_contains", TextPredicate2::Contains)?;
-    bind_text_predicate2(linker, "__faber_rt_v1_text_starts_with", TextPredicate2::StartsWith)?;
-    bind_text_predicate2(linker, "__faber_rt_v1_text_ends_with", TextPredicate2::EndsWith)?;
-    bind_text_transform(linker, "__faber_rt_v1_text_uppercase", TextTransform::Uppercase)?;
-    bind_text_transform(linker, "__faber_rt_v1_text_lowercase", TextTransform::Lowercase)?;
+    bind_text_predicate1(
+        linker,
+        "__faber_rt_v1_text_is_empty",
+        TextPredicate1::IsEmpty,
+    )?;
+    bind_text_predicate2(
+        linker,
+        "__faber_rt_v1_text_contains",
+        TextPredicate2::Contains,
+    )?;
+    bind_text_predicate2(
+        linker,
+        "__faber_rt_v1_text_starts_with",
+        TextPredicate2::StartsWith,
+    )?;
+    bind_text_predicate2(
+        linker,
+        "__faber_rt_v1_text_ends_with",
+        TextPredicate2::EndsWith,
+    )?;
+    bind_text_transform(
+        linker,
+        "__faber_rt_v1_text_uppercase",
+        TextTransform::Uppercase,
+    )?;
+    bind_text_transform(
+        linker,
+        "__faber_rt_v1_text_lowercase",
+        TextTransform::Lowercase,
+    )?;
     bind_text_transform(linker, "__faber_rt_v1_text_trim", TextTransform::Trim)?;
     bind_text_slice(linker)?;
     bind_text_split(linker)?;
@@ -1135,7 +1161,9 @@ fn bind_stdout_diagnostic(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<(), wasmtime::Error> {
             let rendered = caller.data().resolve_diagnostic(handle);
             match rendered {
                 Some(rendered) => {
@@ -1168,7 +1196,9 @@ fn bind_stdout_text(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<(), wasmtime::Error> {
             let text = caller.data().resolve_text(handle).map(str::to_owned);
             match text {
                 Some(text) => {
@@ -1230,7 +1260,9 @@ fn bind_stderr_text(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<(), wasmtime::Error> {
             let text = caller.data().resolve_text(handle).map(str::to_owned);
             match text {
                 Some(text) => {
@@ -1264,7 +1296,9 @@ fn bind_solum_read_handle(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             Err(typed_unsupported(
                 &mut caller,
                 format!(
@@ -1315,7 +1349,9 @@ fn bind_json_handle(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             Err(typed_unsupported(
                 &mut caller,
                 format!(
@@ -1391,15 +1427,24 @@ fn format_result(
             format!("format template handle {template}: unknown text handle"),
         ));
     };
-    Ok(caller.data_mut().alloc_text(render_template(&template_text, &args)))
+    Ok(caller
+        .data_mut()
+        .alloc_text(render_template(&template_text, &args)))
 }
 
 fn bind_format_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_i1",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, value: i32| -> Result<i32, wasmtime::Error> {
-            format_result(&mut caller, template, vec![display_bivalens(value).to_owned()])
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              value: i32|
+              -> Result<i32, wasmtime::Error> {
+            format_result(
+                &mut caller,
+                template,
+                vec![display_bivalens(value).to_owned()],
+            )
         },
     )?;
     Ok(())
@@ -1409,7 +1454,10 @@ fn bind_format_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_i64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, value: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              value: i64|
+              -> Result<i32, wasmtime::Error> {
             format_result(&mut caller, template, vec![value.to_string()])
         },
     )?;
@@ -1420,7 +1468,11 @@ fn bind_format_i64_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_i64_i64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, first: i64, second: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              first: i64,
+              second: i64|
+              -> Result<i32, wasmtime::Error> {
             format_result(
                 &mut caller,
                 template,
@@ -1435,7 +1487,12 @@ fn bind_format_i64_i64_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtim
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_i64_i64_i64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, first: i64, second: i64, third: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              first: i64,
+              second: i64,
+              third: i64|
+              -> Result<i32, wasmtime::Error> {
             format_result(
                 &mut caller,
                 template,
@@ -1450,7 +1507,10 @@ fn bind_format_f64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_f64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, value: f64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              value: f64|
+              -> Result<i32, wasmtime::Error> {
             // Scalar float display parity with the Rust oracle: integral
             // floats keep the `.0` decimal marker (`display_fractus`).
             format_result(&mut caller, template, vec![display_fractus(value)])
@@ -1463,7 +1523,10 @@ fn bind_format_text(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_text",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, text: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(value) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1480,7 +1543,11 @@ fn bind_format_text_text(linker: &mut Linker<HostState>) -> Result<(), wasmtime:
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_text_text",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, first: i32, second: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              first: i32,
+              second: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(first) = caller.data().resolve_text(first).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1503,7 +1570,11 @@ fn bind_format_text_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_text_i64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, text: i32, value: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              text: i32,
+              value: i64|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1520,7 +1591,11 @@ fn bind_format_i64_text(linker: &mut Linker<HostState>) -> Result<(), wasmtime::
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_i64_text",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, value: i64, text: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              value: i64,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1537,7 +1612,12 @@ fn bind_format_text_text_text(linker: &mut Linker<HostState>) -> Result<(), wasm
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_text_text_text",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, first: i32, second: i32, third: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              first: i32,
+              second: i32,
+              third: i32|
+              -> Result<i32, wasmtime::Error> {
             let mut args = Vec::with_capacity(3);
             for (index, handle) in [first, second, third].into_iter().enumerate() {
                 let Some(value) = caller.data().resolve_text(handle).map(str::to_owned) else {
@@ -1558,7 +1638,12 @@ fn bind_format_text_i64_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtim
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_text_i64_i1",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, text: i32, integer: i64, boolean: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              text: i32,
+              integer: i64,
+              boolean: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1568,7 +1653,11 @@ fn bind_format_text_i64_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtim
             format_result(
                 &mut caller,
                 template,
-                vec![text, integer.to_string(), display_bivalens(boolean).to_owned()],
+                vec![
+                    text,
+                    integer.to_string(),
+                    display_bivalens(boolean).to_owned(),
+                ],
             )
         },
     )?;
@@ -1584,7 +1673,10 @@ fn bind_format_1_ptr_to_ptr(linker: &mut Linker<HostState>) -> Result<(), wasmti
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_format_1_ptr_to_ptr",
-        move |mut caller: wasmtime::Caller<'_, HostState>, template: i32, value: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              template: i32,
+              value: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(rendered) = caller.data().resolve_diagnostic(value) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1613,7 +1705,10 @@ fn bind_text_concat(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_concat",
-        move |mut caller: wasmtime::Caller<'_, HostState>, first: i32, second: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              first: i32,
+              second: i32|
+              -> Result<i32, wasmtime::Error> {
             let first = caller.data().resolve_text(first).map(str::to_owned);
             let second = caller.data().resolve_text(second).map(str::to_owned);
             let (Some(first), Some(second)) = (first, second) else {
@@ -1636,7 +1731,10 @@ fn bind_text_eq_ne(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, first: i32, second: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              first: i32,
+              second: i32|
+              -> Result<i32, wasmtime::Error> {
             let first = caller.data().resolve_text(first).map(str::to_owned);
             let second = caller.data().resolve_text(second).map(str::to_owned);
             let (Some(first), Some(second)) = (first, second) else {
@@ -1656,7 +1754,9 @@ fn bind_text_length(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_length",
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32|
+              -> Result<i64, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1689,7 +1789,9 @@ fn bind_text_predicate1(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1712,7 +1814,10 @@ fn bind_text_predicate2(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32, other: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32,
+              other: i32|
+              -> Result<i32, wasmtime::Error> {
             let text = caller.data().resolve_text(text).map(str::to_owned);
             let other = caller.data().resolve_text(other).map(str::to_owned);
             let (Some(text), Some(other)) = (text, other) else {
@@ -1747,7 +1852,9 @@ fn bind_text_transform(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1769,7 +1876,11 @@ fn bind_text_slice(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_slice",
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32, start: i64, end: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32,
+              start: i64,
+              end: i64|
+              -> Result<i32, wasmtime::Error> {
             let Some(text) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1796,7 +1907,10 @@ fn bind_text_split(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_split",
-        move |mut caller: wasmtime::Caller<'_, HostState>, _text: i32, _separator: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              _text: i32,
+              _separator: i32|
+              -> Result<i32, wasmtime::Error> {
             Err(typed_unsupported(
                 &mut caller,
                 "`__faber_rt_v1_text_split` requires a lista arena (not in this stage's host); \
@@ -1811,7 +1925,11 @@ fn bind_text_replace(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_replace",
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32, old: i32, new: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32,
+              old: i32,
+              new: i32|
+              -> Result<i32, wasmtime::Error> {
             let text = caller.data().resolve_text(text).map(str::to_owned);
             let old = caller.data().resolve_text(old).map(str::to_owned);
             let new = caller.data().resolve_text(new).map(str::to_owned);
@@ -1842,7 +1960,9 @@ fn bind_regex_from_text(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, text: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(pattern) = caller.data().resolve_text(text).map(str::to_owned) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -1864,7 +1984,9 @@ fn bind_array_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_new",
-        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              kind: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller
                 .data_mut()
                 .alloc_collection(false, kind as u32, Vec::new()))
@@ -1879,7 +2001,10 @@ fn bind_array_push(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_push",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              value: i64|
+              -> Result<i32, wasmtime::Error> {
             let collection = caller.data().find_collection(handle).map(|c| c.kind);
             if let Some(kind) = collection {
                 let Some(value) = value_from_i64(kind, value) else {
@@ -1918,7 +2043,10 @@ fn bind_array_extend(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_extend",
-        move |mut caller: wasmtime::Caller<'_, HostState>, destination: i32, source: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              destination: i32,
+              source: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let dest_kind = state.find_collection(destination).map(|c| c.kind);
             let source_values = state.find_collection(source).map(|c| c.values.clone());
@@ -1952,7 +2080,9 @@ fn bind_array_length(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_length",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i64, wasmtime::Error> {
             if let Some(collection) = caller.data().find_collection(handle) {
                 return Ok(i64::try_from(collection.values.len()).expect("length fits i64"));
             }
@@ -1979,7 +2109,10 @@ fn bind_array_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_get",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i64| -> Result<i64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              index: i64|
+              -> Result<i64, wasmtime::Error> {
             let state = caller.data();
             if let Some(collection) = state.find_collection(handle) {
                 let Ok(index) = usize::try_from(index) else {
@@ -2015,7 +2148,10 @@ fn bind_array_option(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_option",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              key: i64|
+              -> Result<i32, wasmtime::Error> {
             // Resolve `(kind, payload)` under a scoped borrow, then encode the
             // option result mutably.
             let kind_payload = {
@@ -2047,8 +2183,10 @@ fn bind_array_option(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
                     let Ok(index) = usize::try_from(key) else {
                         return Ok(0);
                     };
-                    let payload =
-                        bytes.get(index).copied().map(|b| RuntimeValue::I32(b as i32));
+                    let payload = bytes
+                        .get(index)
+                        .copied()
+                        .map(|b| RuntimeValue::I32(b as i32));
                     Some((VALUE_KIND_U8, payload, false, false))
                 } else {
                     None
@@ -2089,7 +2227,10 @@ fn bind_array_contains(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_contains",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              value: i64|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             if let Some(collection) = state.find_collection(handle) {
                 let Some(value) = value_from_i64(collection.kind, value) else {
@@ -2099,7 +2240,10 @@ fn bind_array_contains(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
                     ));
                 };
                 return Ok(i32::from(
-                    collection.values.iter().any(|v| runtime_value_eq(*v, value)),
+                    collection
+                        .values
+                        .iter()
+                        .any(|v| runtime_value_eq(*v, value)),
                 ));
             }
             if let Some(map) = state.find_map(handle) {
@@ -2124,7 +2268,9 @@ fn bind_array_is_empty(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_is_empty",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             if let Some(collection) = state.find_collection(handle) {
                 return Ok(i32::from(collection.values.is_empty()));
@@ -2146,7 +2292,9 @@ fn bind_array_reverse(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_reverse",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<(), wasmtime::Error> {
             let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -2166,7 +2314,9 @@ fn bind_array_sort(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_sort",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let kind = caller.data().find_collection(handle).map(|c| c.kind);
             let Some(kind) = kind else {
                 return Err(typed_unsupported(
@@ -2194,7 +2344,9 @@ fn bind_array_sum(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_sum",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i64, wasmtime::Error> {
             let state = caller.data();
             let Some(collection) = state.find_collection(handle) else {
                 return Err(typed_unsupported(
@@ -2218,7 +2370,10 @@ fn bind_map_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_map_new",
-        move |mut caller: wasmtime::Caller<'_, HostState>, key_kind: i32, value_kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              key_kind: i32,
+              value_kind: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller
                 .data_mut()
                 .alloc_map(key_kind as u32, value_kind as u32, Vec::new()))
@@ -2233,7 +2388,11 @@ fn bind_map_put(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_map_put",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i32, value: i64| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              key: i32,
+              value: i64|
+              -> Result<(), wasmtime::Error> {
             let state = caller.data();
             let (value_kind, key_kind) = match state.find_map(handle) {
                 Some(map) => (map.value_kind, map.key_kind),
@@ -2256,7 +2415,8 @@ fn bind_map_put(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                     format!("map_put handle {handle}: unknown map handle"),
                 ));
             };
-            let key_value = value_from_i64(key_kind, i64::from(key)).unwrap_or(RuntimeValue::Handle(key));
+            let key_value =
+                value_from_i64(key_kind, i64::from(key)).unwrap_or(RuntimeValue::Handle(key));
             // Insert or replace by key identity.
             if let Some(entry) = map
                 .entries
@@ -2280,7 +2440,10 @@ fn bind_map_delete(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_map_delete",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, key: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              key: i64|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             if let Some(map) = state.find_map(handle) {
                 let key_kind = map.key_kind;
@@ -2333,7 +2496,9 @@ fn bind_map_keys(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> 
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_map_keys",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(map) = state.find_map(handle) else {
                 return Err(typed_unsupported(
@@ -2345,7 +2510,9 @@ fn bind_map_keys(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> 
             for (key, _) in &map.entries {
                 keys.push(*key);
             }
-            Ok(caller.data_mut().alloc_collection(false, VALUE_KIND_TEXT, keys))
+            Ok(caller
+                .data_mut()
+                .alloc_collection(false, VALUE_KIND_TEXT, keys))
         },
     )?;
     Ok(())
@@ -2356,7 +2523,9 @@ fn bind_map_values(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_map_values",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(map) = state.find_map(handle) else {
                 return Err(typed_unsupported(
@@ -2380,7 +2549,9 @@ fn bind_set_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_new",
-        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              kind: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller
                 .data_mut()
                 .alloc_collection(true, kind as u32, Vec::new()))
@@ -2395,7 +2566,9 @@ fn bind_set_from_array(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_from_array",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(collection) = state.find_collection(handle) else {
                 return Err(typed_unsupported(
@@ -2406,7 +2579,10 @@ fn bind_set_from_array(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
             let kind = collection.kind;
             let mut unique = Vec::new();
             for value in &collection.values {
-                if !unique.iter().any(|existing| runtime_value_eq(*existing, *value)) {
+                if !unique
+                    .iter()
+                    .any(|existing| runtime_value_eq(*existing, *value))
+                {
                     unique.push(*value);
                 }
             }
@@ -2421,7 +2597,9 @@ fn bind_array_from_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_array_from_set",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(collection) = state.find_collection(handle) else {
                 return Err(typed_unsupported(
@@ -2458,9 +2636,8 @@ where
         ));
     };
     let kind = left.kind;
-    let values = reduce(left, right).map_err(|()| {
-        typed_unsupported(caller, "set algebra element-kind mismatch")
-    })?;
+    let values = reduce(left, right)
+        .map_err(|()| typed_unsupported(caller, "set algebra element-kind mismatch"))?;
     Ok(caller.data_mut().alloc_collection(true, kind, values))
 }
 
@@ -2469,7 +2646,10 @@ fn bind_set_union(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_union",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             set_algebra(&mut caller, left, right, |l, r| {
                 let mut values = l.values.clone();
                 for value in &r.values {
@@ -2489,7 +2669,10 @@ fn bind_set_intersection(linker: &mut Linker<HostState>) -> Result<(), wasmtime:
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_intersection",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             set_algebra(&mut caller, left, right, |l, r| {
                 Ok(l.values
                     .iter()
@@ -2507,7 +2690,10 @@ fn bind_set_difference(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_difference",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             set_algebra(&mut caller, left, right, |l, r| {
                 Ok(l.values
                     .iter()
@@ -2525,7 +2711,10 @@ fn bind_set_symmetric_difference(linker: &mut Linker<HostState>) -> Result<(), w
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_symmetric_difference",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             set_algebra(&mut caller, left, right, |l, r| {
                 let mut values = Vec::new();
                 for value in &l.values {
@@ -2550,20 +2739,22 @@ fn bind_set_is_subset(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_is_subset",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
-            let (Some(left), Some(right)) = (state.find_collection(left), state.find_collection(right))
+            let (Some(left), Some(right)) =
+                (state.find_collection(left), state.find_collection(right))
             else {
                 return Err(typed_unsupported(
                     &mut caller,
                     "set_is_subset received an unknown collection handle",
                 ));
             };
-            Ok(i32::from(
-                left.values
-                    .iter()
-                    .all(|value| right.values.iter().any(|v| runtime_value_eq(*v, *value))),
-            ))
+            Ok(i32::from(left.values.iter().all(|value| {
+                right.values.iter().any(|v| runtime_value_eq(*v, *value))
+            })))
         },
     )?;
     Ok(())
@@ -2574,21 +2765,22 @@ fn bind_set_is_superset(linker: &mut Linker<HostState>) -> Result<(), wasmtime::
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_set_is_superset",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
-            let (Some(left), Some(right)) = (state.find_collection(left), state.find_collection(right))
+            let (Some(left), Some(right)) =
+                (state.find_collection(left), state.find_collection(right))
             else {
                 return Err(typed_unsupported(
                     &mut caller,
                     "set_is_superset received an unknown collection handle",
                 ));
             };
-            Ok(i32::from(
-                right
-                    .values
-                    .iter()
-                    .all(|value| left.values.iter().any(|v| runtime_value_eq(*v, *value))),
-            ))
+            Ok(i32::from(right.values.iter().all(|value| {
+                left.values.iter().any(|v| runtime_value_eq(*v, *value))
+            })))
         },
     )?;
     Ok(())
@@ -2603,7 +2795,9 @@ fn bind_option_none(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_option_none",
-        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              kind: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller.data_mut().alloc_option(kind as u32, None))
         },
     )?;
@@ -2616,7 +2810,10 @@ fn bind_option_some(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_option_some",
-        move |mut caller: wasmtime::Caller<'_, HostState>, value: i64, kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              value: i64,
+              kind: i32|
+              -> Result<i32, wasmtime::Error> {
             let Some(payload) = value_from_i64(kind as u32, value) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -2634,7 +2831,9 @@ fn bind_option_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_option_get",
-        move |caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+        move |caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i64, wasmtime::Error> {
             let state = caller.data();
             match state.find_option(handle) {
                 Some(option) => match option.payload {
@@ -2654,7 +2853,10 @@ fn bind_option_get_or(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_option_get_or",
-        move |caller: wasmtime::Caller<'_, HostState>, handle: i32, fallback: i64| -> Result<i64, wasmtime::Error> {
+        move |caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              fallback: i64|
+              -> Result<i64, wasmtime::Error> {
             let state = caller.data();
             match state.find_option(handle) {
                 Some(option) => match option.payload {
@@ -2674,7 +2876,9 @@ fn bind_option_is_present(linker: &mut Linker<HostState>) -> Result<(), wasmtime
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_option_is_present",
-        move |caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             Ok(match state.find_option(handle) {
                 Some(option) => i32::from(option.payload.is_some()),
@@ -2690,16 +2894,17 @@ fn bind_option_is_present(linker: &mut Linker<HostState>) -> Result<(), wasmtime
 // ---------------------------------------------------------------------------
 
 /// `nota_i1 (param i32)`: bivalens diagnostics render `verum`/`falsum`.
-fn bind_scalar_i1(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+fn bind_scalar_i1(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
         move |mut caller: wasmtime::Caller<'_, HostState>, value: i32| {
-            caller.data_mut().write_line(if value != 0 {
-                "verum"
-            } else {
-                "falsum"
-            });
+            caller
+                .data_mut()
+                .write_line(if value != 0 { "verum" } else { "falsum" });
             Ok(())
         },
     )?;
@@ -2712,7 +2917,9 @@ fn bind_assert(linker: &mut Linker<HostState>, field: &'static str) -> Result<()
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, condition: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              condition: i32|
+              -> Result<(), wasmtime::Error> {
             if condition == 0 {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -2730,7 +2937,10 @@ fn bind_assert_message(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_assert_message",
-        move |mut caller: wasmtime::Caller<'_, HostState>, condition: i32, message: i32| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              condition: i32,
+              message: i32|
+              -> Result<(), wasmtime::Error> {
             if condition == 0 {
                 let message = caller
                     .data()
@@ -2753,7 +2963,9 @@ fn bind_text_i64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> 
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_i64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, value: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              value: i64|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller.data_mut().alloc_text(value.to_string()))
         },
     )?;
@@ -2765,7 +2977,9 @@ fn bind_text_f64(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> 
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_f64",
-        move |mut caller: wasmtime::Caller<'_, HostState>, value: f64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              value: f64|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller.data_mut().alloc_text(display_fractus(value)))
         },
     )?;
@@ -2777,7 +2991,9 @@ fn bind_text_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_i1",
-        move |mut caller: wasmtime::Caller<'_, HostState>, value: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              value: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller.data_mut().alloc_text(if value != 0 {
                 "verum".to_owned()
             } else {
@@ -2790,7 +3006,10 @@ fn bind_text_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
 
 /// `text_truthy (param i32) (result i32)` / `ascii_truthy (param i32)
 /// (result i32)`: text/ascii → bivalens carrier (non-empty text is verum).
-fn bind_text_truthy(linker: &mut Linker<HostState>, field: &'static str) -> Result<(), wasmtime::Error> {
+fn bind_text_truthy(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
@@ -2830,7 +3049,10 @@ fn bind_text_parse_integer_or(linker: &mut Linker<HostState>) -> Result<(), wasm
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_parse_integer_or",
-        move |caller: wasmtime::Caller<'_, HostState>, text: i32, fallback: i64| -> Result<i64, wasmtime::Error> {
+        move |caller: wasmtime::Caller<'_, HostState>,
+              text: i32,
+              fallback: i64|
+              -> Result<i64, wasmtime::Error> {
             let parsed = caller
                 .data()
                 .resolve_text(text)
@@ -2864,7 +3086,10 @@ fn bind_text_parse_float_or(linker: &mut Linker<HostState>) -> Result<(), wasmti
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_text_parse_float_or",
-        move |caller: wasmtime::Caller<'_, HostState>, text: i32, fallback: f64| -> Result<f64, wasmtime::Error> {
+        move |caller: wasmtime::Caller<'_, HostState>,
+              text: i32,
+              fallback: f64|
+              -> Result<f64, wasmtime::Error> {
             let parsed = caller
                 .data()
                 .resolve_text(text)
@@ -2904,12 +3129,13 @@ fn tensor_value_from_carrier(
     value: RuntimeValue,
 ) -> Result<RuntimeValue, String> {
     match (tensor.kind, value) {
-        (VALUE_KIND_F32 | VALUE_KIND_F64, RuntimeValue::F64(value)) => {
-            Ok(RuntimeValue::F64(value))
-        }
+        (VALUE_KIND_F32 | VALUE_KIND_F64, RuntimeValue::F64(value)) => Ok(RuntimeValue::F64(value)),
         (VALUE_KIND_I64 | VALUE_KIND_U64, RuntimeValue::I64(value)) => Ok(RuntimeValue::I64(value)),
-        (VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_I32 | VALUE_KIND_U8 | VALUE_KIND_U16
-        | VALUE_KIND_U32, RuntimeValue::I64(value)) => Ok(RuntimeValue::I32(value as i32)),
+        (
+            VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_I32 | VALUE_KIND_U8 | VALUE_KIND_U16
+            | VALUE_KIND_U32,
+            RuntimeValue::I64(value),
+        ) => Ok(RuntimeValue::I32(value as i32)),
         (VALUE_KIND_TEXT | VALUE_KIND_ASCII, RuntimeValue::Handle(handle)) => {
             Ok(RuntimeValue::Handle(handle))
         }
@@ -2940,7 +3166,9 @@ fn bind_tensor_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_new",
-        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              kind: i32|
+              -> Result<i32, wasmtime::Error> {
             Ok(caller.data_mut().alloc_tensor(TensorValue {
                 kind: kind as u32,
                 shape: Vec::new(),
@@ -2958,7 +3186,11 @@ fn bind_tensor_create(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_create",
-        move |mut caller: wasmtime::Caller<'_, HostState>, seed: i32, fill: f64, shape: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              seed: i32,
+              fill: f64,
+              shape: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape) = (|| {
                 let state = caller.data();
                 let tensor = state
@@ -2973,7 +3205,11 @@ fn bind_tensor_create(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
                 typed_unsupported(&mut caller, "tensor_create shape element count overflow")
             })?;
             let value = tensor_value_from_carrier(
-                &TensorValue { kind, shape: shape.clone(), values: Vec::new() },
+                &TensorValue {
+                    kind,
+                    shape: shape.clone(),
+                    values: Vec::new(),
+                },
                 RuntimeValue::F64(fill),
             )
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -2994,7 +3230,11 @@ fn bind_tensor_from_flat(linker: &mut Linker<HostState>) -> Result<(), wasmtime:
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_from_flat",
-        move |mut caller: wasmtime::Caller<'_, HostState>, seed: i32, flat: i32, shape: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              seed: i32,
+              flat: i32,
+              shape: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, values) = (|| {
                 let state = caller.data();
                 let tensor = state.find_tensor(seed).ok_or_else(|| {
@@ -3002,9 +3242,9 @@ fn bind_tensor_from_flat(linker: &mut Linker<HostState>) -> Result<(), wasmtime:
                 })?;
                 let shape = read_index_vector(state, shape)
                     .ok_or_else(|| "tensor_from_flat shape must be a lista of dims".to_owned())?;
-                let collection = state.find_collection(flat).ok_or_else(|| {
-                    format!("tensor_from_flat flat {flat}: unknown lista handle")
-                })?;
+                let collection = state
+                    .find_collection(flat)
+                    .ok_or_else(|| format!("tensor_from_flat flat {flat}: unknown lista handle"))?;
                 Ok::<_, String>((tensor.kind, shape, collection.values.clone()))
             })()
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3036,7 +3276,9 @@ fn bind_tensor_rank(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_rank",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i64, wasmtime::Error> {
             let state = caller.data();
             let Some(tensor) = state.find_tensor(handle) else {
                 return Err(typed_unsupported(
@@ -3056,7 +3298,9 @@ fn bind_tensor_shape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_shape",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(tensor) = state.find_tensor(handle) else {
                 return Err(typed_unsupported(
@@ -3069,7 +3313,9 @@ fn bind_tensor_shape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
                 .iter()
                 .map(|dim| RuntimeValue::I64(*dim))
                 .collect::<Vec<_>>();
-            Ok(caller.data_mut().alloc_collection(false, VALUE_KIND_I64, dims))
+            Ok(caller
+                .data_mut()
+                .alloc_collection(false, VALUE_KIND_I64, dims))
         },
     )?;
     Ok(())
@@ -3082,15 +3328,17 @@ fn bind_tensor_reshape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_reshape",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, shape: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              shape: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, values, new_shape) = (|| {
                 let state = caller.data();
                 let tensor = state.find_tensor(handle).ok_or_else(|| {
                     format!("tensor_reshape handle {handle}: unknown tensor handle")
                 })?;
-                let new_shape = read_index_vector(state, shape).ok_or_else(|| {
-                    "tensor_reshape shape must be a lista of dims".to_owned()
-                })?;
+                let new_shape = read_index_vector(state, shape)
+                    .ok_or_else(|| "tensor_reshape shape must be a lista of dims".to_owned())?;
                 Ok::<_, String>((tensor.kind, tensor.values.clone(), new_shape))
             })()
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3119,7 +3367,10 @@ fn bind_tensor_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_get",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              index: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(handle) else {
@@ -3136,11 +3387,9 @@ fn bind_tensor_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                     "tensor_get index must be a lista of dims",
                 ));
             };
-            let payload = tensor_flat_offset(&shape, &index)
-                .and_then(|offset| values.get(offset).copied());
-            let result = caller
-                .data_mut()
-                .option_result(kind, payload);
+            let payload =
+                tensor_flat_offset(&shape, &index).and_then(|offset| values.get(offset).copied());
+            let result = caller.data_mut().option_result(kind, payload);
             Ok(result)
         },
     )?;
@@ -3153,12 +3402,16 @@ fn bind_tensor_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_set",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i32, value: f64| -> Result<(), wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              index: i32,
+              value: f64|
+              -> Result<(), wasmtime::Error> {
             let (kind, shape) = (|| {
                 let state = caller.data();
-                let tensor = state.find_tensor(handle).ok_or_else(|| {
-                    format!("tensor_set handle {handle}: unknown tensor handle")
-                })?;
+                let tensor = state
+                    .find_tensor(handle)
+                    .ok_or_else(|| format!("tensor_set handle {handle}: unknown tensor handle"))?;
                 Ok::<_, String>((tensor.kind, tensor.shape.clone()))
             })()
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3172,7 +3425,11 @@ fn bind_tensor_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                 return Ok(());
             };
             let converted = tensor_value_from_carrier(
-                &TensorValue { kind, shape, values: Vec::new() },
+                &TensorValue {
+                    kind,
+                    shape,
+                    values: Vec::new(),
+                },
                 RuntimeValue::F64(value),
             )
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3197,19 +3454,26 @@ fn bind_tensor_fill(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_fill",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: f64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              value: f64|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, count) = (|| {
                 let state = caller.data();
-                let tensor = state.find_tensor(handle).ok_or_else(|| {
-                    format!("tensor_fill handle {handle}: unknown tensor handle")
-                })?;
+                let tensor = state
+                    .find_tensor(handle)
+                    .ok_or_else(|| format!("tensor_fill handle {handle}: unknown tensor handle"))?;
                 let count = tensor_shape_element_count(&tensor.shape)
                     .ok_or_else(|| "tensor_fill element count overflow".to_owned())?;
                 Ok::<_, String>((tensor.kind, tensor.shape.clone(), count))
             })()
             .map_err(|message| typed_unsupported(&mut caller, message))?;
             let converted = tensor_value_from_carrier(
-                &TensorValue { kind, shape, values: Vec::new() },
+                &TensorValue {
+                    kind,
+                    shape,
+                    values: Vec::new(),
+                },
                 RuntimeValue::F64(value),
             )
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3232,7 +3496,9 @@ fn bind_tensor_flatten(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_flatten",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(handle) else {
@@ -3243,9 +3509,7 @@ fn bind_tensor_flatten(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
                 };
                 (tensor.kind, tensor.values.clone())
             };
-            Ok(caller
-                .data_mut()
-                .alloc_collection(false, kind, values))
+            Ok(caller.data_mut().alloc_collection(false, kind, values))
         },
     )?;
     Ok(())
@@ -3257,7 +3521,9 @@ fn bind_tensor_materialize(linker: &mut Linker<HostState>) -> Result<(), wasmtim
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_materialize",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<i32, wasmtime::Error> {
             let state = caller.data();
             let Some(tensor) = state.find_tensor(handle) else {
                 return Err(typed_unsupported(
@@ -3283,7 +3549,11 @@ fn bind_tensor_slice(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_slice",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, start: i64, end: i64| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              start: i64,
+              end: i64|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(handle) else {
@@ -3295,21 +3565,24 @@ fn bind_tensor_slice(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
                 (tensor.kind, tensor.shape.clone(), tensor.values.clone())
             };
             let Some((&first, rest)) = shape.split_first() else {
-                return Err(typed_unsupported(&mut caller, "tensor_slice requires rank >= 1"));
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_slice requires rank >= 1",
+                ));
             };
             if start < 0 || end < start || end > first {
-                return Err(typed_unsupported(&mut caller, "tensor_slice bounds out of range"));
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_slice bounds out of range",
+                ));
             }
-            let row_stride =
-                tensor_shape_element_count(rest).unwrap_or(1);
+            let row_stride = tensor_shape_element_count(rest).unwrap_or(1);
             let row_len = usize::try_from(row_stride).expect("row stride fits usize");
             let take = usize::try_from(end - start).expect("slice width fits usize");
             let mut sliced = Vec::with_capacity(take * row_len);
             for row in start..end {
                 let base = usize::try_from(row).expect("row fits usize") * row_len;
-                sliced.extend_from_slice(
-                    &values[base..base + row_len],
-                );
+                sliced.extend_from_slice(&values[base..base + row_len]);
             }
             let mut new_shape = Vec::with_capacity(shape.len());
             new_shape.push(end - start);
@@ -3376,7 +3649,10 @@ fn bind_tensor_add_sub_mul(
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         field,
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(left) else {
@@ -3415,7 +3691,10 @@ fn bind_tensor_matmul(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_matmul",
-        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              left: i32,
+              right: i32|
+              -> Result<i32, wasmtime::Error> {
             let (kind, shape, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(left) else {
@@ -3481,7 +3760,7 @@ fn bind_tensor_matmul(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Er
                                         RuntimeValue::I64(current) => current,
                                         _ => 0,
                                     }
-                                        .wrapping_add(a.wrapping_mul(b)),
+                                    .wrapping_add(a.wrapping_mul(b)),
                                 );
                             }
                             _ => {
@@ -3510,7 +3789,9 @@ fn bind_tensor_sum(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_sum",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<f64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<f64, wasmtime::Error> {
             let state = caller.data();
             let Some(tensor) = state.find_tensor(handle) else {
                 return Err(typed_unsupported(
@@ -3518,17 +3799,17 @@ fn bind_tensor_sum(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                     format!("tensor_sum handle {handle}: unknown tensor handle"),
                 ));
             };
-            let sum = tensor.values.iter().try_fold(0.0_f64, |acc, value| match value {
-                RuntimeValue::F64(value) => Some(acc + value),
-                RuntimeValue::I64(value) => Some(acc + *value as f64),
-                RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
-                _ => None,
-            });
+            let sum = tensor
+                .values
+                .iter()
+                .try_fold(0.0_f64, |acc, value| match value {
+                    RuntimeValue::F64(value) => Some(acc + value),
+                    RuntimeValue::I64(value) => Some(acc + *value as f64),
+                    RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
+                    _ => None,
+                });
             sum.ok_or_else(|| {
-                typed_unsupported(
-                    &mut caller,
-                    "tensor_sum element kind not summable to f64",
-                )
+                typed_unsupported(&mut caller, "tensor_sum element kind not summable to f64")
             })
         },
     )?;
@@ -3541,24 +3822,28 @@ fn bind_tensor_mean(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_mean",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<f64, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32|
+              -> Result<f64, wasmtime::Error> {
             let (sum, count) = (|| {
                 let state = caller.data();
-                let tensor = state.find_tensor(handle).ok_or_else(|| {
-                    format!("tensor_mean handle {handle}: unknown tensor handle")
-                })?;
+                let tensor = state
+                    .find_tensor(handle)
+                    .ok_or_else(|| format!("tensor_mean handle {handle}: unknown tensor handle"))?;
                 if tensor.values.is_empty() {
                     return Err("tensor_mean requires at least one element".to_owned());
                 }
-                let sum = tensor.values.iter().try_fold(0.0_f64, |acc, value| match value {
-                    RuntimeValue::F64(value) => Some(acc + value),
-                    RuntimeValue::I64(value) => Some(acc + *value as f64),
-                    RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
-                    _ => None,
-                });
-                let sum = sum.ok_or_else(|| {
-                    "tensor_mean element kind not summable to f64".to_owned()
-                })?;
+                let sum = tensor
+                    .values
+                    .iter()
+                    .try_fold(0.0_f64, |acc, value| match value {
+                        RuntimeValue::F64(value) => Some(acc + value),
+                        RuntimeValue::I64(value) => Some(acc + *value as f64),
+                        RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
+                        _ => None,
+                    });
+                let sum =
+                    sum.ok_or_else(|| "tensor_mean element kind not summable to f64".to_owned())?;
                 Ok((sum, tensor.values.len()))
             })()
             .map_err(|message| typed_unsupported(&mut caller, message))?;
@@ -3570,15 +3855,14 @@ fn bind_tensor_mean(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
 
 /// Convert one tensor element from the source kind to the target kind
 /// (`tensor_convert` element-width conversions: numerus→fractus etc.).
-fn convert_tensor_value(
-    from: u32,
-    to: u32,
-    value: RuntimeValue,
-) -> Option<RuntimeValue> {
+fn convert_tensor_value(from: u32, to: u32, value: RuntimeValue) -> Option<RuntimeValue> {
     let scalar = match (from, value) {
         (VALUE_KIND_I64 | VALUE_KIND_U64, RuntimeValue::I64(value)) => value as f64,
-        (VALUE_KIND_I32 | VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_U8 | VALUE_KIND_U16
-        | VALUE_KIND_U32, RuntimeValue::I32(value)) => f64::from(value),
+        (
+            VALUE_KIND_I32 | VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_U8 | VALUE_KIND_U16
+            | VALUE_KIND_U32,
+            RuntimeValue::I32(value),
+        ) => f64::from(value),
         (VALUE_KIND_F32 | VALUE_KIND_F64, RuntimeValue::F64(value)) => value,
         _ => return None,
     };
@@ -3598,7 +3882,11 @@ fn bind_tensor_convert(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
     linker.func_wrap(
         WASM_IMPORT_MODULE_V1,
         "__faber_rt_v1_tensor_convert",
-        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, from: i32, to: i32| -> Result<i32, wasmtime::Error> {
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              handle: i32,
+              from: i32,
+              to: i32|
+              -> Result<i32, wasmtime::Error> {
             let (shape, values) = {
                 let state = caller.data();
                 let Some(tensor) = state.find_tensor(handle) else {
@@ -3615,9 +3903,7 @@ fn bind_tensor_convert(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
                     convert_tensor_value(from as u32, to as u32, *value).ok_or_else(|| {
                         typed_unsupported(
                             &mut caller,
-                            format!(
-                                "tensor_convert {from}→{to} on {value:?}",
-                            ),
+                            format!("tensor_convert {from}→{to} on {value:?}",),
                         )
                     })
                 })

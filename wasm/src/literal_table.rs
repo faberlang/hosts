@@ -63,11 +63,7 @@ pub(crate) fn initialize_literal_table(
         return Ok(());
     }
     let ptr = global_i32(ptr_global.as_ref(), LITERAL_TABLE_PTR_GLOBAL, store)?;
-    let count = global_i32(
-        count_global.as_ref(),
-        LITERAL_TABLE_COUNT_GLOBAL,
-        store,
-    )?;
+    let count = global_i32(count_global.as_ref(), LITERAL_TABLE_COUNT_GLOBAL, store)?;
     if ptr < 0 || count < 0 {
         return Err(init_failed(
             "literal table pointer/count must be non-negative",
@@ -75,9 +71,7 @@ pub(crate) fn initialize_literal_table(
     }
     let memory = instance
         .get_memory(&mut *store, "memory")
-        .ok_or_else(|| {
-            init_failed("literal table declared but the module exports no `memory`")
-        })?;
+        .ok_or_else(|| init_failed("literal table declared but the module exports no `memory`"))?;
     let rows = read_literal_rows(&memory, store, ptr, count)?;
     store.data_mut().intern_literal_table(&rows)?;
     Ok(())
@@ -111,9 +105,9 @@ fn read_literal_rows(
     let data = memory.data(store);
     let ptr = usize::try_from(ptr).expect("non-negative pointer");
     let count = usize::try_from(count).expect("non-negative count");
-    let table_bytes = count.checked_mul(ROW_BYTES).ok_or_else(|| {
-        init_failed("literal table byte size overflows host address space")
-    })?;
+    let table_bytes = count
+        .checked_mul(ROW_BYTES)
+        .ok_or_else(|| init_failed("literal table byte size overflows host address space"))?;
     let table_end = ptr
         .checked_add(table_bytes)
         .ok_or_else(|| init_failed("literal table extends past host address space"))?;
@@ -139,7 +133,9 @@ fn read_payload<'a>(data: &'a [u8], offset: usize) -> Result<&'a [u8], RunOutcom
         .checked_add(length)
         .ok_or_else(|| init_failed("literal payload extends past host address space"))?;
     if end > data.len() {
-        return Err(init_failed("declared literal payload extends past linear memory"));
+        return Err(init_failed(
+            "declared literal payload extends past linear memory",
+        ));
     }
     Ok(&data[start..end])
 }

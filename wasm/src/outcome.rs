@@ -43,14 +43,9 @@ pub enum RunOutcome {
     /// Entry completed; `stdout` holds the captured program output and
     /// `stderr` the captured diagnostic stream (W12: mone lines are captured,
     /// never dropped or redirected to stdout).
-    Success {
-        stdout: String,
-        stderr: String,
-    },
+    Success { stdout: String, stderr: String },
     /// Module bytes failed Wasm validation.
-    ValidationFailed {
-        message: String,
-    },
+    ValidationFailed { message: String },
     /// Import surface rejected during preflight.
     ImportRejected {
         module: String,
@@ -58,35 +53,19 @@ pub enum RunOutcome {
         message: String,
     },
     /// Linking or instantiation failed after import admission.
-    LinkFailed {
-        message: String,
-    },
+    LinkFailed { message: String },
     /// Generated initialization failed.
-    InitializationFailed {
-        message: String,
-    },
+    InitializationFailed { message: String },
     /// The configured entry export is missing.
-    EntryMissing {
-        entry: String,
-    },
+    EntryMissing { entry: String },
     /// The entry export trapped during invocation.
-    EntryTrapped {
-        entry: String,
-        message: String,
-    },
+    EntryTrapped { entry: String, message: String },
     /// Host-side runtime failure.
-    RuntimeFailure {
-        message: String,
-    },
+    RuntimeFailure { message: String },
     /// Capability policy denied the run.
-    PolicyDenied {
-        message: String,
-    },
+    PolicyDenied { message: String },
     /// The program exited with an explicit status.
-    Exited {
-        code: i32,
-        stdout: String,
-    },
+    Exited { code: i32, stdout: String },
 }
 
 impl RunOutcome {

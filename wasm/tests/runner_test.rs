@@ -9,7 +9,9 @@
 //! literal reference is the arena handle). Reject cases assert the typed
 //! validation/import/link/initialization/entry/trap/runtime distinctions.
 
-use faber_host_wasm::{OutcomeCategory, RunConfig, RunOutcome, WasmRtV1Host, WASM_IMPORT_MODULE_V1};
+use faber_host_wasm::{
+    OutcomeCategory, RunConfig, RunOutcome, WasmRtV1Host, WASM_IMPORT_MODULE_V1,
+};
 
 const SIC_WASM: &[u8] = include_bytes!("fixtures/sic.wasm");
 const PER_WASM: &[u8] = include_bytes!("fixtures/per.wasm");
@@ -69,12 +71,14 @@ fn per_compiler_artifact_matches_rust_outcome() {
 /// typed import outcome naming the offending module.
 #[test]
 fn legacy_import_module_rejects_with_typed_outcome() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_diag" "nota_i64" (func $legacy (param i64)))
   (func (export "incipit") (call $legacy (i64.const 1)))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert!(
         matches!(
@@ -93,12 +97,14 @@ fn legacy_import_module_rejects_with_typed_outcome() {
 /// the previously-unadmitted `tensor_shape` is bound since W14.
 #[test]
 fn unknown_v1_field_rejects_with_typed_outcome() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_tensor_div" (func $len (param i32) (result i32)))
   (func (export "incipit") (drop (call $len (i32.const 0))))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert!(
         matches!(
@@ -115,12 +121,14 @@ fn unknown_v1_field_rejects_with_typed_outcome() {
 /// with a typed link outcome (distinct from the preflight import rejection).
 #[test]
 fn signature_mismatch_fails_link_with_typed_outcome() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota (param i32)))
   (func (export "incipit") (call $nota (i32.const 1)))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -133,11 +141,13 @@ fn signature_mismatch_fails_link_with_typed_outcome() {
 /// entry-missing outcome.
 #[test]
 fn missing_entry_rejects_with_typed_outcome() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (func (export "other") (return))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert!(
         matches!(&outcome, RunOutcome::EntryMissing { entry } if entry == "incipit"),
@@ -160,11 +170,13 @@ fn invalid_bytes_fail_validation() {
 /// A module whose entry traps produces a typed entry-trap outcome.
 #[test]
 fn entry_trap_is_typed() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (func (export "incipit") (unreachable))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -178,12 +190,14 @@ fn entry_trap_is_typed() {
 /// default).
 #[test]
 fn text_handle_call_produces_typed_runtime_failure() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
   (func (export "incipit") (call $nota_ptr (i32.const 18)))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -208,7 +222,8 @@ fn text_handle_call_produces_typed_runtime_failure() {
 /// closed-set surface is accepted, not rejected as unknown (W13).
 #[test]
 fn w4b_provider_surface_accepted_by_preflight_and_link() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_lines" (func $read_lines (param i32) (result i32)))
@@ -218,7 +233,8 @@ fn w4b_provider_surface_accepted_by_preflight_and_link() {
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_text" (func $mone_text (param i32)))
   (func (export "incipit") (nop))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -236,12 +252,14 @@ fn w4b_provider_surface_accepted_by_preflight_and_link() {
 /// symbol — never a silent no-op or a synthesized result handle.
 #[test]
 fn w4b_solum_fixture_read_produces_typed_unsupported() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
   (func (export "incipit") (drop (call $read_text (i32.const 3))))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -265,7 +283,8 @@ fn w4b_solum_fixture_read_produces_typed_unsupported() {
 /// outcome on first invocation.
 #[test]
 fn w4b_solum_fixture_full_surface_links_then_typed_unsupported() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_lines" (func $read_lines (param i32) (result i32)))
@@ -276,7 +295,8 @@ fn w4b_solum_fixture_full_surface_links_then_typed_unsupported() {
     (drop (call $read_text (i32.const 3)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -291,7 +311,8 @@ fn w4b_solum_fixture_full_surface_links_then_typed_unsupported() {
 /// outcome naming the symbol and its oracle stream.
 #[test]
 fn w4b_consolum_fixture_produces_typed_unsupported() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_text" (func $mone_text (param i32)))
@@ -300,7 +321,8 @@ fn w4b_consolum_fixture_produces_typed_unsupported() {
     (call $mone_text (i32.const 6))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -324,12 +346,14 @@ fn w4b_consolum_fixture_produces_typed_unsupported() {
 /// permissive).
 #[test]
 fn w4b_provider_signature_mismatch_fails_link() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_solum_read_text" (func $read_text (param i32)))
   (func (export "incipit") (call $read_text (i32.const 3)))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -349,14 +373,16 @@ fn w4b_provider_signature_mismatch_fails_link() {
 /// accepted, not rejected as unknown (W13).
 #[test]
 fn we6_json_provider_surface_accepted_by_preflight_and_link() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_json_pange" (func $pange (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_json_solve" (func $solve (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_json_tempta" (func $tempta (param i32) (result i32)))
   (func (export "incipit") (nop))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -374,12 +400,14 @@ fn we6_json_provider_surface_accepted_by_preflight_and_link() {
 /// naming the symbol — never a silent no-op or a synthesized result handle.
 #[test]
 fn we6_json_fixture_produces_typed_unsupported() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_json_solve" (func $solve (param i32) (result i32)))
   (func (export "incipit") (drop (call $solve (i32.const 3))))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -403,12 +431,14 @@ fn we6_json_fixture_produces_typed_unsupported() {
 /// signature-checked, not permissive).
 #[test]
 fn we6_json_signature_mismatch_fails_link() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_json_pange" (func $pange (param i64) (result i32)))
   (func (export "incipit") (drop (call $pange (i64.const 3))))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -448,7 +478,8 @@ fn salve_munde_renders_literal_through_the_host_text_arena() {
 /// reconstruction of an interner table from WAT.
 #[test]
 fn declared_literal_table_interning_renders_text() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
   (memory (export "memory") 1)
@@ -460,7 +491,8 @@ fn declared_literal_table_interning_renders_text() {
     (call $nota_text (i32.const 0))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -476,12 +508,14 @@ fn declared_literal_table_interning_renders_text() {
 /// generated initialization with a typed outcome — entry never runs.
 #[test]
 fn partial_literal_table_declaration_fails_initialization() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 0))
   (func (export "incipit") (return))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -501,14 +535,16 @@ fn partial_literal_table_declaration_fails_initialization() {
 /// module's memory and never synthesizes a handle table.
 #[test]
 fn literal_table_out_of_bounds_fails_initialization() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (memory (export "memory") 1)
   (global (export "__faber_rt_v1_literal_table_ptr") i32 (i32.const 65532))
   (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
   (func (export "incipit") (return))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -522,7 +558,8 @@ fn literal_table_out_of_bounds_fails_initialization() {
 /// table.
 #[test]
 fn uninterned_handle_produces_typed_runtime_failure() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_text" (func $nota_text (param i32)))
   (memory (export "memory") 1)
@@ -534,7 +571,8 @@ fn uninterned_handle_produces_typed_runtime_failure() {
     (call $nota_text (i32.const 1))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -553,7 +591,8 @@ fn uninterned_handle_produces_typed_runtime_failure() {
 /// Debug shape (`[104, 105]`), mirroring the LLVM host's opaque display.
 #[test]
 fn octeti_rows_intern_and_render_byte_list_through_nota() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
   (memory (export "memory") 1)
@@ -568,7 +607,8 @@ fn octeti_rows_intern_and_render_byte_list_through_nota() {
     (call $nota_ptr (i32.const 1))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -585,7 +625,8 @@ fn octeti_rows_intern_and_render_byte_list_through_nota() {
 /// `nota_ptr` renders the pattern text — the shared oracle's regex display.
 #[test]
 fn regex_rows_pair_flags_and_render_pattern_through_nota() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
   (memory (export "memory") 1)
@@ -599,7 +640,8 @@ fn regex_rows_pair_flags_and_render_pattern_through_nota() {
     (call $nota_ptr (i32.const 0))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -614,7 +656,8 @@ fn regex_rows_pair_flags_and_render_pattern_through_nota() {
 /// A regex literal without a flags row (pattern row only) also resolves.
 #[test]
 fn regex_row_without_flags_render_pattern_through_nota() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
   (memory (export "memory") 1)
@@ -626,7 +669,8 @@ fn regex_row_without_flags_render_pattern_through_nota() {
     (call $nota_ptr (i32.const 0))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -642,7 +686,8 @@ fn regex_row_without_flags_render_pattern_through_nota() {
 /// initialization with a typed outcome — entry never runs.
 #[test]
 fn unknown_literal_row_kind_fails_initialization() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (memory (export "memory") 1)
   (data (i32.const 0) "x")
@@ -651,7 +696,8 @@ fn unknown_literal_row_kind_fails_initialization() {
   (global (export "__faber_rt_v1_literal_table_count") i32 (i32.const 1))
   (func (export "incipit") (return))
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome.category(),
@@ -664,7 +710,8 @@ fn unknown_literal_row_kind_fails_initialization() {
 /// their raw indices (the flags row is a continuation row, not a handle).
 #[test]
 fn regex_flags_row_keeps_later_rows_at_raw_indices() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
   (memory (export "memory") 1)
@@ -681,7 +728,8 @@ fn regex_flags_row_keeps_later_rows_at_raw_indices() {
     (call $nota_ptr (i32.const 2))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -701,7 +749,8 @@ fn regex_flags_row_keeps_later_rows_at_raw_indices() {
 /// rows; the returned dynamic text handle feeds a later `nota_ptr`.
 #[test]
 fn format_text_renders_template_into_a_new_text_handle() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_format_text" (func $format_text (param i32 i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
@@ -717,7 +766,8 @@ fn format_text_renders_template_into_a_new_text_handle() {
     (call $nota_ptr (i32.const 2))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -734,7 +784,8 @@ fn format_text_renders_template_into_a_new_text_handle() {
 /// oracle template policy).
 #[test]
 fn format_i64_renders_scalar_and_numbered_placeholders() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_format_i64_i64" (func $format_i64_i64 (param i32 i64 i64) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_format_i64" (func $format_i64 (param i32 i64) (result i32)))
@@ -753,7 +804,8 @@ fn format_i64_renders_scalar_and_numbered_placeholders() {
     (call $nota_ptr (i32.const 3))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -773,7 +825,8 @@ fn format_i64_renders_scalar_and_numbered_placeholders() {
 /// interned literals directly on the arena.
 #[test]
 fn text_concat_and_eq_operate_on_the_host_text_arena() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_text_concat" (func $concat (param i32 i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_text_eq" (func $eq (param i32 i32) (result i32)))
@@ -793,7 +846,8 @@ fn text_concat_and_eq_operate_on_the_host_text_arena() {
     (call $nota_i32 (call $ne (i32.const 0) (i32.const 1)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -809,7 +863,8 @@ fn text_concat_and_eq_operate_on_the_host_text_arena() {
 /// `slice`) mirror the LLVM host semantics against the interned literals.
 #[test]
 fn text_query_and_transform_rows_operate_on_the_host_text_arena() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_text_length" (func $len (param i32) (result i64)))
   (import "faber_rt_v1" "__faber_rt_v1_text_contains" (func $contains (param i32 i32) (result i32)))
@@ -831,7 +886,8 @@ fn text_query_and_transform_rows_operate_on_the_host_text_arena() {
     (call $nota_ptr (call $slice (i32.const 0) (i64.const 1) (i64.const 4)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -851,7 +907,8 @@ fn text_query_and_transform_rows_operate_on_the_host_text_arena() {
 /// `Success::stderr` — never a silent redirect to stdout.
 #[test]
 fn mone_streams_to_captured_stderr() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_mone_ptr" (func $mone_ptr (param i32)))
   (memory (export "memory") 1)
@@ -863,7 +920,8 @@ fn mone_streams_to_captured_stderr() {
     (call $mone_ptr (i32.const 0))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -881,7 +939,8 @@ fn mone_streams_to_captured_stderr() {
 /// the pattern text.
 #[test]
 fn regex_from_text_converts_a_text_handle_to_a_renderable_regex() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_regex_from_text" (func $from_text (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
@@ -895,7 +954,8 @@ fn regex_from_text_converts_a_text_handle_to_a_renderable_regex() {
     (call $nota_ptr (i32.const 1))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -916,7 +976,8 @@ fn regex_from_text_converts_a_text_handle_to_a_renderable_regex() {
 /// diagnostic resolves the handle.
 #[test]
 fn array_literal_renders_bracket_debug_shape() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_array_new" (func $array_new (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
@@ -930,7 +991,8 @@ fn array_literal_renders_bracket_debug_shape() {
     (call $nota_ptr (local.get $t))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -946,7 +1008,8 @@ fn array_literal_renders_bracket_debug_shape() {
 /// `array_get` reads elements back as i64 carriers.
 #[test]
 fn text_array_renders_quoted_elements_and_array_get_reads_elements() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_array_new" (func $array_new (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
@@ -968,7 +1031,8 @@ fn text_array_renders_quoted_elements_and_array_get_reads_elements() {
     (call $nota_i64 (call $array_get (local.get $t) (i64.const 1)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -984,7 +1048,8 @@ fn text_array_renders_quoted_elements_and_array_get_reads_elements() {
 /// the Rust-oracle derived `Json(Tabula({...}))` Debug shape.
 #[test]
 fn map_literal_renders_json_tabula_debug_shape() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
@@ -1003,7 +1068,8 @@ fn map_literal_renders_json_tabula_debug_shape() {
     (call $nota_ptr (local.get $t))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -1019,7 +1085,8 @@ fn map_literal_renders_json_tabula_debug_shape() {
 /// `array_contains`/`array_length` read back set facts.
 #[test]
 fn set_renders_brace_shape_and_reads_back_facts() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_set_new" (func $set_new (param i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_array_push" (func $array_push (param i32 i64) (result i32)))
@@ -1039,7 +1106,8 @@ fn set_renders_brace_shape_and_reads_back_facts() {
     (call $nota_i64 (call $length (local.get $t)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -1056,7 +1124,8 @@ fn set_renders_brace_shape_and_reads_back_facts() {
 /// unwraps with a fallback.
 #[test]
 fn map_index_returns_option_rendered_as_payload_or_nihil() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
@@ -1083,7 +1152,8 @@ fn map_index_returns_option_rendered_as_payload_or_nihil() {
     (call $nota_i64 (call $get_or (local.get $opt) (i64.const 0)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -1099,7 +1169,8 @@ fn map_index_returns_option_rendered_as_payload_or_nihil() {
 /// display half of the cluster).
 #[test]
 fn bivalens_diagnostics_render_verum_falsum() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i1" (func $nota_i1 (param i32)))
   (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i32" (func $nota_i32 (param i32)))
@@ -1109,7 +1180,8 @@ fn bivalens_diagnostics_render_verum_falsum() {
     (call $nota_i32 (i32.const 1))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
@@ -1125,7 +1197,8 @@ fn bivalens_diagnostics_render_verum_falsum() {
 /// the `["aelia", "balbus"]` / `[95, 87]` shapes.
 #[test]
 fn map_keys_and_values_project_lista_handles() {
-    let bytes = wat_bytes(r#"
+    let bytes = wat_bytes(
+        r#"
 (module
   (import "faber_rt_v1" "__faber_rt_v1_map_new" (func $map_new (param i32 i32) (result i32)))
   (import "faber_rt_v1" "__faber_rt_v1_map_put" (func $map_put (param i32 i32 i64)))
@@ -1147,7 +1220,8 @@ fn map_keys_and_values_project_lista_handles() {
     (call $nota_ptr (call $map_values (local.get $map)))
   )
 )
-"#);
+"#,
+    );
     let outcome = host().run(&bytes, &RunConfig::default());
     assert_eq!(
         outcome,
