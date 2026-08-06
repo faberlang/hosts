@@ -327,3 +327,79 @@ fn w4b_provider_signature_mismatch_fails_link() {
         "declared signature conflicting with the admitted solum binding must be LinkFailed, got: {outcome:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WE6 json surface: the three emitter-route json v1 symbols
+// ---------------------------------------------------------------------------
+
+/// All three WE6 json symbols are admitted by preflight and bound at link
+/// with the exact signatures the radix Wasm emitter emits (`(param i32)
+/// (result i32)` handle carriers). A module that declares them but never
+/// invokes them runs to success — proof that the closed-set surface is
+/// accepted, not rejected as unknown (W13).
+#[test]
+fn we6_json_provider_surface_accepted_by_preflight_and_link() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_json_pange" (func $pange (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_json_solve" (func $solve (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_json_tempta" (func $tempta (param i32) (result i32)))
+  (func (export "incipit") (nop))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success { stdout: String::new() },
+        "declared-only WE6 json surface must pass preflight and link, got: {outcome:?}"
+    );
+}
+
+/// Json fixture: `solve` (parse wire text -> json value) is admitted but has
+/// no host json implementation in this stage (W13 typed-unsupported until the
+/// json host impl lands), so invoking it is a typed unsupported outcome
+/// naming the symbol — never a silent no-op or a synthesized result handle.
+#[test]
+fn we6_json_fixture_produces_typed_unsupported() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_json_solve" (func $solve (param i32) (result i32)))
+  (func (export "incipit") (drop (call $solve (i32.const 3))))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "json solve without a host json implementation must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("__faber_rt_v1_json_solve"),
+            "message must name the json symbol: {message}"
+        );
+        assert!(
+            message.contains("typed unsupported"),
+            "message must declare the typed-unsupported outcome: {message}"
+        );
+    }
+}
+
+/// A declared signature that conflicts with an admitted WE6 json binding
+/// fails at link time with a typed link outcome (the binding is
+/// signature-checked, not permissive).
+#[test]
+fn we6_json_signature_mismatch_fails_link() {
+    let bytes = wat_bytes(r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_json_pange" (func $pange (param i64) (result i32)))
+  (func (export "incipit") (drop (call $pange (i64.const 3))))
+)
+"#);
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::LinkFailed,
+        "declared signature conflicting with the admitted json binding must be LinkFailed, got: {outcome:?}"
+    );
+}

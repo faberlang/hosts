@@ -52,9 +52,26 @@ pub(crate) const V1_PROVIDER_TEXT_FIELDS: &[&str] = &[
     "__faber_rt_v1_diagnostic_mone_text",
 ];
 
+/// WE6 json surface: the closed-set v1 rows the radix Wasm emitter now emits
+/// for `json` (pange -> `__faber_rt_v1_json_pange`, solve ->
+/// `__faber_rt_v1_json_solve`, tempta -> `__faber_rt_v1_json_tempta`). The
+/// emitter rows carry `(param i32) (result i32)` handle carriers (pange: a
+/// Json/Valor value handle in, a text handle out; solve/tempta: a text wire
+/// handle in, a json value handle out). No host json implementation exists in
+/// this stage (the W13 json host impl is a later stage), so invoking one is a
+/// typed unsupported outcome — never a silent no-op or a plausible default
+/// (W4B pattern).
+pub(crate) const V1_JSON_FIELDS: &[&str] = &[
+    "__faber_rt_v1_json_pange",
+    "__faber_rt_v1_json_solve",
+    "__faber_rt_v1_json_tempta",
+];
+
 /// True when `field` is admitted by the closed v1 registry.
 fn is_admitted_field(field: &str) -> bool {
-    V1_DIAGNOSTIC_FIELDS.contains(&field) || V1_PROVIDER_TEXT_FIELDS.contains(&field)
+    V1_DIAGNOSTIC_FIELDS.contains(&field)
+        || V1_PROVIDER_TEXT_FIELDS.contains(&field)
+        || V1_JSON_FIELDS.contains(&field)
 }
 
 /// Per-run host state: captured stdout, capture bound, and the typed
@@ -155,6 +172,13 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
         "__faber_rt_v1_diagnostic_mone_text",
         "mone -> stderr",
     )?;
+    // WE6 json surface: bound with the exact `(param i32) (result i32)`
+    // handle signatures the radix Wasm emitter emits. No json host
+    // implementation exists in this stage, so invoking one is a typed
+    // unsupported outcome (W13) — never a silent no-op.
+    bind_json_handle(linker, "__faber_rt_v1_json_pange", "pange")?;
+    bind_json_handle(linker, "__faber_rt_v1_json_solve", "solve")?;
+    bind_json_handle(linker, "__faber_rt_v1_json_tempta", "tempta")?;
     Ok(())
 }
 
@@ -288,6 +312,35 @@ fn bind_consolum_diagnostic_text(
             ));
             Err(wasmtime::Error::msg(
                 "unsupported v1 consolum diagnostic text (admitted symbol, unfinished behavior)",
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// The json v1 rows (`pange`/`solve`/`tempta`) are admitted-but-unimplemented
+/// in this stage: no json host implementation exists (a later stage lands the
+/// W13 json host impl), and the emitted operands are opaque handles the runner
+/// cannot materialize without linear-memory literal data (Stage 4 literal
+/// initialization). Invoking one is a typed runtime failure (W13) — never a
+/// synthesized result handle.
+fn bind_json_handle(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+    verb: &'static str,
+) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            caller.data_mut().unsupported = Some(format!(
+                "`{field}` handle {handle}: json {verb} requires a json host implementation \
+                 (admitted symbol, unfinished behavior; typed unsupported until the json host \
+                 impl lands) and handle materialization (Stage 4 literal initialization); \
+                 declared-but-unimplemented -> typed unsupported"
+            ));
+            Err(wasmtime::Error::msg(
+                "unsupported v1 json (admitted symbol, unfinished behavior)",
             ))
         },
     )?;
