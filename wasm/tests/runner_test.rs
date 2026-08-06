@@ -87,13 +87,15 @@ fn legacy_import_module_rejects_with_typed_outcome() {
     assert_eq!(outcome.category(), OutcomeCategory::ImportRejected);
 }
 
-/// A known v1 symbol outside the admitted Stage 2/5 registry rejects during
-/// preflight with a typed import outcome naming the field.
+/// A known v1 symbol outside the admitted Stage 2/5/14 registry rejects during
+/// preflight with a typed import outcome naming the field. `tensor_div` is
+/// genuinely unadmitted (the wasm emitter fails closed on the division row);
+/// the previously-unadmitted `tensor_shape` is bound since W14.
 #[test]
 fn unknown_v1_field_rejects_with_typed_outcome() {
     let bytes = wat_bytes(r#"
 (module
-  (import "faber_rt_v1" "__faber_rt_v1_tensor_shape" (func $len (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_tensor_div" (func $len (param i32) (result i32)))
   (func (export "incipit") (drop (call $len (i32.const 0))))
 )
 "#);
@@ -102,7 +104,7 @@ fn unknown_v1_field_rejects_with_typed_outcome() {
         matches!(
             &outcome,
             RunOutcome::ImportRejected { module, field, .. }
-                if module == WASM_IMPORT_MODULE_V1 && field == "__faber_rt_v1_tensor_shape"
+                if module == WASM_IMPORT_MODULE_V1 && field == "__faber_rt_v1_tensor_div"
         ),
         "unbound v1 field must reject with ImportRejected, got: {outcome:?}"
     );

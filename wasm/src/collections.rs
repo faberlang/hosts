@@ -7,6 +7,11 @@
 //! diagnostic resolves the handle. The wasm row signatures carry scalar
 //! values widened to i64 (there are no pointer carriers in wasm); the host
 //! interprets each value per its declared kind.
+//!
+//! W14 tensor arena: dense tensor values (element kind + row-major shape +
+//! flat values) stored arena-style like the collections/maps/options, so the
+//! wasm tensor rows (`tensor_new/create/from_flat/get/set/…`) keep the same
+//! opaque-handle contract the collection rows use.
 
 use radix_host_abi::{
     VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32,
@@ -24,6 +29,16 @@ pub(crate) enum RuntimeValue {
     F64(f64),
     /// Opaque handle (text/aggregate/valor element).
     Handle(i32),
+}
+
+/// One dense tensor: element kind + row-major shape dims + flat element
+/// values (W14). The shape mirrors the LLVM host's `Tensor` metadata; the
+/// element kind tags the flat values exactly like a collection's.
+#[derive(Debug)]
+pub(crate) struct TensorValue {
+    pub(crate) kind: u32,
+    pub(crate) shape: Vec<i64>,
+    pub(crate) values: Vec<RuntimeValue>,
 }
 
 /// One collection (`lista` or `copia`): element kind + stored values.
@@ -97,4 +112,38 @@ pub(crate) fn display_fractus(value: f64) -> String {
     } else {
         value.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// W14 tensor shape arithmetic (mirrors the radix-runtime-contract tensor
+// shape math — row-major flat offsets and element counts).
+// ---------------------------------------------------------------------------
+
+/// Total element count of a shape, or `None` on overflow/negative dims.
+pub(crate) fn tensor_shape_element_count(shape: &[i64]) -> Option<usize> {
+    shape.iter().try_fold(1_usize, |acc, dim| {
+        let dim = usize::try_from(*dim).ok()?;
+        acc.checked_mul(dim)
+    })
+}
+
+/// Row-major flat offset for `index` into a tensor of `shape`, or `None` when
+/// the ranks disagree, a dimension/index is negative, or an index is out of
+/// bounds (mirrors `radix-runtime-contract::tensor::tensor_flat_offset`).
+pub(crate) fn tensor_flat_offset(shape: &[i64], index: &[i64]) -> Option<usize> {
+    if shape.len() != index.len() {
+        return None;
+    }
+    let mut offset = 0_usize;
+    let mut stride = 1_usize;
+    for (dim, idx) in shape.iter().zip(index.iter()).rev() {
+        let dim = usize::try_from(*dim).ok()?;
+        let idx = usize::try_from(*idx).ok()?;
+        if idx >= dim {
+            return None;
+        }
+        offset = offset.checked_add(idx.checked_mul(stride)?)?;
+        stride = stride.checked_mul(dim)?;
+    }
+    Some(offset)
 }

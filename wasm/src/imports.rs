@@ -8,13 +8,15 @@
 //! "must not return a plausible default").
 
 use crate::collections::{
-    display_fractus, runtime_value_eq, value_from_i64, value_to_i64, CollectionValue, MapValue,
-    OptionValue, RuntimeValue,
+    display_fractus, runtime_value_eq, tensor_flat_offset, tensor_shape_element_count,
+    value_from_i64, value_to_i64, CollectionValue, MapValue, OptionValue, RuntimeValue,
+    TensorValue,
 };
 use crate::outcome::RunOutcome;
 use radix_host_abi::{
-    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I32,
-    VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32,
+    VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U16, VALUE_KIND_U32,
+    VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
 };
 use std::collections::{BTreeMap, HashMap};
 use wasmtime::{Linker, Module};
@@ -190,6 +192,37 @@ pub(crate) const V1_SCALAR_FIELDS: &[&str] = &[
     "__faber_rt_v1_read_line_0_to_ptr",
 ];
 
+/// W14 tensor surface: the closed-set v1 rows the radix Wasm emitter now
+/// emits for the tensor display family. Construction (`tensor_new` vacua /
+/// `tensor_create` fill+shape / `tensor_from_flat` flat+shape) produces a
+/// dense tensor handle; reads (`tensor_rank`/`tensor_shape`/`tensor_get`)
+/// and writes (`tensor_set`/`tensor_fill`) match the LLVM lane's tensor
+/// carrier semantics. `tensor_convert` carries the source/target element
+/// kinds as trailing i32 consts (one host binding per kind pair). The
+/// element/value carriers are i32 handles for tensors and shapes, f64 for
+/// f32/f64 element values, and i64 for the row-major index vectors.
+pub(crate) const V1_TENSOR_FIELDS: &[&str] = &[
+    "__faber_rt_v1_tensor_new",
+    "__faber_rt_v1_tensor_create",
+    "__faber_rt_v1_tensor_from_flat",
+    "__faber_rt_v1_tensor_rank",
+    "__faber_rt_v1_tensor_shape",
+    "__faber_rt_v1_tensor_reshape",
+    "__faber_rt_v1_tensor_get",
+    "__faber_rt_v1_tensor_set",
+    "__faber_rt_v1_tensor_fill",
+    "__faber_rt_v1_tensor_flatten",
+    "__faber_rt_v1_tensor_materialize",
+    "__faber_rt_v1_tensor_slice",
+    "__faber_rt_v1_tensor_add",
+    "__faber_rt_v1_tensor_sub",
+    "__faber_rt_v1_tensor_mul",
+    "__faber_rt_v1_tensor_matmul",
+    "__faber_rt_v1_tensor_sum",
+    "__faber_rt_v1_tensor_mean",
+    "__faber_rt_v1_tensor_convert",
+];
+
 /// True when `field` is admitted by the closed v1 registry.
 fn is_admitted_field(field: &str) -> bool {
     V1_DIAGNOSTIC_FIELDS.contains(&field)
@@ -201,6 +234,7 @@ fn is_admitted_field(field: &str) -> bool {
         || V1_COLLECTION_FIELDS.contains(&field)
         || V1_OPTION_FIELDS.contains(&field)
         || V1_SCALAR_FIELDS.contains(&field)
+        || V1_TENSOR_FIELDS.contains(&field)
 }
 
 /// Kind of one interned literal-table row (W12).
@@ -248,6 +282,10 @@ enum DynamicValue {
     Option {
         index: usize,
     },
+    /// W14 — dense tensor arena entry.
+    Tensor {
+        index: usize,
+    },
 }
 
 /// Per-run host state: captured stdout/stderr, capture bound, the typed
@@ -275,6 +313,8 @@ pub(crate) struct HostState {
     maps: Vec<MapValue>,
     /// W13 — option arena (payload entries).
     options: Vec<OptionValue>,
+    /// W14 — tensor arena (dense element-kind + shape + flat values).
+    tensors: Vec<TensorValue>,
     /// Dynamic-handle allocator: starts after the last declared row.
     next_dynamic: i32,
     /// Host-allocated dynamic values by handle.
@@ -295,6 +335,7 @@ impl HostState {
             collections: Vec::new(),
             maps: Vec::new(),
             options: Vec::new(),
+            tensors: Vec::new(),
             next_dynamic: 0,
             dynamic: HashMap::new(),
         }
@@ -602,6 +643,29 @@ impl HostState {
     pub(crate) fn find_option(&self, handle: i32) -> Option<&OptionValue> {
         match self.dynamic.get(&handle) {
             Some(DynamicValue::Option { index }) => self.options.get(*index),
+            _ => None,
+        }
+    }
+
+    /// W14 — allocate one dense tensor and return its handle.
+    pub(crate) fn alloc_tensor(&mut self, tensor: TensorValue) -> i32 {
+        let index = self.tensors.len();
+        self.tensors.push(tensor);
+        self.alloc_dynamic(DynamicValue::Tensor { index })
+    }
+
+    /// W14 — resolve a tensor handle.
+    pub(crate) fn find_tensor(&self, handle: i32) -> Option<&TensorValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Tensor { index }) => self.tensors.get(*index),
+            _ => None,
+        }
+    }
+
+    /// W14 — resolve a tensor handle mutably.
+    pub(crate) fn find_tensor_mut(&mut self, handle: i32) -> Option<&mut TensorValue> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Tensor { index }) => self.tensors.get_mut(*index),
             _ => None,
         }
     }
@@ -994,6 +1058,26 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_option_get(linker)?;
     bind_option_get_or(linker)?;
     bind_option_is_present(linker)?;
+    // W14 tensor display rows.
+    bind_tensor_new(linker)?;
+    bind_tensor_create(linker)?;
+    bind_tensor_from_flat(linker)?;
+    bind_tensor_rank(linker)?;
+    bind_tensor_shape(linker)?;
+    bind_tensor_reshape(linker)?;
+    bind_tensor_get(linker)?;
+    bind_tensor_set(linker)?;
+    bind_tensor_fill(linker)?;
+    bind_tensor_flatten(linker)?;
+    bind_tensor_materialize(linker)?;
+    bind_tensor_slice(linker)?;
+    bind_tensor_add_sub_mul(linker, "__faber_rt_v1_tensor_add", TensorBinaryOp::Add)?;
+    bind_tensor_add_sub_mul(linker, "__faber_rt_v1_tensor_sub", TensorBinaryOp::Sub)?;
+    bind_tensor_add_sub_mul(linker, "__faber_rt_v1_tensor_mul", TensorBinaryOp::Mul)?;
+    bind_tensor_matmul(linker)?;
+    bind_tensor_sum(linker)?;
+    bind_tensor_mean(linker)?;
+    bind_tensor_convert(linker)?;
     Ok(())
 }
 
@@ -1026,7 +1110,10 @@ fn bind_scalar_f64(linker: &mut Linker<HostState>, field: &str) -> Result<(), wa
         WASM_IMPORT_MODULE_V1,
         field,
         move |mut caller: wasmtime::Caller<'_, HostState>, value: f64| {
-            caller.data_mut().write_line(&format_float(value));
+            // The oracle Debug shape keeps the `.0` marker for integral
+            // floats (`nota 9.0` → `9.0`), matching the collection/option
+            // display renderer (`display_fractus`) and the LLVM lane.
+            caller.data_mut().write_line(&display_fractus(value));
             Ok(())
         },
     )?;
@@ -1766,14 +1853,6 @@ fn bind_regex_from_text(
         },
     )?;
     Ok(())
-}
-
-fn format_float(value: f64) -> String {
-    if value.fract() == 0.0 && value.abs() < 1e15 {
-        format!("{}", value as i64)
-    } else {
-        value.to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2807,6 +2886,747 @@ fn bind_read_line(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
         move |mut caller: wasmtime::Caller<'_, HostState>| -> Result<i32, wasmtime::Error> {
             let kind = VALUE_KIND_TEXT as i32;
             Ok(caller.data_mut().alloc_option(kind as u32, None))
+        },
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W14 tensor display rows
+// ---------------------------------------------------------------------------
+
+/// Resolve a tensor element value carrier helper: element kinds whose scalar
+/// carrier is f64 (`fractus<f32>`/`fractus<f64>`) cross the f64 row carrier;
+/// numerus kinds cross i64; handle kinds cross i32 handles. Mirrors the
+/// emitter's `collection_element_kind`-driven carriers.
+fn tensor_value_from_carrier(
+    tensor: &TensorValue,
+    value: RuntimeValue,
+) -> Result<RuntimeValue, String> {
+    match (tensor.kind, value) {
+        (VALUE_KIND_F32 | VALUE_KIND_F64, RuntimeValue::F64(value)) => {
+            Ok(RuntimeValue::F64(value))
+        }
+        (VALUE_KIND_I64 | VALUE_KIND_U64, RuntimeValue::I64(value)) => Ok(RuntimeValue::I64(value)),
+        (VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_I32 | VALUE_KIND_U8 | VALUE_KIND_U16
+        | VALUE_KIND_U32, RuntimeValue::I64(value)) => Ok(RuntimeValue::I32(value as i32)),
+        (VALUE_KIND_TEXT | VALUE_KIND_ASCII, RuntimeValue::Handle(handle)) => {
+            Ok(RuntimeValue::Handle(handle))
+        }
+        _ => Err(format!(
+            "tensor element kind {} with value {value:?}",
+            tensor.kind
+        )),
+    }
+}
+
+/// Read one index vector from a `lista` handle (the index dims the emitter
+/// passes as an i64 collection). Returns `None` on unknown/unsupported shape.
+fn read_index_vector(state: &HostState, handle: i32) -> Option<Vec<i64>> {
+    let collection = state.find_collection(handle)?;
+    collection
+        .values
+        .iter()
+        .map(|value| match value {
+            RuntimeValue::I64(value) => Some(*value),
+            RuntimeValue::I32(value) => Some(i64::from(*value)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `tensor_new (param i32) (result i32)`: element kind → empty rank-0 tensor.
+fn bind_tensor_new(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_new",
+        move |mut caller: wasmtime::Caller<'_, HostState>, kind: i32| -> Result<i32, wasmtime::Error> {
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind: kind as u32,
+                shape: Vec::new(),
+                values: Vec::new(),
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_create (param i32 f64 i32) (result i32)`: (seed receiver, fill
+/// value, shape lista) → dense tensor with the given shape filled with the
+/// value (the seed carries the element kind).
+fn bind_tensor_create(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_create",
+        move |mut caller: wasmtime::Caller<'_, HostState>, seed: i32, fill: f64, shape: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, shape) = (|| {
+                let state = caller.data();
+                let tensor = state
+                    .find_tensor(seed)
+                    .ok_or_else(|| format!("tensor_create seed {seed}: unknown tensor handle"))?;
+                let shape = read_index_vector(state, shape)
+                    .ok_or_else(|| "tensor_create shape must be a lista of dims".to_owned())?;
+                Ok::<_, String>((tensor.kind, shape))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let count = tensor_shape_element_count(&shape).ok_or_else(|| {
+                typed_unsupported(&mut caller, "tensor_create shape element count overflow")
+            })?;
+            let value = tensor_value_from_carrier(
+                &TensorValue { kind, shape: shape.clone(), values: Vec::new() },
+                RuntimeValue::F64(fill),
+            )
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape,
+                values: vec![value; count],
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_from_flat (param i32 i32 i32) (result i32)`: (seed receiver, flat
+/// lista, shape lista) → dense tensor whose values are the flat lista's
+/// elements (the seed carries the element kind).
+fn bind_tensor_from_flat(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_from_flat",
+        move |mut caller: wasmtime::Caller<'_, HostState>, seed: i32, flat: i32, shape: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, values) = (|| {
+                let state = caller.data();
+                let tensor = state.find_tensor(seed).ok_or_else(|| {
+                    format!("tensor_from_flat seed {seed}: unknown tensor handle")
+                })?;
+                let shape = read_index_vector(state, shape)
+                    .ok_or_else(|| "tensor_from_flat shape must be a lista of dims".to_owned())?;
+                let collection = state.find_collection(flat).ok_or_else(|| {
+                    format!("tensor_from_flat flat {flat}: unknown lista handle")
+                })?;
+                Ok::<_, String>((tensor.kind, shape, collection.values.clone()))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let expected = tensor_shape_element_count(&shape).ok_or_else(|| {
+                typed_unsupported(&mut caller, "tensor_from_flat shape element count overflow")
+            })?;
+            if values.len() != expected {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!(
+                        "tensor_from_flat flat length {} != shape element count {expected}",
+                        values.len()
+                    ),
+                ));
+            }
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape,
+                values,
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_rank (param i32) (result i64)`: receiver → rank (the number of
+/// shape dimensions; tensor `longitudo`).
+fn bind_tensor_rank(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_rank",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i64, wasmtime::Error> {
+            let state = caller.data();
+            let Some(tensor) = state.find_tensor(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_rank handle {handle}: unknown tensor handle"),
+                ));
+            };
+            Ok(i64::try_from(tensor.shape.len()).expect("rank fits i64"))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_shape (param i32) (result i32)`: receiver → shape dims as a
+/// `lista` handle (renders `[2, 3]` through the collection display).
+fn bind_tensor_shape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_shape",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(tensor) = state.find_tensor(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_shape handle {handle}: unknown tensor handle"),
+                ));
+            };
+            let dims = tensor
+                .shape
+                .iter()
+                .map(|dim| RuntimeValue::I64(*dim))
+                .collect::<Vec<_>>();
+            Ok(caller.data_mut().alloc_collection(false, VALUE_KIND_I64, dims))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_reshape (param i32 i32) (result i32)`: receiver + new shape lista
+/// → tensor with the same flat values and the new shape (element count must
+/// match).
+fn bind_tensor_reshape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_reshape",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, shape: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, values, new_shape) = (|| {
+                let state = caller.data();
+                let tensor = state.find_tensor(handle).ok_or_else(|| {
+                    format!("tensor_reshape handle {handle}: unknown tensor handle")
+                })?;
+                let new_shape = read_index_vector(state, shape).ok_or_else(|| {
+                    "tensor_reshape shape must be a lista of dims".to_owned()
+                })?;
+                Ok::<_, String>((tensor.kind, tensor.values.clone(), new_shape))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let expected = tensor_shape_element_count(&new_shape).ok_or_else(|| {
+                typed_unsupported(&mut caller, "tensor_reshape shape element count overflow")
+            })?;
+            if values.len() != expected {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_reshape element count mismatch",
+                ));
+            }
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape: new_shape,
+                values,
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_get (param i32 i32) (result i32)`: receiver + index lista → option
+/// result (present payload or absent, matching the emitter's coalesce paths).
+fn bind_tensor_get(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_get",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_get handle {handle}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.kind, tensor.shape.clone(), tensor.values.clone())
+            };
+            let Some(index) = read_index_vector(caller.data(), index) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_get index must be a lista of dims",
+                ));
+            };
+            let payload = tensor_flat_offset(&shape, &index)
+                .and_then(|offset| values.get(offset).copied());
+            let result = caller
+                .data_mut()
+                .option_result(kind, payload);
+            Ok(result)
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_set (param i32 i32 f64)`: receiver + index lista + value — writes
+/// the element in place (no result).
+fn bind_tensor_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_set",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, index: i32, value: f64| -> Result<(), wasmtime::Error> {
+            let (kind, shape) = (|| {
+                let state = caller.data();
+                let tensor = state.find_tensor(handle).ok_or_else(|| {
+                    format!("tensor_set handle {handle}: unknown tensor handle")
+                })?;
+                Ok::<_, String>((tensor.kind, tensor.shape.clone()))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let index = read_index_vector(caller.data(), index).ok_or_else(|| {
+                typed_unsupported(&mut caller, "tensor_set index must be a lista of dims")
+            })?;
+            let Some(offset) = tensor_flat_offset(&shape, &index) else {
+                // Out-of-bounds set mirrors the oracle's no-op (the Rust
+                // runtime latches an error; the display rows read the
+                // original value).
+                return Ok(());
+            };
+            let converted = tensor_value_from_carrier(
+                &TensorValue { kind, shape, values: Vec::new() },
+                RuntimeValue::F64(value),
+            )
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let Some(tensor) = caller.data_mut().find_tensor_mut(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_set handle {handle}: unknown tensor handle"),
+                ));
+            };
+            if let Some(slot) = tensor.values.get_mut(offset) {
+                *slot = converted;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_fill (param i32 f64) (result i32)`: receiver + fill value — fills
+/// every element and returns the receiver.
+fn bind_tensor_fill(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_fill",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, value: f64| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, count) = (|| {
+                let state = caller.data();
+                let tensor = state.find_tensor(handle).ok_or_else(|| {
+                    format!("tensor_fill handle {handle}: unknown tensor handle")
+                })?;
+                let count = tensor_shape_element_count(&tensor.shape)
+                    .ok_or_else(|| "tensor_fill element count overflow".to_owned())?;
+                Ok::<_, String>((tensor.kind, tensor.shape.clone(), count))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let converted = tensor_value_from_carrier(
+                &TensorValue { kind, shape, values: Vec::new() },
+                RuntimeValue::F64(value),
+            )
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            let Some(tensor) = caller.data_mut().find_tensor_mut(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_fill handle {handle}: unknown tensor handle"),
+                ));
+            };
+            tensor.values = vec![converted; count];
+            Ok(handle)
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_flatten (param i32) (result i32)`: receiver → the flat element
+/// `lista` handle (renders `[1.0, 4.0, …]` through the collection display).
+fn bind_tensor_flatten(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_flatten",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_flatten handle {handle}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.kind, tensor.values.clone())
+            };
+            Ok(caller
+                .data_mut()
+                .alloc_collection(false, kind, values))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_materialize (param i32) (result i32)`: receiver → an owned copy
+/// (the arena tensors are already owned; the row returns the copy).
+fn bind_tensor_materialize(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_materialize",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<i32, wasmtime::Error> {
+            let state = caller.data();
+            let Some(tensor) = state.find_tensor(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_materialize handle {handle}: unknown tensor handle"),
+                ));
+            };
+            let copy = TensorValue {
+                kind: tensor.kind,
+                shape: tensor.shape.clone(),
+                values: tensor.values.clone(),
+            };
+            Ok(caller.data_mut().alloc_tensor(copy))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_slice (param i32 i64 i64) (result i32)`: receiver + start/end row
+/// bounds → the axis-0 slice (`sectio`). Mirrors the LLVM lane's
+/// `tensor_slice` row: a contiguous row slice over the first dimension.
+fn bind_tensor_slice(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_slice",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, start: i64, end: i64| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_slice handle {handle}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.kind, tensor.shape.clone(), tensor.values.clone())
+            };
+            let Some((&first, rest)) = shape.split_first() else {
+                return Err(typed_unsupported(&mut caller, "tensor_slice requires rank >= 1"));
+            };
+            if start < 0 || end < start || end > first {
+                return Err(typed_unsupported(&mut caller, "tensor_slice bounds out of range"));
+            }
+            let row_stride =
+                tensor_shape_element_count(rest).unwrap_or(1);
+            let row_len = usize::try_from(row_stride).expect("row stride fits usize");
+            let take = usize::try_from(end - start).expect("slice width fits usize");
+            let mut sliced = Vec::with_capacity(take * row_len);
+            for row in start..end {
+                let base = usize::try_from(row).expect("row fits usize") * row_len;
+                sliced.extend_from_slice(
+                    &values[base..base + row_len],
+                );
+            }
+            let mut new_shape = Vec::with_capacity(shape.len());
+            new_shape.push(end - start);
+            new_shape.extend(rest.iter().copied());
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape: new_shape,
+                values: sliced,
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// One elementwise tensor binary op (`addita`/`subtrahe`/`multiplica`).
+#[derive(Clone, Copy)]
+enum TensorBinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+fn tensor_binary_values(
+    op: TensorBinaryOp,
+    left: &[RuntimeValue],
+    right: &[RuntimeValue],
+) -> Result<Vec<RuntimeValue>, String> {
+    if left.len() != right.len() {
+        return Err("tensor binary operand element count mismatch".to_owned());
+    }
+    left.iter()
+        .zip(right.iter())
+        .map(|(a, b)| match (op, a, b) {
+            (TensorBinaryOp::Add, RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+                Ok(RuntimeValue::F64(a + b))
+            }
+            (TensorBinaryOp::Sub, RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+                Ok(RuntimeValue::F64(a - b))
+            }
+            (TensorBinaryOp::Mul, RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+                Ok(RuntimeValue::F64(a * b))
+            }
+            (TensorBinaryOp::Add, RuntimeValue::I64(a), RuntimeValue::I64(b)) => {
+                Ok(RuntimeValue::I64(a.wrapping_add(*b)))
+            }
+            (TensorBinaryOp::Sub, RuntimeValue::I64(a), RuntimeValue::I64(b)) => {
+                Ok(RuntimeValue::I64(a.wrapping_sub(*b)))
+            }
+            (TensorBinaryOp::Mul, RuntimeValue::I64(a), RuntimeValue::I64(b)) => {
+                Ok(RuntimeValue::I64(a.wrapping_mul(*b)))
+            }
+            _ => Err(format!("tensor binary op on {a:?} / {b:?}")),
+        })
+        .collect()
+}
+
+/// `tensor_add`/`tensor_sub`/`tensor_mul (param i32 i32) (result i32)`:
+/// elementwise arithmetic on same-shaped tensors → new tensor.
+fn bind_tensor_add_sub_mul(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+    op: TensorBinaryOp,
+) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(left) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("{field} left {left}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.kind, tensor.shape.clone(), tensor.values.clone())
+            };
+            let right_values = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(right) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("{field} right {right}: unknown tensor handle"),
+                    ));
+                };
+                tensor.values.clone()
+            };
+            let values = tensor_binary_values(op, &values, &right_values)
+                .map_err(|message| typed_unsupported(&mut caller, message))?;
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape,
+                values,
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_matmul (param i32 i32) (result i32)`: rank-2 matrix multiply
+/// (`matmul`). V1 is rank-2 only; the inner dimension must unify.
+fn bind_tensor_matmul(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_matmul",
+        move |mut caller: wasmtime::Caller<'_, HostState>, left: i32, right: i32| -> Result<i32, wasmtime::Error> {
+            let (kind, shape, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(left) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_matmul left {left}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.kind, tensor.shape.clone(), tensor.values.clone())
+            };
+            let (right_shape, right_values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(right) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_matmul right {right}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.shape.clone(), tensor.values.clone())
+            };
+            let [m, k] = shape.as_slice() else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_matmul requires rank-2 receiver",
+                ));
+            };
+            let [k2, n] = right_shape.as_slice() else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_matmul requires rank-2 argument",
+                ));
+            };
+            if k != k2 {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor_matmul inner dimension mismatch",
+                ));
+            }
+            let (m, k, n) = (
+                usize::try_from(*m).map_err(|_| typed_unsupported(&mut caller, "matmul dim"))?,
+                usize::try_from(*k).map_err(|_| typed_unsupported(&mut caller, "matmul dim"))?,
+                usize::try_from(*n).map_err(|_| typed_unsupported(&mut caller, "matmul dim"))?,
+            );
+            let mut out = Vec::with_capacity(m * n);
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = RuntimeValue::F64(0.0);
+                    for inner in 0..k {
+                        let a = values[row * k + inner];
+                        let b = right_values[inner * n + col];
+                        match (a, b) {
+                            (RuntimeValue::F64(a), RuntimeValue::F64(b)) => {
+                                acc = RuntimeValue::F64(
+                                    match acc {
+                                        RuntimeValue::F64(current) => current,
+                                        _ => 0.0,
+                                    } + a * b,
+                                );
+                            }
+                            (RuntimeValue::I64(a), RuntimeValue::I64(b)) => {
+                                acc = RuntimeValue::I64(
+                                    match acc {
+                                        RuntimeValue::I64(current) => current,
+                                        _ => 0,
+                                    }
+                                        .wrapping_add(a.wrapping_mul(b)),
+                                );
+                            }
+                            _ => {
+                                return Err(typed_unsupported(
+                                    &mut caller,
+                                    "tensor_matmul mixed element carriers",
+                                ));
+                            }
+                        }
+                    }
+                    out.push(acc);
+                }
+            }
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind,
+                shape: vec![m as i64, n as i64],
+                values: out,
+            }))
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_sum (param i32) (result f64)`: full-reduction sum of all elements.
+fn bind_tensor_sum(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_sum",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<f64, wasmtime::Error> {
+            let state = caller.data();
+            let Some(tensor) = state.find_tensor(handle) else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("tensor_sum handle {handle}: unknown tensor handle"),
+                ));
+            };
+            let sum = tensor.values.iter().try_fold(0.0_f64, |acc, value| match value {
+                RuntimeValue::F64(value) => Some(acc + value),
+                RuntimeValue::I64(value) => Some(acc + *value as f64),
+                RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
+                _ => None,
+            });
+            sum.ok_or_else(|| {
+                typed_unsupported(
+                    &mut caller,
+                    "tensor_sum element kind not summable to f64",
+                )
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// `tensor_mean (param i32) (result f64)`: full-reduction mean of all
+/// elements.
+fn bind_tensor_mean(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_mean",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<f64, wasmtime::Error> {
+            let (sum, count) = (|| {
+                let state = caller.data();
+                let tensor = state.find_tensor(handle).ok_or_else(|| {
+                    format!("tensor_mean handle {handle}: unknown tensor handle")
+                })?;
+                if tensor.values.is_empty() {
+                    return Err("tensor_mean requires at least one element".to_owned());
+                }
+                let sum = tensor.values.iter().try_fold(0.0_f64, |acc, value| match value {
+                    RuntimeValue::F64(value) => Some(acc + value),
+                    RuntimeValue::I64(value) => Some(acc + *value as f64),
+                    RuntimeValue::I32(value) => Some(acc + f64::from(*value)),
+                    _ => None,
+                });
+                let sum = sum.ok_or_else(|| {
+                    "tensor_mean element kind not summable to f64".to_owned()
+                })?;
+                Ok((sum, tensor.values.len()))
+            })()
+            .map_err(|message| typed_unsupported(&mut caller, message))?;
+            Ok(sum / count as f64)
+        },
+    )?;
+    Ok(())
+}
+
+/// Convert one tensor element from the source kind to the target kind
+/// (`tensor_convert` element-width conversions: numerus→fractus etc.).
+fn convert_tensor_value(
+    from: u32,
+    to: u32,
+    value: RuntimeValue,
+) -> Option<RuntimeValue> {
+    let scalar = match (from, value) {
+        (VALUE_KIND_I64 | VALUE_KIND_U64, RuntimeValue::I64(value)) => value as f64,
+        (VALUE_KIND_I32 | VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_U8 | VALUE_KIND_U16
+        | VALUE_KIND_U32, RuntimeValue::I32(value)) => f64::from(value),
+        (VALUE_KIND_F32 | VALUE_KIND_F64, RuntimeValue::F64(value)) => value,
+        _ => return None,
+    };
+    Some(match to {
+        VALUE_KIND_F32 | VALUE_KIND_F64 => RuntimeValue::F64(scalar),
+        VALUE_KIND_I64 | VALUE_KIND_U64 => RuntimeValue::I64(scalar as i64),
+        VALUE_KIND_I32 | VALUE_KIND_I8 | VALUE_KIND_I16 | VALUE_KIND_U8 | VALUE_KIND_U16
+        | VALUE_KIND_U32 => RuntimeValue::I32(scalar as i32),
+        _ => return None,
+    })
+}
+
+/// `tensor_convert (param i32 i32 i32) (result i32)`: source + from-kind +
+/// to-kind → a tensor with the same shape and the element values converted
+/// (`tensor ↦ tensor` element-width conversio).
+fn bind_tensor_convert(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_tensor_convert",
+        move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32, from: i32, to: i32| -> Result<i32, wasmtime::Error> {
+            let (shape, values) = {
+                let state = caller.data();
+                let Some(tensor) = state.find_tensor(handle) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("tensor_convert handle {handle}: unknown tensor handle"),
+                    ));
+                };
+                (tensor.shape.clone(), tensor.values.clone())
+            };
+            let converted = values
+                .iter()
+                .map(|value| {
+                    convert_tensor_value(from as u32, to as u32, *value).ok_or_else(|| {
+                        typed_unsupported(
+                            &mut caller,
+                            format!(
+                                "tensor_convert {from}→{to} on {value:?}",
+                            ),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(caller.data_mut().alloc_tensor(TensorValue {
+                kind: to as u32,
+                shape,
+                values: converted,
+            }))
         },
     )?;
     Ok(())
