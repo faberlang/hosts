@@ -456,32 +456,32 @@ impl DeviceDescriptor {
     /// Returns the first typed [`HostError`] the descriptor violates.
     pub fn validate(&self) -> HostResult<()> {
         if self.module_image.is_empty() {
-            return Err(descriptor_error(
+            return Err(errors::descriptor(
                 "device descriptor carries an empty module image",
             ));
         }
         if self.kernels.is_empty() {
-            return Err(descriptor_error("device descriptor declares no kernels"));
+            return Err(errors::descriptor("device descriptor declares no kernels"));
         }
         if self.launches.is_empty() {
-            return Err(descriptor_error("device descriptor declares no launches"));
+            return Err(errors::descriptor("device descriptor declares no launches"));
         }
 
         let mut launch_ids: Vec<u32> = Vec::with_capacity(self.launches.len());
         for launch in &self.launches {
             if launch.id == 0 {
-                return Err(descriptor_error(
+                return Err(errors::descriptor(
                     "device descriptor has a launch with the reserved zero identity",
                 ));
             }
             if launch_ids.contains(&launch.id) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor repeats launch identity {}",
                     launch.id
                 )));
             }
             if self.kernels.get(launch.kernel_index as usize).is_none() {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor launch {} references unknown kernel index {}",
                     launch.id, launch.kernel_index
                 )));
@@ -495,24 +495,24 @@ impl DeviceDescriptor {
         let mut root_ids: Vec<u32> = Vec::with_capacity(self.roots.len());
         for root in &self.roots {
             if *root == 0 {
-                return Err(descriptor_error(
+                return Err(errors::descriptor(
                     "device descriptor has a root with the reserved zero identity",
                 ));
             }
             if root_ids.contains(root) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor repeats legal execution root {root}"
                 )));
             }
             if !launch_ids.contains(root) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor root {root} names an unknown launch"
                 )));
             }
             root_ids.push(*root);
         }
         if root_ids.is_empty() {
-            return Err(descriptor_error(
+            return Err(errors::descriptor(
                 "device descriptor declares no legal execution roots",
             ));
         }
@@ -521,13 +521,13 @@ impl DeviceDescriptor {
             Vec::with_capacity(self.buffer_versions.len());
         for version in &self.buffer_versions {
             if version.version == 0 {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor buffer {} uses the reserved zero version",
                     version.buffer_id
                 )));
             }
             if version.element_count == 0 {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor buffer {} version {} has a zero element count",
                     version.buffer_id, version.version
                 )));
@@ -536,7 +536,7 @@ impl DeviceDescriptor {
                 first.buffer_id == version.buffer_id && first.version == version.version
             }) {
                 if first.element_ty != version.element_ty {
-                    return Err(dtype_error(format!(
+                    return Err(errors::dtype_mismatch(format!(
                         "device buffer {} version {} carries conflicting element types {} and {}",
                         version.buffer_id,
                         version.version,
@@ -545,7 +545,7 @@ impl DeviceDescriptor {
                     )));
                 }
                 if first.element_count != version.element_count {
-                    return Err(shape_error(format!(
+                    return Err(errors::shape_mismatch(format!(
                         "device buffer {} version {} carries conflicting element counts {} and {}",
                         version.buffer_id,
                         version.version,
@@ -553,7 +553,7 @@ impl DeviceDescriptor {
                         version.element_count
                     )));
                 }
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor repeats buffer {} version {} metadata",
                     version.buffer_id, version.version
                 )));
@@ -561,25 +561,25 @@ impl DeviceDescriptor {
             versions.push(*version);
         }
         if versions.is_empty() {
-            return Err(descriptor_error(
+            return Err(errors::descriptor(
                 "device descriptor declares no version-keyed buffer metadata",
             ));
         }
 
         for edge in &self.data_flow {
             if edge.version == 0 || edge.producer == 0 || edge.consumer == 0 {
-                return Err(descriptor_error(
+                return Err(errors::descriptor(
                     "device descriptor data-flow edge uses a reserved zero identity",
                 ));
             }
             if edge.producer == edge.consumer {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor data-flow edge for buffer {} version {} is self-referential at launch {}",
                     edge.buffer_id, edge.version, edge.producer
                 )));
             }
             if !launch_ids.contains(&edge.producer) || !launch_ids.contains(&edge.consumer) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor data-flow edge for buffer {} version {} references an unknown launch",
                     edge.buffer_id, edge.version
                 )));
@@ -587,7 +587,7 @@ impl DeviceDescriptor {
             if !versions.iter().any(|version| {
                 version.buffer_id == edge.buffer_id && version.version == edge.version
             }) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor data-flow edge references unknown buffer {} version {}",
                     edge.buffer_id, edge.version
                 )));
@@ -621,7 +621,7 @@ impl DeviceDescriptor {
                     // is unique — admit the repeated edge.
                     continue;
                 }
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor defines buffer {} version {} twice (producers {} and {}); one value generation has exactly one producer",
                     edge.buffer_id, edge.version, first_producer, edge.producer
                 )));
@@ -636,7 +636,7 @@ impl DeviceDescriptor {
             let producer_at = position[&edge.producer];
             let consumer_at = position[&edge.consumer];
             if producer_at >= consumer_at {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor launch order violates the carried dependency graph: launch {} (producer of buffer {} version {}) is not scheduled before launch {} (its consumer)",
                     edge.producer, edge.buffer_id, edge.version, edge.consumer
                 )));
@@ -657,7 +657,7 @@ impl DeviceDescriptor {
         }
         for launch in &launch_ids {
             if !reachable.contains(launch) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor launch {launch} is not reachable from any declared root; the carried graph is incomplete"
                 )));
             }
@@ -670,18 +670,18 @@ impl DeviceDescriptor {
 
         for kernel in &self.kernels {
             if kernel.entry.trim().is_empty() {
-                return Err(descriptor_error(
+                return Err(errors::descriptor(
                     "device descriptor has a kernel with an empty entry name",
                 ));
             }
             if kernel.buffers.is_empty() {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor kernel `{}` binds no buffers",
                     kernel.entry
                 )));
             }
             if kernel.grid.contains(&0) || kernel.block.contains(&0) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor kernel `{}` has a zero grid or block axis",
                     kernel.entry
                 )));
@@ -690,19 +690,19 @@ impl DeviceDescriptor {
             let mut seen_bindings: Vec<u32> = Vec::new();
             for slot in &kernel.buffers {
                 if slot.element_count == 0 {
-                    return Err(descriptor_error(format!(
+                    return Err(errors::descriptor(format!(
                         "device descriptor kernel `{}` binds a zero-count buffer `{}`",
                         kernel.entry, slot.buffer_name
                     )));
                 }
                 if slot.version == 0 {
-                    return Err(descriptor_error(format!(
+                    return Err(errors::descriptor(format!(
                         "device descriptor kernel `{}` binds buffer `{}` with the reserved zero version",
                         kernel.entry, slot.buffer_name
                     )));
                 }
                 if seen_bindings.contains(&slot.binding) {
-                    return Err(abi_error(format!(
+                    return Err(errors::abi_mismatch(format!(
                         "device descriptor kernel `{}` binds index {} more than once",
                         kernel.entry, slot.binding
                     )));
@@ -714,7 +714,7 @@ impl DeviceDescriptor {
                 // never alias one value (two unrelated same-name/same-shape
                 // values are distinct).
                 if slot.semantic_value == 0 {
-                    return Err(descriptor_error(format!(
+                    return Err(errors::descriptor(format!(
                         "device buffer `{}` (id {}) carries the reserved zero semantic value identity",
                         slot.buffer_name, slot.buffer_id
                     )));
@@ -723,7 +723,7 @@ impl DeviceDescriptor {
                     semantic_values.iter().find(|(id, _)| *id == slot.buffer_id)
                 {
                     if *first_semantic != slot.semantic_value {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffer `{}` (id {}) is referenced with conflicting semantic value identities {} and {}",
                             slot.buffer_name,
                             slot.buffer_id,
@@ -736,7 +736,7 @@ impl DeviceDescriptor {
                         .iter()
                         .find(|(_, value)| *value == slot.semantic_value)
                     {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffers `{}` (id {}) and id {} alias the same semantic value {}; each value is held by exactly one buffer",
                             slot.buffer_name, slot.buffer_id, other_id, slot.semantic_value
                         )));
@@ -748,7 +748,7 @@ impl DeviceDescriptor {
                     identities.iter().find(|(id, _, _)| *id == slot.buffer_id)
                 {
                     if role_conflict(*role, slot.role) {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffer `{}` (id {}) is referenced with conflicting roles {} and {}",
                             slot.buffer_name,
                             slot.buffer_id,
@@ -757,7 +757,7 @@ impl DeviceDescriptor {
                         )));
                     }
                     if *name != slot.buffer_name {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffer id {} is referenced with conflicting names `{}` and `{}`",
                             slot.buffer_id, name, slot.buffer_name
                         )));
@@ -769,13 +769,13 @@ impl DeviceDescriptor {
                 let Some(version) = versions.iter().find(|version| {
                     version.buffer_id == slot.buffer_id && version.version == slot.version
                 }) else {
-                    return Err(descriptor_error(format!(
+                    return Err(errors::descriptor(format!(
                         "device buffer `{}` (id {}) version {} has no keyed metadata",
                         slot.buffer_name, slot.buffer_id, slot.version
                     )));
                 };
                 if version.element_ty != slot.element_ty {
-                    return Err(dtype_error(format!(
+                    return Err(errors::dtype_mismatch(format!(
                         "device buffer `{}` (id {}) version {} is referenced with conflicting element types {} and {}",
                         slot.buffer_name,
                         slot.buffer_id,
@@ -785,7 +785,7 @@ impl DeviceDescriptor {
                     )));
                 }
                 if version.element_count != slot.element_count {
-                    return Err(shape_error(format!(
+                    return Err(errors::shape_mismatch(format!(
                         "device buffer `{}` (id {}) version {} is referenced with conflicting element counts {} and {}",
                         slot.buffer_name,
                         slot.buffer_id,
@@ -802,7 +802,7 @@ impl DeviceDescriptor {
                     lifetimes.iter().find(|(id, _)| *id == slot.buffer_id)
                 {
                     if *first_lifetime != slot.lifetime {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffer `{}` (id {}) is referenced with conflicting lifetimes {} and {}",
                             slot.buffer_name,
                             slot.buffer_id,
@@ -823,7 +823,7 @@ impl DeviceDescriptor {
                     initializations.iter().find(|(id, _)| *id == slot.buffer_id)
                 {
                     if *first_init != slot.initialization {
-                        return Err(abi_error(format!(
+                        return Err(errors::abi_mismatch(format!(
                             "device buffer `{}` (id {}) is referenced with conflicting initialization policies {} and {}",
                             slot.buffer_name,
                             slot.buffer_id,
@@ -856,7 +856,7 @@ impl DeviceDescriptor {
                         .map(|(_, name, _)| name.as_str())
                         .unwrap_or("<unknown>");
                     if lifetime != Some(DeviceBufferLifetime::PerProgram) {
-                        return Err(descriptor_error(format!(
+                        return Err(errors::descriptor(format!(
                             "RepeatingStep buffer `{name}` (id {id}) is host-provided but has lifetime `{}`; a repeating step once-inits its host-provided params at session creation, which is defined only for per-program storage",
                             lifetime
                                 .map(DeviceBufferLifetime::spelling)
@@ -877,37 +877,37 @@ impl DeviceDescriptor {
         let mut result_buffer_ids: Vec<u32> = Vec::with_capacity(self.results.len());
         for result in &self.results {
             if result.version == 0 {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result for buffer {} uses the reserved zero version",
                     result.buffer_id
                 )));
             }
             if result.produced_by == 0 || result.at_launch == 0 {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result for buffer {} uses a reserved zero launch identity",
                     result.buffer_id
                 )));
             }
             if !launch_ids.contains(&result.produced_by) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result for buffer {} names unknown producing launch {}",
                     result.buffer_id, result.produced_by
                 )));
             }
             if !launch_ids.contains(&result.at_launch) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result for buffer {} names unknown observation launch {}",
                     result.buffer_id, result.at_launch
                 )));
             }
             if position[&result.at_launch] < position[&result.produced_by] {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result for buffer {} is observed at launch {} before its producing launch {}; an observation is valid only at or after the producer",
                     result.buffer_id, result.at_launch, result.produced_by
                 )));
             }
             if result_buffer_ids.contains(&result.buffer_id) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor repeats observation buffer {}; results must be unique in the host receipt",
                     result.buffer_id
                 )));
@@ -916,13 +916,13 @@ impl DeviceDescriptor {
 
             let Some((_, lifetime)) = lifetimes.iter().find(|(id, _)| *id == result.buffer_id)
             else {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result names buffer {} which no kernel slot allocates",
                     result.buffer_id
                 )));
             };
             if *lifetime != DeviceBufferLifetime::ObservationPoint {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result names buffer {} with lifetime `{}`; only declared observation-point buffers are read back (no undeclared readback)",
                     result.buffer_id,
                     lifetime.spelling()
@@ -932,7 +932,7 @@ impl DeviceDescriptor {
                 version.buffer_id == result.buffer_id && version.version == result.version
             });
             if !keyed {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor result names buffer {} version {} which has no keyed metadata",
                     result.buffer_id, result.version
                 )));
@@ -951,19 +951,19 @@ impl DeviceDescriptor {
         let mut end_of_run_buffer_ids: Vec<u32> = Vec::with_capacity(self.end_of_run_results.len());
         for end_of_run in &self.end_of_run_results {
             if end_of_run.version == 0 {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation for buffer {} uses the reserved zero version",
                     end_of_run.buffer_id
                 )));
             }
             if result_buffer_ids.contains(&end_of_run.buffer_id) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation names per-step observation buffer {}; a buffer is never read both per step and at the end",
                     end_of_run.buffer_id
                 )));
             }
             if end_of_run_buffer_ids.contains(&end_of_run.buffer_id) {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation repeats buffer {}; the set must be unique in the host receipt",
                     end_of_run.buffer_id
                 )));
@@ -978,13 +978,13 @@ impl DeviceDescriptor {
                     slot.buffer_id == end_of_run.buffer_id && slot.version == end_of_run.version
                 })
             else {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation names buffer {} version {} which no kernel slot allocates",
                     end_of_run.buffer_id, end_of_run.version
                 )));
             };
             if meta.role == DeviceBufferRole::Input {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation names input buffer {}; a final value must be written by the program",
                     end_of_run.buffer_id
                 )));
@@ -992,7 +992,7 @@ impl DeviceDescriptor {
             if meta.lifetime != DeviceBufferLifetime::PerStep
                 && meta.lifetime != DeviceBufferLifetime::PerProgram
             {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation names buffer {} with lifetime `{}`; only per-step and per-program buffers are read back once at the end (observation-point buffers are the per-step results)",
                     end_of_run.buffer_id,
                     meta.lifetime.spelling()
@@ -1002,7 +1002,7 @@ impl DeviceDescriptor {
                 version.buffer_id == end_of_run.buffer_id && version.version == end_of_run.version
             });
             if !keyed {
-                return Err(descriptor_error(format!(
+                return Err(errors::descriptor(format!(
                     "device descriptor end-of-run observation names buffer {} version {} which has no keyed metadata",
                     end_of_run.buffer_id, end_of_run.version
                 )));
@@ -1138,39 +1138,8 @@ fn role_conflict(first: DeviceBufferRole, second: DeviceBufferRole) -> bool {
     )
 }
 
-fn descriptor_error(message: impl Into<String>) -> HostError {
-    HostError {
-        code: E_DEVICE_DESCRIPTOR.to_owned(),
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-fn abi_error(message: impl Into<String>) -> HostError {
-    HostError {
-        code: E_DEVICE_ABI_MISMATCH.to_owned(),
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-fn shape_error(message: impl Into<String>) -> HostError {
-    HostError {
-        code: E_DEVICE_SHAPE_MISMATCH.to_owned(),
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-fn dtype_error(message: impl Into<String>) -> HostError {
-    HostError {
-        code: E_DEVICE_DTYPE_MISMATCH.to_owned(),
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-/// Stable error constructors shared by the composite host and tests.
+/// Stable error constructors shared by the descriptor validator, the
+/// composite host, and the launch adapters.
 pub(crate) mod errors {
     use super::{HostError, E_BACKEND_UNAVAILABLE, E_NO_DEVICE_PROGRAM};
 
