@@ -148,19 +148,21 @@ impl CudaHostSession {
         if !report.admitted {
             return Err(cuda_unavailable(report.reason));
         }
-        let mut session = Self {
-            driver,
-            handles: HandleRegistry::new(),
-            admitted: true,
-        };
-        session.driver.create_context()?;
-        Ok(session)
+        Self::from_driver(driver, true)
     }
 
     /// Inject a driver for unit tests (sequencing / reject paths only).
     pub fn with_driver(mut driver: Box<dyn CudaDriver>) -> HostResult<Self> {
         let report = driver.discover()?;
-        let admitted = report.admitted;
+        Self::from_driver(driver, report.admitted)
+    }
+
+    /// Shared session assembly from an already-discovered driver: create the
+    /// backend context when the driver admits, then wrap the driver with an
+    /// empty handle registry. Both the live-environment opener and the
+    /// injectable test seam use this so the admission → context → session
+    /// setup lives in exactly one place.
+    fn from_driver(mut driver: Box<dyn CudaDriver>, admitted: bool) -> HostResult<Self> {
         if admitted {
             driver.create_context()?;
         }
@@ -324,10 +326,7 @@ impl CudaHostSession {
                 "CUDA readback returned unexpected byte length",
             ));
         }
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect())
+        Ok(f32_bytes_to_values(&bytes))
     }
 
     pub fn release(&mut self, id: CudaHandleId) -> HostResult<()> {
@@ -384,7 +383,8 @@ fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
     }
 }
 
-/// Reinterpret f32 bytes back into values (fake-driver simulation reads).
+/// Reinterpret f32 bytes back into values. Shared by the session readback
+/// surface and the fake-driver simulation reads.
 fn f32_bytes_to_values(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
