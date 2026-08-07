@@ -384,6 +384,14 @@ fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
     }
 }
 
+/// Reinterpret f32 bytes back into values (fake-driver simulation reads).
+fn f32_bytes_to_values(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
 fn cuda_unavailable(message: impl Into<String>) -> HostError {
     HostError {
         code: E_CUDA_UNAVAILABLE.to_owned(),
@@ -890,6 +898,11 @@ pub struct FakeCudaDriver {
     /// `E_DEVICE_ENTRY_MISMATCH`, mirroring `cuModuleGetFunction` on the real
     /// lane.
     known_entries: Vec<String>,
+    /// Matmul plan facts the fake simulates when configured
+    /// (`with_matmul_simulation`, U-03 host adapter tests): a 3-buffer launch
+    /// computes `out = a × b` for the M·K × K·N → M·N shapes. An absent
+    /// configuration keeps the legacy elementwise-add simulation.
+    matmul_simulation: Option<(u64, u64, u64)>,
     /// Cumulative module loads (S2-2 module-cache leak bar).
     module_loads: usize,
     /// Cumulative module releases.
@@ -917,6 +930,15 @@ impl FakeCudaDriver {
     /// Declare a module entry for launch-time entry validation.
     pub fn with_known_entry(mut self, entry: impl Into<String>) -> Self {
         self.known_entries.push(entry.into());
+        self
+    }
+
+    /// Configure the fake to simulate the tiled-matmul kernel (U-03 host
+    /// adapter tests): a 3-buffer launch computes `out = a × b` for the given
+    /// M·K × K·N → M·N shapes. An absent configuration keeps the legacy
+    /// elementwise-add simulation.
+    pub fn with_matmul_simulation(mut self, m: u64, k: u64, n: u64) -> Self {
+        self.matmul_simulation = Some((m, k, n));
         self
     }
 
@@ -1054,6 +1076,67 @@ impl FakeCudaDriver {
         out_buf.copy_from_slice(&src_bytes);
         Ok(())
     }
+
+    /// Simulate the tiled-matmul kernel for the U-03 host adapter unit tests:
+    /// `out[ri * n + ci] = Σ_kk a[ri * k + kk] * b[kk * n + ci]` with the
+    /// configured M·K / K·N / M·N shapes. Sequencing evidence only — never a
+    /// real-device claim.
+    fn simulate_matmul(
+        &mut self,
+        module: u64,
+        a: u64,
+        b: u64,
+        out: u64,
+        m: u64,
+        k: u64,
+        n: u64,
+    ) -> HostResult<()> {
+        if !self.modules.contains_key(&module) {
+            return Err(HostError::internal("fake matmul missing module"));
+        }
+        let a_bytes = self
+            .buffers
+            .get(&a)
+            .ok_or_else(|| HostError::internal("fake matmul missing a"))?
+            .clone();
+        let b_bytes = self
+            .buffers
+            .get(&b)
+            .ok_or_else(|| HostError::internal("fake matmul missing b"))?
+            .clone();
+        let out_buf = self
+            .buffers
+            .get_mut(&out)
+            .ok_or_else(|| HostError::internal("fake matmul missing out"))?;
+        let (m, k, n) = (m as usize, k as usize, n as usize);
+        let (a_len, b_len, out_len) = (
+            m.checked_mul(k),
+            k.checked_mul(n),
+            m.checked_mul(n),
+        );
+        let (Some(a_len), Some(b_len), Some(out_len)) = (a_len, b_len, out_len) else {
+            return Err(HostError::internal("fake matmul plan dims overflow"));
+        };
+        if a_bytes.len() != a_len * 4 || b_bytes.len() != b_len * 4 || out_buf.len() != out_len * 4
+        {
+            return Err(HostError::invalid_args(
+                "fake matmul buffer sizes contradict the M·K/K·N/M·N plan",
+            ));
+        }
+        let a_values = f32_bytes_to_values(&a_bytes);
+        let b_values = f32_bytes_to_values(&b_bytes);
+        for ri in 0..m {
+            for ci in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += a_values[ri * k + kk] * b_values[kk * n + ci];
+                }
+                let offset = (ri * n + ci) * 4;
+                out_buf[offset..offset + 4].copy_from_slice(&acc.to_le_bytes());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CudaDriver for FakeCudaDriver {
@@ -1153,6 +1236,14 @@ impl CudaDriver for FakeCudaDriver {
         // the simulated accumulation kernel takes two (a, acc) and adds a
         // into acc in place (G4). Anything else fails closed in the fake
         // just as it would on device.
+        if let Some((m, k, n)) = self.matmul_simulation {
+            if buffers.len() != 3 {
+                return Err(HostError::invalid_args(
+                    "fake launch_kernel matmul simulation requires exactly 3 buffers (a, b, out)",
+                ));
+            }
+            return self.simulate_matmul(module, buffers[0], buffers[1], buffers[2], m, k, n);
+        }
         if entry == b"accumulate" {
             if buffers.len() != 2 {
                 return Err(HostError::invalid_args(

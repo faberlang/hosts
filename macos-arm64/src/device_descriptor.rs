@@ -1197,4 +1197,28 @@ pub(crate) mod errors {
             retryable: false,
         }
     }
+
+    pub(crate) fn descriptor(message: impl Into<String>) -> HostError {
+        HostError {
+            code: super::E_DEVICE_DESCRIPTOR.to_owned(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub(crate) fn abi_mismatch(message: impl Into<String>) -> HostError {
+        HostError {
+            code: super::E_DEVICE_ABI_MISMATCH.to_owned(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub(crate) fn dtype_mismatch(message: impl Into<String>) -> HostError {
+        HostError {
+            code: super::E_DEVICE_DTYPE_MISMATCH.to_owned(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
 }
