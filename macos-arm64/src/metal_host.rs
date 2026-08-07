@@ -308,9 +308,8 @@ impl MetalHostSession {
                 "Metal readback returned unexpected byte length",
             ));
         }
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        Ok((0..bytes.len() / 4)
+            .map(|index| read_f32_at(&bytes, index))
             .collect())
     }
 
@@ -368,6 +367,24 @@ fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
     }
 }
 
+/// Read the f32 stored little-endian at element `index` of a byte-laid-out
+/// buffer (one f32 per 4 bytes, matching the emitted kernels' buffer layout).
+fn read_f32_at(bytes: &[u8], index: usize) -> f32 {
+    let offset = index * 4;
+    f32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+/// Write an f32 little-endian at element `index` of a byte-laid-out buffer.
+fn write_f32_at(bytes: &mut [u8], index: usize, value: f32) {
+    let offset = index * 4;
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn metal_unavailable(message: impl Into<String>) -> HostError {
     HostError {
         code: E_METAL_UNAVAILABLE.to_owned(),
@@ -382,6 +399,32 @@ fn metal_invalid_handle(id: MetalHandleId) -> HostError {
         message: format!("unknown or released Metal handle {}", id.0),
         retryable: false,
     }
+}
+
+/// Typed fail-closed error for a launch naming an entry the loaded module
+/// does not declare. Shared by the real driver's per-entry pipeline map and
+/// the fake driver's declared-function-table check so both lanes report the
+/// same stable code and message (mirrors `cuModuleGetFunction` on the CUDA
+/// lane).
+fn metal_entry_mismatch(entry_name: &str) -> HostError {
+    HostError {
+        code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
+        message: format!("launch: module has no entry named {entry_name}"),
+        retryable: false,
+    }
+}
+
+/// Fail closed unless a fake per-entry dispatch carries exactly `count`
+/// buffers. The simulated kernels have fixed binding orders (mirroring the
+/// real driver's fixed binding order); a mismatched arity is a harness bug,
+/// not a device failure.
+fn expect_fake_arity(buffers: &[u64], count: usize, what: &str) -> HostResult<()> {
+    if buffers.len() != count {
+        return Err(HostError::invalid_args(format!(
+            "fake launch_kernel {what}"
+        )));
+    }
+    Ok(())
 }
 
 // System default Metal device probe. The `metal` crate (gfx-rs) manages the
@@ -521,20 +564,9 @@ impl FakeMetalDriver {
         }
         let len = a_bytes.len() / 4;
         for i in 0..len {
-            let ai = f32::from_le_bytes([
-                a_bytes[i * 4],
-                a_bytes[i * 4 + 1],
-                a_bytes[i * 4 + 2],
-                a_bytes[i * 4 + 3],
-            ]);
-            let bi = f32::from_le_bytes([
-                b_bytes[i * 4],
-                b_bytes[i * 4 + 1],
-                b_bytes[i * 4 + 2],
-                b_bytes[i * 4 + 3],
-            ]);
-            let sum = (ai + bi).to_le_bytes();
-            out_buf[i * 4..i * 4 + 4].copy_from_slice(&sum);
+            let ai = read_f32_at(&a_bytes, i);
+            let bi = read_f32_at(&b_bytes, i);
+            write_f32_at(out_buf, i, ai + bi);
         }
         Ok(())
     }
@@ -561,20 +593,9 @@ impl FakeMetalDriver {
         }
         let len = a_bytes.len() / 4;
         for i in 0..len {
-            let ai = f32::from_le_bytes([
-                a_bytes[i * 4],
-                a_bytes[i * 4 + 1],
-                a_bytes[i * 4 + 2],
-                a_bytes[i * 4 + 3],
-            ]);
-            let acc_i = f32::from_le_bytes([
-                acc_buf[i * 4],
-                acc_buf[i * 4 + 1],
-                acc_buf[i * 4 + 2],
-                acc_buf[i * 4 + 3],
-            ]);
-            let sum = (acc_i + ai).to_le_bytes();
-            acc_buf[i * 4..i * 4 + 4].copy_from_slice(&sum);
+            let ai = read_f32_at(&a_bytes, i);
+            let acc_i = read_f32_at(acc_buf, i);
+            write_f32_at(acc_buf, i, acc_i + ai);
         }
         Ok(())
     }
@@ -687,40 +708,25 @@ impl MetalDriver for FakeMetalDriver {
                 .iter()
                 .any(|entry_name| entry_name.as_bytes() == entry)
         {
-            return Err(HostError {
-                code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
-                message: format!(
-                    "module has no entry named {}",
-                    String::from_utf8_lossy(entry)
-                ),
-                retryable: false,
-            });
+            return Err(metal_entry_mismatch(&String::from_utf8_lossy(entry)));
         }
         // The simulated elementwise-add kernel takes exactly three buffers
         // (a, b, out); the simulated accumulate kernel takes two (a, acc)
         // and adds a into acc in place. Anything else fails closed in the
         // fake just as it would on device.
         if entry == b"accumulate" {
-            if buffers.len() != 2 {
-                return Err(HostError::invalid_args(
-                    "fake launch_kernel 'accumulate' simulates the 2-buffer kernel (a, acc)",
-                ));
-            }
+            expect_fake_arity(buffers, 2, "'accumulate' simulates the 2-buffer kernel (a, acc)")?;
             return self.simulate_accumulate(module, buffers[0], buffers[1]);
         }
         if entry == b"observa" {
-            if buffers.len() != 2 {
-                return Err(HostError::invalid_args(
-                    "fake launch_kernel 'observa' simulates the 2-buffer kernel (src, out)",
-                ));
-            }
+            expect_fake_arity(buffers, 2, "'observa' simulates the 2-buffer kernel (src, out)")?;
             return self.simulate_copy(module, buffers[0], buffers[1]);
         }
-        if buffers.len() != 3 {
-            return Err(HostError::invalid_args(
-                "fake launch_kernel simulates the 3-buffer elementwise-add kernel (a, b, out)",
-            ));
-        }
+        expect_fake_arity(
+            buffers,
+            3,
+            "simulates the 3-buffer elementwise-add kernel (a, b, out)",
+        )?;
         self.simulate_elementwise_add(module, buffers[0], buffers[1], buffers[2])
     }
 
@@ -965,11 +971,7 @@ impl MetalDriver for SystemMetalDriver {
         let pipeline = module_record
             .pipelines
             .get(entry_name.as_ref())
-            .ok_or_else(|| HostError {
-                code: crate::device_descriptor::E_DEVICE_ENTRY_MISMATCH.to_owned(),
-                message: format!("launch: module has no entry named {entry_name}"),
-                retryable: false,
-            })?;
+            .ok_or_else(|| metal_entry_mismatch(&entry_name))?;
         if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0
         {
             return Err(metal_driver(
