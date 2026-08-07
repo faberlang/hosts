@@ -147,3 +147,45 @@ pub(crate) fn tensor_flat_offset(shape: &[i64], index: &[i64]) -> Option<usize> 
     }
     Some(offset)
 }
+
+// ---------------------------------------------------------------------------
+// U6-B cursor-stream yield channel
+// ---------------------------------------------------------------------------
+
+/// One in-flight cursor-stream materialization (U6-B, P5 host ABI). The host
+/// pushes a yield buffer when it starts materializing a generator (invoking
+/// the `__faber_rt_v1_cursor_stream` row), the bound cede (yield) imports
+/// append to the active buffer, and popping the buffer yields the materialized
+/// `lista<T>`. Reference semantics: the MIR stepper's `eval_cursor_stream`
+/// (run the generator to completion, collect its `cede` yields in program
+/// order, discard the generator's own return value).
+#[derive(Debug, Default)]
+pub(crate) struct CursorYieldBuffer {
+    /// The recorded yields in program order.
+    pub(crate) values: Vec<RuntimeValue>,
+    /// The element kind once the first yield fixes it. An empty
+    /// materialization has no observable element kind (an empty `lista<T>`
+    /// renders `[]` and exposes no values under any kind), so `None` until the
+    /// first yield.
+    pub(crate) kind: Option<u32>,
+}
+
+impl CursorYieldBuffer {
+    /// Record one `cede` yield. The first yield fixes the element kind; a
+    /// later yield of a different kind fails closed (the v1 collection model
+    /// keeps one kind per `lista<T>`, so a heterogeneous yield sequence is a
+    /// typed runtime failure — never a silent coercion).
+    pub(crate) fn push(&mut self, kind: u32, value: RuntimeValue) -> Result<(), String> {
+        if let Some(existing) = self.kind {
+            if existing != kind {
+                return Err(format!(
+                    "cursor-stream yield kind mismatch: kind {existing} then kind {kind}"
+                ));
+            }
+        } else {
+            self.kind = Some(kind);
+        }
+        self.values.push(value);
+        Ok(())
+    }
+}

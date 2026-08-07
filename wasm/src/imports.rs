@@ -9,20 +9,60 @@
 
 use crate::collections::{
     display_fractus, runtime_value_eq, tensor_flat_offset, tensor_shape_element_count,
-    value_from_i64, value_to_i64, CollectionValue, MapValue, OptionValue, RuntimeValue,
-    TensorValue,
+    value_from_i64, value_to_i64, CollectionValue, CursorYieldBuffer, MapValue, OptionValue,
+    RuntimeValue, TensorValue,
 };
 use crate::outcome::RunOutcome;
 use radix_host_abi::{
-    VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16,
-    VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U16,
-    VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+    SYMBOL_CURSOR_STREAM, VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
+    VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
+    VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
 };
 use std::collections::{BTreeMap, HashMap};
-use wasmtime::{Linker, Module};
+use wasmtime::{FuncType, Linker, Module, Val, ValType};
 
 /// Import module for the closed CPU host ABI v1 surface.
 pub const WASM_IMPORT_MODULE_V1: &str = "faber_rt_v1";
+
+/// Legacy import module for generator cede (yield) rows (U6-B admitted
+/// exception). The radix Wasm emitter declares generator yields on this
+/// module; the product host admits exactly the closed cede field grammar
+/// below and binds it to the cursor-stream yield channel.
+pub(crate) const LEGACY_CEDE_MODULE: &str = "faber_runtime";
+
+/// U6-B — the cede (yield) channel fields the radix Wasm emitter declares on
+/// the legacy `faber_runtime` module (one import per carrier pair,
+/// `cede_1_{arg}_to_{result}` over the i32/i64/f64 wasm carriers). Recorded
+/// unit decision: moving these rows onto the closed `faber_rt_v1` surface is
+/// a radix-mir-wasm emitter change (out of U6-B's scope), so the yield
+/// channel is bound as an **explicit admitted exception** — exactly this
+/// closed set, nothing else. Any other legacy-module import still rejects
+/// during preflight; the closed v1 registry for all standard rows is
+/// unchanged.
+pub(crate) const LEGACY_CEDE_ROWS: &[(&str, ValType, ValType)] = &[
+    ("cede_1_i32_to_i32", ValType::I32, ValType::I32),
+    ("cede_1_i32_to_i64", ValType::I32, ValType::I64),
+    ("cede_1_i32_to_f64", ValType::I32, ValType::F64),
+    ("cede_1_i64_to_i32", ValType::I64, ValType::I32),
+    ("cede_1_i64_to_i64", ValType::I64, ValType::I64),
+    ("cede_1_i64_to_f64", ValType::I64, ValType::F64),
+    ("cede_1_f64_to_i32", ValType::F64, ValType::I32),
+    ("cede_1_f64_to_i64", ValType::F64, ValType::I64),
+    ("cede_1_f64_to_f64", ValType::F64, ValType::F64),
+];
+
+/// True for the closed cede (yield) field grammar (U6-B exception).
+fn is_cede_yield_field(field: &str) -> bool {
+    LEGACY_CEDE_ROWS
+        .iter()
+        .any(|(name, _, _)| *name == field)
+}
+
+/// The module's callable-table export the P5 cursor-stream host resolves the
+/// generator function-id reference against (the U6-A mechanism: the emitter
+/// emits and exports `faber_callables` whenever a cursor stream is
+/// materialized).
+pub(crate) const FABER_CALLABLE_TABLE: &str = "faber_callables";
 
 /// Admitted v1 field surface for the Stage 2 product host: the scalar and
 /// pointer-carrier diagnostic family the predecessor v1 host proved. The
@@ -223,6 +263,15 @@ pub(crate) const V1_TENSOR_FIELDS: &[&str] = &[
     "__faber_rt_v1_tensor_convert",
 ];
 
+/// U6-B cursor-stream surface: the closed-set v1 row the radix Wasm emitter
+/// emits for `@ cursor` / `fiunt` / `fient` materialization. One fixed symbol
+/// whose signature carries the generator function-id reference (i32 — the
+/// generator's entry in the exported callable table) plus the generator's
+/// argument carriers and returns the materialized `lista<T>` aggregate
+/// handle; the host invokes the referenced generator to completion and
+/// collects its `cede` yields (P5 contract).
+pub(crate) const V1_CURSOR_STREAM_FIELDS: &[&str] = &["__faber_rt_v1_cursor_stream"];
+
 /// True when `field` is admitted by the closed v1 registry.
 fn is_admitted_field(field: &str) -> bool {
     V1_DIAGNOSTIC_FIELDS.contains(&field)
@@ -235,6 +284,7 @@ fn is_admitted_field(field: &str) -> bool {
         || V1_OPTION_FIELDS.contains(&field)
         || V1_SCALAR_FIELDS.contains(&field)
         || V1_TENSOR_FIELDS.contains(&field)
+        || V1_CURSOR_STREAM_FIELDS.contains(&field)
 }
 
 /// Kind of one interned literal-table row (W12).
@@ -315,6 +365,10 @@ pub(crate) struct HostState {
     options: Vec<OptionValue>,
     /// W14 — tensor arena (dense element-kind + shape + flat values).
     tensors: Vec<TensorValue>,
+    /// U6-B — cursor-stream yield-buffer stack. The host pushes one buffer
+    /// per active materialization; the bound cede (yield) rows append to the
+    /// active buffer, and popping it yields the materialized `lista<T>`.
+    pub(crate) cursor_yields: Vec<CursorYieldBuffer>,
     /// Dynamic-handle allocator: starts after the last declared row.
     next_dynamic: i32,
     /// Host-allocated dynamic values by handle.
@@ -336,6 +390,7 @@ impl HostState {
             maps: Vec::new(),
             options: Vec::new(),
             tensors: Vec::new(),
+            cursor_yields: Vec::new(),
             next_dynamic: 0,
             dynamic: HashMap::new(),
         }
@@ -916,6 +971,14 @@ pub(crate) fn preflight_imports(module: &Module) -> Result<(), RunOutcome> {
     for import in module.imports() {
         let module_name = import.module();
         let field = import.name();
+        // U6-B recorded decision: the generator cede (yield) channel is an
+        // explicit admitted exception on the legacy `faber_runtime` module —
+        // exactly the closed field grammar the radix Wasm emitter declares,
+        // bound to the cursor-stream yield channel. Every other legacy-module
+        // import still rejects below.
+        if module_name == LEGACY_CEDE_MODULE && is_cede_yield_field(field) {
+            continue;
+        }
         if module_name != WASM_IMPORT_MODULE_V1 {
             return Err(RunOutcome::ImportRejected {
                 module: module_name.to_owned(),
@@ -942,8 +1005,13 @@ pub(crate) fn preflight_imports(module: &Module) -> Result<(), RunOutcome> {
 
 /// Bind every admitted v1 import on the linker. A declared signature that
 /// conflicts with the admitted binding fails at bind/instantiate time and
-/// surfaces as [`RunOutcome::LinkFailed`].
-pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+/// surfaces as [`RunOutcome::LinkFailed`]. The module is inspected for the
+/// declared cursor-stream signature (the one v1 field whose signature varies
+/// with the generator's argument carriers).
+pub(crate) fn link_v1_imports(
+    linker: &mut Linker<HostState>,
+    module: &Module,
+) -> Result<(), wasmtime::Error> {
     bind_scalar_i64(linker, "__faber_rt_v1_diagnostic_nota_i64")?;
     bind_scalar_i64(linker, "__faber_rt_v1_diagnostic_mone_i64")?;
     bind_scalar_i64(linker, "__faber_rt_v1_diagnostic_vide_i64")?;
@@ -1104,6 +1172,9 @@ pub(crate) fn link_v1_imports(linker: &mut Linker<HostState>) -> Result<(), wasm
     bind_tensor_sum(linker)?;
     bind_tensor_mean(linker)?;
     bind_tensor_convert(linker)?;
+    // U6-B cursor-stream materialization + the cede (yield) channel.
+    bind_cursor_stream(linker, module)?;
+    bind_cede_fields(linker)?;
     Ok(())
 }
 
@@ -3915,5 +3986,255 @@ fn bind_tensor_convert(linker: &mut Linker<HostState>) -> Result<(), wasmtime::E
             }))
         },
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// U6-B cursor-stream materialization + cede (yield) channel
+// ---------------------------------------------------------------------------
+
+/// The P5 cursor-stream materialization row (`__faber_rt_v1_cursor_stream`).
+/// The host invokes the referenced generator (function-id i32 into the
+/// module's exported callable table, then the generator's argument carriers)
+/// to completion and collects its `cede` yields into a `lista<T>` aggregate
+/// handle (reference semantics: the MIR stepper's `eval_cursor_stream`; the
+/// generator's own return value is discarded). The binding's signature is
+/// derived from the module's declared import (one field, one signature per
+/// module — the emitter dedups cursor-stream shapes by argument carriers).
+fn bind_cursor_stream(
+    linker: &mut Linker<HostState>,
+    module: &Module,
+) -> Result<(), wasmtime::Error> {
+    let mut declared = Vec::<FuncType>::new();
+    for import in module.imports() {
+        if import.module() != WASM_IMPORT_MODULE_V1 || import.name() != SYMBOL_CURSOR_STREAM {
+            continue;
+        }
+        match import.ty() {
+            wasmtime::ExternType::Func(ty) => declared.push(ty),
+            other => {
+                return Err(wasmtime::Error::msg(format!(
+                    "`{SYMBOL_CURSOR_STREAM}` is declared as a non-function import: {other:?}"
+                )));
+            }
+        }
+    }
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let signature = declared.pop().expect("declared cursor-stream imports are non-empty");
+    let same_shape = |left: &FuncType, right: &FuncType| {
+        left.params().map(|ty| ty.to_string()).eq(right.params().map(|ty| ty.to_string()))
+            && left.results().map(|ty| ty.to_string()).eq(right.results().map(|ty| ty.to_string()))
+    };
+    if declared.iter().any(|other| !same_shape(other, &signature)) {
+        return Err(wasmtime::Error::msg(format!(
+            "`{SYMBOL_CURSOR_STREAM}` imports declare conflicting signatures under the one \
+             v1 field; a module must declare exactly one cursor-stream shape"
+        )));
+    }
+    linker.func_new(
+        WASM_IMPORT_MODULE_V1,
+        SYMBOL_CURSOR_STREAM,
+        signature,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              params: &[Val],
+              results: &mut [Val]|
+              -> wasmtime::Result<()> {
+            let Some(Val::I32(function_id)) = params.first().copied() else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "cursor-stream: first parameter must be the generator function-id (i32)",
+                ));
+            };
+            let index = u64::try_from(function_id).map_err(|_| {
+                typed_unsupported(
+                    &mut caller,
+                    format!("cursor-stream: generator function-id {function_id} is negative"),
+                )
+            })?;
+            // Resolve the referenced generator through the module's exported
+            // callable table (U6-A mechanism: the emitter exports
+            // `faber_callables` whenever a cursor stream is materialized).
+            let generator = {
+                let Some(export) = caller.get_export(FABER_CALLABLE_TABLE) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!(
+                            "cursor-stream: module does not export the callable table \
+                             `{FABER_CALLABLE_TABLE}`"
+                        ),
+                    ));
+                };
+                let Some(table) = export.into_table() else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("cursor-stream: `{FABER_CALLABLE_TABLE}` is not a table export"),
+                    ));
+                };
+                match table.get(&mut caller, index) {
+                    Some(wasmtime::Ref::Func(Some(func))) => func,
+                    Some(wasmtime::Ref::Func(None)) => {
+                        return Err(typed_unsupported(
+                            &mut caller,
+                            format!(
+                                "cursor-stream: callable-table entry {function_id} is null \
+                                 (the generator is not tabled)"
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(typed_unsupported(
+                            &mut caller,
+                            format!(
+                                "cursor-stream: callable-table entry {function_id} is out of \
+                                 bounds"
+                            ),
+                        ));
+                    }
+                    Some(other) => {
+                        return Err(typed_unsupported(
+                            &mut caller,
+                            format!(
+                                "cursor-stream: callable-table entry {function_id} is not a \
+                                 function: {other:?}"
+                            ),
+                        ));
+                    }
+                }
+            };
+            // Materialize: run the generator to completion over a fresh yield
+            // buffer. The generator's own return value is discarded, so a
+            // result buffer is allocated per the generator's declared results.
+            caller.data_mut().cursor_yields.push(CursorYieldBuffer::default());
+            let mut discarded = Vec::new();
+            for result_ty in generator.ty(&caller).results() {
+                let Some(value) = default_wasm_value(&result_ty) else {
+                    caller.data_mut().cursor_yields.pop();
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!(
+                            "cursor-stream: generator result type {result_ty} cannot be \
+                             discarded on the v1 cursor surface"
+                        ),
+                    ));
+                };
+                discarded.push(value);
+            }
+            let generator_result = generator.call(&mut caller, &params[1..], &mut discarded);
+            // Pop the buffer even on generator failure so stacked
+            // materializations stay balanced.
+            let buffer = caller.data_mut().cursor_yields.pop().unwrap_or_default();
+            generator_result.map_err(|error| {
+                wasmtime::Error::msg(format!(
+                    "cursor-stream: generator (callable-table entry {function_id}) failed: {error:#}"
+                ))
+            })?;
+            // The materialized `lista<T>`: one collection, element kind fixed
+            // by the first yield (an empty materialization has no observable
+            // element kind and renders `[]` under the neutral numerus kind).
+            let kind = buffer.kind.unwrap_or(VALUE_KIND_I64);
+            let handle = caller.data_mut().alloc_collection(false, kind, buffer.values);
+            if let Some(result) = results.first_mut() {
+                *result = Val::I32(handle);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// A neutral wasm value for one result carrier (used to discard a
+/// generator's own return value during cursor-stream materialization).
+fn default_wasm_value(ty: &ValType) -> Option<Val> {
+    Some(match ty {
+        ValType::I32 => Val::I32(0),
+        ValType::I64 => Val::I64(0),
+        ValType::F32 => Val::F32(0),
+        ValType::F64 => Val::F64(0),
+        ValType::V128 => Val::V128(0u128.into()),
+        ValType::Ref(_) => return None,
+    })
+}
+
+/// The `VALUE_KIND_*` element kind for one cede yield carrier. i64 crosses
+/// scalar (numerus) yields, f64 crosses fractus; the i32 carrier is a handle
+/// carrier with no declared element kind on the v1 cursor surface, so it
+/// fails closed (never a guessed kind).
+fn cede_carrier_kind(ty: ValType) -> Option<u32> {
+    match ty {
+        ValType::I64 => Some(VALUE_KIND_I64),
+        ValType::F64 => Some(VALUE_KIND_F64),
+        _ => None,
+    }
+}
+
+/// Bind the closed cede (yield) channel fields on the legacy
+/// `faber_runtime` module (U6-B admitted exception). Every field is
+/// signature-exact per the emitter's carrier grammar. Inside an active
+/// cursor-stream materialization the yielded value appends to the active
+/// yield buffer; outside one the row is identity (the stepper's non-generator
+/// `cede` passthrough).
+fn bind_cede_fields(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    for (field, arg, result) in LEGACY_CEDE_ROWS {
+        let arg_ty = arg.clone();
+        let result_ty = result.clone();
+        let arg_kind = cede_carrier_kind(arg_ty.clone());
+        linker.func_new(
+            LEGACY_CEDE_MODULE,
+            field,
+            FuncType::new(linker.engine(), [arg_ty.clone()], [result_ty.clone()]),
+            move |mut caller: wasmtime::Caller<'_, HostState>,
+                  params: &[Val],
+                  results: &mut [Val]|
+                  -> wasmtime::Result<()> {
+                // Handle-carrier (i32) yields: fail typed when a
+                // materialization is active (no declared element kind on the
+                // v1 surface); outside one the row is identity.
+                let Some(kind) = arg_kind else {
+                    if caller.data().cursor_yields.last().is_some() {
+                        return Err(typed_unsupported(
+                            &mut caller,
+                            format!(
+                                "`{field}`: a handle-carrier (i32) cede yield has no declared \
+                                 element kind on the v1 cursor surface; the yield channel is \
+                                 bound for i64/f64 carriers (U6-B recorded decision)"
+                            ),
+                        ));
+                    }
+                    if let (Some(dest), Some(src)) = (results.first_mut(), params.first()) {
+                        *dest = *src;
+                    }
+                    return Ok(());
+                };
+                let value = match (&arg_ty, params.first()) {
+                    (ValType::I64, Some(Val::I64(value))) => RuntimeValue::I64(*value),
+                    (ValType::F64, Some(Val::F64(bits))) => RuntimeValue::F64(f64::from_bits(*bits)),
+                    _ => {
+                        return Err(wasmtime::Error::msg(format!(
+                            "`{field}`: unexpected cede yield carrier"
+                        )));
+                    }
+                };
+                let push_error = {
+                    let state = caller.data_mut();
+                    match state.cursor_yields.last_mut() {
+                        Some(active) => active.push(kind, value),
+                        None => Ok(()),
+                    }
+                };
+                if let Err(message) = push_error {
+                    return Err(typed_unsupported(&mut caller, message));
+                }
+                // Identity passthrough: the emitter drops the result in
+                // statement position, and outside a materialization `cede`
+                // is identity.
+                if let (Some(dest), Some(src)) = (results.first_mut(), params.first()) {
+                    *dest = *src;
+                }
+                Ok(())
+            },
+        )?;
+    }
     Ok(())
 }

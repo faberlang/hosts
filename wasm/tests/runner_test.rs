@@ -1232,3 +1232,398 @@ fn map_keys_and_values_project_lista_handles() {
         "map_keys/map_values must project renderable lista handles, got: {outcome:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// U6-B cursor-stream materialization (P5 host ABI) + cede yield channel
+// ---------------------------------------------------------------------------
+
+/// The U6-A emitted cursor-stream shape (synthetic WAT mirroring the
+/// emitter's output): the `__faber_rt_v1_cursor_stream` v1 row carries the
+/// generator function-id reference (i32 — its entry in the exported
+/// `faber_callables` table), the generator's `cede_1_i64_to_i64` yields ride
+/// the legacy `faber_runtime` cede rows (U6-B admitted exception), and the
+/// callable table is exported so the host can resolve and invoke the
+/// generator. The host runs the generator to completion, collects the yields
+/// into a `lista<T>`, and the `nota_ptr` diagnostic renders it in the
+/// Rust-oracle `[1, 2]` Debug shape.
+#[test]
+fn cursor_stream_materializes_generator_and_renders_lista() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (import "faber_runtime" "cede_1_i64_to_i64" (func $cede_i64 (param i64) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (table $faber_callables 2 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream (result i64)
+    (drop (call $cede_i64 (i64.const 1)))
+    (drop (call $cede_i64 (i64.const 2)))
+    (i64.const 0)
+  )
+  (func (export "incipit")
+    (call $nota_ptr (call $cursor_stream (i32.const 0)))
+  )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[1, 2]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "the materialized generator's cede yields must render as the lista, got: {outcome:?}"
+    );
+    assert_eq!(outcome.category(), OutcomeCategory::Success);
+}
+
+/// An empty generator materializes an empty `lista<T>` (`[]`).
+#[test]
+fn cursor_stream_empty_generator_renders_empty_lista() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream)
+  (func (export "incipit")
+    (call $nota_ptr (call $cursor_stream (i32.const 0)))
+  )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "an empty generator must materialize an empty lista, got: {outcome:?}"
+    );
+}
+
+/// The generator's argument carriers are forwarded to the generator through
+/// the callable table (the row signature carries them after the function-id).
+#[test]
+fn cursor_stream_forwards_generator_args() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32 i64) (result i32)))
+  (import "faber_runtime" "cede_1_i64_to_i64" (func $cede_i64 (param i64) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $nota_ptr (param i32)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream (param i64)
+    (drop (call $cede_i64 (i64.add (local.get 0) (i64.const 10))))
+  )
+  (func (export "incipit")
+    (call $nota_ptr (call $cursor_stream (i32.const 0) (i64.const 1)))
+  )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[11]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "generator args must reach the generator through the callable table, got: {outcome:?}"
+    );
+}
+
+/// A cursor-stream module without the exported callable table is a typed
+/// runtime failure (the generator cannot be resolved) — never a plausible
+/// default list.
+#[test]
+fn cursor_stream_missing_callable_table_is_typed_runtime_failure() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (func (export "incipit") (drop (call $cursor_stream (i32.const 0))))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "a cursor-stream module without the callable table must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("faber_callables"),
+            "message must name the missing table export: {message}"
+        );
+    }
+}
+
+/// A null/untabled generator entry (function-id resolves to no function) is
+/// a typed runtime failure.
+#[test]
+fn cursor_stream_null_generator_entry_is_typed_runtime_failure() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (func (export "incipit") (drop (call $cursor_stream (i32.const 0))))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "a null generator table entry must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("null"),
+            "message must name the null table entry: {message}"
+        );
+    }
+}
+
+/// A generator that traps during materialization surfaces as a typed entry
+/// trap (the host propagates the generator failure — never a partial list).
+#[test]
+fn cursor_stream_generator_trap_is_entry_trap() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream (unreachable))
+  (func (export "incipit") (drop (call $cursor_stream (i32.const 0))))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::EntryTrapped,
+        "a trapping generator must be EntryTrapped, got: {outcome:?}"
+    );
+}
+
+/// The cede (yield) channel is admitted by preflight and linked on the legacy
+/// `faber_runtime` module (U6-B recorded exception). Outside a materialization
+/// the row is identity (the stepper's non-generator `cede` passthrough), so a
+/// declared-and-invoked cede runs to success.
+#[test]
+fn legacy_cede_yield_channel_admitted_and_identity_outside_generator() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_runtime" "cede_1_i64_to_i64" (func $cede_i64 (param i64) (result i64)))
+  (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_i64" (func $nota_i64 (param i64)))
+  (func (export "incipit")
+    (call $nota_i64 (call $cede_i64 (i64.const 5)))
+  )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "5\n".to_owned(),
+            stderr: String::new(),
+        },
+        "the closed cede yield channel must be admitted and identity outside a generator, got: {outcome:?}"
+    );
+}
+
+/// The cede exception is closed: a legacy `faber_runtime` import outside the
+/// cede field grammar still rejects during preflight.
+#[test]
+fn legacy_non_cede_import_still_rejects() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_runtime" "not_a_cede_row" (func $not_cede))
+  (func (export "incipit") (nop))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert!(
+        matches!(
+            &outcome,
+            RunOutcome::ImportRejected { module, field, .. }
+                if module == "faber_runtime" && field == "not_a_cede_row"
+        ),
+        "a non-cede legacy import must reject with ImportRejected, got: {outcome:?}"
+    );
+    assert_eq!(outcome.category(), OutcomeCategory::ImportRejected);
+}
+
+/// A handle-carrier (i32) cede yield inside a materialization fails closed:
+/// the i32 carrier has no declared element kind on the v1 cursor surface, so
+/// the host refuses rather than guessing a kind.
+#[test]
+fn handle_carrier_cede_yield_inside_materialization_is_typed_failure() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (import "faber_runtime" "cede_1_i32_to_i32" (func $cede_i32 (param i32) (result i32)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream (drop (call $cede_i32 (i32.const 5))))
+  (func (export "incipit") (drop (call $cursor_stream (i32.const 0))))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "a handle-carrier cede yield inside a materialization must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("cede_1_i32_to_i32"),
+            "message must name the handle-carrier cede row: {message}"
+        );
+    }
+}
+
+/// A heterogeneous yield sequence (i64 then f64) fails closed: the v1
+/// collection model keeps one element kind per `lista<T>`, so a mixed-kind
+/// materialization is a typed runtime failure — never a silent coercion.
+#[test]
+fn mixed_kind_yields_fail_typed() {
+    let bytes = wat_bytes(
+        r#"
+(module
+  (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $cursor_stream (param i32) (result i32)))
+  (import "faber_runtime" "cede_1_i64_to_i64" (func $cede_i64 (param i64) (result i64)))
+  (import "faber_runtime" "cede_1_f64_to_f64" (func $cede_f64 (param f64) (result f64)))
+  (table $faber_callables 1 funcref)
+  (export "faber_callables" (table $faber_callables))
+  (elem (i32.const 0) $stream)
+  (func $stream
+    (drop (call $cede_i64 (i64.const 1)))
+    (drop (call $cede_f64 (f64.const 2.5)))
+  )
+  (func (export "incipit") (drop (call $cursor_stream (i32.const 0))))
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome.category(),
+        OutcomeCategory::RuntimeFailure,
+        "mixed-kind yields must be RuntimeFailure, got: {outcome:?}"
+    );
+    if let RunOutcome::RuntimeFailure { message } = &outcome {
+        assert!(
+            message.contains("kind mismatch"),
+            "message must name the kind mismatch: {message}"
+        );
+    }
+}
+
+/// Pair verification (U6-A + U6-B): the REAL compiler artifact for
+/// `cede/cede.fab` (emitted verbatim by `radix emit -t wasm-text`, U6-A
+/// landed) runs through `WasmRtV1Host` and its captured stdout matches the
+/// sibling `.expected` oracle (`[1, 2]`). This is the U6-A generator
+/// reference (function-id i32 over the exported `faber_callables` table) +
+/// the U6-B host binding + the cede yield channel, verified as one
+/// checkpoint.
+#[test]
+fn cede_fixture_compiler_artifact_matches_expected() {
+    let bytes = wat_bytes(
+        r#";; Generated by radix MIR WASM text probe - experimental artifact.
+(module
+    (import "faber_runtime" "cede_1_i64_to_i64" (func $__faber_runtime_cede_1_i64_to_i64 (param i64) (result i64)))
+    (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $__faber_rt_v1_cursor_stream__0_to_aggregate (param i32) (result i32)))
+    (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $__faber_rt_v1_diagnostic_nota_ptr__aggregate_handle (param i32)))
+    (table $faber_callables 2 funcref)
+    (export "faber_callables" (table $faber_callables))
+    (elem (i32.const 0) $stream $incipit)
+    (func $stream (export "stream") (result i64)
+          (local $t0 i64)
+          (local $t1 i64)
+          (local.set $t0 (call $__faber_runtime_cede_1_i64_to_i64 (i64.const 1)))
+          (local.set $t1 (call $__faber_runtime_cede_1_i64_to_i64 (i64.const 2)))
+          (return (i64.const 0))
+    )
+    (func $incipit (export "incipit")
+          (local $t0 i32)
+          (local.set $t0 (call $__faber_rt_v1_cursor_stream__0_to_aggregate (i32.const 0)))
+          (call $__faber_rt_v1_diagnostic_nota_ptr__aggregate_handle (local.get $t0))
+          (return)
+    )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[1, 2]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "cede/cede.fab must run through the product host matching its .expected oracle, got: {outcome:?}"
+    );
+}
+
+/// Pair verification (U6-A + U6-B): the REAL compiler artifact for
+/// `cursor/cursor.fab` (emitted verbatim by `radix emit -t wasm-text`, U6-A
+/// landed) runs through `WasmRtV1Host` and its captured stdout matches the
+/// sibling `.expected` oracle (`[1, 2]`).
+#[test]
+fn cursor_fixture_compiler_artifact_matches_expected() {
+    let bytes = wat_bytes(
+        r#";; Generated by radix MIR WASM text probe - experimental artifact.
+(module
+    (import "faber_runtime" "cede_1_i64_to_i64" (func $__faber_runtime_cede_1_i64_to_i64 (param i64) (result i64)))
+    (import "faber_rt_v1" "__faber_rt_v1_cursor_stream" (func $__faber_rt_v1_cursor_stream__0_to_aggregate (param i32) (result i32)))
+    (import "faber_rt_v1" "__faber_rt_v1_diagnostic_nota_ptr" (func $__faber_rt_v1_diagnostic_nota_ptr__aggregate_handle (param i32)))
+    (table $faber_callables 2 funcref)
+    (export "faber_callables" (table $faber_callables))
+    (elem (i32.const 0) $stream $incipit)
+    (func $stream (export "stream") (result i64)
+          (local $t0 i64)
+          (local $t1 i64)
+          (local.set $t0 (call $__faber_runtime_cede_1_i64_to_i64 (i64.const 1)))
+          (local.set $t1 (call $__faber_runtime_cede_1_i64_to_i64 (i64.const 2)))
+          (return (i64.const 0))
+    )
+    (func $incipit (export "incipit")
+          (local $t0 i32)
+          (local.set $t0 (call $__faber_rt_v1_cursor_stream__0_to_aggregate (i32.const 0)))
+          (call $__faber_rt_v1_diagnostic_nota_ptr__aggregate_handle (local.get $t0))
+          (return)
+    )
+)
+"#,
+    );
+    let outcome = host().run(&bytes, &RunConfig::default());
+    assert_eq!(
+        outcome,
+        RunOutcome::Success {
+            stdout: "[1, 2]\n".to_owned(),
+            stderr: String::new(),
+        },
+        "cursor/cursor.fab must run through the product host matching its .expected oracle, got: {outcome:?}"
+    );
+}

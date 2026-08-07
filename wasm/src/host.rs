@@ -54,7 +54,7 @@ impl WasmRtV1Host {
 
         let mut store = Store::new(&self.engine, HostState::new(config.max_stdout_bytes));
         let mut linker = Linker::new(&self.engine);
-        if let Err(error) = link_v1_imports(&mut linker) {
+        if let Err(error) = link_v1_imports(&mut linker, &module) {
             return RunOutcome::LinkFailed {
                 message: format!("link failed: {error:#}"),
             };
