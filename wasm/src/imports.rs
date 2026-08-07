@@ -18,11 +18,33 @@ use radix_host_abi::{
     VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
     VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
 };
-use std::collections::{BTreeMap, HashMap};
-use wasmtime::{FuncType, Linker, Module, Val, ValType};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use wasmtime::{FuncType, Instance, Linker, Module, Store, Val, ValType};
 
 /// Import module for the closed CPU host ABI v1 surface.
 pub const WASM_IMPORT_MODULE_V1: &str = "faber_rt_v1";
+
+/// U6-E — package-namespace import module for external identities. The radix
+/// Wasm emitter lands every external identity import on this module — both
+/// library identities (`norma:*`, dependency packages) and, in package-aware
+/// emit mode (`emit_wasm_text_probe_package_aware`, U6-C), same-package
+/// cross-module identities (`importa:auxilium:saluta`) — under the canonical
+/// identity-based field name (`external_product_<product>_module_…_func_<name>`,
+/// the LLVM-lane naming). The product host admits this module ONLY in package
+/// run mode ([`crate::host::WasmRtV1Host::run_package`]) and resolves each
+/// field against the sibling modules' canonical external-symbol exports.
+/// Single-module runs keep the closed v1 preflight, so `faber_external`
+/// rejects there — a package import is never a host symbol (W13 registry
+/// cleanliness).
+pub(crate) const FABER_EXTERNAL_IMPORT_MODULE: &str = "faber_external";
+
+/// The emitter's canonical external-symbol prefix
+/// (`radix-mir-wasm/src/import_names.rs` `FABER_EXTERNAL_IMPORT_PREFIX`): a
+/// `faber_external` import with field `F` resolves against a sibling module
+/// export named `__faber_{F}`. The canonical symbol never carries the
+/// `__faber_rt_v1_` prefix, so the closed host-symbol registry never sees a
+/// package import.
+pub(crate) const FABER_EXTERNAL_IMPORT_PREFIX: &str = "__faber_";
 
 /// Legacy import module for generator cede (yield) rows (U6-B admitted
 /// exception). The radix Wasm emitter declares generator yields on this
@@ -968,6 +990,15 @@ fn write_capped(out: &mut String, text: &str, max_bytes: usize) {
 /// `faber_rt_v1` and use an admitted field; otherwise the run rejects before
 /// linking with a typed [`RunOutcome::ImportRejected`].
 pub(crate) fn preflight_imports(module: &Module) -> Result<(), RunOutcome> {
+    preflight_closed_surface(module, false)
+}
+
+/// U6-E — preflight one package module's closed import surface. Same rule
+/// set as the single-module [`preflight_imports`] (the closed `faber_rt_v1`
+/// registry plus the U6-B legacy cede exception); when `admit_external` is
+/// set, the package-namespace `faber_external` module is deferred to the
+/// package resolver ([`preflight_package_imports`]) instead of rejecting.
+fn preflight_closed_surface(module: &Module, admit_external: bool) -> Result<(), RunOutcome> {
     for import in module.imports() {
         let module_name = import.module();
         let field = import.name();
@@ -980,6 +1011,9 @@ pub(crate) fn preflight_imports(module: &Module) -> Result<(), RunOutcome> {
             continue;
         }
         if module_name != WASM_IMPORT_MODULE_V1 {
+            if admit_external && module_name == FABER_EXTERNAL_IMPORT_MODULE {
+                continue;
+            }
             return Err(RunOutcome::ImportRejected {
                 module: module_name.to_owned(),
                 field: field.to_owned(),
@@ -998,6 +1032,72 @@ pub(crate) fn preflight_imports(module: &Module) -> Result<(), RunOutcome> {
                      (not admitted by the v1 product registry)"
                 ),
             });
+        }
+    }
+    Ok(())
+}
+
+/// Canonical external symbol for one `faber_external` import field:
+/// `__faber_` + field (mirrors `radix-mir-wasm` `external_function_import_symbol`).
+fn external_canonical_symbol(field: &str) -> String {
+    format!("{FABER_EXTERNAL_IMPORT_PREFIX}{field}")
+}
+
+/// U6-E — preflight a package run's whole import surface (entry + siblings).
+///
+/// Every module keeps the closed `faber_rt_v1` preflight (the U6-B cede
+/// exception included). The package-namespace `faber_external` module is the
+/// one new admission: each of its imports must resolve to the canonical
+/// external-symbol export (`__faber_{field}`) of another module in the
+/// package set — the entry (index 0) is never a provider (it instantiates
+/// last), so the entry's imports resolve against the siblings and a sibling's
+/// against the other siblings. An unresolvable external import rejects before
+/// any linking with a typed [`RunOutcome::ImportRejected`] naming the module
+/// and field — the `wasm_external.rs` `MissingImport` bucket (typed, never a
+/// silent default). Single-module runs never enter this path; `faber_external`
+/// keeps rejecting there ([`preflight_imports`]).
+pub(crate) fn preflight_package_imports(
+    entry: &Module,
+    siblings: &[Module],
+) -> Result<(), RunOutcome> {
+    let mut modules = Vec::with_capacity(siblings.len() + 1);
+    modules.push(entry);
+    modules.extend(siblings.iter());
+
+    // Canonical external-symbol export surface per module.
+    let export_sets: Vec<HashSet<String>> = modules
+        .iter()
+        .map(|module| {
+            module
+                .exports()
+                .filter(|export| export.name().starts_with(FABER_EXTERNAL_IMPORT_PREFIX))
+                .map(|export| export.name().to_owned())
+                .collect()
+        })
+        .collect();
+
+    for (index, module) in modules.iter().enumerate() {
+        preflight_closed_surface(module, true)?;
+        for import in module.imports() {
+            if import.module() != FABER_EXTERNAL_IMPORT_MODULE {
+                continue;
+            }
+            let field = import.name();
+            let canonical = external_canonical_symbol(field);
+            let resolvable = export_sets.iter().enumerate().any(|(other, set)| {
+                other != index && other != 0 && set.contains(&canonical)
+            });
+            if !resolvable {
+                return Err(RunOutcome::ImportRejected {
+                    module: FABER_EXTERNAL_IMPORT_MODULE.to_owned(),
+                    field: field.to_owned(),
+                    message: format!(
+                        "package run cannot resolve `{FABER_EXTERNAL_IMPORT_MODULE}::{field}`: \
+                         no other module in the package exports the canonical symbol \
+                         `{canonical}` (U6-C package-aware surface); typed missing import"
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -1175,6 +1275,41 @@ pub(crate) fn link_v1_imports(
     // U6-B cursor-stream materialization + the cede (yield) channel.
     bind_cursor_stream(linker, module)?;
     bind_cede_fields(linker)?;
+    Ok(())
+}
+
+/// U6-E — bind one module's `faber_external` imports against the
+/// already-instantiated provider instances. Each import field `F` resolves
+/// to the provider export named `__faber_{F}` (the canonical external
+/// symbol). A provider that is not yet instantiated — a package provided out
+/// of dependency order — or a declared signature that conflicts with the
+/// provider's export fails at link/instantiate time and surfaces as
+/// [`RunOutcome::LinkFailed`]; the package preflight gate
+/// ([`preflight_package_imports`]) has already proved the symbol exists
+/// somewhere in the package set.
+pub(crate) fn bind_external_imports(
+    linker: &mut Linker<HostState>,
+    store: &mut Store<HostState>,
+    module: &Module,
+    providers: &[Instance],
+) -> Result<(), wasmtime::Error> {
+    for import in module.imports() {
+        if import.module() != FABER_EXTERNAL_IMPORT_MODULE {
+            continue;
+        }
+        let field = import.name();
+        let canonical = external_canonical_symbol(field);
+        let Some(func) = providers
+            .iter()
+            .find_map(|instance| instance.get_func(&mut *store, &canonical))
+        else {
+            return Err(wasmtime::Error::msg(format!(
+                "package external import `{FABER_EXTERNAL_IMPORT_MODULE}::{field}` has no \
+                 instantiated provider for `{canonical}` (dependency order or package assembly)"
+            )));
+        };
+        linker.define(&mut *store, FABER_EXTERNAL_IMPORT_MODULE, field, func)?;
+    }
     Ok(())
 }
 

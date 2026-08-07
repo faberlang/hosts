@@ -46,7 +46,11 @@ pub enum RunOutcome {
     Success { stdout: String, stderr: String },
     /// Module bytes failed Wasm validation.
     ValidationFailed { message: String },
-    /// Import surface rejected during preflight.
+    /// Import surface rejected during preflight: legacy module, unknown
+    /// field, or a declared field the registry does not admit — plus, on the
+    /// U6-E package run path, an unresolvable `faber_external` package import
+    /// (the `wasm_external.rs` `MissingImport` bucket: typed, never a silent
+    /// default).
     ImportRejected {
         module: String,
         field: String,
