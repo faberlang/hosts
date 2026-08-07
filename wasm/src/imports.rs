@@ -239,7 +239,6 @@ pub(crate) const V1_OPTION_FIELDS: &[&str] = &[
 /// W13 scalar conversion surface: the closed-set v1 rows for scalar/format
 /// display and text↦scalar conversion the corpus fixtures route through.
 pub(crate) const V1_SCALAR_FIELDS: &[&str] = &[
-    "__faber_rt_v1_diagnostic_nota_i1",
     "__faber_rt_v1_assert",
     "__faber_rt_v1_assert_message",
     "__faber_rt_v1_text_i64",
@@ -745,42 +744,6 @@ impl HostState {
         }
     }
 
-    /// Resolve a diagnostic handle to its rendered line: text rows and
-    /// dynamic texts render as-is, regex handles render their pattern,
-    /// octeti handles render the byte-list Debug shape, and the W13
-    /// collection/scalar arenas render in the Rust-oracle Debug shapes
-    /// (`[1, 2, 3]` / `["prima", "secunda"]` / `{1, 2}` /
-    /// `Json(Tabula({...}))` / payload-or-`nihil`) — mirroring the LLVM
-    /// host's opaque display.
-    pub(crate) fn resolve_diagnostic(&self, handle: i32) -> Option<String> {
-        if let Some(text) = self.resolve_text(handle) {
-            return Some(text.to_owned());
-        }
-        if let Some(regex) = self.resolve_regex(handle) {
-            return Some(regex.pattern.clone());
-        }
-        if let Some(bytes) = self.resolve_octeti(handle) {
-            return Some(format!("{bytes:?}"));
-        }
-        if let Some(collection) = self.find_collection(handle) {
-            return self.render_collection(collection);
-        }
-        if let Some(map) = self.find_map(handle) {
-            return self.render_map(map);
-        }
-        if let Some(option) = self.find_option(handle) {
-            return match option.payload {
-                Some(payload) => self.render_option_payload(option.kind, payload),
-                None => Some("nihil".to_owned()),
-            };
-        }
-        // Null-encoded option: handle 0 is `nihil`.
-        if handle == 0 {
-            return Some("nihil".to_owned());
-        }
-        None
-    }
-
     /// Render one collection element in the Rust-oracle Debug shape. Text
     /// elements quote (`"prima"`, matching `Vec<String>` Debug), bivalens
     /// elements render `true`/`false`, and nested aggregate handles resolve
@@ -895,8 +858,15 @@ impl HostState {
         None
     }
 
-    /// Render an opaque handle for collection-element/option display: text
-    /// renders plain, collections/maps/options render recursively.
+    /// Render one opaque handle in the shared oracle display shape (the L10
+    /// opaque display contract): text rows render as-is, regex handles render
+    /// their pattern, octeti handles render the byte-list Debug shape, and
+    /// the W13 collection/scalar arenas render in the Rust-oracle Debug
+    /// shapes (`[1, 2, 3]` / `["prima", "secunda"]` / `{1, 2}` /
+    /// `Json(Tabula({...}))` / payload-or-`nihil`) — mirroring the LLVM
+    /// host's opaque display. Shared by the diagnostic streams
+    /// (nota/vide/mone), the format opaque-arg row, and nested
+    /// collection/option element display.
     fn render_handle_display(&self, handle: i32) -> Option<String> {
         if let Some(text) = self.resolve_text(handle) {
             return Some(text.to_owned());
@@ -1370,7 +1340,7 @@ fn bind_stdout_diagnostic(
         move |mut caller: wasmtime::Caller<'_, HostState>,
               handle: i32|
               -> Result<(), wasmtime::Error> {
-            let rendered = caller.data().resolve_diagnostic(handle);
+            let rendered = caller.data().render_handle_display(handle);
             match rendered {
                 Some(rendered) => {
                     caller.data_mut().write_line(&rendered);
@@ -1436,7 +1406,7 @@ fn bind_stderr_diagnostic(
         WASM_IMPORT_MODULE_V1,
         field,
         move |mut caller: wasmtime::Caller<'_, HostState>, handle: i32| -> Result<(), wasmtime::Error> {
-            let rendered = caller.data().resolve_diagnostic(handle);
+            let rendered = caller.data().render_handle_display(handle);
             match rendered {
                 Some(rendered) => {
                     caller.data_mut().write_stderr_line(&rendered);
@@ -1883,7 +1853,7 @@ fn bind_format_1_ptr_to_ptr(linker: &mut Linker<HostState>) -> Result<(), wasmti
               template: i32,
               value: i32|
               -> Result<i32, wasmtime::Error> {
-            let Some(rendered) = caller.data().resolve_diagnostic(value) else {
+            let Some(rendered) = caller.data().render_handle_display(value) else {
                 return Err(typed_unsupported(
                     &mut caller,
                     format!("format opaque arg handle {value}: unrecognized aggregate handle"),
@@ -2523,13 +2493,12 @@ fn bind_array_sort(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
         move |mut caller: wasmtime::Caller<'_, HostState>,
               handle: i32|
               -> Result<i32, wasmtime::Error> {
-            let kind = caller.data().find_collection(handle).map(|c| c.kind);
-            let Some(kind) = kind else {
+            if caller.data().find_collection(handle).is_none() {
                 return Err(typed_unsupported(
                     &mut caller,
                     format!("array_sort handle {handle}: unknown collection handle"),
                 ));
-            };
+            }
             let Some(collection) = caller.data_mut().find_collection_mut(handle) else {
                 return Err(typed_unsupported(
                     &mut caller,
@@ -2537,7 +2506,6 @@ fn bind_array_sort(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                 ));
             };
             collection.values.sort_by_key(|value| value_to_i64(*value));
-            let _ = kind;
             Ok(handle)
         },
     )?;
