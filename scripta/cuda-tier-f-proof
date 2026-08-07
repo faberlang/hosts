@@ -108,12 +108,32 @@ if ! grep -q 'addrspace(1)' "$LL"; then
 fi
 
 # Descriptor must parse and match the kernel-signature contract.
+#
+# The NVVM descriptor is a VERSIONED contract (council 2263930a item 1), not
+# additive-over-v1: a schema bump is a clean break and strict consumers must
+# update as ONE versioned set. This lane tracks the schema constant
+# `NVVM_DESCRIPTOR_SCHEMA_VERSION` from the radix source
+# (radix-mir-llvm/src/nvvm_descriptor.rs) and asserts the emitted descriptor
+# matches it — a future schema bump fails this lane loudly here instead of a
+# stale literal `== 1` silently passing (or lying about compatibility).
+NVVM_DESCRIPTOR_RS="$RADIX_ROOT/crates/radix-mir-llvm/src/nvvm_descriptor.rs"
+if [[ ! -f "$NVVM_DESCRIPTOR_RS" ]]; then
+  fail "cannot track NVVM_DESCRIPTOR_SCHEMA_VERSION: $NVVM_DESCRIPTOR_RS not found"
+fi
+EXPECTED_SCHEMA_VERSION="$(grep -oE 'pub const NVVM_DESCRIPTOR_SCHEMA_VERSION: u32 = [0-9]+' "$NVVM_DESCRIPTOR_RS" | grep -oE '[0-9]+$' || true)"
+if [[ -z "$EXPECTED_SCHEMA_VERSION" ]]; then
+  fail "cannot parse NVVM_DESCRIPTOR_SCHEMA_VERSION from $NVVM_DESCRIPTOR_RS"
+fi
+
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$DESCRIPTOR" <<'PY'
+  python3 - "$DESCRIPTOR" "$EXPECTED_SCHEMA_VERSION" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
-assert d.get("schema_version") == 1, f"schema_version {d.get('schema_version')}"
+assert d.get("schema_version") == int(sys.argv[2]), (
+    f"schema_version {d.get('schema_version')} != "
+    f"NVVM_DESCRIPTOR_SCHEMA_VERSION {sys.argv[2]}"
+)
 assert d.get("target") == "llvm-nvvm", f"target {d.get('target')}"
 ks = d.get("kernels")
 assert isinstance(ks, list) and len(ks) == 1, f"kernels {ks}"
@@ -124,12 +144,14 @@ assert k.get("element_byte_width") == 4, f"element_byte_width {k.get('element_by
 assert k.get("element_count") == 256, f"element_count {k.get('element_count')}"
 assert k.get("input_buffers") == 2, f"input_buffers {k.get('input_buffers')}"
 assert k.get("output_buffers") == 1, f"output_buffers {k.get('output_buffers')}"
-print(f"descriptor OK: target={d['target']} entry={k['entry']} "
+print(f"descriptor OK: schema_version={d['schema_version']} target={d['target']} entry={k['entry']} "
       f"element={k['element_type']}[{k['element_count']}] "
       f"in={k['input_buffers']} out={k['output_buffers']}")
 PY
 else
   # python3 absent: structural grep fallback, not a deep parse.
+  grep -q "\"schema_version\": $EXPECTED_SCHEMA_VERSION" "$DESCRIPTOR" \
+    || fail "descriptor schema_version != $EXPECTED_SCHEMA_VERSION (NVVM_DESCRIPTOR_SCHEMA_VERSION)"
   for needle in '"target": "llvm-nvvm"' '"entry": "addita"' '"element_type": "f32"' \
                 '"element_count": 256' '"input_buffers": 2' '"output_buffers": 1'; do
     grep -q "$needle" "$DESCRIPTOR" || fail "descriptor missing $needle"
