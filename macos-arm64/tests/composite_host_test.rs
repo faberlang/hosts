@@ -16,7 +16,7 @@ use faber_host_macos_arm64::composite_host::{
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
+    fnv1a64, sha256_hex, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
     DescriptorEndOfRunResult, DescriptorKernel, DescriptorLaunch, DescriptorResult,
     DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
     DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH,
@@ -32,6 +32,22 @@ use faber_host_macos_arm64::{
 };
 
 const MODULE_IMAGE: &[u8] = b"// fake compiler-owned module image";
+
+/// The SHA-256 implementation under the re-domained program-graph receipt is
+/// FIPS 180-4-correct: the `"abc"` known-answer vector.
+#[test]
+fn sha256_matches_fips_180_4_abc_vector() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    // A second vector across a block boundary (112 bytes → two 64-byte
+    // blocks), catching schedule/padding errors on multi-block input.
+    assert_eq!(
+        sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+}
 
 /// One elementwise-add kernel: `out = a + b` over `count` f32 elements.
 /// Matches the simulated `addita` / `add_one` kernel shape (3 buffers).
@@ -3315,17 +3331,22 @@ fn receipt_declares_resource_graph_and_observed_events() {
         "completion guaranteed at the explicit step-boundary sync after launch 2"
     );
 
-    // The receipt carries the execution-descriptor hash the host computed
-    // from the descriptor it consumed (the execution identity of this run;
-    // backend-entry-inclusive, S5A-U3).
+    // The receipt carries the program-graph hash the host computed from the
+    // descriptor it consumed (the run/session identity — a SHA-256 receipt
+    // over the domain-tagged canonical graph bytes, OQ1 distinct host-graph
+    // domain; backend-entry-inclusive, S5A-U3).
     assert_eq!(
-        receipt.execution_descriptor_hash,
-        descriptor.execution_descriptor_hash()
+        receipt.program_graph_hash,
+        descriptor.program_graph_hash()
     );
     assert_eq!(
-        session.execution_descriptor_hash(),
-        descriptor.execution_descriptor_hash()
+        session.program_graph_hash(),
+        descriptor.program_graph_hash().as_str()
     );
+    // The re-domained identity is a SHA-256 receipt under the distinct name:
+    // the `sha256:<64-hex>` spelling, never a u64 FNV value.
+    assert!(receipt.program_graph_hash.starts_with("sha256:"));
+    assert_eq!(receipt.program_graph_hash.len(), 71);
 
     session.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -3425,14 +3446,13 @@ fn receipt_consumes_carried_version_facts_not_coincidence() {
 
 // ---------------------------------------------------------------------------
 // Stage 3R U5: coherent host execution — graph-ordered scheduling (F3/G1),
-// observation-only readback (F6), honest receipts (R9), execution descriptor
-// hash
+// observation-only readback (F6), honest receipts (R9), program-graph hash
 // ---------------------------------------------------------------------------
 
 /// The declaration-reorder red test (G1 host side): reordering the kernel
 /// DECLARATIONS — the host never infers execution from declaration order —
 /// does not change the executed launch sequence, the results, or the
-/// execution-descriptor hash. The host schedules the carried launches +
+/// program-graph hash. The host schedules the carried launches +
 /// graph, so the same launches with differently-ordered declarations are
 /// one program.
 #[test]
@@ -3516,16 +3536,16 @@ fn declaration_reorder_does_not_change_execution_or_descriptor_hash() {
     assert_eq!(receipt_b.outputs, receipt_a.outputs);
     assert_eq!(receipt_b.outputs.get(&6), Some(&vec![12.0, 14.0]));
 
-    // The execution-descriptor hash is declaration-independent too: both
+    // The program-graph hash is declaration-independent too: both
     // descriptors name the same launches, graph, semantic identities, and
-    // observation points.
+    // observation points (the domain-tagged SHA-256 receipt, OQ1).
     assert_eq!(
-        declared_zero_first.execution_descriptor_hash(),
-        declared_one_first.execution_descriptor_hash()
+        declared_zero_first.program_graph_hash(),
+        declared_one_first.program_graph_hash()
     );
     assert_eq!(
-        receipt_a.execution_descriptor_hash,
-        declared_zero_first.execution_descriptor_hash()
+        receipt_a.program_graph_hash,
+        declared_zero_first.program_graph_hash()
     );
     assert_eq!(
         host.device().expect("device present").live_handle_count(),

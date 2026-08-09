@@ -253,10 +253,10 @@ pub struct ProgramSession<'host> {
     /// declared end-of-run set is live and observable at the declared
     /// completion boundary.
     final_step_completed: bool,
-    /// FNV-1a hash of the carried execution-descriptor facts the session
-    /// executes (backend-entry-inclusive; S5A-U3 — not a semantic-identity
-    /// claim).
-    execution_descriptor_hash: u64,
+    /// SHA-256 receipt of the carried program-graph facts the session
+    /// executes (the domain-tagged host program-graph identity, OQ1;
+    /// backend-entry-inclusive; S5A-U3 — not a semantic-identity claim).
+    program_graph_hash: String,
     /// Whether a `RepeatingStep` session's HostProvided params have been
     /// once-init'd via [`ProgramSession::init_params`] (S5-U6). Steps
     /// refuse until the once-init has run; a second once-init is refused
@@ -437,7 +437,7 @@ impl<'host> ProgramSession<'host> {
                 .collect(),
             end_of_run_read: false,
             final_step_completed: false,
-            execution_descriptor_hash: descriptor.execution_descriptor_hash(),
+            program_graph_hash: descriptor.program_graph_hash(),
             params_initialized: false,
             closed: false,
         })
@@ -1011,7 +1011,7 @@ impl<'host> ProgramSession<'host> {
             completion_boundary: CompletionBoundary::StepSync {
                 after_launch: self.launches.last().map(|launch| launch.id).unwrap_or(0),
             },
-            execution_descriptor_hash: self.execution_descriptor_hash,
+            program_graph_hash: self.program_graph_hash.clone(),
         })
     }
 
@@ -1209,15 +1209,16 @@ impl<'host> ProgramSession<'host> {
         self.module_hash
     }
 
-    /// The FNV-1a execution-descriptor hash of the descriptor this session
+    /// The SHA-256 program-graph receipt of the descriptor this session
     /// executes (roots + launches + dependency edges + buffer semantic
-    /// identities + observation points + backend entry-name bytes). The
-    /// execution identity the session consumed — distinct from
-    /// [`ProgramSession::module_hash`], which only names the backend blob.
-    /// Backend-entry-inclusive (S5A-U3); not a semantic-identity claim —
-    /// the A10 complete-program SHA is the semantic identity.
+    /// identities + observation points + backend entry-name bytes, under the
+    /// distinct host-graph domain tag — OQ1). The run/session identity the
+    /// session consumed — distinct from [`ProgramSession::module_hash`],
+    /// which only names the backend blob. Backend-entry-inclusive (S5A-U3);
+    /// not a semantic-identity claim — the A10 complete-program SHA is the
+    /// semantic identity.
     #[must_use]
-    pub fn execution_descriptor_hash(&self) -> u64 {
-        self.execution_descriptor_hash
+    pub fn program_graph_hash(&self) -> &str {
+        &self.program_graph_hash
     }
 }

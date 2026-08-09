@@ -1,5 +1,5 @@
 //! A9/A10 execution receipts: the observable device facts of one descriptor
-//! execution (module hash, execution-descriptor hash, launches, transfers,
+//! execution (module hash, program-graph hash, launches, transfers,
 //! readbacks, syncs, releases) plus the declared logical resource graph and
 //! the inter-kernel data-flow edges (R2 consume — never re-derived).
 
@@ -84,14 +84,14 @@ pub struct DeviceExecutionReceipt {
     /// observation is valid. Stated exactly — never beyond the explicit
     /// synchronization the host actually performed.
     pub completion_boundary: CompletionBoundary,
-    /// FNV-1a hash of the carried execution-descriptor facts (roots +
-    /// launches + dependency edges + buffer semantic identities + observation
-    /// points + backend entry-name bytes), computed by the host from the
-    /// descriptor it consumed — the execution identity this run executed,
-    /// distinct from the module provenance hash. Backend-entry-inclusive
-    /// (S5A-U3); not a semantic-identity claim — the A10 complete-program
-    /// SHA is.
-    pub execution_descriptor_hash: u64,
+    /// SHA-256 receipt of the carried program-graph facts (roots + launches +
+    /// dependency edges + buffer semantic identities + observation points +
+    /// backend entry-name bytes, under the distinct host-graph domain tag —
+    /// OQ1), computed by the host from the descriptor it consumed — the
+    /// run/session identity this run executed, distinct from the module
+    /// provenance hash. Backend-entry-inclusive (S5A-U3); not a
+    /// semantic-identity claim — the A10 complete-program SHA is.
+    pub program_graph_hash: String,
 }
 
 /// The completion boundary of one execution (R9).
