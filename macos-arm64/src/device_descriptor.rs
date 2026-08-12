@@ -1015,11 +1015,13 @@ impl DeviceDescriptor {
     }
 
     /// SHA-256 receipt of the descriptor's carried **program-graph** facts
-    /// (F3/F6): the buffer semantic identities + content versions, the
-    /// declared roots, the ordered launch sequence with the full facts of
-    /// each launched kernel **including the backend entry-name bytes**
-    /// (`kernel.entry`), the carried dependency edges, the declared per-step
-    /// observation points, and the declared end-of-run observations (S5A-U1).
+    /// (F3/F6): the buffer semantic identities + content versions + the
+    /// execution-affecting buffer facts (binding, lifetime, initialization),
+    /// the program execution-lifetime regime, the declared roots, the ordered
+    /// launch sequence with the full facts of each launched kernel
+    /// **including the backend entry-name bytes** (`kernel.entry`), the
+    /// carried dependency edges, the declared per-step observation points,
+    /// and the declared end-of-run observations (S5A-U1).
     ///
     /// This is the **host program-graph identity** (OQ1 resolution — a
     /// DISTINCT domain from the radix call/region execution-descriptor
@@ -1055,6 +1057,10 @@ impl DeviceDescriptor {
         // substrate: length-prefixed like every UTF-8 field in the canonical
         // byte stream.
         push_bytes(&mut bytes, HOST_PROGRAM_GRAPH_DOMAIN_TAG.as_bytes());
+        // The program execution-lifetime regime (single-run vs repeating
+        // training step) changes how the session executes the graph, so it is
+        // part of the graph identity (S3-U5 census: M07).
+        push_u32(&mut bytes, self.program_lifetime as u32);
         let mut buffers: Vec<(&DescriptorBuffer, &u32)> = self
             .kernels
             .iter()
@@ -1075,6 +1081,13 @@ impl DeviceDescriptor {
             push_u32(&mut bytes, *version);
             push_u32(&mut bytes, slot.element_ty as u32);
             bytes.extend_from_slice(&slot.element_count.to_le_bytes());
+            // S3-U5 (M07): lifetime and initialization are buffer IDENTITY
+            // facts (validation enforces cross-reference consistency), so
+            // they join the sorted canonical stream — every deduplicated key
+            // carries one validated value, keeping the stream
+            // declaration-independent.
+            push_u32(&mut bytes, slot.lifetime as u32);
+            push_u32(&mut bytes, slot.initialization as u32);
         }
         push_u32(&mut bytes, self.roots.len() as u32);
         for root in &self.roots {
@@ -1088,11 +1101,29 @@ impl DeviceDescriptor {
                 // independent).
                 push_bytes(&mut bytes, kernel.entry.as_bytes());
                 push_u32(&mut bytes, kernel.buffers.len() as u32);
-                for slot in &kernel.buffers {
+                // S3-U5 (M07): the per-slot facts are inlined in a
+                // declaration-independent order too — sorted by the total
+                // order (buffer_id, version, binding) — so reordering buffer
+                // slot declarations within a kernel declaration does not
+                // change the receipt.
+                let mut slots: Vec<&DescriptorBuffer> = kernel.buffers.iter().collect();
+                slots.sort_by(|left, right| {
+                    (left.buffer_id, left.version, left.binding)
+                        .cmp(&(right.buffer_id, right.version, right.binding))
+                });
+                for slot in slots {
                     push_u32(&mut bytes, slot.buffer_id);
                     push_u32(&mut bytes, slot.semantic_value);
                     push_u32(&mut bytes, slot.version);
                     push_u32(&mut bytes, slot.role as u32);
+                    // S3-U5 (M07): binding is a per-slot ABI fact (unique per
+                    // kernel; the same buffer id may bind different indices
+                    // in different kernels), and lifetime/initialization are
+                    // the slot-level execution policies — all part of the
+                    // launched kernel's executed facts.
+                    push_u32(&mut bytes, slot.binding);
+                    push_u32(&mut bytes, slot.lifetime as u32);
+                    push_u32(&mut bytes, slot.initialization as u32);
                     push_u32(&mut bytes, slot.element_ty as u32);
                     bytes.extend_from_slice(&slot.element_count.to_le_bytes());
                 }
