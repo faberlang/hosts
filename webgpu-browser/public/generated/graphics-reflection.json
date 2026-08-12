@@ -5,7 +5,7 @@
     {
       "provenance": {
         "kind": "source-function",
-        "source_def": 4098
+        "source_def": 4103
       },
       "entry_name": "hello_voxel_vertex",
       "shader_stage": "vertex",
@@ -17,7 +17,7 @@
           "role": "input",
           "access": "read",
           "element_type": {
-            "semantic": 0,
+            "semantic": 2,
             "layout": null
           },
           "element_layout": "f32",
@@ -178,7 +178,7 @@
                 "shader_visibility": "vertex",
                 "buffer_binding_type": "read-only-storage",
                 "element_type": {
-                  "semantic": 0,
+                  "semantic": 2,
                   "layout": null
                 },
                 "element_layout": "f32",
@@ -259,7 +259,7 @@
                   "shader_access": "read",
                   "shader_visibility": "vertex",
                   "element_type": {
-                    "semantic": 0,
+                    "semantic": 2,
                     "layout": null
                   },
                   "element_layout": "f32",
@@ -372,7 +372,7 @@
     {
       "provenance": {
         "kind": "source-function",
-        "source_def": 4099
+        "source_def": 4104
       },
       "entry_name": "hello_voxel_fragment",
       "shader_stage": "fragment",
@@ -384,7 +384,7 @@
           "role": "input",
           "access": "read",
           "element_type": {
-            "semantic": 0,
+            "semantic": 2,
             "layout": null
           },
           "element_layout": "f32",
@@ -528,7 +528,7 @@
                 "shader_visibility": "fragment",
                 "buffer_binding_type": "read-only-storage",
                 "element_type": {
-                  "semantic": 0,
+                  "semantic": 2,
                   "layout": null
                 },
                 "element_layout": "f32",
@@ -609,7 +609,7 @@
                   "shader_access": "read",
                   "shader_visibility": "fragment",
                   "element_type": {
-                    "semantic": 0,
+                    "semantic": 2,
                     "layout": null
                   },
                   "element_layout": "f32",
@@ -692,7 +692,7 @@
         "role": "input",
         "access": "read",
         "element_type": {
-          "semantic": 0,
+          "semantic": 2,
           "layout": null
         },
         "element_layout": "f32",
@@ -712,7 +712,7 @@
         "role": "input",
         "access": "read",
         "element_type": {
-          "semantic": 0,
+          "semantic": 2,
           "layout": null
         },
         "element_layout": "f32",

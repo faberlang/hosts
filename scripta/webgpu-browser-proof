@@ -5,17 +5,25 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="$ROOT/webgpu-browser"
-# Radix is the sibling compiler; emit uses its workspace.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-RADIX_ROOT="$(cd "$ROOT/../radix" && pwd)"
-TRIGA_ROOT="$(cd "$ROOT/../triga" && pwd)"
+# Faber owns reader-locale selection and delegates lowering to sibling Radix.
+FABER_ROOT="$(cd "$ROOT/../faber" && pwd)"
 FIXTURE="$HOST/fixtures/add-one.fab"
-GRAPHICS_FIXTURE="$TRIGA_ROOT/exempla/triga-hello-voxel-shaders.fab"
+GRAPHICS_FIXTURE="$HOST/fixtures/graphics.fab"
 PUBLIC="$HOST/public"
 GENERATED="$PUBLIC/generated"
 PORT="${WEBGPU_BROWSER_PROOF_PORT:-8787}"
 FABER_LIBRARY_HOME="${FABER_LIBRARY_HOME:-$ROOT/..}"
 export FABER_LIBRARY_HOME
+
+emit_wgsl() {
+  local locale="$1"
+  local input="$2"
+  local output="$3"
+  shift 3
+
+  cargo run --manifest-path "$FABER_ROOT/Cargo.toml" -p faber --bin faber -- \
+    emit --locale "$locale" "$@" -t wgsl-text "$input" -o "$output"
+}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -32,24 +40,16 @@ generate_into() {
   local output_dir="$1"
   mkdir -p "$output_dir"
 
-  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
-    emit -t wgsl-text "$FIXTURE" \
-    -o "$output_dir/kernel.wgsl"
-  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
-    emit --reflection -t wgsl-text "$FIXTURE" \
-    -o "$output_dir/reflection.json"
+  emit_wgsl la "$FIXTURE" "$output_dir/kernel.wgsl"
+  emit_wgsl la "$FIXTURE" "$output_dir/reflection.json" --reflection
 }
 
 generate_graphics_into() {
   local output_dir="$1"
   mkdir -p "$output_dir"
 
-  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
-    emit -t wgsl-text "$GRAPHICS_FIXTURE" \
-    -o "$output_dir/graphics.wgsl"
-  cargo run --manifest-path "$RADIX_ROOT/Cargo.toml" -p radix --bin radix -- \
-    emit --reflection -t wgsl-text "$GRAPHICS_FIXTURE" \
-    -o "$output_dir/graphics-reflection.json"
+  emit_wgsl en "$GRAPHICS_FIXTURE" "$output_dir/graphics.wgsl"
+  emit_wgsl en "$GRAPHICS_FIXTURE" "$output_dir/graphics-reflection.json" --reflection
 
   python3 "$ROOT/scripta/generate-graphics-payloads.py" "$output_dir"
 }
@@ -108,7 +108,7 @@ reflection_path = generated / "reflection.json"
 kernel_path = generated / "kernel.wgsl"
 index_path = public / "index.html"
 app_path = public / "src" / "app.js"
-runtime_path = public / "src" / "webgpu-runtime.js"
+runtime_path = public / "src" / "backend" / "webgpu-runtime.js"
 manifest_path = public / "faber-webgpu-product.json"
 
 def fail(message):
@@ -138,11 +138,13 @@ require(isinstance(layouts, list) and len(layouts) == 1, "expected one bind grou
 require(isinstance(groups, list) and len(groups) == 1, "expected one bind group descriptor")
 
 entries = groups[0].get("entries")
-require(isinstance(entries, list) and len(entries) == 2, "expected two bind group entries")
+require(isinstance(entries, list) and len(entries) == 3, "expected three bind group entries")
 roles = [entry.get("role") for entry in entries]
-require(roles == ["input", "output"], "expected input/output bind group roles")
+require(roles == ["input", "output", "input"], "expected input/output/runtime-extent roles")
 require(entries[0].get("buffer_type") == "read-only-storage", "input must be read-only-storage")
 require(entries[1].get("buffer_type") == "storage", "output must be storage")
+require(entries[2].get("kind") == "runtime-extent", "third entry must be runtime extent")
+require(entries[2].get("buffer_type") == "read-only-storage", "runtime extent must be read-only-storage")
 require(all(entry.get("buffer_byte_len") == 4 for entry in entries), "each buffer must be 4 bytes")
 require(all(entry.get("has_dynamic_offset") is False for entry in entries), "dynamic offsets must be false")
 
@@ -150,6 +152,7 @@ kernel_wgsl = kernel_path.read_text()
 require("@compute" in kernel_wgsl, "kernel.wgsl must contain a compute entrypoint")
 require("@group(0) @binding(0)" in kernel_wgsl, "kernel.wgsl must contain binding 0")
 require("@group(0) @binding(1)" in kernel_wgsl, "kernel.wgsl must contain binding 1")
+require("@group(0) @binding(2)" in kernel_wgsl, "kernel.wgsl must contain runtime-extent binding 2")
 
 index = index_path.read_text()
 app = app_path.read_text()
@@ -165,9 +168,9 @@ require("createBindGroup" in runtime, "runtime must create bind groups")
 require("copyBufferToBuffer" in runtime, "runtime must copy output for readback")
 require('"webgpu"' in runtime, "runtime must tag unavailable WebGPU as kind webgpu")
 
-kernel_js = (public / "src" / "faber-kernel.js").read_text()
-require("artifact-fetch" in kernel_js, "faber-kernel must tag fetch failures as artifact-fetch")
-require('kind = "reflection"' in kernel_js, "faber-kernel must default contract errors to kind reflection")
+artifact_admission_js = (public / "src" / "contract" / "artifact-admission.js").read_text()
+require("artifact-fetch" in artifact_admission_js, "artifact admission must tag fetch failures as artifact-fetch")
+require('kind = "reflection"' in artifact_admission_js, "artifact admission must default contract errors to kind reflection")
 boundary_check = public / "src" / "product-boundary-check.mjs"
 require(boundary_check.is_file(), "product-boundary-check.mjs must exist for focused admission")
 
@@ -287,14 +290,16 @@ require(vertex_colors_path.stat().st_size == 432, "graphics-vertex-colors.bin: e
 require(indices_path.stat().st_size == 144, "graphics-indices.bin: expected 144 bytes")
 require(transform_path.stat().st_size == 256, "graphics-transform.bin: expected 256 bytes")
 
-runtime = (public / "src" / "webgpu-runtime.js").read_text()
+runtime = runtime_path.read_text()
 require("createGraphicsResources" in runtime, "runtime must export createGraphicsResources")
 require("runGraphicsFrame" in runtime, "runtime must export runGraphicsFrame")
 require("replaceDepthTextureOnResize" in runtime, "runtime must export replaceDepthTextureOnResize")
 require("onDeviceLost" in runtime, "runtime must export onDeviceLost")
 
-kernel_js = (public / "src" / "faber-kernel.js").read_text()
-require("loadFaberGraphicsPipeline" in kernel_js, "faber-kernel must export loadFaberGraphicsPipeline")
+require(
+    "loadFaberGraphicsPipeline" in artifact_admission_js,
+    "artifact admission must export loadFaberGraphicsPipeline",
+)
 
 print("graphics static contract check passed")
 print("graphics manual browser assertion: window.faberWebGpuGraphicsProof.submittedFrameCount > 0")
