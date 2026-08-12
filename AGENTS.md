@@ -27,5 +27,5 @@ Path deps expect sibling `faberlang/{faber-runtime,radix}` for library/product w
 ```bash
 cargo test --workspace
 cargo test -p faber-host-macos-arm64
-./scripta/webgpu-browser-proof check   # optional; needs node + sibling radix
+./scripta/webgpu-browser-proof check   # optional; needs node + sibling faber/radix/triga
 ```
