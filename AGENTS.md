@@ -12,11 +12,13 @@ Sibling monorepo for host libraries and host products. Not the Radix compiler.
 | `macos-arm64` | `faber-host-macos-arm64` |
 | `webgpu-browser` | browser WebGPU product |
 
-Path deps expect sibling `faberlang/{faber-runtime,radix}` for library/product work.
+Path deps expect sibling `faberlang/{faber,radix}` for library/product work.
+Public generated-Rust carriers live under `faber/runtime/rust`.
 
 ## Invariants
 
-1. Hosts are **execution** products and libraries. Radix does not need this repo to compile.
+1. Hosts are **execution** products and libraries. Compiler-only Radix builds do
+   not need this repo; Faber product builds with host features do.
 2. Emitters only know **ABI contracts** (`radix-host-abi` inside radix).
 3. One directory per host **product**. Shared kernel/providers live under `crates/`.
 4. Library crates keep **explicit** path deps (no workspace inheritance) so Faber core-support can embed them alone.
