@@ -22,10 +22,10 @@
 //!    pending markers, seven families with valid tri-state rows).
 
 use crate::capability::*;
-use faber::model_format::PinnedDtype;
 use faber::Json;
-use faber::repack_plan::{RepackSelection, RowIdentity};
 use faber::Valor;
+
+use crate::repack_plan::{PinnedDtype, RepackSelection, RowIdentity};
 
 fn initial_record() -> CapabilityRecord {
     let selection = RepackSelection::initial_declared_f32_conversion(RowIdentity::pinned_row());
@@ -356,7 +356,10 @@ fn committed_evidence_record_is_hash_accounted_and_matches_the_initial_contract(
     // Row identity binds to the pinned digest.
     let row = obj(root, "row");
     assert_eq!(text(obj(row, "model_name")), "SmolLM2-360M-Instruct Q4_K_M");
-    assert_eq!(text(obj(row, "sha256_hex")), faber::model_format::PINNED_SHA256_HEX);
+    assert_eq!(
+        text(obj(row, "sha256_hex")),
+        crate::repack_plan::PINNED_SHA256_HEX,
+    );
     assert_eq!(int(obj(row, "tensor_count")), 290);
 
     // Repack selection: five classes, every one the declared f32 conversion
@@ -391,7 +394,7 @@ fn committed_evidence_record_is_hash_accounted_and_matches_the_initial_contract(
         );
         assert_eq!(
             text(obj(sr, "transform_impl")),
-            faber::model_widen::ORACLE_TRANSFORM_IMPL
+            crate::repack_plan::ORACLE_TRANSFORM_IMPL
         );
     }
 

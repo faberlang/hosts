@@ -24,10 +24,12 @@ pub mod discovery;
 pub mod execution_transaction;
 pub mod partition;
 pub mod policy;
+pub mod repack_plan;
 pub mod transport;
 
 pub use backend::DeviceBackend;
 pub use device_handle::{DeviceHandle, DeviceHandleKind};
+pub use repack_plan::{PinnedDtype, RepackDescriptor, RepackSelection, RowIdentity};
 
 // `capability` has no in-module test decl in the source layout; its test
 // module is wired at the crate root (as in faber-runtime/src/lib.rs). All

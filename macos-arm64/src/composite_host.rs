@@ -45,7 +45,6 @@
 //! and reports an A9-style receipt (selected hardware, module hash, launches,
 //! transfers, readbacks, allocations).
 
-
 mod receipt;
 mod session;
 
@@ -56,16 +55,46 @@ pub use session::ProgramSession;
 
 use std::collections::BTreeMap;
 
-use host_coordinator::DeviceBackend;
-// RADIX-ARTIFACT+FABER-BUILD: DeviceSelection selection surface re-points at
-// S8A to the Radix artifact-contract selection + Faber build config.
-use faber::device::DeviceSelection;
+pub use host_coordinator::DeviceBackend;
 
 use crate::device_descriptor::{errors as descriptor_errors, DeviceDescriptor};
 use crate::device_host::DeviceRuntime;
 use crate::kernel::{HostKernel, HostResult};
 use crate::manifest::CapabilityManifest;
 use crate::Frame;
+
+/// Product request for host backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceSelection {
+    /// Resolve against the admitted native backends.
+    Auto,
+    /// Select Metal explicitly.
+    Metal,
+    /// Select CUDA explicitly.
+    Cuda,
+}
+
+impl DeviceSelection {
+    /// Stable command and diagnostic spelling.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+
+    /// The physical backend named by an explicit selection.
+    #[must_use]
+    pub const fn backend(self) -> Option<DeviceBackend> {
+        match self {
+            Self::Auto => None,
+            Self::Metal => Some(DeviceBackend::Metal),
+            Self::Cuda => Some(DeviceBackend::Cuda),
+        }
+    }
+}
 
 /// One deliberate host-construction request (see module docs for the policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +138,6 @@ pub enum CompositeDeviceState {
         device_name: String,
     },
 }
-
 
 /// Probe the machine for admitted native backends (discovery receipts).
 #[must_use]

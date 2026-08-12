@@ -23,8 +23,7 @@
 //! conversion-required; the direct-native alternative); every other dimension
 //! is explicitly [`PendingSecondRepresentation`].
 
-use faber::model_format::PinnedDtype;
-use faber::repack_plan::{RepackDescriptor, RepackSelection, RowIdentity};
+use crate::repack_plan::{PinnedDtype, RepackDescriptor, RepackSelection, RowIdentity};
 
 // ---------------------------------------------------------------------------
 // Op families
