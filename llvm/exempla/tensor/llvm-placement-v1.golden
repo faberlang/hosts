@@ -1,0 +1,23 @@
+# Golden reference for llvm-placement-v1 kernel.
+#
+# Honesty note (2026-07-26, hand-11 residual): The WebGPU host pipeline is
+# not available in the LLVM test environment, so no live WebGPU capture was
+# performed. This golden is a PRE-COMPUTED MATHEMATICAL REFERENCE for the
+# deterministic elementwise multiply-by-2 kernel. The expected output
+# [2.0, 4.0, 6.0, 8.0] is trivially correct for input [1.0, 2.0, 3.0, 4.0]
+# and does not depend on a particular backend capture. When the WebGPU host
+# pipeline is available, re-capture the golden by running the same kernel on
+# the WebGPU host and update this provenance block with the commit SHA.
+#
+# Provenance
+#   Type:              Pre-computed reference (not captured from a live backend)
+#   Kernel:            elementwise multiply-by-2, rank-1 f32, 4 elements
+#   Kernel source:     exempla/tensor/llvm-placement-v1.fab
+#   Input:             [1.0, 2.0, 3.0, 4.0]
+#   Expected output:   [2.0, 4.0, 6.0, 8.0]
+#   Authored:          2026-07-22 by hand-6 (G-SPINE-08 S3)
+#   Honesty review:    2026-07-26 by hand-11 (G-SPINE-08 residual)
+2.0
+4.0
+6.0
+8.0

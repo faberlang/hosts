@@ -461,6 +461,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "faber-host-llvm"
+version = "0.1.0"
+dependencies = [
+ "faber-runtime",
+ "radix-host-abi",
+]
+
+[[package]]
 name = "faber-host-macos-arm64"
 version = "0.1.0"
 dependencies = [

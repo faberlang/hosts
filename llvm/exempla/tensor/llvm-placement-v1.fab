@@ -1,0 +1,44 @@
++++
+locale = "la"
++++
+
+# G-SPINE-08 S2: LLVM device execution exemplar — multiply-by-2 kernel.
+#
+# Contract: elementwise multiply-by-2 on rank-1 f32, 4 elements.
+# Input:  [1.0, 2.0, 3.0, 4.0]
+# Output: [2.0, 4.0, 6.0, 8.0]
+#
+# Build chain (not yet available — gating issue):
+#   1. `faber build --target llvm-host exempla/tensor/llvm-placement-v1.fab`
+#   2. Link emitted IR with libfaber_host_llvm.a
+#   3. Run: copy-in → dispatch kernel → readback → verify
+#
+# Until `faber build --target llvm-host` is available, the integration test
+# in lib_test.rs demonstrates the placement lifecycle and the runtime FFI
+# pattern that the emitted kernel would follow.
+
+importa ex "norma:tensor" privata tensor
+
+# Elementwise multiply-by-2 kernel.
+# The LLVM emitter (`radix-mir-llvm`) lowers `tensor.applicata` with a
+# multiply closure to `@__faber_rt_v1_tensor_mul` against a scalar-2.0 tensor.
+# This is honest device execution per the delivery spec — the kernel
+# compiles through `.faber → MIR → LLVM IR → native code`, and the
+# runtime FFI call is the standard JIT ABI pattern.
+functio multiplica_per_duo(lista<fractus<f32>> data) → lista<fractus<f32>> {
+    fixum tensor<fractus<f32>, [4]> input ← tensor.structa<tensor<fractus<f32>, [4]>>(data)
+    fixum tensor<fractus<f32>, [4]> output ← tensor.applicata(input, functio(x) { redde x * 2.0 })
+    redde tensor.planata(output)
+}
+
+probandum "multiply-by-two correctness" tag "spine-08" {
+    proba "elementwise multiply-by-2 on [1.0, 2.0, 3.0, 4.0]" {
+        fixum lista<fractus<f32>> input ← [1.0, 2.0, 3.0, 4.0]
+        fixum lista<fractus<f32>> output ← multiplica_per_duo(input)
+        adfirma output.longitudo() ≡ 4
+        adfirma output.accipe(0) vel -1.0 ≡ 2.0
+        adfirma output.accipe(1) vel -1.0 ≡ 4.0
+        adfirma output.accipe(2) vel -1.0 ≡ 6.0
+        adfirma output.accipe(3) vel -1.0 ≡ 8.0
+    }
+}

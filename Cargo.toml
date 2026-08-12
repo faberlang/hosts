@@ -9,6 +9,7 @@ members = [
     "crates/provider-contracts",
     "crates/solum",
     "crates/tempus",
+    "llvm",
     "macos-arm64",
     "wasm",
 ]

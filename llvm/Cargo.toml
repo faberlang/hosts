@@ -1,0 +1,17 @@
+[package]
+name = "faber-host-llvm"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned host runtime for Faber LLVM executables"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+faber = { package = "faber-runtime", path = "../../faber/runtime/rust" }
+# S3-U3 re-point (faber-target-runtime inventory §3.4): the C ABI symbol/layout
+# authority is radix-host-abi (compiler-owned). The LLVM host side of the ABI
+# symbols lives in this crate; the historical `faber::host_abi` carrier module
+# is not re-exported by the faber/runtime/rust contract package.
+radix-host-abi = { path = "../../radix/crates/radix-host-abi" }
