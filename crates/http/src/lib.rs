@@ -2,6 +2,11 @@
 //!
 //! The provider exposes only the manifest contract. Framework routing,
 //! middleware, and request/response application semantics remain Faber code.
+//!
+//! The crate also carries the concrete HTTP client effects
+//! ([`client`]) — the single home for generated-Rust HTTP client surface.
+
+pub mod client;
 
 use faber::Valor;
 use host_kernel::{

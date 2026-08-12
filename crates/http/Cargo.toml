@@ -11,3 +11,4 @@ pedantic = "deny"
 [dependencies]
 faber = { package = "faber-runtime", path = "../../../faber-runtime" }
 host-kernel = { path = "../host-kernel" }
+ureq = "2"
