@@ -731,6 +731,7 @@ name = "host-coordinator"
 version = "0.1.0"
 dependencies = [
  "faber-runtime",
+ "sha2",
 ]
 
 [[package]]

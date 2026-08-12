@@ -481,7 +481,7 @@ pub fn bind(
     };
     let bytes = plan.canonical_bytes();
     plan.bound_distributed_plan_hash =
-        format!("sha256:{}", hex_lower(&faber::model_format::sha256(&bytes)));
+        format!("sha256:{}", hex_lower(&crate::repack_plan::sha256(&bytes)),);
     Ok(plan)
 }
 

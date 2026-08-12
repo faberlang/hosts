@@ -4,11 +4,11 @@
 //! single-partition degenerate, the bound-plan hash domain, and the receipt
 //! taxonomy (`hardware_isolation_claimed=false`).
 
+use crate::backend::DeviceBackend;
 use crate::bound_plan::{
     bind, AdmitError, AdmittedLogicalPlan, BindError, BoundDistributedPlan, BoundPlanKind,
     DeclaredPlacementConstraint, LogicalPartitionId, PartitionBinding,
 };
-use crate::backend::DeviceBackend;
 use crate::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use crate::device_set::{DeviceSet, MembershipError};
 use crate::discovery::{

@@ -26,7 +26,7 @@ Sibling path deps (not in this repo):
 
 | Sibling | Role |
 | --- | --- |
-| `faber-runtime/` | Runtime types (`use faber::…`) |
+| `faber/runtime/rust/` | Generated Rust carriers (`use faber::...`) |
 | `radix/` | Compiler (ABI contract only) |
 | `faber/` | User CLI; embeds selected `hosts/crates/*` as core-support |
 

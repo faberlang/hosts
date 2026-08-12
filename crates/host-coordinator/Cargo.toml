@@ -14,3 +14,4 @@ pedantic = "deny"
 # coordinator consumes Valor/frame carriers only — no device session behavior
 # enters the runtime contract (C2), and no faber-runtime dependency remains.
 faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
+sha2 = "0.10"

@@ -9,13 +9,10 @@
 
 use std::collections::BTreeMap;
 
-use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
-// RADIX-ARTIFACT+FABER-BUILD: DeviceSelection selection surface re-points at
-// S8A to the Radix artifact-contract selection + Faber build config.
-use faber::device::DeviceSelection;
 use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
     resolve_device_selection, CompletionBoundary, CompositeHost, CompositeHostConfig, DataFlowEdge,
+    DeviceSelection,
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
@@ -33,6 +30,7 @@ use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession, Status,
 };
+use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
 const MODULE_IMAGE: &[u8] = b"// fake compiler-owned module image";
 
@@ -3338,10 +3336,7 @@ fn receipt_declares_resource_graph_and_observed_events() {
     // descriptor it consumed (the run/session identity — a SHA-256 receipt
     // over the domain-tagged canonical graph bytes, OQ1 distinct host-graph
     // domain; backend-entry-inclusive, S5A-U3).
-    assert_eq!(
-        receipt.program_graph_hash,
-        descriptor.program_graph_hash()
-    );
+    assert_eq!(receipt.program_graph_hash, descriptor.program_graph_hash());
     assert_eq!(
         session.program_graph_hash(),
         descriptor.program_graph_hash().as_str()
