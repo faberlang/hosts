@@ -8,7 +8,7 @@ license = "MIT"
 pedantic = "deny"
 
 [dependencies]
-faber = { package = "faber-runtime", path = "../../../faber-runtime" }
+faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
 host-kernel = { path = "../host-kernel" }
 
 [dev-dependencies]
