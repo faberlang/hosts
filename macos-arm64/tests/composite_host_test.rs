@@ -9,7 +9,10 @@
 
 use std::collections::BTreeMap;
 
-use faber::device::{DeviceBackend, DeviceHandle, DeviceHandleKind, DeviceSelection};
+use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
+// RADIX-ARTIFACT+FABER-BUILD: DeviceSelection selection surface re-points at
+// S8A to the Radix artifact-contract selection + Faber build config.
+use faber::device::DeviceSelection;
 use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
     resolve_device_selection, CompletionBoundary, CompositeHost, CompositeHostConfig, DataFlowEdge,

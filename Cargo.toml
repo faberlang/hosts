@@ -4,6 +4,7 @@ members = [
     "crates/host-native",
     "crates/aleator",
     "crates/consolum",
+    "crates/host-coordinator",
     "crates/http",
     "crates/processus",
     "crates/provider-contracts",

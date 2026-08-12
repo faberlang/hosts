@@ -9,7 +9,7 @@
 //! — and every handle carries its backend, so a handle from one backend
 //! session fails closed when passed to the other.
 
-use faber::device::{DeviceBackend, DeviceHandle, DeviceHandleKind};
+use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
 use crate::cuda_host::{CudaHandleId, CudaHostSession};
 use crate::device_registry::DriverCounters;

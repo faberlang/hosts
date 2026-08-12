@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 faber = { package = "faber-runtime", path = "../../faber/runtime/rust" }
+host-coordinator = { path = "../crates/host-coordinator" }
 host-kernel = { path = "../crates/host-kernel" }
 aleator = { path = "../crates/aleator" }
 consolum = { path = "../crates/consolum" }

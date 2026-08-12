@@ -56,7 +56,10 @@ pub use session::ProgramSession;
 
 use std::collections::BTreeMap;
 
-use faber::device::{DeviceBackend, DeviceSelection};
+use host_coordinator::DeviceBackend;
+// RADIX-ARTIFACT+FABER-BUILD: DeviceSelection selection surface re-points at
+// S8A to the Radix artifact-contract selection + Faber build config.
+use faber::device::DeviceSelection;
 
 use crate::device_descriptor::{errors as descriptor_errors, DeviceDescriptor};
 use crate::device_host::DeviceRuntime;

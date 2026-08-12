@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use faber::device::{DeviceBackend, DeviceHandle};
+use host_coordinator::{DeviceBackend, DeviceHandle};
 
 use crate::device_descriptor::{
     errors as descriptor_errors, fnv1a64, DeviceBufferInitialization, DeviceBufferLifetime,

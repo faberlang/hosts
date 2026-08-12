@@ -1,0 +1,16 @@
+[package]
+name = "host-coordinator"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-device coordinator surface for Faber hosts (identity, topology, plans, transactions)"
+license = "MIT"
+publish = false
+
+[lints.clippy]
+pedantic = "deny"
+
+[dependencies]
+# GENRUST-CONTRACT: the faber/runtime/rust package (alias faber). The
+# coordinator consumes Valor/frame carriers only — no device session behavior
+# enters the runtime contract (C2), and no faber-runtime dependency remains.
+faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }

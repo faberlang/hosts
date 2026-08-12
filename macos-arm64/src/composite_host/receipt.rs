@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use faber::device::DeviceBackend;
+use host_coordinator::DeviceBackend;
 
 use crate::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceProgramLifetime,

@@ -12,7 +12,7 @@
 //! program_lifetime) is the focus; every already-hashed field is re-flipped
 //! as a control.
 
-use faber::device::DeviceBackend;
+use host_coordinator::DeviceBackend;
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
     DescriptorKernel, DescriptorLaunch, DescriptorResult, DeviceBufferInitialization,

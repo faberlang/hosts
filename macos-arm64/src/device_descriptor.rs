@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use faber::device::DeviceBackend;
+use host_coordinator::DeviceBackend;
 
 use crate::kernel::{HostError, HostResult};
 
