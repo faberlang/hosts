@@ -26,7 +26,10 @@ type BufferKey = (u32, u32);
 ///
 /// `SingleRun` executions copy per call (the one-shot-with-repeat surface);
 /// `RepeatingStep` executions copy nothing — the HostProvided params were
-/// once-init'd at session creation and stay device-resident (S5-U6).
+/// once-init'd at session creation and stay device-resident (S5-U6); the
+/// prepared resident-session surface (E03-U1) copies only the declared
+/// `PerStep` input slots (the per-token values) and never the once-init
+/// weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyMode {
     /// Copy declared host inputs per execution (`SingleRun`).
@@ -34,6 +37,10 @@ enum CopyMode {
     /// No copy-in: params are already device-resident from the once-init at
     /// session creation (`RepeatingStep`).
     OnceInit,
+    /// Copy only the declared `PerStep` input slots per execution (the
+    /// prepared resident-session surface, E03-U1); the once-init weights
+    /// stay device-resident.
+    ResidentStep,
 }
 
 /// One descriptor launch record retained by a program session.
@@ -169,6 +176,19 @@ struct SessionBufferMeta {
 /// `RepeatingStep` session and `execute_step` refuses a `SingleRun` one
 /// (params once-init + never re-copied is the `RepeatingStep` contract).
 ///
+/// # Prepared resident-session mode (E03-U1)
+///
+/// The composite host can also prepare a **resident session** for one
+/// admitted model: a thin [`PreparedResidentSession`] layer over a
+/// `RepeatingStep` session that once-inits the `HostProvided` weights at
+/// prepare, reuses them across repeated decode executions (resident steps —
+/// per-token inputs copied, weights never re-copied), resets the
+/// prompt-scoped device-resident state (content cleared, allocation
+/// retained), and counts prepare/reuse/reset/release facts in its receipt.
+/// No new executor is invented — the prepared mode is exactly the
+/// `RepeatingStep` once-init mechanism plus the resident-step copy class and
+/// the state-clear operation below.
+///
 /// # End-of-run readback (S5A-U1)
 ///
 /// A `RepeatingStep` run reads the DECLARED **end-of-run observation set**
@@ -265,6 +285,68 @@ pub struct ProgramSession<'host> {
     /// True after an error-path release (S2-3): every handle has been
     /// released and the session cannot execute again.
     closed: bool,
+}
+
+/// Copy this kernel's declared host inputs into their slots for this
+/// execution, returning the number of copy-ins performed. `PerStep`
+/// mode copies every declared Input slot (`SingleRun`); `ResidentStep`
+/// mode copies only the declared `PerStep` Input slots — the per-token
+/// values — and never the once-init weights, which stay device-resident
+/// (E03-U1); `OnceInit` mode copies nothing (`RepeatingStep`).
+/// A free function over the disjoint session fields so the caller can
+/// keep its immutable borrows of the launch plan and kernel table.
+fn copy_declared_inputs(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    buffer_meta: &BTreeMap<BufferKey, SessionBufferMeta>,
+    kernel: &SessionKernel,
+    inputs: &BTreeMap<u32, Vec<f32>>,
+    mode: CopyMode,
+) -> HostResult<usize> {
+    let mut copies = 0usize;
+    for slot in &kernel.slots {
+        if slot.role != DeviceBufferRole::Input {
+            continue;
+        }
+        let is_per_step = buffer_meta
+            .get(&(slot.buffer_id, slot.version))
+            .is_some_and(|meta| meta.lifetime == DeviceBufferLifetime::PerStep);
+        let copies_this_mode = match mode {
+            CopyMode::PerStep => true,
+            CopyMode::ResidentStep => is_per_step,
+            CopyMode::OnceInit => false,
+        };
+        if !copies_this_mode {
+            continue;
+        }
+        let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
+            descriptor_errors::shape_mismatch(format!(
+                    "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
+                    kernel.entry, slot.buffer_name, slot.buffer_id
+                ))
+        })?;
+        let expected = buffer_meta
+            .get(&(slot.buffer_id, slot.version))
+            .map(|meta| meta.element_count)
+            .unwrap_or(0);
+        if u64::try_from(values.len()).ok() != Some(expected) {
+            return Err(descriptor_errors::shape_mismatch(format!(
+                "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
+                slot.buffer_name,
+                slot.buffer_id,
+                values.len(),
+                kernel.entry,
+                expected
+            )));
+        }
+        let handle = buffers
+            .get(&(slot.buffer_id, slot.version))
+            .copied()
+            .ok_or_else(|| HostError::internal("session input buffer disappeared"))?;
+        runtime.copy_in_f32(&handle, values)?;
+        copies += 1;
+    }
+    Ok(copies)
 }
 
 impl<'host> ProgramSession<'host> {
@@ -651,6 +733,56 @@ impl<'host> ProgramSession<'host> {
         self.execute_step_impl(true)
     }
 
+    /// Execute one resident decode step on a `RepeatingStep` session whose
+    /// weights were once-init'd (E03-U1, the prepared resident-session
+    /// surface): allocate the step's `PerStep` + `ObservationPoint` buffers,
+    /// copy the declared per-step inputs (the per-token values), run the
+    /// ordered launch sequence with **no `PerProgram` copy-in** (the weights
+    /// stay device-resident from the once-init at prepare), synchronize at
+    /// the step boundary, read back the declared observation, and recycle
+    /// the per-step buffers. The session never reloads the module and never
+    /// re-allocates a `PerProgram` buffer across resident steps.
+    ///
+    /// **Error-path teardown is designed into this method (S2-3):** a failure
+    /// at any stage runs the ordered release before the error escapes and
+    /// closes the session, so a failed resident step leaves
+    /// `live_handle_count() == 0`.
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the session is not `RepeatingStep`, or the weights
+    ///   were not once-init'd;
+    /// - `E_DEVICE_SHAPE_MISMATCH` — a declared per-step input is missing or
+    ///   its size contradicts the declared element count;
+    /// - session-level failures (copy-in, launch, sync, readback) bubble
+    ///   through unchanged.
+    fn execute_resident_step(
+        &mut self,
+        token_inputs: &BTreeMap<u32, Vec<f32>>,
+    ) -> HostResult<DeviceExecutionReceipt> {
+        if self.closed {
+            return Err(HostError::internal(
+                "program session is closed after a failed execution; create a new session",
+            ));
+        }
+        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "a resident step is a RepeatingStep contract: the HostProvided weights are once-init'd at prepare and never re-copied on later steps",
+            ));
+        }
+        if !self.params_initialized {
+            return Err(HostError::internal(
+                "RepeatingStep weights were not once-init'd; prepare the resident session before resident steps",
+            ));
+        }
+        let result = self.execute_inner(token_inputs, CopyMode::ResidentStep, false);
+        if result.is_err() {
+            // Release-on-error on all paths (S2-3).
+            drop(self.release_all_handles());
+            self.closed = true;
+        }
+        result
+    }
+
     /// The shared body of [`ProgramSession::execute_step`] and
     /// [`ProgramSession::execute_final_step`]: `keep_end_of_run` decides
     /// whether the declared end-of-run `PerStep` buffers stay live past the
@@ -799,6 +931,70 @@ impl<'host> ProgramSession<'host> {
         })
     }
 
+    /// Prompt-scoped reset (E03-U1): clear the content of the device-resident
+    /// state buffers — the `PerProgram` + `ZeroFill` class (the KV/SSM state
+    /// that accumulates across token steps) — back to the zeroed initial
+    /// state, **retaining the allocation**: no buffer is released and no
+    /// buffer is re-allocated, so a subsequent prompt starts from the same
+    /// zeroed initial condition as the first (deterministic replay matches
+    /// token-for-token). The once-init `PerProgram` weights (`HostProvided`)
+    /// are never touched. Returns the number of state buffers cleared.
+    ///
+    /// **Error-path teardown (S2-3):** a failed reset runs the ordered
+    /// release before the error escapes and closes the session, so it leaves
+    /// `live_handle_count() == 0`.
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the session is closed;
+    /// - session-level copy failures bubble through unchanged.
+    fn clear_resident_state(&mut self) -> HostResult<usize> {
+        if self.closed {
+            return Err(HostError::internal(
+                "program session is closed after a failed execution; create a new session",
+            ));
+        }
+        let result = self.clear_resident_state_inner();
+        if result.is_err() {
+            // Release-on-error on all paths (S2-3).
+            drop(self.release_all_handles());
+            self.closed = true;
+        }
+        result
+    }
+
+    /// The prompt-scoped reset body of [`ProgramSession::clear_resident_state`]:
+    /// the zero-copy loop over the live `PerProgram` + `ZeroFill` state
+    /// buffers, without the error-path release, which the caller owns.
+    fn clear_resident_state_inner(&mut self) -> HostResult<usize> {
+        let keys: Vec<BufferKey> = self
+            .buffers
+            .iter()
+            .filter(|(key, _)| {
+                self.buffer_meta.get(key).is_some_and(|meta| {
+                    meta.lifetime == DeviceBufferLifetime::PerProgram
+                        && meta.initialization == DeviceBufferInitialization::ZeroFill
+                })
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut cleared = 0usize;
+        for key in keys {
+            let meta = self
+                .buffer_meta
+                .get(&key)
+                .ok_or_else(|| HostError::internal("session state-buffer metadata disappeared"))?;
+            let handle = self
+                .buffers
+                .get(&key)
+                .copied()
+                .ok_or_else(|| HostError::internal("session state buffer disappeared"))?;
+            self.runtime
+                .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
+            cleared += 1;
+        }
+        Ok(cleared)
+    }
+
     /// The executable body shared by [`ProgramSession::execute`] and
     /// [`ProgramSession::execute_step`] / [`ProgramSession::execute_final_step`]:
     /// the ordered launch sequence (step-buffer allocation → copy-in
@@ -839,46 +1035,21 @@ impl<'host> ProgramSession<'host> {
                 launch_buffers.push(handle);
             }
 
-            // Copy-in declared inputs for this kernel — SingleRun only
-            // (PerStep mode). A RepeatingStep step (OnceInit mode) copies
-            // nothing: the HostProvided params were once-init'd at session
-            // creation and stay device-resident (S5-U6).
-            if mode == CopyMode::PerStep {
-                for slot in &kernel.slots {
-                    if slot.role == DeviceBufferRole::Input {
-                        let values = inputs.get(&slot.buffer_id).ok_or_else(|| {
-                            descriptor_errors::shape_mismatch(format!(
-                                "descriptor kernel `{}` declares input buffer `{}` (id {}) but no host input was provided",
-                                kernel.entry, slot.buffer_name, slot.buffer_id
-                            ))
-                        })?;
-                        let expected = self
-                            .buffer_meta
-                            .get(&(slot.buffer_id, slot.version))
-                            .map(|meta| meta.element_count)
-                            .unwrap_or(0);
-                        if u64::try_from(values.len()).ok() != Some(expected) {
-                            return Err(descriptor_errors::shape_mismatch(format!(
-                                "input for buffer `{}` (id {}) has {} f32 elements but kernel `{}` declares {}",
-                                slot.buffer_name,
-                                slot.buffer_id,
-                                values.len(),
-                                kernel.entry,
-                                expected
-                            )));
-                        }
-                        let handle = self
-                            .buffers
-                            .get(&(slot.buffer_id, slot.version))
-                            .copied()
-                            .ok_or_else(|| {
-                                HostError::internal("session input buffer disappeared")
-                            })?;
-                        self.runtime.copy_in_f32(&handle, values)?;
-                        copy_ins += 1;
-                    }
-                }
-            }
+            // Copy-in declared inputs for this kernel — `SingleRun` copies
+            // every declared input (PerStep mode); a prepared resident step
+            // (ResidentStep mode) copies only the declared `PerStep` input
+            // slots (the per-token values) — the once-init weights stay
+            // device-resident (E03-U1); a `RepeatingStep` step (OnceInit
+            // mode) copies nothing: the HostProvided params were once-init'd
+            // at session creation and stay device-resident (S5-U6).
+            copy_ins += copy_declared_inputs(
+                &mut self.runtime,
+                &self.buffers,
+                &self.buffer_meta,
+                kernel,
+                inputs,
+                mode,
+            )?;
 
             self.runtime.launch_kernel(
                 &self.module_handle,
@@ -1144,10 +1315,27 @@ impl<'host> ProgramSession<'host> {
         if let Err(error) = self.runtime.release(&self.module_handle) {
             first_error.get_or_insert(error);
         }
+        // The released handles are no longer live: drop them from the map so
+        // `session_handle_count()` reports reality on every release path
+        // (the `closed` flag already reports 0 for the error paths).
+        self.buffers.clear();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Ordered release without consuming the session (E03-U1): release every
+    /// buffer, then the module, then mark the session closed so further use
+    /// is refused and [`ProgramSession::session_handle_count`] reports 0.
+    /// The prepared-session executor uses this so it can still report its
+    /// receipt after the release. Every release is attempted even if one
+    /// fails; the first failure bubbles through after every release has been
+    /// attempted.
+    pub fn release(&mut self) -> HostResult<()> {
+        let result = self.release_all_handles();
+        self.closed = true;
+        result
     }
 
     /// The program-level buffer ids this session manages (A9 receipt): every
@@ -1220,5 +1408,345 @@ impl<'host> ProgramSession<'host> {
     #[must_use]
     pub fn program_graph_hash(&self) -> &str {
         &self.program_graph_hash
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E03-U1: prepared resident-session executor
+// ---------------------------------------------------------------------------
+
+/// The descriptor buffer classes a prepared resident session needs (E03-U1).
+struct PreparedBufferClasses {
+    /// Distinct `PerProgram` + HostProvided ids (the once-init weights).
+    host_provided_weights: usize,
+    /// Distinct `PerProgram` + ZeroFill ids (the device-resident state the
+    /// prompt-scoped reset clears).
+    zero_fill_state: usize,
+    /// Distinct `PerStep` + `ObservationPoint` keys (allocated per reuse).
+    per_execution_alloc_count: usize,
+}
+
+/// Project the descriptor's buffer classes onto the prepared-session axes
+/// (E03-U1): which ids are the once-init weights, which are the
+/// device-resident state, and how many buffers every reuse allocates. The
+/// descriptor's validation has already proven cross-reference consistency,
+/// so counting by buffer id is unambiguous.
+fn prepared_buffer_classes(descriptor: &DeviceDescriptor) -> PreparedBufferClasses {
+    let mut host_provided: BTreeSet<u32> = BTreeSet::new();
+    let mut zero_fill: BTreeSet<u32> = BTreeSet::new();
+    let mut per_execution: BTreeSet<(u32, u32)> = BTreeSet::new();
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            match slot.lifetime {
+                DeviceBufferLifetime::PerProgram => match slot.initialization {
+                    DeviceBufferInitialization::HostProvided => {
+                        host_provided.insert(slot.buffer_id);
+                    }
+                    DeviceBufferInitialization::ZeroFill => {
+                        zero_fill.insert(slot.buffer_id);
+                    }
+                    DeviceBufferInitialization::KernelInitialized => {}
+                },
+                DeviceBufferLifetime::PerStep | DeviceBufferLifetime::ObservationPoint => {
+                    per_execution.insert((slot.buffer_id, slot.version));
+                }
+            }
+        }
+    }
+    PreparedBufferClasses {
+        host_provided_weights: host_provided.len(),
+        zero_fill_state: zero_fill.len(),
+        per_execution_alloc_count: per_execution.len(),
+    }
+}
+
+/// Lifecycle counts of one prepared resident session (E03-U1): prepare,
+/// reuse, reset, release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparedSessionCounters {
+    /// Resident sessions prepared (weights once-init'd at prepare).
+    pub prepares: usize,
+    /// Decode executions reusing the resident weights.
+    pub reuses: usize,
+    /// Prompt-scoped resets performed.
+    pub resets: usize,
+    /// Ordered releases (teardowns) performed.
+    pub releases: usize,
+}
+
+/// The prepared-session receipt (E03-U1): the lifecycle counts plus the
+/// residency evidence — module reloads and PerProgram re-allocations between
+/// reuses, derived from the driver counters against the prepare-time
+/// baseline — and the live-handle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSessionReceipt {
+    /// Selected backend.
+    pub backend: DeviceBackend,
+    /// Selected-hardware name from the admission probe.
+    pub device_name: String,
+    /// SHA-256 program-graph receipt of the prepared descriptor (OQ1).
+    pub program_graph_hash: String,
+    /// The prepare/reuse/reset/release lifecycle counts.
+    pub counters: PreparedSessionCounters,
+    /// Module loads observed beyond the prepare-time load. 0 across reuses =
+    /// the resident session never reloaded the module (the E03-U1 first
+    /// failing oracle).
+    pub module_reloads: usize,
+    /// PerProgram buffer allocations observed beyond the prepare-time
+    /// allocations and the expected per-reuse step buffers. 0 across reuses
+    /// = the resident weights/state were never re-allocated (the E03-U1
+    /// first failing oracle).
+    pub per_program_reallocs: usize,
+    /// Live device handles at receipt time (0 after an ordered release).
+    pub live_handles: usize,
+}
+
+impl PreparedSessionReceipt {
+    /// The canonical printed form (E03-U1 closeout evidence): the lifecycle
+    /// counts and the residency facts.
+    #[must_use]
+    pub fn spelling(&self) -> String {
+        format!(
+            "prepared-session receipt: prepare={} reuse={} reset={} release={} reload={} realloc={} live-handles={} (backend {}, {})",
+            self.counters.prepares,
+            self.counters.reuses,
+            self.counters.resets,
+            self.counters.releases,
+            self.module_reloads,
+            self.per_program_reallocs,
+            self.live_handles,
+            self.backend.spelling(),
+            self.program_graph_hash,
+        )
+    }
+}
+
+/// A prepared resident session (E03-U1): one admitted model bound once —
+/// weights once-init'd and device-resident (`PerProgram` + HostProvided),
+/// plus device-resident state (`PerProgram` + ZeroFill) — reused across
+/// repeated decode executions and prompt-scoped resets without reloading the
+/// module or re-allocating any `PerProgram` buffer, with countable lifecycle
+/// facts (prepare/reuse/reset/release) and fail-closed behavior.
+///
+/// The executor is a thin [`ProgramSession`]-based layer over the
+/// `RepeatingStep` once-init mechanism (S5-U6) — it does not invent a
+/// parallel executor: the resident step reuses the step-machine (per-step
+/// buffer allocation/recycle, ordered launches, observation readback) with a
+/// per-token copy class, and the reset is a state-content clear that
+/// retains allocation.
+pub struct PreparedResidentSession<'host> {
+    session: ProgramSession<'host>,
+    backend: DeviceBackend,
+    device_name: String,
+    program_graph_hash: String,
+    counters: PreparedSessionCounters,
+    /// Driver-counter baselines at prepare (module loads / buffer allocs)
+    /// for the reload/realloc derivation in [`PreparedResidentSession::receipt`].
+    module_loads_at_prepare: usize,
+    buffer_allocs_at_prepare: usize,
+    /// Distinct `PerStep` + `ObservationPoint` buffers allocated per reuse.
+    per_execution_alloc_count: usize,
+    /// Closed after an error-path release (S2-3): every handle is gone and
+    /// no further reuse/reset is possible.
+    closed: bool,
+}
+
+impl<'host> PreparedResidentSession<'host> {
+    /// Prepare one resident session from an admitted descriptor (E03-U1):
+    /// validate the prepared-session shape (a `RepeatingStep` program with
+    /// once-init `HostProvided` weights AND device-resident `ZeroFill`
+    /// state), create the underlying [`ProgramSession`] (module loaded once,
+    /// every `PerProgram` buffer allocated once), and once-init the weights
+    /// so they stay device-resident. The first failing oracle — a module
+    /// reload or PerProgram re-allocation between reuses — is measured from
+    /// the driver counters baselined here.
+    ///
+    /// # Errors
+    /// - `E_DEVICE_DESCRIPTOR` — the descriptor is not a prepared-session
+    ///   shape (wrong backend, not `RepeatingStep`, no `HostProvided`
+    ///   weights, or no `ZeroFill` device-resident state);
+    /// - session-level failures (module load, allocation, once-init) bubble
+    ///   through; creation/once-init failures run the error-path teardown.
+    pub fn prepare(
+        runtime: &'host mut DeviceRuntime,
+        descriptor: &DeviceDescriptor,
+        weights: &BTreeMap<u32, Vec<f32>>,
+        device_name: String,
+    ) -> HostResult<Self> {
+        descriptor.validate()?;
+        if runtime.backend() != descriptor.backend {
+            return Err(HostError {
+                code: E_DEVICE_DESCRIPTOR.to_owned(),
+                message: format!(
+                    "device descriptor targets backend `{}` but the composite host's device session is `{}`",
+                    descriptor.backend.spelling(),
+                    runtime.backend().spelling()
+                ),
+                retryable: false,
+            });
+        }
+        if descriptor.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(descriptor_errors::descriptor(
+                "a prepared resident session is a RepeatingStep contract: its HostProvided weights are once-init'd at prepare and never re-copied; a SingleRun program is not a prepared session",
+            ));
+        }
+        let classes = prepared_buffer_classes(descriptor);
+        if classes.host_provided_weights == 0 {
+            return Err(descriptor_errors::descriptor(
+                "a prepared resident session requires once-init weights: at least one PerProgram + HostProvided buffer",
+            ));
+        }
+        if classes.zero_fill_state == 0 {
+            return Err(descriptor_errors::descriptor(
+                "a prepared resident session requires device-resident state: at least one PerProgram + ZeroFill buffer (the prompt-scoped reset clears exactly this class)",
+            ));
+        }
+
+        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
+        session.init_params(weights)?;
+        let counters = session.driver_counters();
+        Ok(Self {
+            program_graph_hash: descriptor.program_graph_hash(),
+            backend: descriptor.backend,
+            device_name,
+            session,
+            counters: PreparedSessionCounters {
+                prepares: 1,
+                ..PreparedSessionCounters::default()
+            },
+            module_loads_at_prepare: counters.module_loads,
+            buffer_allocs_at_prepare: counters.buffer_allocs,
+            per_execution_alloc_count: classes.per_execution_alloc_count,
+            closed: false,
+        })
+    }
+
+    /// One resident decode execution (E03-U1 "reuse"): copy the declared
+    /// per-step inputs (the per-token values) into their slots, run the
+    /// ordered launch sequence on the resident weights/state (no module
+    /// reload, no `PerProgram` re-allocation), synchronize, read back the
+    /// declared observation, and recycle the per-step buffers. Counts one
+    /// reuse. A failed reuse runs the ordered release, closes the prepared
+    /// session, and leaves zero live handles (S2-3).
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the prepared session is closed;
+    /// - `E_DEVICE_SHAPE_MISMATCH` — a declared per-token input is missing
+    ///   or its size contradicts the declared element count;
+    /// - session-level failures (copy-in, launch, sync, readback) bubble
+    ///   through unchanged.
+    pub fn execute_step(
+        &mut self,
+        token_inputs: &BTreeMap<u32, Vec<f32>>,
+    ) -> HostResult<DeviceExecutionReceipt> {
+        if self.closed {
+            return Err(HostError::internal(
+                "prepared resident session is closed after a failure; prepare a new session",
+            ));
+        }
+        let result = self.session.execute_resident_step(token_inputs);
+        match result {
+            Ok(receipt) => {
+                self.counters.reuses += 1;
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Prompt-scoped reset (E03-U1): clear the content of the device-resident
+    /// state buffers (the `PerProgram` + `ZeroFill` class) back to the
+    /// zeroed initial condition, **retaining allocation** — no buffer is
+    /// released and no buffer is re-allocated. After a reset, replaying the
+    /// first prompt matches token-for-token (the state starts from the same
+    /// zeroed condition). Counts one reset and returns the number of state
+    /// buffers cleared. The once-init weights are never touched. A failed
+    /// reset runs the ordered release and closes the prepared session
+    /// (S2-3).
+    ///
+    /// # Errors
+    /// - `E_INTERNAL` — the prepared session is closed;
+    /// - session-level copy failures bubble through unchanged.
+    pub fn reset_prompt(&mut self) -> HostResult<usize> {
+        if self.closed {
+            return Err(HostError::internal(
+                "prepared resident session is closed after a failure; prepare a new session",
+            ));
+        }
+        let result = self.session.clear_resident_state();
+        match result {
+            Ok(cleared) => {
+                self.counters.resets += 1;
+                Ok(cleared)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// The current prepared-session receipt: the lifecycle counts and the
+    /// residency evidence derived from the driver counters (module reloads
+    /// and PerProgram re-allocations beyond the prepare-time baseline and
+    /// the expected per-reuse step-buffer allocations).
+    #[must_use]
+    pub fn receipt(&self) -> PreparedSessionReceipt {
+        let counters = self.session.driver_counters();
+        let per_reuse_allocs = self.per_execution_alloc_count * self.counters.reuses;
+        PreparedSessionReceipt {
+            backend: self.backend,
+            device_name: self.device_name.clone(),
+            program_graph_hash: self.program_graph_hash.clone(),
+            counters: self.counters,
+            module_reloads: counters
+                .module_loads
+                .saturating_sub(self.module_loads_at_prepare),
+            per_program_reallocs: counters
+                .buffer_allocs
+                .saturating_sub(self.buffer_allocs_at_prepare)
+                .saturating_sub(per_reuse_allocs),
+            live_handles: self.session.session_handle_count(),
+        }
+    }
+
+    /// Number of live device handles the prepared session currently holds
+    /// (module + `PerProgram` weights + `PerProgram` state; per-step and
+    /// observation buffers are recycled per reuse).
+    #[must_use]
+    pub fn session_handle_count(&self) -> usize {
+        self.session.session_handle_count()
+    }
+
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar).
+    #[must_use]
+    pub fn driver_counters(&self) -> DriverCounters {
+        self.session.driver_counters()
+    }
+
+    /// The FNV-1a provenance hash of the loaded module.
+    #[must_use]
+    pub fn module_hash(&self) -> u64 {
+        self.session.module_hash()
+    }
+
+    /// Ordered release (E03-U1 "release"): release every buffer then the
+    /// module, leaving zero live handles, and return the final
+    /// prepared-session receipt (release count included, live-handles 0). A
+    /// session already closed by an error-path release has nothing left to
+    /// release and returns the receipt.
+    ///
+    /// # Errors
+    /// The first session-level release failure bubbles through after every
+    /// release has been attempted.
+    pub fn teardown(mut self) -> HostResult<PreparedSessionReceipt> {
+        if !self.closed {
+            self.session.release()?;
+        }
+        self.counters.releases += 1;
+        Ok(self.receipt())
     }
 }
