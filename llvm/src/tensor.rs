@@ -7,9 +7,10 @@
 use super::array::{find_array, read_value, store_array, write_value, RuntimeArray, RuntimeValue};
 use super::option::store_option;
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtStatusV1, FaberRtValueKindV1,
-    STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC, VALUE_KIND_I64,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
+use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_I64};
 use crate::abi::FaberRtContextV1;
 use faber::tensor::{
     tensor_flat_offset, tensor_shape_element_count, tensor_shape_has_element_count,

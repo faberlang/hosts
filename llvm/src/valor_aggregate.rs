@@ -6,8 +6,9 @@ use super::convert::{store_valor, with_valor};
 use super::format::{find_text, store_text, text_value};
 use super::tensor::find_tensor;
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtSliceV1, FaberRtValueKindV1,
-    STATUS_INVALID_ARGUMENT, STATUS_PANIC, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
+use crate::abi::{FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC};
+use radix_host_abi::{FaberRtValueKindV1,
+    VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
     VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
     VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
 };

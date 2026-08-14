@@ -5,9 +5,11 @@ use super::format::{store_text, text_value};
 use super::option::store_option;
 use super::valor_aggregate::{find_octeti, store_octeti};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT,
-    STATUS_OK, STATUS_PANIC, VALUE_KIND_U8,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
+    STATUS_PANIC,
 };
+use radix_host_abi::VALUE_KIND_U8;
 use crate::abi::FaberRtContextV1;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{self, AssertUnwindSafe};

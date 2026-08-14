@@ -9,8 +9,8 @@
 use super::convert::{store_valor, with_valor};
 use super::format::{store_text, text_value};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC,
-    STATUS_UNSUPPORTED,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC, STATUS_UNSUPPORTED,
 };
 use crate::abi::FaberRtContextV1;
 use faber::{Json, Valor};

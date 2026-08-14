@@ -3,9 +3,12 @@
 use super::convert::with_valor;
 use super::format::{store_text, text_value};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtInstansPrecisionV1, FaberRtPtrResultV1, FaberRtSliceV1,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC,
+};
+use radix_host_abi::{FaberRtInstansPrecisionV1,
     INSTANS_PRECISION_MICROS, INSTANS_PRECISION_MILLIS, INSTANS_PRECISION_NANOS,
-    INSTANS_PRECISION_SECONDS, STATUS_INVALID_ARGUMENT, STATUS_PANIC,
+    INSTANS_PRECISION_SECONDS,
 };
 use crate::abi::FaberRtContextV1;
 use faber::{Instans, InstansPraecisio, Valor};

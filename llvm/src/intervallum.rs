@@ -8,9 +8,10 @@ use super::array::{store_array, RuntimeValue};
 use super::option::store_option;
 use super::tensor::store_tensor;
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
-    STATUS_PANIC, VALUE_KIND_I64, VALUE_KIND_PTR,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
+use radix_host_abi::{VALUE_KIND_I64, VALUE_KIND_PTR};
 use crate::abi::FaberRtContextV1;
 use faber::{Intervallum, IntervallumKind};
 use std::ffi::c_void;

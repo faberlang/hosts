@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 
-use radix_host_abi::{
+use crate::abi::{
     FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR, STATUS_OK, STATUS_PANIC,
 };
 

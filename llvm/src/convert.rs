@@ -2,8 +2,9 @@
 
 use super::format::{store_text, text_value};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT,
-    STATUS_OK, STATUS_PANIC,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
+    STATUS_PANIC,
 };
 use crate::abi::FaberRtContextV1;
 use faber::{FromValor, Valor};

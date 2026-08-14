@@ -55,14 +55,14 @@ use convert::{
     __faber_rt_v1_valor_i1, __faber_rt_v1_valor_i64, __faber_rt_v1_valor_nihil,
     __faber_rt_v1_valor_text,
 };
-#[cfg(not(test))]
-use radix_host_abi::FaberRtExitV1;
-#[cfg(test)]
-use radix_host_abi::FaberRtPtrResultV1;
-use radix_host_abi::{
+use crate::abi::{
     FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR, STATUS_OK,
     STATUS_PANIC, STATUS_UNSUPPORTED,
 };
+#[cfg(test)]
+use crate::abi::FaberRtPtrResultV1;
+#[cfg(not(test))]
+use crate::abi::FaberRtExitV1;
 #[cfg(test)]
 use radix_host_abi::{
     FaberRtValueKindV1, ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST,
@@ -347,10 +347,10 @@ pub unsafe extern "C" fn __faber_rt_v1_shutdown(context: *mut FaberRtContextV1) 
 #[no_mangle]
 pub unsafe extern "C" fn __faber_rt_v1_arguments(
     context: *mut FaberRtContextV1,
-) -> radix_host_abi::FaberRtPtrResultV1 {
+) -> crate::abi::FaberRtPtrResultV1 {
     format::ffi_ptr_result(|| {
         let Some(runtime) = (unsafe { array::runtime_mut(context) }) else {
-            return radix_host_abi::FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+            return crate::abi::FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         let mut values = Vec::with_capacity(runtime.arguments.len());
         for argument in &runtime.arguments {

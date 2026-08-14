@@ -3,8 +3,11 @@
 use super::array::{RuntimeArray, RuntimeValue};
 use super::format::{store_text, text_value};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT,
-    STATUS_OK, STATUS_PANIC, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
+    STATUS_PANIC,
+};
+use radix_host_abi::{VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32,
     VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64,
     VALUE_KIND_U8,
 };

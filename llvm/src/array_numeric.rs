@@ -2,8 +2,10 @@
 
 use super::array::{write_value, RuntimeArray, RuntimeValue};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtStatusV1, FaberRtValueKindV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
-    STATUS_PANIC, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64,
+use crate::abi::{
+    FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
+};
+use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64,
     VALUE_KIND_I8, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
 };
 use crate::abi::FaberRtContextV1;

@@ -6,8 +6,10 @@
 use super::array::{find_array, read_value, write_value, RuntimeValue};
 use super::tensor::{find_tensor, store_tensor_from_parts, tensor_to_runtime_values};
 use super::RuntimeContext;
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtStatusV1, FaberRtValueKindV1,
-    STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC, VALUE_KIND_F32, VALUE_KIND_F64,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
+};
+use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_F32, VALUE_KIND_F64,
     VALUE_KIND_I32, VALUE_KIND_I64,
 };
 use crate::abi::FaberRtContextV1;

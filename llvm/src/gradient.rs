@@ -11,9 +11,10 @@
 //! from C/LLVM code.
 
 use super::{RuntimeContext, StableBox};
-use radix_host_abi::{FaberRtPtrResultV1, FaberRtStatusV1, FaberRtValueKindV1,
-    STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
+use crate::abi::{
+    FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
+use radix_host_abi::FaberRtValueKindV1;
 use crate::abi::FaberRtContextV1;
 use std::ffi::c_void;
 
