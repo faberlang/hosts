@@ -51,7 +51,9 @@ mod session;
 pub use receipt::{
     CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
 };
-pub use session::ProgramSession;
+pub use session::{
+    PreparedResidentSession, PreparedSessionCounters, PreparedSessionReceipt, ProgramSession,
+};
 
 use std::collections::BTreeMap;
 
@@ -376,6 +378,37 @@ impl CompositeHost {
                 Err(error)
             }
         }
+    }
+
+    /// Prepare a resident session for one admitted model (E03-U1): validate
+    /// the descriptor admits the prepared-session shape (a `RepeatingStep`
+    /// program with once-init `HostProvided` weights and device-resident
+    /// `ZeroFill` state), create the underlying [`ProgramSession`] (module
+    /// loaded once, `PerProgram` buffers allocated once), and once-init the
+    /// weights so they stay device-resident. The returned
+    /// [`PreparedResidentSession`] reuses the resident weights across
+    /// repeated decode executions and prompt-scoped resets without reload or
+    /// `PerProgram` re-allocation, and reports prepare/reuse/reset/release
+    /// counts.
+    ///
+    /// # Errors
+    /// - `E_NO_DEVICE_PROGRAM` — no device session on this host;
+    /// - `E_DEVICE_DESCRIPTOR` — wrong-backend, structurally invalid, or not
+    ///   a prepared-session shape;
+    /// - session-level failures (module load, allocation, once-init) bubble
+    ///   through.
+    pub fn prepare_resident_session(
+        &mut self,
+        descriptor: &DeviceDescriptor,
+        weights: &BTreeMap<u32, Vec<f32>>,
+    ) -> HostResult<PreparedResidentSession<'_>> {
+        let device_name = self.device_name().to_owned();
+        let runtime = self.device_mut().ok_or_else(|| {
+            descriptor_errors::no_device_program(
+                "composite host has no device session; a device descriptor cannot be prepared",
+            )
+        })?;
+        PreparedResidentSession::prepare(runtime, descriptor, weights, device_name)
     }
 
     fn device_name(&self) -> &str {
