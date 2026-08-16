@@ -2,12 +2,19 @@
 
 Sibling monorepo for host libraries and host products. Not the Radix compiler.
 
+**Workspace work mode.** Ordinary development is **direct** in this
+checkout on `main`. Worktree packets under `../worktrees/<lane>/` are
+optional Tugboat isolation. Do not stand up lanes unless the operator
+asked. Container law: [`../AGENTS.md`](../AGENTS.md).
+
 ## Orientation
 
 | Path | Package / product |
 | --- | --- |
 | `crates/host-kernel` | `host-kernel` |
 | `crates/host-native` | `host-native` |
+| `crates/host-coordinator` | `host-coordinator` |
+| `crates/provider-contracts` | shared provider contracts |
 | `crates/{aleator,consolum,http,processus,solum,tempus}` | providers |
 | `macos-arm64` | `faber-host-macos-arm64` |
 | `webgpu-browser` | browser WebGPU product |
