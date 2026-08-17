@@ -4,6 +4,7 @@ mod array_numeric;
 mod cli;
 mod collection_map;
 mod convert;
+mod failable;
 mod format;
 mod gpu_placement;
 mod gradient;
@@ -21,8 +22,14 @@ mod text;
 mod valor_aggregate;
 mod valor_genus;
 
-// Opaque C ABI context carrier (LLVM host side of the ABI; see `crate::abi`).
-pub use crate::abi::FaberRtContextV1;
+// LLVM-host side of the FaberRt C ABI. radix-host-abi owns symbol names and
+// status *codes*; this crate owns the repr(C) layouts (see `crate::abi`).
+pub use crate::abi::{
+    FaberRtContextV1, FaberRtExitV1, FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1,
+    STATUS_FALLIBLE, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR, STATUS_OK, STATUS_PANIC,
+    STATUS_UNSUPPORTED,
+};
+pub use crate::failable::__faber_rt_v1_fallible_error;
 
 use array::RuntimeArray;
 #[cfg(test)]
@@ -55,14 +62,6 @@ use convert::{
     __faber_rt_v1_valor_i1, __faber_rt_v1_valor_i64, __faber_rt_v1_valor_nihil,
     __faber_rt_v1_valor_text,
 };
-use crate::abi::{
-    FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR, STATUS_OK,
-    STATUS_PANIC, STATUS_UNSUPPORTED,
-};
-#[cfg(test)]
-use crate::abi::FaberRtPtrResultV1;
-#[cfg(not(test))]
-use crate::abi::FaberRtExitV1;
 #[cfg(test)]
 use radix_host_abi::{
     FaberRtValueKindV1, ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST,

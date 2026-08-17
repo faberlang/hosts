@@ -21,6 +21,42 @@ use super::*;
 use std::ffi::{c_void, CStr};
 
 #[test]
+fn abi_status_codes_match_radix_host_abi_authority() {
+    // Runtime owns the struct layouts; radix-host-abi owns the code values.
+    let ours = [
+        ("STATUS_OK", STATUS_OK.code),
+        ("STATUS_INVALID_ARGUMENT", STATUS_INVALID_ARGUMENT.code),
+        ("STATUS_IO_ERROR", STATUS_IO_ERROR.code),
+        ("STATUS_PANIC", STATUS_PANIC.code),
+        ("STATUS_UNSUPPORTED", STATUS_UNSUPPORTED.code),
+        ("STATUS_FALLIBLE", STATUS_FALLIBLE.code),
+    ];
+    assert_eq!(ours.as_slice(), radix_host_abi::STATUS_CODES);
+}
+
+#[test]
+fn fallible_error_pairs_status_first_with_payload_handle() {
+    let mut context = ptr::null_mut();
+    let status = unsafe { __faber_rt_v1_init(0, ptr::null(), &raw mut context) };
+    assert_eq!(status, STATUS_OK);
+
+    let stored = format::store_text(context, "tensor".to_owned());
+    assert!(stored.status.is_ok());
+    let result = unsafe { __faber_rt_v1_fallible_error(context, stored.value) };
+    assert_eq!(result.status, STATUS_FALLIBLE);
+    assert_eq!(result.value, stored.value);
+    assert!(!result.status.is_ok());
+
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
+
+#[test]
+fn fallible_error_rejects_null_context() {
+    let result = unsafe { __faber_rt_v1_fallible_error(ptr::null_mut(), ptr::dangling_mut()) };
+    assert_eq!(result, FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT));
+}
+
+#[test]
 fn init_write_and_shutdown_round_trip() {
     let mut context = ptr::null_mut();
     let status = unsafe { __faber_rt_v1_init(0, ptr::null(), &raw mut context) };

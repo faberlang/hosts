@@ -52,6 +52,9 @@ pub const STATUS_PANIC: FaberRtStatusV1 = FaberRtStatusV1 { code: 3 };
 /// Status 4 — the operation is not supported on this host.
 pub const STATUS_UNSUPPORTED: FaberRtStatusV1 = FaberRtStatusV1 { code: 4 };
 
+/// Status 5 — the failable error channel (typed `ReturnError` payload).
+pub const STATUS_FALLIBLE: FaberRtStatusV1 = FaberRtStatusV1 { code: 5 };
+
 /// Byte-slice carrier (`%FaberRtSliceV1 = type { ptr, i64 }`). `data` points
 /// to `len` readable bytes; a null `data` is allowed only when `len` is zero.
 #[repr(C)]
@@ -98,6 +101,16 @@ impl FaberRtPtrResultV1 {
         Self {
             status,
             value: core::ptr::null_mut(),
+        }
+    }
+
+    /// Build the failable error-channel result: `STATUS_FALLIBLE` plus the
+    /// typed `ReturnError` payload handle.
+    #[must_use]
+    pub const fn fallible(value: *mut c_void) -> Self {
+        Self {
+            status: STATUS_FALLIBLE,
+            value,
         }
     }
 }
