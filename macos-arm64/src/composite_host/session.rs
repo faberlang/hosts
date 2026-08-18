@@ -5,6 +5,7 @@
 //! readback) under lifetime-distinct allocation/release (S2-4).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use host_coordinator::{DeviceBackend, DeviceHandle};
 
@@ -285,6 +286,14 @@ pub struct ProgramSession<'host> {
     /// True after an error-path release (S2-3): every handle has been
     /// released and the session cannot execute again.
     closed: bool,
+    /// Module-image compile + pipeline create wall at session construction.
+    pub(crate) load_module_us: u64,
+    /// PerProgram allocation wall at session construction.
+    pub(crate) per_program_alloc_us: u64,
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Copy this kernel's declared host inputs into their slots for this
@@ -384,7 +393,9 @@ impl<'host> ProgramSession<'host> {
         // hash, reused by every execution, released at teardown — repeated
         // execution does not leak, and there is no cross-session or
         // cross-process cache.
+        let load_module_started = Instant::now();
         let module_handle = runtime.load_module(&descriptor.module_image)?;
+        let load_module_us = elapsed_us(load_module_started);
         let module_hash = fnv1a64(&descriptor.module_image);
 
         // Allocate every distinct PerProgram buffer once (S2-4): they persist
@@ -399,6 +410,7 @@ impl<'host> ProgramSession<'host> {
         let mut buffer_meta: BTreeMap<BufferKey, SessionBufferMeta> = BTreeMap::new();
         let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
 
+        let alloc_started = Instant::now();
         let result = (|| {
             for kernel in &descriptor.kernels {
                 let mut slots = Vec::with_capacity(kernel.buffers.len());
@@ -444,6 +456,7 @@ impl<'host> ProgramSession<'host> {
             }
             Ok(())
         })();
+        let per_program_alloc_us = elapsed_us(alloc_started);
 
         if let Err(error) = result {
             // Error-path teardown at creation (S2-3): release every buffer
@@ -522,6 +535,8 @@ impl<'host> ProgramSession<'host> {
             program_graph_hash: descriptor.program_graph_hash(),
             params_initialized: false,
             closed: false,
+            load_module_us,
+            per_program_alloc_us,
         })
     }
 
@@ -1017,6 +1032,8 @@ impl<'host> ProgramSession<'host> {
         // reports this execution's batch, not the session lifetime total.
         let submits_before = self.runtime.command_submit_count();
         let waits_before = self.runtime.blocking_wait_count();
+        let mut copy_in_us = 0u64;
+        let mut encode_us = 0u64;
 
         // Allocate this step's PerStep + ObservationPoint buffers (S2-4).
         // PerProgram buffers were allocated once at session creation and
@@ -1046,6 +1063,7 @@ impl<'host> ProgramSession<'host> {
             // device-resident (E03-U1); a `RepeatingStep` step (OnceInit
             // mode) copies nothing: the HostProvided params were once-init'd
             // at session creation and stay device-resident (S5-U6).
+            let copy_started = Instant::now();
             copy_ins += copy_declared_inputs(
                 &mut self.runtime,
                 &self.buffers,
@@ -1054,7 +1072,9 @@ impl<'host> ProgramSession<'host> {
                 inputs,
                 mode,
             )?;
+            copy_in_us = copy_in_us.saturating_add(elapsed_us(copy_started));
 
+            let encode_started = Instant::now();
             self.runtime.launch_kernel(
                 &self.module_handle,
                 &kernel.entry,
@@ -1062,6 +1082,7 @@ impl<'host> ProgramSession<'host> {
                 kernel.grid,
                 kernel.block,
             )?;
+            encode_us = encode_us.saturating_add(elapsed_us(encode_started));
             launch_count += 1;
             launch_ids.push(launch.id);
             launch_entries.push(kernel.entry.clone());
@@ -1072,7 +1093,9 @@ impl<'host> ProgramSession<'host> {
         // already synced internally). Every encode in this step has completed
         // before any readback. The completion boundary is this barrier after
         // the last launch (R9).
+        let submit_started = Instant::now();
         self.runtime.sync()?;
+        let gpu_encode_submit_wait_us = encode_us.saturating_add(elapsed_us(submit_started));
 
         // Observation-only readback (F6): read back exactly the DECLARED
         // observation points — the result rows projected from the
@@ -1083,6 +1106,7 @@ impl<'host> ProgramSession<'host> {
         let mut readback_count = 0usize;
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
         let observed: Vec<SessionResult> = self.results.clone();
+        let readback_started = Instant::now();
         for result in &observed {
             let key = (result.buffer_id, result.version);
             let meta = self.buffer_meta.get(&key).ok_or_else(|| {
@@ -1109,6 +1133,7 @@ impl<'host> ProgramSession<'host> {
             self.release_buffer(key)?;
             release_count += 1;
         }
+        let readback_us = elapsed_us(readback_started);
 
         // Step-boundary recycle (S2-4): PerStep buffers are released at the
         // step boundary and re-allocated for the next execution. The FINAL
@@ -1190,6 +1215,9 @@ impl<'host> ProgramSession<'host> {
                 after_launch: self.launches.last().map(|launch| launch.id).unwrap_or(0),
             },
             program_graph_hash: self.program_graph_hash.clone(),
+            copy_in_us,
+            gpu_encode_submit_wait_us,
+            readback_us,
         })
     }
 

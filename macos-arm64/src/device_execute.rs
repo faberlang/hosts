@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use host_coordinator::DeviceBackend;
 use serde::{Deserialize, Serialize};
@@ -98,23 +99,49 @@ pub fn usage_text() -> &'static str {
 /// Load files, validate the descriptor, construct the composite host, and
 /// execute one packed device run.
 pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteReceipt> {
+    let cli_started = Instant::now();
+    let read_started = Instant::now();
     let descriptor_bytes = read_file(&args.descriptor)?;
     let module_image = read_file(&args.module)?;
     let inputs_bytes = read_file(&args.inputs)?;
+    let file_read_us = elapsed_us(read_started);
+    let descriptor_started = Instant::now();
     let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
+    let descriptor_decode_us = elapsed_us(descriptor_started);
+    let inputs_started = Instant::now();
     let inputs = inputs_from_json(&inputs_bytes)?;
+    let json_decode_us = elapsed_us(inputs_started);
     descriptor.validate()?;
     let selection = args
         .backend
         .unwrap_or_else(|| selection_for_backend(descriptor.backend));
+    let host_started = Instant::now();
     let mut host = CompositeHost::new(CompositeHostConfig {
         selection,
         requires_device: true,
     })?;
+    let host_construct_us = elapsed_us(host_started);
+    let session_started = Instant::now();
     let mut session = host.create_program_session(&descriptor)?;
+    let session_create_us = elapsed_us(session_started);
+    let load_module_us = session.load_module_us;
+    let per_program_alloc_us = session.per_program_alloc_us;
     let receipt = session.execute(&inputs)?;
     session.teardown()?;
-    Ok(DeviceExecuteReceipt::from_host(&receipt))
+    let mut wire = DeviceExecuteReceipt::from_host(&receipt);
+    wire.file_read_us = file_read_us;
+    wire.descriptor_decode_us = descriptor_decode_us;
+    wire.json_decode_us = json_decode_us;
+    wire.host_construct_us = host_construct_us;
+    wire.session_create_us = session_create_us;
+    wire.load_module_us = load_module_us;
+    wire.per_program_alloc_us = per_program_alloc_us;
+    wire.cli_internal_us = elapsed_us(cli_started);
+    Ok(wire)
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Decode a descriptor JSON plus a raw module image.
@@ -262,6 +289,39 @@ pub struct DeviceExecuteReceipt {
     pub readbacks: usize,
     /// Program-graph SHA-256 receipt.
     pub program_graph_hash: String,
+    /// Child file-read wall (descriptor + module + inputs).
+    #[serde(default)]
+    pub file_read_us: u64,
+    /// Descriptor JSON decode wall.
+    #[serde(default)]
+    pub descriptor_decode_us: u64,
+    /// Inputs JSON decode wall (packed weights ride this file).
+    #[serde(default)]
+    pub json_decode_us: u64,
+    /// Composite-host construction wall (Metal device admit).
+    #[serde(default)]
+    pub host_construct_us: u64,
+    /// Session create wall (module compile + PerProgram alloc).
+    #[serde(default)]
+    pub session_create_us: u64,
+    /// Module compile + pipeline-create wall inside session create.
+    #[serde(default)]
+    pub load_module_us: u64,
+    /// PerProgram allocation wall inside session create.
+    #[serde(default)]
+    pub per_program_alloc_us: u64,
+    /// Host→device copy-in wall (packed-weight upload on SingleRun).
+    #[serde(default)]
+    pub copy_in_us: u64,
+    /// Kernel encode + submit + blocking wait (true GPU step time).
+    #[serde(default)]
+    pub gpu_encode_submit_wait_us: u64,
+    /// Observation readback wall.
+    #[serde(default)]
+    pub readback_us: u64,
+    /// Child wall from first file read through teardown (excludes dyld).
+    #[serde(default)]
+    pub cli_internal_us: u64,
 }
 
 impl DeviceExecuteReceipt {
@@ -285,6 +345,17 @@ impl DeviceExecuteReceipt {
             transfers: receipt.transfers,
             readbacks: receipt.readbacks,
             program_graph_hash: receipt.program_graph_hash.clone(),
+            file_read_us: 0,
+            descriptor_decode_us: 0,
+            json_decode_us: 0,
+            host_construct_us: 0,
+            session_create_us: 0,
+            load_module_us: 0,
+            per_program_alloc_us: 0,
+            copy_in_us: receipt.copy_in_us,
+            gpu_encode_submit_wait_us: receipt.gpu_encode_submit_wait_us,
+            readback_us: receipt.readback_us,
+            cli_internal_us: 0,
         }
     }
 }
