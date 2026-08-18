@@ -139,9 +139,10 @@ pub fn descriptor_to_json(descriptor: &DeviceDescriptor) -> HostResult<Vec<u8>> 
 
 /// Decode `{ "<buffer-id>": [f32, ...] }`.
 ///
-/// Finite values are JSON numbers. Non-finite values use the strings
-/// `"NaN"`, `"Infinity"`, and `"-Infinity"` so the CLI file does not
-/// collapse them to JSON null.
+/// Finite values are JSON numbers (`f32` → `f64` is injective). NaN
+/// payloads are `"0x"` + 8 hex bits so packed GGUF words survive the
+/// file; `"NaN"` still decodes as the canonical quiet NaN. Infinities
+/// stay `"Infinity"` / `"-Infinity"`.
 pub fn inputs_from_json(bytes: &[u8]) -> HostResult<BTreeMap<u32, Vec<f32>>> {
     let wire: BTreeMap<String, Vec<serde_json::Value>> =
         serde_json::from_slice(bytes).map_err(|error| {
@@ -185,7 +186,7 @@ pub fn inputs_to_json(inputs: &BTreeMap<u32, Vec<f32>>) -> HostResult<Vec<u8>> {
 
 fn f32_to_json(value: f32) -> serde_json::Value {
     if value.is_nan() {
-        serde_json::Value::String("NaN".to_owned())
+        serde_json::Value::String(hex_f32_bits(value))
     } else if value == f32::INFINITY {
         serde_json::Value::String("Infinity".to_owned())
     } else if value == f32::NEG_INFINITY {
@@ -193,7 +194,7 @@ fn f32_to_json(value: f32) -> serde_json::Value {
     } else {
         serde_json::Number::from_f64(f64::from(value))
             .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String("NaN".to_owned()))
+            .unwrap_or_else(|| serde_json::Value::String(hex_f32_bits(value)))
     }
 }
 
@@ -203,14 +204,27 @@ fn f32_from_json(value: &serde_json::Value) -> Result<f32, String> {
             .as_f64()
             .map(|wide| wide as f32)
             .ok_or_else(|| "number is not finite".to_owned()),
-        serde_json::Value::String(spelling) => match spelling.as_str() {
-            "NaN" => Ok(f32::NAN),
-            "Infinity" => Ok(f32::INFINITY),
-            "-Infinity" => Ok(f32::NEG_INFINITY),
-            other => Err(format!("unknown f32 spelling `{other}`")),
-        },
+        serde_json::Value::String(spelling) => parse_f32_string(spelling),
         serde_json::Value::Null => Ok(f32::NAN),
         other => Err(format!("expected number or non-finite string, got {other}")),
+    }
+}
+
+fn hex_f32_bits(value: f32) -> String {
+    format!("0x{:08x}", value.to_bits())
+}
+
+fn parse_f32_string(spelling: &str) -> Result<f32, String> {
+    match spelling {
+        "NaN" => Ok(f32::NAN),
+        "Infinity" => Ok(f32::INFINITY),
+        "-Infinity" => Ok(f32::NEG_INFINITY),
+        hex if hex.len() == 10 && hex.as_bytes()[..2].eq_ignore_ascii_case(b"0x") => {
+            u32::from_str_radix(&hex[2..], 16)
+                .map(f32::from_bits)
+                .map_err(|_| format!("f32 bit string `{spelling}` is not hex"))
+        }
+        other => Err(format!("unknown f32 spelling `{other}`")),
     }
 }
 

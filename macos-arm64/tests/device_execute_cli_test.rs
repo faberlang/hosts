@@ -161,9 +161,50 @@ fn descriptor_json_round_trips_without_the_module_image() {
     assert_eq!(decoded.module_image, b"reloaded");
     assert_eq!(decoded.kernels, original.kernels);
     assert_eq!(decoded.launches, original.launches);
+    assert_eq!(decoded.buffer_versions, original.buffer_versions);
+    assert_eq!(decoded.data_flow, original.data_flow);
     assert_eq!(decoded.roots, original.roots);
     assert_eq!(decoded.results, original.results);
+    assert_eq!(decoded.end_of_run_results, original.end_of_run_results);
     assert_eq!(decoded.program_lifetime, DeviceProgramLifetime::SingleRun);
+}
+
+/// Spawn-shaped descriptor (radix `WireDescriptor` field set) decodes
+/// bit-identical on the structural fields — no f32 payloads on this file.
+#[test]
+fn spawn_shaped_descriptor_json_is_structurally_identical() {
+    let json = br#"{
+      "backend": "metal",
+      "kernels": [{
+        "entry": "addita",
+        "buffers": [
+          {"buffer_id":1,"buffer_name":"a","semantic_value":1,"role":"input","lifetime":"per-program","initialization":"host-provided","binding":0,"element_ty":"f32","element_count":2,"version":1},
+          {"buffer_id":2,"buffer_name":"b","semantic_value":2,"role":"input","lifetime":"per-program","initialization":"host-provided","binding":1,"element_ty":"f32","element_count":2,"version":1},
+          {"buffer_id":3,"buffer_name":"out","semantic_value":3,"role":"output","lifetime":"observation-point","initialization":"kernel-initialized","binding":2,"element_ty":"f32","element_count":2,"version":1}
+        ],
+        "grid": [1,1,1],
+        "block": [2,1,1]
+      }],
+      "launches": [{"id":1,"kernel_index":0}],
+      "buffer_versions": [
+        {"buffer_id":1,"version":1,"element_ty":"f32","element_count":2},
+        {"buffer_id":2,"version":1,"element_ty":"f32","element_count":2},
+        {"buffer_id":3,"version":1,"element_ty":"f32","element_count":2}
+      ],
+      "program_lifetime": "single-run",
+      "data_flow": [],
+      "roots": [1],
+      "results": [{"buffer_id":3,"version":1,"produced_by":1,"at_launch":1}],
+      "end_of_run_results": []
+    }"#;
+    let decoded = descriptor_from_json(json, MODULE_IMAGE.to_vec()).expect("decode");
+    let reencoded = descriptor_to_json(&decoded).expect("encode");
+    let again = descriptor_from_json(&reencoded, MODULE_IMAGE.to_vec()).expect("redecode");
+    assert_eq!(decoded.kernels, again.kernels);
+    assert_eq!(decoded.launches, again.launches);
+    assert_eq!(decoded.buffer_versions, again.buffer_versions);
+    assert_eq!(decoded.roots, again.roots);
+    assert_eq!(decoded.results, again.results);
 }
 
 #[test]
@@ -179,14 +220,58 @@ fn inputs_json_round_trips_non_finite_values() {
     let inputs = BTreeMap::from([(1, vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5])]);
     let json = inputs_to_json(&inputs).expect("encode");
     let text = String::from_utf8(json.clone()).expect("utf8");
-    assert!(text.contains("\"NaN\""), "{text}");
+    assert!(
+        text.contains(&format!("\"0x{:08x}\"", f32::NAN.to_bits())),
+        "{text}"
+    );
     assert!(!text.contains("null"), "{text}");
     let decoded = inputs_from_json(&json).expect("decode");
     let values = decoded.get(&1).expect("buffer 1");
-    assert!(values[0].is_nan());
+    assert_eq!(values[0].to_bits(), f32::NAN.to_bits());
     assert_eq!(values[1], f32::INFINITY);
     assert_eq!(values[2], f32::NEG_INFINITY);
     assert_eq!(values[3], 1.5);
+}
+
+/// First spawn-wire divergence on SmolLM2: packed GGUF word `0xff810000`
+/// (file offset 1_774_948) was encoded as `"NaN"` and came back as
+/// canonical `0x7fc00000`. Packed weights ride `f32` slots as raw bits.
+#[test]
+fn inputs_json_preserves_smollm2_first_nan_payload() {
+    const FIRST: u32 = 0xff81_0000;
+    let inputs = BTreeMap::from([(1, vec![f32::from_bits(FIRST)])]);
+    let json = inputs_to_json(&inputs).expect("encode");
+    let text = String::from_utf8(json.clone()).expect("utf8");
+    assert!(text.contains("\"0xff810000\""), "{text}");
+    assert!(!text.contains("\"NaN\""), "{text}");
+    let decoded = inputs_from_json(&json).expect("decode");
+    assert_eq!(decoded[&1][0].to_bits(), FIRST);
+}
+
+#[test]
+fn inputs_json_round_trips_smollm2_token_bit_patterns() {
+    let tokens: Vec<f32> = [504u32, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+        .into_iter()
+        .map(f32::from_bits)
+        .collect();
+    let inputs = BTreeMap::from([(1, tokens.clone())]);
+    let json = inputs_to_json(&inputs).expect("encode");
+    let decoded = inputs_from_json(&json).expect("decode");
+    let got = decoded.get(&1).expect("buffer 1");
+    assert_eq!(got.len(), tokens.len());
+    for (index, (observed, expected)) in got.iter().zip(&tokens).enumerate() {
+        assert_eq!(
+            observed.to_bits(),
+            expected.to_bits(),
+            "token[{index}] bits diverged"
+        );
+    }
+}
+
+#[test]
+fn inputs_json_accepts_legacy_nan_string() {
+    let decoded = inputs_from_json(br#"{"1":["NaN"]}"#).expect("decode");
+    assert!(decoded[&1][0].is_nan());
 }
 
 #[test]
