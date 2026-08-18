@@ -24,7 +24,9 @@ pub struct DeviceExecutionReceipt {
     pub device_name: String,
     /// FNV-1a provenance hash of the loaded module image.
     pub module_hash: u64,
-    /// Launches dispatched (each synchronizes internally).
+    /// Command-buffer submissions this execution. Metal batches every kernel
+    /// encode into one submit per step (W8-U1); CUDA submits once per kernel.
+    /// `launch_ids` / `launch_entries` still name every encoded kernel.
     pub launches: usize,
     /// Descriptor launch identities dispatched, in exact descriptor order.
     pub launch_ids: Vec<u32>,
@@ -64,11 +66,9 @@ pub struct DeviceExecutionReceipt {
     /// Input/InOut references — equal to `BufferRegistry::data_flow_pairs`
     /// for constructor-valid programs.
     pub data_flow_edges: Vec<DataFlowEdge>,
-    /// Observed real synchronization operations this execution (R9): one per
-    /// launch (a launch synchronizes internally) plus the explicit
-    /// step-boundary barrier, counted only where the backend's `sync()`
-    /// actually performs a device synchronization (a no-op step sync is not
-    /// an actual synchronization event and is not counted).
+    /// Observed real synchronization operations this execution (R9 / W8-U1).
+    /// Metal waits once at the step-boundary commit (`wait_until_completed`);
+    /// CUDA waits per kernel plus the additive step-boundary `cuCtxSynchronize`.
     pub syncs: usize,
     /// Observed transfers this execution (host→device copy-ins plus
     /// device→host readbacks).

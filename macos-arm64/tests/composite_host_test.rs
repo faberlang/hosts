@@ -622,7 +622,14 @@ fn program_session_executes_reordered_and_repeated_launches_verbatim() {
         .execute_descriptor(&descriptor, &inputs)
         .expect("reordered repeated launches");
 
-    assert_eq!(receipt.launches, 3);
+    assert_eq!(
+        receipt.launches, 1,
+        "W8-U1: three kernel encodes batch into one command-buffer submit"
+    );
+    assert_eq!(
+        receipt.syncs, 1,
+        "W8-U1: one blocking wait at the step boundary"
+    );
     assert_eq!(receipt.launch_ids, vec![1, 2, 3]);
     assert_eq!(
         receipt.launch_entries,
@@ -823,7 +830,11 @@ fn inout_buffer_stays_device_resident_across_kernels() {
         .execute_descriptor(&descriptor, &inputs)
         .expect("two-kernel chain");
 
-    assert_eq!(receipt.launches, 2);
+    assert_eq!(
+        receipt.launches, 1,
+        "W8-U1: two kernel encodes batch into one command-buffer submit"
+    );
+    assert_eq!(receipt.syncs, 1);
     // Only the three Input slots were copied in; the InOut acc never was.
     assert_eq!(receipt.copy_ins, 3);
     assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
@@ -1529,7 +1540,8 @@ fn program_session_two_kernel_chain_reuses_buffers_across_steps() {
     assert_eq!(session.allocated_buffers(), vec![1, 2, 3, 4, 5]);
 
     let receipt = session.execute(&inputs).expect("execute");
-    assert_eq!(receipt.launches, 2);
+    assert_eq!(receipt.launches, 1, "W8-U1: batched command buffer");
+    assert_eq!(receipt.syncs, 1);
     assert_eq!(receipt.copy_ins, 3); // only Input slots (a, b, c)
     assert_eq!(receipt.outputs.get(&5), Some(&vec![14.0, 16.0]));
     assert_eq!(session.session_handle_count(), 4); // per-step + observation released
@@ -1832,10 +1844,10 @@ fn metal_launch_failure_releases_every_handle() {
 
 #[test]
 fn metal_sync_failure_releases_every_handle() {
-    // The driver syncs once inside each launch and once at the step boundary;
-    // sync call 2 is the explicit step-boundary barrier in `execute`.
+    // W8-U1: Metal encodes without waiting; the only real `sync()` is the
+    // step-boundary commit. Inject on call 1.
     let mut host =
-        metal_composite_failing("add_one", FakeFailureStage::Sync, 2).expect("metal composite");
+        metal_composite_failing("add_one", FakeFailureStage::Sync, 1).expect("metal composite");
     let descriptor = elementwise_add_descriptor(DeviceBackend::Metal, "add_one", 2);
     let err = host
         .execute_descriptor(&descriptor, &add_inputs(vec![1.0, 2.0], vec![3.0, 4.0]))
@@ -2142,7 +2154,11 @@ fn mul_mean_companion_classified_buffers_follow_lifetime_policy() {
     // and released; the PerStep intermediates recycled at the step
     // boundary.
     let receipt = session.execute(&inputs).expect("execute 1");
-    assert_eq!(receipt.launches, 4);
+    assert_eq!(
+        receipt.launches, 1,
+        "W8-U1: four kernel encodes, one submit"
+    );
+    assert_eq!(receipt.syncs, 1);
     assert_eq!(receipt.copy_ins, 4);
     assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0])); // grad_x
     assert_eq!(receipt.outputs.get(&7), Some(&vec![7.0, 10.0])); // grad_w
@@ -2457,7 +2473,10 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
             receipt.program_lifetime,
             DeviceProgramLifetime::RepeatingStep
         );
-        assert_eq!(receipt.launches, 2);
+        assert_eq!(
+            receipt.launches, 1,
+            "W8-U1: one command-buffer submit per step"
+        );
         assert_eq!(receipt.launch_ids, vec![1, 2]);
         assert_eq!(
             receipt.copy_ins, 0,
@@ -2472,8 +2491,8 @@ fn repeating_step_session_runs_n_steps_once_init_recycle_observation_leak_free()
             "readback-only transfers per step (no copy-ins)"
         );
         assert_eq!(
-            receipt.syncs, 2,
-            "2 launches each sync internally; the Metal step-boundary sync() is a no-op and is not counted"
+            receipt.syncs, 1,
+            "W8-U1: one blocking wait at the Metal step-boundary commit"
         );
         assert_eq!(
             receipt.releases, 2,
@@ -2937,7 +2956,10 @@ fn repeating_step_end_of_run_readback_once_after_loop() {
         assert_eq!(receipt.outputs.get(&6), Some(&vec![5.0, 8.0]));
         assert_eq!(receipt.copy_ins, 0, "zero per-step copy-in");
         assert_eq!(receipt.transfers, 1, "readback-only transfers per step");
-        assert_eq!(receipt.syncs, 4, "4 launches each sync internally");
+        assert_eq!(
+            receipt.syncs, 1,
+            "W8-U1: four kernel encodes, one blocking wait per step"
+        );
         total_step_transfers += receipt.transfers;
         total_step_readbacks += receipt.readbacks;
     }
@@ -3306,14 +3328,14 @@ fn receipt_declares_resource_graph_and_observed_events() {
         }]
     );
 
-    // Observed lifecycle events (A9): 2 launches, 2 real synchronization
-    // operations (one per launch's internal wait — the Metal step-boundary
-    // `sync()` is a no-op because every launch already waited, so it is NOT
-    // an actual synchronization event and is not counted), 3 copy-ins + 1
-    // readback = 4 transfers, 1 readback, and 2 releases (read-then-release
-    // of `out` + step-boundary recycle of `acc`).
-    assert_eq!(receipt.launches, 2);
-    assert_eq!(receipt.syncs, 2);
+    // Observed lifecycle events (A9 / W8-U1): one command-buffer submit and
+    // one blocking wait (the step-boundary commit), 3 copy-ins + 1 readback
+    // = 4 transfers, 1 readback, and 2 releases (read-then-release of `out`
+    // + step-boundary recycle of `acc`). `launch_ids` still names both
+    // encoded kernels.
+    assert_eq!(receipt.launches, 1);
+    assert_eq!(receipt.syncs, 1);
+    assert_eq!(receipt.launch_ids, vec![1, 2]);
     assert_eq!(receipt.copy_ins, 3);
     assert_eq!(receipt.transfers, 4);
     assert_eq!(receipt.readbacks, 1);
@@ -3350,14 +3372,11 @@ fn receipt_declares_resource_graph_and_observed_events() {
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
-/// P1-4 (A9 evidence honesty): a receipt counts only ACTUAL device
-/// synchronization events. Every launch synchronizes internally on both
-/// backends (Metal waits per launch; CUDA syncs per launch) — counted. The
-/// explicit step-boundary `sync()` is counted only where it performs a real
-/// synchronization: CUDA issues `cuCtxSynchronize` (additive), while Metal is
-/// a no-op because every launch already waited (NOT counted). For the
-/// identical two-launch descriptor, the Metal receipt reports 2 syncs and the
-/// CUDA receipt reports 3.
+/// P1-4 (A9 / W8-U1 evidence honesty): a receipt counts only ACTUAL device
+/// synchronization events. Metal encodes both kernels into one command
+/// buffer and waits once at the step-boundary commit (`launches = 1`,
+/// `syncs = 1`). CUDA still submits and syncs per kernel plus the additive
+/// step-boundary `cuCtxSynchronize` (`launches = 2`, `syncs = 3`).
 #[test]
 fn receipt_syncs_count_only_real_synchronizations_per_backend() {
     for (backend, composite) in [
@@ -3371,15 +3390,11 @@ fn receipt_syncs_count_only_real_synchronizations_per_backend() {
             .expect("session create");
         let receipt = session.execute(&two_kernel_inputs()).expect("execute");
 
-        assert_eq!(receipt.launches, 2);
-        let expected_syncs = match backend {
-            // One real sync per launch's internal wait; the step-boundary
-            // sync() is a no-op on Metal and must not be counted.
-            DeviceBackend::Metal => 2,
-            // One real sync per launch's cuCtxSynchronize plus the additive
-            // step-boundary cuCtxSynchronize.
-            DeviceBackend::Cuda => 3,
+        let (expected_launches, expected_syncs) = match backend {
+            DeviceBackend::Metal => (1, 1),
+            DeviceBackend::Cuda => (2, 3),
         };
+        assert_eq!(receipt.launches, expected_launches);
         assert_eq!(receipt.syncs, expected_syncs);
         // The completion boundary stays the step-boundary barrier after the
         // last launch on both lanes.

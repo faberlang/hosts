@@ -387,7 +387,11 @@ fn prepared_session_reuses_record_reload_zero_realloc_zero_identical_buffers() {
             receipt.copy_ins, 1,
             "only the per-token input is copied per reuse; the once-init weights are never re-copied"
         );
-        assert_eq!(receipt.launches, 3);
+        assert_eq!(
+            receipt.launches, 1,
+            "W8-U1: three kernel encodes batch into one command-buffer submit"
+        );
+        assert_eq!(receipt.syncs, 1);
         assert_eq!(
             receipt.program_lifetime,
             DeviceProgramLifetime::RepeatingStep
