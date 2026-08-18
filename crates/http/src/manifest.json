@@ -10,7 +10,16 @@
     {"route": "http:respond_open", "summary": "Begin a chunked HTTP response and return its writer handle.", "opener": "lista<valor>", "result": "numerus"},
     {"route": "http:respond_chunk", "summary": "Write one chunked frame; blocks under backpressure.", "opener": "lista<valor>", "result": "vacuum"},
     {"route": "http:respond_finish", "summary": "Finish a chunked response and apply keep-alive policy.", "opener": "lista<valor>", "result": "vacuum"},
-    {"route": "http:stop", "summary": "Stop an HTTP listener and close its connections.", "opener": "numerus", "result": "vacuum"}
+    {"route": "http:stop", "summary": "Stop an HTTP listener and close its connections.", "opener": "numerus", "result": "vacuum"},
+    {"route": "http:agent", "summary": "Create an HTTP client agent handle for connection reuse.", "opener": "lista<valor>", "result": "numerus"},
+    {"route": "http:get", "summary": "Send one HTTP GET and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:post", "summary": "Send one HTTP POST and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:put", "summary": "Send one HTTP PUT and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:delete", "summary": "Send one HTTP DELETE and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:patch", "summary": "Send one HTTP PATCH and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:request", "summary": "Send one HTTP request with an explicit method and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:request_open", "summary": "Send one HTTP request and return a reader handle for incremental receive.", "opener": "lista<valor>", "result": "valor"},
+    {"route": "http:read", "summary": "Read one bounded body chunk from an open request; never drains the remainder.", "opener": "lista<valor>", "result": "valor"}
   ],
   "native_dependencies": []
 }

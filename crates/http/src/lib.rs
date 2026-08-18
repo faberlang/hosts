@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_BIND_HOST: &str = "127.0.0.1";
-const MAX_CONFIGURED_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CONFIGURED_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_BACKLOG: i32 = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -45,6 +45,7 @@ struct HttpState {
     next_request: AtomicU64,
     next_connection: AtomicI64,
     next_writer: AtomicI64,
+    client: client::ClientState,
 }
 
 struct ListenerState {
@@ -111,6 +112,7 @@ impl Http {
                 next_request: AtomicU64::new(1),
                 next_connection: AtomicI64::new(1),
                 next_writer: AtomicI64::new(1),
+                client: client::ClientState::new(),
             }),
         })
     }
@@ -149,6 +151,15 @@ impl Provider for Http {
             "http:respond_chunk" => self.respond_chunk(&request.opener, context),
             "http:respond_finish" => self.respond_finish(&request.opener, context),
             "http:stop" => self.stop(&request.opener),
+            "http:agent" => self.state.client.agent(&request.opener),
+            "http:get" => self.state.client.verb_get(&request.opener),
+            "http:post" => self.state.client.verb_post(&request.opener),
+            "http:put" => self.state.client.verb_put(&request.opener),
+            "http:delete" => self.state.client.verb_delete(&request.opener),
+            "http:patch" => self.state.client.verb_patch(&request.opener),
+            "http:request" => self.state.client.request(&request.opener),
+            "http:request_open" => self.state.client.request_open(&request.opener),
+            "http:read" => self.state.client.read(&request.opener, context),
             other => Err(HostError::no_route(format!(
                 "no built-in http syscall registered for {other}"
             ))),
@@ -879,7 +890,7 @@ fn request_carrier(parts: &RequestParts, connection: i64) -> Valor {
     Valor::Tabula(fields)
 }
 
-fn headers_value(headers: &[(String, String)]) -> Valor {
+pub(crate) fn headers_value(headers: &[(String, String)]) -> Valor {
     Valor::Lista(
         headers
             .iter()
@@ -893,7 +904,7 @@ fn headers_value(headers: &[(String, String)]) -> Valor {
     )
 }
 
-fn response_headers(value: &Valor) -> HostResult<Vec<(String, String)>> {
+pub(crate) fn response_headers(value: &Valor) -> HostResult<Vec<(String, String)>> {
     let Valor::Lista(items) = value else {
         return Err(HostError::invalid_args(
             "http:respond headers must be a list",
@@ -1009,7 +1020,7 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn list_args<'a>(value: &'a Valor, route: &str) -> HostResult<&'a [Valor]> {
+pub(crate) fn list_args<'a>(value: &'a Valor, route: &str) -> HostResult<&'a [Valor]> {
     match value {
         Valor::Lista(values) => Ok(values),
         _ => Err(HostError::invalid_args(format!(
@@ -1028,7 +1039,7 @@ fn positional<'a>(value: &'a Valor, index: usize, name: &str) -> HostResult<&'a 
     })
 }
 
-fn integer_arg(value: &Valor, name: &str) -> HostResult<i64> {
+pub(crate) fn integer_arg(value: &Valor, name: &str) -> HostResult<i64> {
     match value {
         Valor::Numerus(value) => Ok(*value),
         _ => Err(HostError::invalid_args(format!("{name} must be numerus"))),
@@ -1052,7 +1063,7 @@ fn status_arg(value: &Valor, route: &str) -> HostResult<u16> {
         })
 }
 
-fn text_arg(value: &Valor, name: &str) -> HostResult<String> {
+pub(crate) fn text_arg(value: &Valor, name: &str) -> HostResult<String> {
     match value {
         Valor::Textus(value) | Valor::Instans(value) => Ok(value.clone()),
         _ => Err(HostError::invalid_args(format!("{name} must be textus"))),
@@ -1066,7 +1077,7 @@ fn text_field(fields: &BTreeMap<String, Valor>, name: &str) -> HostResult<String
         .and_then(|value| text_arg(value, name))
 }
 
-fn bytes_value(value: &Valor, name: &str) -> HostResult<Vec<u8>> {
+pub(crate) fn bytes_value(value: &Valor, name: &str) -> HostResult<Vec<u8>> {
     match value {
         Valor::Octeti(bytes) => Ok(bytes.clone()),
         Valor::Textus(text) => Ok(text.as_bytes().to_vec()),
@@ -1109,7 +1120,7 @@ fn is_valid_header_value(value: &str) -> bool {
         .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
 }
 
-fn is_token_byte(byte: u8) -> bool {
+pub(crate) fn is_token_byte(byte: u8) -> bool {
     matches!(
         byte,
         b'0'..=b'9'
@@ -1152,7 +1163,7 @@ fn apply_accept_backlog(listener: &TcpListener) -> HostResult<()> {
     Ok(())
 }
 
-fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> HostResult<MutexGuard<'a, T>> {
+pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> HostResult<MutexGuard<'a, T>> {
     mutex
         .lock()
         .map_err(|_| HostError::internal(format!("{label} lock poisoned")))
