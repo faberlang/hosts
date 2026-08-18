@@ -69,6 +69,25 @@ impl DeviceRuntime {
             Self::Cuda(session) => session.driver_counters(),
         }
     }
+
+    /// Command buffers submitted on this runtime (W8-U1). CUDA reports 0 —
+    /// its receipt still counts per-kernel submits.
+    #[must_use]
+    pub fn command_submit_count(&self) -> usize {
+        match self {
+            Self::Metal(session) => session.command_submit_count(),
+            Self::Cuda(_) => 0,
+        }
+    }
+
+    /// Blocking waits on this runtime (W8-U1). CUDA reports 0.
+    #[must_use]
+    pub fn blocking_wait_count(&self) -> usize {
+        match self {
+            Self::Metal(session) => session.blocking_wait_count(),
+            Self::Cuda(_) => 0,
+        }
+    }
 }
 
 /// Backend-neutral lifecycle surface shared by every native device session.
@@ -88,7 +107,8 @@ pub trait DeviceSession {
     /// Copy f32 values into a device buffer (exact size match required).
     fn copy_in_f32(&mut self, buffer: &DeviceHandle, values: &[f32]) -> HostResult<()>;
     /// Launch a named kernel entry over device buffers with a 3D grid/block
-    /// shape; the launch synchronizes internally.
+    /// shape. Metal encodes into the step command buffer (commit+wait at
+    /// `sync`); CUDA still synchronizes internally.
     fn launch_kernel(
         &mut self,
         module: &DeviceHandle,

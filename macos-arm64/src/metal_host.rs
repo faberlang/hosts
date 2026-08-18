@@ -15,8 +15,8 @@ use std::path::Path;
 use faber::Valor;
 #[cfg(target_os = "macos")]
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLResourceOptions, MTLSize,
+    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,12 +77,13 @@ pub trait MetalDriver: Send {
         out: u64,
         len: usize,
     ) -> HostResult<()>;
-    /// Generalized kernel launch: resolve `entry` inside `module` and launch
-    /// over the given device buffers (binding order: inputs first, output
-    /// last) with the given 3D grid and 3D block shape. The session
-    /// synchronizes after launching; the system driver routes the legacy
-    /// elementwise-add path through this so there is exactly one
-    /// encoder/commit site.
+    /// Generalized kernel launch: resolve `entry` inside `module` and encode
+    /// a dispatch over the given device buffers (binding order: inputs first,
+    /// output last) with the given 3D grid and 3D block shape. Encoding is
+    /// mid-step only — the driver does not commit or wait here. The session
+    /// (or an explicit `sync` / readback) commits the pending command buffer
+    /// once at the step boundary. The system driver routes the legacy
+    /// elementwise-add path through this so there is exactly one encode site.
     fn launch_kernel(
         &mut self,
         module: u64,
@@ -95,6 +96,7 @@ pub trait MetalDriver: Send {
         block_y: u32,
         block_z: u32,
     ) -> HostResult<()>;
+    /// Commit the pending step command buffer (if any) and wait once.
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
     fn free(&mut self, token: u64) -> HostResult<()>;
@@ -104,6 +106,17 @@ pub trait MetalDriver: Send {
     /// prove the cache policy at the driver boundary.
     fn counters(&self) -> DriverCounters {
         DriverCounters::default()
+    }
+    /// Command buffers actually submitted. Encode-only `launch_kernel`
+    /// calls do not increment this; `sync` / readback flush increment it
+    /// once per committed buffer.
+    fn command_submit_count(&self) -> usize {
+        0
+    }
+    /// Blocking waits actually performed (`wait_until_completed` or the fake
+    /// equivalent). Mid-step encodes do not wait.
+    fn blocking_wait_count(&self) -> usize {
+        0
     }
 }
 
@@ -175,6 +188,18 @@ impl MetalHostSession {
         self.driver.counters()
     }
 
+    /// Command buffers submitted since the session opened (W8-U1).
+    #[must_use]
+    pub fn command_submit_count(&self) -> usize {
+        self.driver.command_submit_count()
+    }
+
+    /// Blocking waits since the session opened (W8-U1).
+    #[must_use]
+    pub fn blocking_wait_count(&self) -> usize {
+        self.driver.blocking_wait_count()
+    }
+
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<MetalHandleId> {
         self.require_admitted()?;
         if image.is_empty() {
@@ -236,11 +261,13 @@ impl MetalHostSession {
         self.driver.sync()
     }
 
-    /// Generalized launch: resolve `entry` inside `module` and dispatch over
-    /// `buffers` (inputs first, output last) with the given grid/block shape.
-    /// Every buffer handle is validated and resolved to a backend token before
-    /// the driver is touched; the launch synchronizes internally. This helper
-    /// preserves the original 1D session surface for elementwise callers.
+    /// Generalized launch: resolve `entry` inside `module` and encode a
+    /// dispatch over `buffers` (inputs first, output last) with the given
+    /// grid/block shape. Every buffer handle is validated and resolved to a
+    /// backend token before the driver is touched. Encoding does not commit
+    /// or wait — `sync` (or the next readback) commits the pending command
+    /// buffer once. This helper preserves the original 1D session surface
+    /// for elementwise callers.
     pub fn launch_kernel(
         &mut self,
         module: MetalHandleId,
@@ -254,7 +281,7 @@ impl MetalHostSession {
 
     /// Generalized launch with explicit 3D grid and block shape. Matmul and
     /// other collection kernels use y/z dimensions; elementwise callers can use
-    /// `launch_kernel`.
+    /// `launch_kernel`. Encodes only; call [`Self::sync`] to commit+wait.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_kernel_3d(
         &mut self,
@@ -288,12 +315,11 @@ impl MetalHostSession {
             block_x,
             block_y,
             block_z,
-        )?;
-        self.driver.sync()
+        )
     }
 
-    /// Explicit device synchronization barrier. The launch paths already sync
-    /// internally; this exposes the barrier for callers that need it directly.
+    /// Commit the pending step command buffer and wait once. A no-op when
+    /// nothing is pending (already flushed, or no encodes this step).
     pub fn sync(&mut self) -> HostResult<()> {
         self.require_admitted()?;
         self.driver.sync()
@@ -493,6 +519,12 @@ pub struct FakeMetalDriver {
     fail_at: BTreeMap<FakeFailureStage, u32>,
     /// Running call count per stage (drives `fail_at`).
     stage_calls: BTreeMap<FakeFailureStage, u32>,
+    /// Encodes waiting for the next `sync` / readback flush.
+    pending_encodes: usize,
+    /// Command buffers submitted (one per flush of a non-empty encode batch).
+    command_submits: usize,
+    /// Blocking waits performed (one per flush of a non-empty encode batch).
+    blocking_waits: usize,
 }
 
 impl FakeMetalDriver {
@@ -683,7 +715,12 @@ impl MetalDriver for FakeMetalDriver {
     ) -> HostResult<()> {
         // `_len` mirrors the session's element count; the shared simulation
         // derives it from the (session-validated, equal) buffer sizes.
-        self.simulate_elementwise_add(module, a, b, out)
+        // Encode-only: the CPU fake applies the write now (later kernels in
+        // the same step must observe it) and defers the submit/wait count
+        // until `sync` / readback flush.
+        self.simulate_elementwise_add(module, a, b, out)?;
+        self.pending_encodes += 1;
+        Ok(())
     }
 
     fn launch_kernel(
@@ -715,27 +752,45 @@ impl MetalDriver for FakeMetalDriver {
         // and adds a into acc in place. Anything else fails closed in the
         // fake just as it would on device.
         if entry == b"accumulate" {
-            expect_fake_arity(buffers, 2, "'accumulate' simulates the 2-buffer kernel (a, acc)")?;
-            return self.simulate_accumulate(module, buffers[0], buffers[1]);
+            expect_fake_arity(
+                buffers,
+                2,
+                "'accumulate' simulates the 2-buffer kernel (a, acc)",
+            )?;
+            self.simulate_accumulate(module, buffers[0], buffers[1])?;
+            self.pending_encodes += 1;
+            return Ok(());
         }
         if entry == b"observa" {
-            expect_fake_arity(buffers, 2, "'observa' simulates the 2-buffer kernel (src, out)")?;
-            return self.simulate_copy(module, buffers[0], buffers[1]);
+            expect_fake_arity(
+                buffers,
+                2,
+                "'observa' simulates the 2-buffer kernel (src, out)",
+            )?;
+            self.simulate_copy(module, buffers[0], buffers[1])?;
+            self.pending_encodes += 1;
+            return Ok(());
         }
         expect_fake_arity(
             buffers,
             3,
             "simulates the 3-buffer elementwise-add kernel (a, b, out)",
         )?;
-        self.simulate_elementwise_add(module, buffers[0], buffers[1], buffers[2])
+        self.simulate_elementwise_add(module, buffers[0], buffers[1], buffers[2])?;
+        self.pending_encodes += 1;
+        Ok(())
     }
 
     fn sync(&mut self) -> HostResult<()> {
         self.maybe_fail(FakeFailureStage::Sync)?;
+        self.flush_pending();
         Ok(())
     }
 
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>> {
+        // Readback coalesces behind the same flush as `sync`: one submit +
+        // one wait if anything is still pending, then the host copy.
+        self.flush_pending();
         self.maybe_fail(FakeFailureStage::Readback)?;
         let buffer = self
             .buffers
@@ -764,6 +819,27 @@ impl MetalDriver for FakeMetalDriver {
             buffer_releases: self.buffer_releases,
         }
     }
+
+    fn command_submit_count(&self) -> usize {
+        self.command_submits
+    }
+
+    fn blocking_wait_count(&self) -> usize {
+        self.blocking_waits
+    }
+}
+
+impl FakeMetalDriver {
+    /// Count one command-buffer submit + blocking wait if any encodes are
+    /// still pending. Idempotent when the step is already flushed.
+    fn flush_pending(&mut self) {
+        if self.pending_encodes == 0 {
+            return;
+        }
+        self.command_submits += 1;
+        self.blocking_waits += 1;
+        self.pending_encodes = 0;
+    }
 }
 
 /// Live Metal driver: real gfx-rs `metal` binding (M2).
@@ -783,6 +859,14 @@ struct SystemMetalDriver {
     modules: BTreeMap<u64, MetalModule>,
     buffers: BTreeMap<u64, Buffer>,
     next_token: u64,
+    /// Open command buffer for the current step. Created on the first
+    /// encode; committed and waited at `sync` / readback flush.
+    pending: Option<CommandBuffer>,
+    /// Temporary buffers (runtime-extent slots) kept alive until the pending
+    /// command buffer commits.
+    deferred_free: Vec<u64>,
+    command_submits: usize,
+    blocking_waits: usize,
 }
 
 /// A compiled Metal compute module: a compute pipeline per declared `kernel
@@ -942,7 +1026,13 @@ impl MetalDriver for SystemMetalDriver {
             1,
             1,
         );
-        self.buffers.remove(&extent_token);
+        // Keep the extent buffer until the pending command buffer commits so
+        // the encoder's bind stays live across encode-only mid-step.
+        if result.is_ok() {
+            self.deferred_free.push(extent_token);
+        } else {
+            self.buffers.remove(&extent_token);
+        }
         result
     }
 
@@ -958,48 +1048,23 @@ impl MetalDriver for SystemMetalDriver {
         block_y: u32,
         block_z: u32,
     ) -> HostResult<()> {
-        // A module is compiled for exactly one kernel entry; an unknown entry
-        // name fails closed with the typed E_DEVICE_ENTRY_MISMATCH (S1-4 audit
-        // P2-2: the real-driver adapter reports the same stable code the fake
-        // driver enforces, so entry mismatches never surface as a generic
-        // driver failure).
-        let module_record = self
+        // Validate everything before touching the encoder so a stale module,
+        // unknown entry, or illegal grid cannot leave a half-recorded buffer.
+        let entry_name = String::from_utf8_lossy(entry);
+        let pipeline = self
             .modules
             .get(&module)
-            .ok_or_else(|| metal_driver("launch: unknown module token"))?;
-        let entry_name = String::from_utf8_lossy(entry);
-        let pipeline = module_record
+            .ok_or_else(|| metal_driver("launch: unknown module token"))?
             .pipelines
             .get(entry_name.as_ref())
-            .ok_or_else(|| metal_entry_mismatch(&entry_name))?;
+            .ok_or_else(|| metal_entry_mismatch(&entry_name))?
+            .clone();
         if grid_x == 0 || grid_y == 0 || grid_z == 0 || block_x == 0 || block_y == 0 || block_z == 0
         {
             return Err(metal_driver(
                 "launch: all grid and block dimensions must be non-zero",
             ));
         }
-        // Resolve every buffer token fail-closed before touching the encoder,
-        // so a stale or non-buffer id cannot silently launch.
-        let mut bound = Vec::with_capacity(buffers.len());
-        for token in buffers {
-            let buffer = self
-                .buffers
-                .get(token)
-                .ok_or_else(|| metal_driver("launch: unknown buffer token"))?;
-            bound.push(buffer);
-        }
-        let queue = self
-            .queue
-            .as_ref()
-            .ok_or_else(|| metal_unavailable("SystemMetalDriver has no command queue"))?;
-
-        let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(pipeline);
-        for (index, buffer) in bound.iter().enumerate() {
-            encoder.set_buffer(index as u64, Some(*buffer), 0);
-        }
-
         // Metal caps threads per threadgroup; a block shape whose volume
         // exceeds the pipeline limit fails closed rather than being clamped,
         // because clamping would flatten the block shape and break 2D/3D
@@ -1013,30 +1078,50 @@ impl MetalDriver for SystemMetalDriver {
                 "launch: threadgroup volume {block_volume} exceeds the pipeline limit of {max_threads} threads per threadgroup"
             )));
         }
+        // Retain buffer handles so the encoder bind does not borrow `self`.
+        let mut bound = Vec::with_capacity(buffers.len());
+        for token in buffers {
+            let buffer = self
+                .buffers
+                .get(token)
+                .ok_or_else(|| metal_driver("launch: unknown buffer token"))?
+                .clone();
+            bound.push(buffer);
+        }
+        if self.pending.is_none() {
+            let queue = self
+                .queue
+                .as_ref()
+                .ok_or_else(|| metal_unavailable("SystemMetalDriver has no command queue"))?;
+            self.pending = Some(queue.new_command_buffer().to_owned());
+        }
+        let command_buffer = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| metal_driver("launch: pending command buffer missing after ensure"))?;
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        for (index, buffer) in bound.iter().enumerate() {
+            encoder.set_buffer(index as u64, Some(buffer), 0);
+        }
         // Each threadgroup carries exactly one block now that the volume is
         // guaranteed to fit, so the grid needs no widening along x.
-        let thread_groups_x = grid_x as u64;
         encoder.dispatch_thread_groups(
-            MTLSize::new(thread_groups_x, grid_y as u64, grid_z as u64),
+            MTLSize::new(grid_x as u64, grid_y as u64, grid_z as u64),
             MTLSize::new(block_x as u64, block_y as u64, block_z as u64),
         );
         encoder.end_encoding();
-
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(metal_driver("Metal command buffer did not complete"));
-        }
         Ok(())
     }
 
     fn sync(&mut self) -> HostResult<()> {
-        // Launch already calls `wait_until_completed`; shared-memory reads are
-        // coherent without an additional barrier.
-        Ok(())
+        self.commit_pending()
     }
 
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>> {
+        // Coalesce readback behind the same step-boundary flush: if the
+        // caller skipped `sync`, the pending buffer commits here once.
+        self.commit_pending()?;
         let buffer = self
             .buffers
             .get(&token)
@@ -1047,7 +1132,7 @@ impl MetalDriver for SystemMetalDriver {
         let mut output = vec![0u8; len_bytes];
         let source = buffer.contents().cast::<u8>();
         // Safe: the buffer length is exactly `len_bytes` (checked above), and
-        // shared-memory storage is host-readable.
+        // shared-memory storage is host-readable after the flush wait.
         unsafe {
             std::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), len_bytes);
         }
@@ -1057,6 +1142,36 @@ impl MetalDriver for SystemMetalDriver {
     fn free(&mut self, token: u64) -> HostResult<()> {
         self.buffers.remove(&token);
         self.modules.remove(&token);
+        Ok(())
+    }
+
+    fn command_submit_count(&self) -> usize {
+        self.command_submits
+    }
+
+    fn blocking_wait_count(&self) -> usize {
+        self.blocking_waits
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SystemMetalDriver {
+    /// Commit the pending step command buffer and block until it completes.
+    /// No-op when the step has nothing pending (already flushed).
+    fn commit_pending(&mut self) -> HostResult<()> {
+        let Some(command_buffer) = self.pending.take() else {
+            return Ok(());
+        };
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        self.command_submits += 1;
+        self.blocking_waits += 1;
+        for token in self.deferred_free.drain(..) {
+            self.buffers.remove(&token);
+        }
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(metal_driver("Metal command buffer did not complete"));
+        }
         Ok(())
     }
 }

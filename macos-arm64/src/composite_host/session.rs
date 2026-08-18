@@ -1013,6 +1013,10 @@ impl<'host> ProgramSession<'host> {
         let mut launch_ids = Vec::with_capacity(self.launches.len());
         let mut launch_entries = Vec::with_capacity(self.launches.len());
         let mut copy_ins = 0usize;
+        // Snapshot Metal submit/wait counters before this step so the receipt
+        // reports this execution's batch, not the session lifetime total.
+        let submits_before = self.runtime.command_submit_count();
+        let waits_before = self.runtime.blocking_wait_count();
 
         // Allocate this step's PerStep + ObservationPoint buffers (S2-4).
         // PerProgram buffers were allocated once at session creation and
@@ -1063,12 +1067,11 @@ impl<'host> ProgramSession<'host> {
             launch_entries.push(kernel.entry.clone());
         }
 
-        // Step-boundary synchronization: every launch in this step has
-        // completed before any readback. The launches also sync internally;
-        // this barrier makes the step boundary explicit and observable. The
-        // completion boundary is this exact barrier after the last launch
-        // (R9): the receipt counts real synchronization operations and names
-        // where completion is guaranteed.
+        // Step-boundary synchronization: Metal commits the pending command
+        // buffer and waits once here. CUDA issues `cuCtxSynchronize` (launches
+        // already synced internally). Every encode in this step has completed
+        // before any readback. The completion boundary is this barrier after
+        // the last launch (R9).
         self.runtime.sync()?;
 
         // Observation-only readback (F6): read back exactly the DECLARED
@@ -1137,26 +1140,30 @@ impl<'host> ProgramSession<'host> {
         // program).
         let (resource_graph, data_flow_edges) = self.declared_resource_graph();
 
-        // R9 real-synchronization accounting (P1-4): one synchronization per
-        // launch — the session launch contract synchronizes internally (Metal
-        // waits per launch; CUDA syncs per launch) — plus the explicit
-        // step-boundary barrier, which is an actual device synchronization
-        // only where the backend's `sync()` performs one. On Metal, `sync()`
-        // is a no-op because every launch already called `wait_until_completed`,
-        // so the step barrier is NOT an actual synchronization event and is
-        // not counted; on CUDA, `sync()` performs `cuCtxSynchronize`, so it
-        // is additive. The completion boundary is that barrier after the last
-        // dispatched launch.
-        let step_boundary_syncs: usize = match self.backend {
-            DeviceBackend::Metal => 0,
-            DeviceBackend::Cuda => 1,
+        // W8-U1 / R9: Metal encodes every kernel into one command buffer and
+        // commits+waits once at the step-boundary `sync()` (readback flush is
+        // a no-op after that). Receipt `launches` / `syncs` are the actual
+        // submits and blocking waits this execution performed — not the
+        // encoded-kernel count (`launch_ids` / `launch_entries` still name
+        // every kernel). CUDA still submits and syncs per kernel plus the
+        // additive step-boundary `cuCtxSynchronize`.
+        let (launches, syncs) = match self.backend {
+            DeviceBackend::Metal => (
+                self.runtime
+                    .command_submit_count()
+                    .saturating_sub(submits_before),
+                self.runtime
+                    .blocking_wait_count()
+                    .saturating_sub(waits_before),
+            ),
+            DeviceBackend::Cuda => (launch_count, launch_count + 1),
         };
 
         Ok(DeviceExecutionReceipt {
             backend: self.backend,
             device_name: self.device_name.clone(),
             module_hash: self.module_hash,
-            launches: launch_count,
+            launches,
             launch_ids,
             launch_entries,
             copy_ins,
@@ -1175,7 +1182,7 @@ impl<'host> ProgramSession<'host> {
                 .buffer_versions_by_lifetime(DeviceBufferLifetime::ObservationPoint),
             resource_graph,
             data_flow_edges,
-            syncs: launch_count + step_boundary_syncs,
+            syncs,
             transfers: copy_ins + readback_count,
             readbacks: readback_count,
             releases: release_count,

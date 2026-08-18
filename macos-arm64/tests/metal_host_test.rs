@@ -125,6 +125,57 @@ fn fake_driver_sequences_generalized_launch_kernel() {
     session.sync().expect("session sync barrier");
 }
 
+/// W8-U1: several kernel encodes stay encode-only until `sync`, which is
+/// one command-buffer submit and one blocking wait. Readback after that
+/// flush does not add another wait (coalesced).
+#[test]
+fn fake_driver_batches_encodes_into_one_submit_and_wait() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = session.alloc_bytes(8).expect("alloc a");
+    let b = session.alloc_bytes(8).expect("alloc b");
+    let mid = session.alloc_bytes(8).expect("alloc mid");
+    let out = session.alloc_bytes(8).expect("alloc out");
+
+    session.copy_in_f32(a, &[1.0, 2.0]).expect("copy a");
+    session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
+
+    session
+        .launch_kernel(module, "add_one", &[a, b, mid], 1, 2)
+        .expect("encode 1");
+    session
+        .launch_kernel(module, "add_one", &[mid, b, out], 1, 2)
+        .expect("encode 2");
+
+    assert_eq!(
+        session.command_submit_count(),
+        0,
+        "encodes must not submit a command buffer"
+    );
+    assert_eq!(session.blocking_wait_count(), 0, "encodes must not wait");
+
+    session.sync().expect("step-boundary commit+wait");
+    assert_eq!(session.command_submit_count(), 1);
+    assert_eq!(session.blocking_wait_count(), 1);
+
+    let values = session.readback_f32(out).expect("coalesced readback");
+    assert_eq!(values, vec![7.0, 10.0]);
+    assert_eq!(
+        session.command_submit_count(),
+        1,
+        "readback after sync must not submit again"
+    );
+    assert_eq!(
+        session.blocking_wait_count(),
+        1,
+        "readback after sync must not wait again"
+    );
+}
+
 #[test]
 fn session_fails_closed_on_guard_checks() {
     let mut session =
@@ -326,6 +377,16 @@ fn system_driver_loads_multi_entry_module_and_dispatches_both_entries() {
     let values = session.readback_f32(out).expect("readback out");
     let expected: Vec<f32> = (0..16).map(|i| (i as f32) * 2.0 + 1.0).collect();
     assert_eq!(values, expected);
+    assert_eq!(
+        session.command_submit_count(),
+        1,
+        "W8-U1: two real-device encodes share one command-buffer submit"
+    );
+    assert_eq!(
+        session.blocking_wait_count(),
+        1,
+        "W8-U1: one blocking wait at the step-boundary sync"
+    );
 
     // An entry the module does not declare fails closed with the typed
     // E_DEVICE_ENTRY_MISMATCH (multi-entry module, unknown name).
