@@ -1,0 +1,22 @@
++++
+locale = "en"
++++
+# Proba-grade proof that `solum:digestio` is callable from a Faber package.
+# Writes the FIPS 180-4 "abc" vector to a temp file and matches the pinned
+# SHA-256 hex Gradus admission takes as `digestio`.
+
+fn write_text(string via, string data) → void {
+    return call 'solum:scribe' ([via, data]) ↦ void
+}
+
+main {
+    const string dir ← call 'solum:temporarium' ↦ string
+    const string path ← call 'solum:iunge' ([dir, "solum-digestio-abc.txt"]) ↦ string
+    write_text(path, "abc")
+    const string digest ← call 'solum:digestio' (path) ↦ string
+    const string pinned ← "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    if digest ≠ pinned {
+        panic "solum:digestio mismatch: " + digest
+    }
+    print digest
+}

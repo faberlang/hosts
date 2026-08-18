@@ -10,6 +10,7 @@ pedantic = "deny"
 [dependencies]
 faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
 host-kernel = { path = "../host-kernel" }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
