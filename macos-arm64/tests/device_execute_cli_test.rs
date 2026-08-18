@@ -175,6 +175,21 @@ fn inputs_json_round_trips_buffer_ids() {
 }
 
 #[test]
+fn inputs_json_round_trips_non_finite_values() {
+    let inputs = BTreeMap::from([(1, vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5])]);
+    let json = inputs_to_json(&inputs).expect("encode");
+    let text = String::from_utf8(json.clone()).expect("utf8");
+    assert!(text.contains("\"NaN\""), "{text}");
+    assert!(!text.contains("null"), "{text}");
+    let decoded = inputs_from_json(&json).expect("decode");
+    let values = decoded.get(&1).expect("buffer 1");
+    assert!(values[0].is_nan());
+    assert_eq!(values[1], f32::INFINITY);
+    assert_eq!(values[2], f32::NEG_INFINITY);
+    assert_eq!(values[3], 1.5);
+}
+
+#[test]
 fn structurally_bad_descriptor_fails_before_host_open() {
     let mut descriptor = elementwise_add_descriptor();
     descriptor.kernels.clear();
