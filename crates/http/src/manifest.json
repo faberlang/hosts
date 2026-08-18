@@ -19,7 +19,7 @@
     {"route": "http:patch", "summary": "Send one HTTP PATCH and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
     {"route": "http:request", "summary": "Send one HTTP request with an explicit method and return the buffered response.", "opener": "lista<valor>", "result": "valor"},
     {"route": "http:request_open", "summary": "Send one HTTP request and return a reader handle for incremental receive.", "opener": "lista<valor>", "result": "valor"},
-    {"route": "http:read", "summary": "Read one bounded body chunk from an open request; never drains the remainder.", "opener": "lista<valor>", "result": "valor"}
+    {"route": "http:read", "summary": "Read one bounded body chunk from an open request; never drains the remainder. Cancellation is entry-only: a blocked read is not interruptible mid-syscall.", "opener": "lista<valor>", "result": "valor"}
   ],
   "native_dependencies": []
 }

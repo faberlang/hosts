@@ -227,7 +227,7 @@ fn accept_cancellation_is_bounded() {
 }
 
 #[test]
-fn malformed_and_oversized_requests_fail_closed() {
+fn malformed_requests_fail_closed() {
     let provider = Arc::new(Http::new().expect("provider"));
     let port = free_port();
     let handle = listen(&provider, i64::from(port));
@@ -245,11 +245,20 @@ fn malformed_and_oversized_requests_fail_closed() {
         .expect("accept thread")
         .expect_err("malformed request");
     assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error.message.contains("HTTP/1.1"),
+        "malformed HTTP/1.0 must fail on parse, not the body cap: {}",
+        error.message
+    );
 
     provider
         .dispatch(&request("http:stop", Valor::Numerus(handle)), &context())
         .expect("stop malformed listener");
+}
 
+#[test]
+fn oversized_requests_fail_closed() {
+    let provider = Arc::new(Http::new().expect("provider"));
     let limited_port = free_port();
     let limited_handle = provider
         .dispatch(
@@ -279,13 +288,18 @@ fn malformed_and_oversized_requests_fail_closed() {
     thread::sleep(Duration::from_millis(10));
     let mut oversized = TcpStream::connect(("127.0.0.1", limited_port)).expect("connect oversized");
     oversized
-        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ntoolong")
+        .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\ntoolong")
         .expect("write oversized");
     let error = accepted
         .join()
         .expect("accept thread")
         .expect_err("oversized request");
     assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error.message.contains("max_body_bytes"),
+        "well-formed oversized request must fail on the body cap: {}",
+        error.message
+    );
     provider
         .dispatch(
             &request("http:stop", Valor::Numerus(limited_handle)),
