@@ -3,7 +3,7 @@ use host_kernel::{CancellationProbe, ProviderContent};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -116,6 +116,15 @@ fn manifest_registers_http_contract_and_routes() {
             ("http:respond_chunk", "lista<valor>", "vacuum"),
             ("http:respond_finish", "lista<valor>", "vacuum"),
             ("http:stop", "numerus", "vacuum"),
+            ("http:agent", "lista<valor>", "numerus"),
+            ("http:get", "lista<valor>", "valor"),
+            ("http:post", "lista<valor>", "valor"),
+            ("http:put", "lista<valor>", "valor"),
+            ("http:delete", "lista<valor>", "valor"),
+            ("http:patch", "lista<valor>", "valor"),
+            ("http:request", "lista<valor>", "valor"),
+            ("http:request_open", "lista<valor>", "valor"),
+            ("http:read", "lista<valor>", "valor"),
         ]
     );
 
@@ -791,4 +800,499 @@ fn listen_bind_host_and_empty_host_are_honored() {
         )
         .expect_err("empty bind_host must fail");
     assert_eq!(error.code, "E_INVALID_ARGS");
+}
+
+struct EchoFixture {
+    port: u16,
+    connections: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl EchoFixture {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind echo fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("echo fixture nonblocking");
+        let port = listener.local_addr().expect("echo fixture addr").port();
+        let connections = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_connections = Arc::clone(&connections);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || loop {
+            if thread_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    thread_connections.fetch_add(1, Ordering::SeqCst);
+                    let conn_stop = Arc::clone(&thread_stop);
+                    thread::spawn(move || serve_echo_connection(stream, &conn_stop));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+        Self {
+            port,
+            connections,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn connection_count(&self) -> u64 {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for EchoFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_echo_connection(mut stream: TcpStream, stop: &AtomicBool) {
+    stream
+        .set_nonblocking(false)
+        .expect("echo connection blocking");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("echo read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("echo write timeout");
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some((method, path, headers, body)) = read_fixture_request(&mut stream) else {
+            return;
+        };
+        let reply = format!("{method} {path} {}", String::from_utf8_lossy(&body));
+        let extra = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-test"))
+            .map(|(_, value)| format!("x-echo-test: {value}\r\n"))
+            .unwrap_or_default();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: keep-alive\r\n{extra}\r\n{reply}",
+            reply.len()
+        );
+        if stream.write_all(response.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+type FixtureRequest = (String, String, Vec<(String, String)>, Vec<u8>);
+
+fn read_fixture_request(stream: &mut TcpStream) -> Option<FixtureRequest> {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(count) => buf.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return None;
+            }
+            Err(_) => return None,
+        }
+        if let Some(end) = find_header_end(&buf) {
+            break end;
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    };
+    let header_text = std::str::from_utf8(&buf[..=header_end]).ok()?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts.next()?.to_owned();
+    let path = parts.next()?.to_owned();
+    let mut headers = Vec::new();
+    let mut content_length = 0_usize;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim().to_owned();
+        let value = value.trim().to_owned();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().ok()?;
+        }
+        headers.push((name, value));
+    }
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(count) => body.extend_from_slice(&chunk[..count]),
+        }
+    }
+    body.truncate(content_length);
+    Some((method, path, headers, body))
+}
+
+fn client_reply_table(reply: &ProviderReply) -> BTreeMap<String, Valor> {
+    let [ProviderContent::Item(Valor::Tabula(fields))] = reply.contents.as_slice() else {
+        panic!("client route must return one table");
+    };
+    fields.clone()
+}
+
+fn client_status(fields: &BTreeMap<String, Valor>) -> i64 {
+    numerus_field(fields, "status")
+}
+
+fn client_body(fields: &BTreeMap<String, Valor>) -> Vec<u8> {
+    match fields.get("body") {
+        Some(Valor::Octeti(bytes)) => bytes.clone(),
+        other => panic!("missing body: {other:?}"),
+    }
+}
+
+fn client_header(fields: &BTreeMap<String, Valor>, name: &str) -> Option<String> {
+    let Some(Valor::Lista(items)) = fields.get("headers") else {
+        return None;
+    };
+    items.iter().find_map(|item| {
+        let Valor::Tabula(header) = item else {
+            return None;
+        };
+        let Some(Valor::Textus(header_name)) = header.get("name") else {
+            return None;
+        };
+        if header_name.eq_ignore_ascii_case(name) {
+            match header.get("value") {
+                Some(Valor::Textus(value)) => Some(value.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn dispatch_list(provider: &Http, route: &str, values: Vec<Valor>) -> HostResult<ProviderReply> {
+    provider.dispatch(&request(route, Valor::Lista(values)), &context())
+}
+
+fn agent_handle(provider: &Http) -> i64 {
+    let reply = dispatch_list(provider, "http:agent", Vec::new()).expect("http:agent");
+    let [ProviderContent::Item(Valor::Numerus(handle))] = reply.contents.as_slice() else {
+        panic!("http:agent must return one numerus handle");
+    };
+    *handle
+}
+
+#[test]
+fn client_verbs_round_trip_against_local_fixture() {
+    let fixture = EchoFixture::spawn();
+    let provider = Http::new().expect("provider");
+
+    let get = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:get",
+            vec![Valor::Textus(fixture.url("/get"))],
+        )
+        .expect("http:get"),
+    );
+    assert_eq!(client_status(&get), 200);
+    assert_eq!(client_body(&get), b"GET /get ");
+
+    let post = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:post",
+            vec![
+                Valor::Textus(fixture.url("/post")),
+                Valor::Textus("hello".into()),
+            ],
+        )
+        .expect("http:post"),
+    );
+    assert_eq!(client_status(&post), 200);
+    assert_eq!(client_body(&post), b"POST /post hello");
+
+    let put = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:put",
+            vec![
+                Valor::Textus(fixture.url("/put")),
+                Valor::Octeti(b"abc".to_vec()),
+            ],
+        )
+        .expect("http:put"),
+    );
+    assert_eq!(client_status(&put), 200);
+    assert_eq!(client_body(&put), b"PUT /put abc");
+
+    let delete = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:delete",
+            vec![Valor::Textus(fixture.url("/delete"))],
+        )
+        .expect("http:delete"),
+    );
+    assert_eq!(client_status(&delete), 200);
+    assert_eq!(client_body(&delete), b"DELETE /delete ");
+
+    let patch = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:patch",
+            vec![
+                Valor::Textus(fixture.url("/patch")),
+                headers(&[("x-test", "yes")]),
+                Valor::Textus("delta".into()),
+            ],
+        )
+        .expect("http:patch"),
+    );
+    assert_eq!(client_status(&patch), 200);
+    assert_eq!(client_body(&patch), b"PATCH /patch delta");
+    assert_eq!(client_header(&patch, "x-echo-test").as_deref(), Some("yes"));
+
+    let request_reply = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:request",
+            vec![
+                Valor::Textus("POST".into()),
+                Valor::Textus(fixture.url("/generic")),
+                headers(&[("x-test", "generic")]),
+                Valor::Textus("payload".into()),
+            ],
+        )
+        .expect("http:request"),
+    );
+    assert_eq!(client_status(&request_reply), 200);
+    assert_eq!(client_body(&request_reply), b"POST /generic payload");
+    assert_eq!(
+        client_header(&request_reply, "x-echo-test").as_deref(),
+        Some("generic")
+    );
+}
+
+#[test]
+fn request_open_read_yields_chunks_before_body_end() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind drip fixture");
+    let port = listener.local_addr().expect("drip addr").port();
+    let (first_written_tx, first_written_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("drip accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("drip read timeout");
+        let _ = read_fixture_request(&mut stream);
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n";
+        stream.write_all(head).expect("write first event");
+        stream.flush().expect("flush first event");
+        first_written_tx.send(()).expect("signal first written");
+        release_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for first read");
+        stream
+            .write_all(b"b\r\ndata: two\n\n\r\n0\r\n\r\n")
+            .expect("write second event");
+        stream.flush().expect("flush second event");
+    });
+
+    let provider = Http::new().expect("provider");
+    let opened = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:request_open",
+            vec![
+                Valor::Textus("GET".into()),
+                Valor::Textus(format!("http://127.0.0.1:{port}/sse")),
+                headers(&[]),
+                Valor::Textus(String::new()),
+            ],
+        )
+        .expect("http:request_open"),
+    );
+    first_written_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first event must be on the wire");
+    assert_eq!(numerus_field(&opened, "status"), 200);
+    let reader = numerus_field(&opened, "reader");
+    let first = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:read",
+            vec![Valor::Numerus(reader), Valor::Numerus(64)],
+        )
+        .expect("first http:read"),
+    );
+    let first_bytes = match first.get("bytes") {
+        Some(Valor::Octeti(bytes)) => bytes.clone(),
+        other => panic!("missing first chunk: {other:?}"),
+    };
+    assert_eq!(first.get("done"), Some(&Valor::Bivalens(false)));
+    assert_eq!(first_bytes, b"data: one\n\n");
+    release_tx.send(()).expect("release second event");
+
+    let mut rest = Vec::new();
+    let mut done = false;
+    for _ in 0..8 {
+        let chunk = client_reply_table(
+            &dispatch_list(
+                &provider,
+                "http:read",
+                vec![Valor::Numerus(reader), Valor::Numerus(64)],
+            )
+            .expect("later http:read"),
+        );
+        match chunk.get("bytes") {
+            Some(Valor::Octeti(bytes)) => rest.extend_from_slice(bytes),
+            other => panic!("missing later chunk: {other:?}"),
+        }
+        if chunk.get("done") == Some(&Valor::Bivalens(true)) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "incremental read must reach done after the drip ends");
+    assert_eq!(rest, b"data: two\n\n");
+    server.join().expect("drip server");
+}
+
+#[test]
+fn agent_reuse_keeps_one_tcp_connection() {
+    let fixture = EchoFixture::spawn();
+    let provider = Http::new().expect("provider");
+    let agent = agent_handle(&provider);
+    let first = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:get",
+            vec![Valor::Numerus(agent), Valor::Textus(fixture.url("/one"))],
+        )
+        .expect("first pooled get"),
+    );
+    assert_eq!(client_status(&first), 200);
+    assert_eq!(client_body(&first), b"GET /one ");
+    let second = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:get",
+            vec![Valor::Numerus(agent), Valor::Textus(fixture.url("/two"))],
+        )
+        .expect("second pooled get"),
+    );
+    assert_eq!(client_status(&second), 200);
+    assert_eq!(client_body(&second), b"GET /two ");
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "one agent must reuse one TCP connection across sequential requests"
+    );
+}
+
+#[test]
+fn ephemeral_agents_open_separate_connections() {
+    let fixture = EchoFixture::spawn();
+    let provider = Http::new().expect("provider");
+    dispatch_list(
+        &provider,
+        "http:get",
+        vec![Valor::Textus(fixture.url("/a"))],
+    )
+    .expect("ephemeral get a");
+    dispatch_list(
+        &provider,
+        "http:get",
+        vec![Valor::Textus(fixture.url("/b"))],
+    )
+    .expect("ephemeral get b");
+    assert_eq!(
+        fixture.connection_count(),
+        2,
+        "fresh agents must not share a connection pool"
+    );
+}
+
+#[test]
+fn client_routes_fail_closed_on_bad_handles_and_bounds() {
+    let provider = Http::new().expect("provider");
+    let unknown_agent = dispatch_list(
+        &provider,
+        "http:get",
+        vec![
+            Valor::Numerus(99),
+            Valor::Textus("http://127.0.0.1:1/".into()),
+        ],
+    )
+    .expect_err("unknown agent");
+    assert_eq!(unknown_agent.code, "E_INVALID_ARGS");
+
+    let unknown_reader = dispatch_list(&provider, "http:read", vec![Valor::Numerus(99)])
+        .expect_err("unknown reader");
+    assert_eq!(unknown_reader.code, "E_INVALID_ARGS");
+
+    let empty_url = dispatch_list(&provider, "http:get", vec![Valor::Textus(String::new())])
+        .expect_err("empty url");
+    assert_eq!(empty_url.code, "E_INVALID_ARGS");
+
+    let bad_method = dispatch_list(
+        &provider,
+        "http:request",
+        vec![
+            Valor::Textus("GET MORE".into()),
+            Valor::Textus("http://127.0.0.1:1/".into()),
+            headers(&[]),
+            Valor::Textus(String::new()),
+        ],
+    )
+    .expect_err("malformed method");
+    assert_eq!(bad_method.code, "E_INVALID_ARGS");
+
+    let hop_header = dispatch_list(
+        &provider,
+        "http:get",
+        vec![
+            Valor::Textus("http://127.0.0.1:1/".into()),
+            headers(&[("content-length", "1")]),
+        ],
+    )
+    .expect_err("provider-owned header");
+    assert_eq!(hop_header.code, "E_INVALID_ARGS");
+
+    let zero_read = dispatch_list(
+        &provider,
+        "http:read",
+        vec![Valor::Numerus(1), Valor::Numerus(0)],
+    )
+    .expect_err("zero max_bytes");
+    assert_eq!(zero_read.code, "E_INVALID_ARGS");
+
+    let huge_read = dispatch_list(
+        &provider,
+        "http:read",
+        vec![Valor::Numerus(1), Valor::Numerus(i64::MAX)],
+    )
+    .expect_err("huge max_bytes");
+    assert_eq!(huge_read.code, "E_INVALID_ARGS");
 }
