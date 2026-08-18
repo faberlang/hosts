@@ -6,14 +6,14 @@ use super::convert::{store_valor, with_valor};
 use super::format::{find_text, store_text, text_value};
 use super::tensor::find_tensor;
 use super::RuntimeContext;
-use crate::abi::{FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC};
-use radix_host_abi::{FaberRtValueKindV1,
-    VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
-    VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
-    VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
-};
 use crate::abi::FaberRtContextV1;
+use crate::abi::{FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC};
 use faber::{FromValor, Valor};
+use radix_host_abi::{
+    FaberRtValueKindV1, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1, VALUE_KIND_I16,
+    VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT, VALUE_KIND_U16,
+    VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_tensor(
         };
         let mut values = Vec::with_capacity(tensor.data.len());
         for value in &tensor.data {
-            let Some(item) = runtime_value_to_valor(runtime, tensor.kind, *value) else {
+            let Some(item) = runtime_value_to_valor(runtime, tensor.kind, value) else {
                 return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
             };
             values.push(item);
@@ -125,7 +125,6 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_array(
         let Some(values) = array
             .values
             .iter()
-            .copied()
             .map(|value| runtime_value_to_valor(runtime, array.kind, value))
             .collect::<Option<Vec<_>>>()
         else {
@@ -306,7 +305,6 @@ fn array_to_valor(runtime: &RuntimeContext, array: &RuntimeArray) -> Option<Valo
     let values = array
         .values
         .iter()
-        .copied()
         .map(|value| runtime_value_to_valor(runtime, array.kind, value))
         .collect::<Option<Vec<_>>>()?;
     Some(Valor::Lista(values))

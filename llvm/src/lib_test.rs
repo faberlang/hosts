@@ -103,7 +103,7 @@ fn arguments_excludes_host_argv0_and_returns_text_lista() {
         .iter()
         .filter_map(|value| match value {
             array::RuntimeValue::Ptr(handle) => {
-                let text = format::find_text(runtime, *handle)?;
+                let text = format::find_text(runtime, handle)?;
                 Some(text.value.clone())
             }
             _ => None,
@@ -3816,7 +3816,7 @@ fn llvm_device_execution_exemplar_multiply_by_two() {
         let array::RuntimeValue::F32(f) = value else {
             panic!("expected F32 at index {i}, got non-F32 RuntimeValue");
         };
-        let f_bytes: [u8; 4] = f32::to_ne_bytes(*f);
+        let f_bytes: [u8; 4] = f32::to_ne_bytes(f);
         output_bytes[i * 4..(i + 1) * 4].copy_from_slice(&f_bytes);
     }
 
@@ -4010,7 +4010,7 @@ fn llvm_golden_oracle_multiply_by_two() {
         let array::RuntimeValue::F32(f) = value else {
             panic!("expected F32 at index {i}, got non-F32 RuntimeValue");
         };
-        output_f32[i] = *f;
+        output_f32[i] = f;
     }
 
     // ── Step 3: Copy-out result to device buffer ───────────────────
@@ -4847,5 +4847,184 @@ fn sermo_materialize_i64_or_recovers_on_type_mismatch() {
     assert!(result.status.is_ok(), "recovery row must not abort");
     let runtime = unsafe { &*context.cast::<RuntimeContext>() };
     assert_eq!(find_numeric(runtime, result.value), Some(0));
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
+
+/// ABI round-trip timings for the hosts runtime-cell / handle-scan work.
+///
+/// Prints wall times and the in-arena f32 payload footprint. This is a
+/// measurement, not a performance gate.
+#[test]
+fn abi_roundtrip_perf_measurement() {
+    use std::time::Instant;
+
+    eprintln!(
+        "RuntimeValue size: {} bytes",
+        std::mem::size_of::<array::RuntimeValue>()
+    );
+
+    let mut context = ptr::null_mut();
+    assert_eq!(
+        unsafe { __faber_rt_v1_init(0, ptr::null(), &raw mut context) },
+        STATUS_OK
+    );
+
+    const N: i64 = 20_000;
+    const HANDLE_COUNT: usize = 2_000;
+
+    let array = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
+    assert!(array.status.is_ok());
+    let started = Instant::now();
+    for index in 0..N {
+        let value = index as f32;
+        assert_eq!(
+            unsafe {
+                __faber_rt_v1_array_push(
+                    context,
+                    array.value,
+                    VALUE_KIND_F32,
+                    std::ptr::from_ref(&value).cast(),
+                )
+            },
+            STATUS_OK
+        );
+    }
+    let mut out = 0.0_f32;
+    for index in 0..N {
+        assert_eq!(
+            unsafe {
+                __faber_rt_v1_array_get(
+                    context,
+                    array.value,
+                    index,
+                    VALUE_KIND_F32,
+                    std::ptr::from_mut(&mut out).cast(),
+                )
+            },
+            STATUS_OK
+        );
+    }
+    eprintln!("array push+get {N} f32: {:?}", started.elapsed());
+
+    let runtime_array = unsafe { &*array.value.cast::<RuntimeArray>() };
+    eprintln!(
+        "f32 array {N} payload bytes: {}",
+        runtime_array.values.payload_bytes()
+    );
+
+    let source = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
+    let target = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
+    for index in 0..10_000 {
+        let value = index as f32;
+        assert_eq!(
+            unsafe {
+                __faber_rt_v1_array_push(
+                    context,
+                    source.value,
+                    VALUE_KIND_F32,
+                    std::ptr::from_ref(&value).cast(),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                __faber_rt_v1_array_push(
+                    context,
+                    target.value,
+                    VALUE_KIND_F32,
+                    std::ptr::from_ref(&value).cast(),
+                )
+            },
+            STATUS_OK
+        );
+    }
+    let started = Instant::now();
+    assert_eq!(
+        unsafe { __faber_rt_v1_array_extend(context, target.value, source.value) },
+        STATUS_OK
+    );
+    eprintln!("array_extend 10000+10000 f32: {:?}", started.elapsed());
+
+    let mut handles = Vec::with_capacity(HANDLE_COUNT);
+    for _ in 0..HANDLE_COUNT {
+        let created = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_I64) };
+        assert!(created.status.is_ok());
+        handles.push(created.value);
+    }
+    let started = Instant::now();
+    let mut length = 0_i64;
+    for _ in 0..20 {
+        for handle in &handles {
+            assert_eq!(
+                unsafe { __faber_rt_v1_array_length(context, *handle, &raw mut length) },
+                STATUS_OK
+            );
+        }
+    }
+    eprintln!(
+        "array_length {HANDLE_COUNT} handles x 20: {:?}",
+        started.elapsed()
+    );
+
+    let shape = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_I64) };
+    let dim = 64_i64;
+    assert_eq!(
+        unsafe {
+            __faber_rt_v1_array_push(
+                context,
+                shape.value,
+                VALUE_KIND_I64,
+                std::ptr::from_ref(&dim).cast(),
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe {
+            __faber_rt_v1_array_push(
+                context,
+                shape.value,
+                VALUE_KIND_I64,
+                std::ptr::from_ref(&dim).cast(),
+            )
+        },
+        STATUS_OK
+    );
+    let fill = 1.0_f32;
+    let tensor = unsafe {
+        __faber_rt_v1_tensor_create(
+            context,
+            VALUE_KIND_F32,
+            std::ptr::from_ref(&fill).cast(),
+            shape.value,
+        )
+    };
+    assert!(tensor.status.is_ok());
+
+    let started = Instant::now();
+    for _ in 0..200 {
+        let flat = unsafe { __faber_rt_v1_tensor_flatten(context, tensor.value) };
+        assert!(flat.status.is_ok());
+    }
+    eprintln!("tensor_flatten 64x64 f32 x200: {:?}", started.elapsed());
+
+    let started = Instant::now();
+    for _ in 0..200 {
+        let sliced = unsafe { __faber_rt_v1_tensor_slice(context, tensor.value, 0, 32) };
+        assert!(sliced.status.is_ok());
+    }
+    eprintln!(
+        "tensor_slice 64x64->32x64 f32 x200: {:?}",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    for _ in 0..100 {
+        let sum = unsafe { __faber_rt_v1_tensor_add(context, tensor.value, tensor.value) };
+        assert!(sum.status.is_ok());
+    }
+    eprintln!("tensor_add 64x64 f32 x100: {:?}", started.elapsed());
+
     unsafe { __faber_rt_v1_shutdown(context) };
 }

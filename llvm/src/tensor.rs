@@ -4,20 +4,23 @@
 //! `sectio` materialize so the link surface stays honest without exposing Rust
 //! layout. Element-width conversion and sparse remain residual families.
 
-use super::array::{find_array, read_value, store_array, write_value, RuntimeArray, RuntimeValue};
+use super::array::{
+    find_array, read_value, store_array, store_array_cells, write_value, RuntimeArray,
+    RuntimeCells, RuntimeValue,
+};
 use super::option::store_option;
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
-use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_I64};
-use crate::abi::FaberRtContextV1;
 use faber::tensor::{
     tensor_flat_offset, tensor_shape_element_count, tensor_shape_has_element_count,
     ERR_INDEX_OUT_OF_BOUNDS, ERR_INVALID_SLICE_RANGE, ERR_NEGATIVE_DIM, ERR_NEGATIVE_INDEX,
     ERR_NEGATIVE_SLICE,
 };
 use faber::Tensor;
+use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_I64};
 use std::ffi::c_void;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
@@ -25,7 +28,7 @@ use std::panic::{self, AssertUnwindSafe};
 pub(super) struct RuntimeTensor {
     pub(super) kind: FaberRtValueKindV1,
     pub(super) shape: Vec<i64>,
-    pub(super) data: Vec<RuntimeValue>,
+    pub(super) data: RuntimeCells,
 }
 
 fn ffi_ptr(operation: impl FnOnce() -> FaberRtPtrResultV1) -> FaberRtPtrResultV1 {
@@ -79,31 +82,27 @@ pub(super) fn store_tensor(
     runtime: &mut RuntimeContext,
     kind: FaberRtValueKindV1,
     shape: Vec<i64>,
-    data: Vec<RuntimeValue>,
+    data: RuntimeCells,
 ) -> FaberRtPtrResultV1 {
     let tensor = super::StableBox::new(RuntimeTensor { kind, shape, data });
     let handle = tensor.handle();
+    let index = runtime.tensors.len();
+    runtime.tensor_by_handle.insert(handle as usize, index);
     runtime.tensors.push(tensor);
     FaberRtPtrResultV1::success(handle)
 }
 
 pub(super) fn find_tensor(runtime: &RuntimeContext, handle: *mut c_void) -> Option<&RuntimeTensor> {
-    runtime
-        .tensors
-        .iter()
-        .find(|tensor| std::ptr::eq(tensor.as_ref(), handle.cast()))
-        .map(super::StableBox::as_ref)
+    let index = *runtime.tensor_by_handle.get(&(handle as usize))?;
+    runtime.tensors.get(index).map(super::StableBox::as_ref)
 }
 
 fn find_tensor_mut(
     runtime: &mut RuntimeContext,
     handle: *mut c_void,
 ) -> Option<&mut RuntimeTensor> {
-    runtime
-        .tensors
-        .iter_mut()
-        .find(|tensor| std::ptr::eq(tensor.as_ref(), handle.cast()))
-        .map(super::StableBox::as_mut)
+    let index = *runtime.tensor_by_handle.get(&(handle as usize))?;
+    runtime.tensors.get_mut(index).map(super::StableBox::as_mut)
 }
 
 /// Read a shape or index vector from an arena integer `lista`.
@@ -120,17 +119,17 @@ fn shape_from_array(array: &RuntimeArray) -> Option<Vec<i64>> {
 /// Convert an integer `RuntimeValue` cell to its `i64` carrier, or `None` for
 /// non-integer cells and `u64` cells at or above 2^63 (the index-vector
 /// contract requires i64-fit widths).
-fn integer_cell_as_i64(value: &RuntimeValue) -> Option<i64> {
+fn integer_cell_as_i64(value: RuntimeValue) -> Option<i64> {
     Some(match value {
-        RuntimeValue::I1(value) => i64::from(*value),
-        RuntimeValue::I8(value) => i64::from(*value),
-        RuntimeValue::I16(value) => i64::from(*value),
-        RuntimeValue::I32(value) => i64::from(*value),
-        RuntimeValue::I64(value) => *value,
-        RuntimeValue::U8(value) => i64::from(*value),
-        RuntimeValue::U16(value) => i64::from(*value),
-        RuntimeValue::U32(value) => i64::from(*value),
-        RuntimeValue::U64(value) => i64::try_from(*value).ok()?,
+        RuntimeValue::I1(value) => i64::from(value),
+        RuntimeValue::I8(value) => i64::from(value),
+        RuntimeValue::I16(value) => i64::from(value),
+        RuntimeValue::I32(value) => i64::from(value),
+        RuntimeValue::I64(value) => value,
+        RuntimeValue::U8(value) => i64::from(value),
+        RuntimeValue::U16(value) => i64::from(value),
+        RuntimeValue::U32(value) => i64::from(value),
+        RuntimeValue::U64(value) => i64::try_from(value).ok()?,
         _ => return None,
     })
 }
@@ -176,7 +175,10 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_new(
         if !tensor_kind(kind) {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
-        store_tensor(runtime, kind, Vec::new(), vec![fill])
+        let Some(data) = RuntimeCells::repeat(kind, fill, 1) else {
+            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+        };
+        store_tensor(runtime, kind, Vec::new(), data)
     })
 }
 
@@ -204,7 +206,10 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_create(
         let Ok(count) = validate_shape(&shape) else {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
-        store_tensor(runtime, kind, shape, vec![fill; count])
+        let Some(data) = RuntimeCells::repeat(kind, fill, count) else {
+            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+        };
+        store_tensor(runtime, kind, shape, data)
     })
 }
 
@@ -336,7 +341,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_get(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         let value = match flat_offset(&tensor.shape, &indices) {
-            Ok(offset) => tensor.data.get(offset).copied(),
+            Ok(offset) => tensor.data.get(offset),
             Err(_) => None,
         };
         store_option(runtime, tensor.kind, value)
@@ -370,10 +375,9 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_set(
         let Ok(offset) = flat_offset(&tensor.shape, &indices) else {
             return STATUS_INVALID_ARGUMENT;
         };
-        let Some(slot) = tensor.data.get_mut(offset) else {
+        if !tensor.data.set(offset, value) {
             return STATUS_INVALID_ARGUMENT;
-        };
-        *slot = value;
+        }
         STATUS_OK
     })
 }
@@ -403,7 +407,10 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_fill(
         let Ok(count) = validate_shape(&shape) else {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
-        store_tensor(runtime, kind, shape, vec![value; count])
+        let Some(data) = RuntimeCells::repeat(kind, value, count) else {
+            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+        };
+        store_tensor(runtime, kind, shape, data)
     })
 }
 
@@ -419,7 +426,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_flatten(
         let Some(tensor) = find_tensor(runtime, handle) else {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
-        store_array(runtime, tensor.kind, tensor.data.clone())
+        store_array_cells(runtime, tensor.kind, tensor.data.clone())
     })
 }
 
@@ -491,7 +498,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_slice(
         if end_off > tensor.data.len() {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
-        let data = tensor.data[start_off..end_off].to_vec();
+        let data = tensor.data.slice(start_off, end_off);
         store_tensor(runtime, tensor.kind, shape, data)
     })
 }
@@ -533,7 +540,7 @@ fn apply_binary(
     left: &RuntimeTensor,
     right: &RuntimeTensor,
     op: BinaryOp,
-) -> Option<(Vec<i64>, Vec<RuntimeValue>)> {
+) -> Option<(Vec<i64>, RuntimeCells)> {
     match left.kind {
         radix_host_abi::VALUE_KIND_F32 => {
             let lhs = to_tensor_f32(left)?;
@@ -606,137 +613,51 @@ fn apply_binary(
 }
 
 fn to_tensor_f32(tensor: &RuntimeTensor) -> Option<Tensor<f32>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::F32(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_f32()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_f32(tensor: &Tensor<f32>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor
-            .planata()
-            .into_iter()
-            .map(RuntimeValue::F32)
-            .collect(),
-    )
+fn from_tensor_f32(tensor: &Tensor<f32>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::F32(tensor.planata()))
 }
 
 fn to_tensor_f64(tensor: &RuntimeTensor) -> Option<Tensor<f64>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::F64(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_f64()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_f64(tensor: &Tensor<f64>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor
-            .planata()
-            .into_iter()
-            .map(RuntimeValue::F64)
-            .collect(),
-    )
+fn from_tensor_f64(tensor: &Tensor<f64>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::F64(tensor.planata()))
 }
 
 fn to_tensor_i64(tensor: &RuntimeTensor) -> Option<Tensor<i64>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::I64(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_i64()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_i64(tensor: &Tensor<i64>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor
-            .planata()
-            .into_iter()
-            .map(RuntimeValue::I64)
-            .collect(),
-    )
+fn from_tensor_i64(tensor: &Tensor<i64>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::I64(tensor.planata()))
 }
 
 fn to_tensor_i32(tensor: &RuntimeTensor) -> Option<Tensor<i32>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::I32(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_i32()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_i32(tensor: &Tensor<i32>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor
-            .planata()
-            .into_iter()
-            .map(RuntimeValue::I32)
-            .collect(),
-    )
+fn from_tensor_i32(tensor: &Tensor<i32>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::I32(tensor.planata()))
 }
 
 fn to_tensor_u8(tensor: &RuntimeTensor) -> Option<Tensor<u8>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::U8(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_u8()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_u8(tensor: &Tensor<u8>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor.planata().into_iter().map(RuntimeValue::U8).collect(),
-    )
+fn from_tensor_u8(tensor: &Tensor<u8>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::U8(tensor.planata()))
 }
 
 fn to_tensor_u16(tensor: &RuntimeTensor) -> Option<Tensor<u16>> {
-    let data = tensor
-        .data
-        .iter()
-        .map(|value| match value {
-            RuntimeValue::U16(value) => Some(*value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Tensor::structa(data, &tensor.shape).ok()
+    Tensor::structa(tensor.data.as_u16()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_u16(tensor: &Tensor<u16>) -> (Vec<i64>, Vec<RuntimeValue>) {
-    (
-        tensor.magnitudines(),
-        tensor
-            .planata()
-            .into_iter()
-            .map(RuntimeValue::U16)
-            .collect(),
-    )
+fn from_tensor_u16(tensor: &Tensor<u16>) -> (Vec<i64>, RuntimeCells) {
+    (tensor.magnitudines(), RuntimeCells::U16(tensor.planata()))
 }
 
 /// Elementwise add with broadcast.
@@ -895,12 +816,17 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_convert(
         if from_kind == to_kind {
             return store_tensor(runtime, to_kind, tensor.shape.clone(), tensor.data.clone());
         }
-        let mut data = Vec::with_capacity(tensor.data.len());
+        let Some(mut data) = RuntimeCells::empty(to_kind) else {
+            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+        };
+        data.reserve(tensor.data.len());
         for value in &tensor.data {
-            let Some(converted) = cast_runtime_value(*value, from_kind, to_kind) else {
+            let Some(converted) = cast_runtime_value(value, from_kind, to_kind) else {
                 return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
             };
-            data.push(converted);
+            if !data.push(converted) {
+                return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+            }
         }
         store_tensor(runtime, to_kind, tensor.shape.clone(), data)
     })
@@ -1016,11 +942,14 @@ pub(super) fn store_tensor_from_parts(
     shape: Vec<i64>,
     data: Vec<RuntimeValue>,
 ) -> FaberRtPtrResultV1 {
+    let Some(data) = RuntimeCells::from_values(kind, data) else {
+        return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+    };
     store_tensor(runtime, kind, shape, data)
 }
 
 pub(super) fn tensor_to_runtime_values(
     tensor: &RuntimeTensor,
 ) -> Option<(Vec<i64>, Vec<RuntimeValue>)> {
-    Some((tensor.shape.clone(), tensor.data.clone()))
+    Some((tensor.shape.clone(), tensor.data.to_values()))
 }

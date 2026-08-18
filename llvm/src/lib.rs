@@ -62,15 +62,6 @@ use convert::{
     __faber_rt_v1_valor_i1, __faber_rt_v1_valor_i64, __faber_rt_v1_valor_nihil,
     __faber_rt_v1_valor_text,
 };
-#[cfg(test)]
-use radix_host_abi::{
-    FaberRtValueKindV1, ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST,
-    ARRAY_OPTION_REMOVE_FIRST, ARRAY_OPTION_REMOVE_LAST, ARRAY_RANGE_DROP_FIRST, ARRAY_RANGE_SLICE,
-    ARRAY_RANGE_TAKE, ARRAY_RANGE_TAKE_LAST, INSTANS_PRECISION_MICROS, INSTANS_PRECISION_MILLIS,
-    INSTANS_PRECISION_SECONDS, VALUE_KIND_ASCII, VALUE_KIND_F16, VALUE_KIND_F32, VALUE_KIND_F64,
-    VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR,
-    VALUE_KIND_TEXT, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
-};
 use faber::{display_bivalens, display_fractus, Valor};
 #[cfg(test)]
 use format::{
@@ -123,6 +114,15 @@ use provider::{
     __faber_rt_v1_toml_solve, __faber_rt_v1_valor_cape,
 };
 #[cfg(test)]
+use radix_host_abi::{
+    FaberRtValueKindV1, ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST,
+    ARRAY_OPTION_REMOVE_FIRST, ARRAY_OPTION_REMOVE_LAST, ARRAY_RANGE_DROP_FIRST, ARRAY_RANGE_SLICE,
+    ARRAY_RANGE_TAKE, ARRAY_RANGE_TAKE_LAST, INSTANS_PRECISION_MICROS, INSTANS_PRECISION_MILLIS,
+    INSTANS_PRECISION_SECONDS, VALUE_KIND_ASCII, VALUE_KIND_F16, VALUE_KIND_F32, VALUE_KIND_F64,
+    VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR,
+    VALUE_KIND_TEXT, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
+};
+#[cfg(test)]
 use regex_rt::{
     __faber_rt_v1_regex_from_ascii, __faber_rt_v1_regex_from_text, __faber_rt_v1_regex_get_text,
     __faber_rt_v1_regex_literal_1_ptr_to_ptr,
@@ -135,7 +135,8 @@ use sermo::{
 };
 #[cfg(test)]
 use solum::{
-    __faber_rt_v1_read_line_0_to_ptr, __faber_rt_v1_solum_read_bytes, __faber_rt_v1_solum_read_lines,
+    __faber_rt_v1_read_line_0_to_ptr, __faber_rt_v1_solum_read_bytes,
+    __faber_rt_v1_solum_read_lines,
 };
 use sparsa::RuntimeSparse;
 #[cfg(test)]
@@ -143,6 +144,7 @@ use sparsa::{
     __faber_rt_v1_sparse_densify, __faber_rt_v1_sparse_from_tensor, __faber_rt_v1_sparse_get,
     __faber_rt_v1_sparse_new, __faber_rt_v1_sparse_nonzero, __faber_rt_v1_sparse_set,
 };
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::fmt::Display;
 use std::io::{self, Write};
@@ -244,10 +246,12 @@ struct RuntimeContext {
     numeric_boxes: Vec<StableBox<i64>>,
     instants: Vec<StableBox<faber::Instans>>,
     arrays: Vec<StableBox<RuntimeArray>>,
+    array_by_handle: HashMap<usize, usize>,
     options: Vec<StableBox<RuntimeOption>>,
     maps: Vec<StableBox<RuntimeMap>>,
     sets: Vec<StableBox<RuntimeSet>>,
     tensors: Vec<StableBox<RuntimeTensor>>,
+    tensor_by_handle: HashMap<usize, usize>,
     sparses: Vec<StableBox<RuntimeSparse>>,
     gradients: Vec<StableBox<gradient::GradientStorage>>,
     gradient_views: Vec<StableBox<gradient::GradientViewV1>>,
@@ -298,10 +302,12 @@ pub unsafe extern "C" fn __faber_rt_v1_init(
             numeric_boxes: Vec::new(),
             instants: Vec::new(),
             arrays: Vec::new(),
+            array_by_handle: HashMap::new(),
             options: Vec::new(),
             maps: Vec::new(),
             sets: Vec::new(),
             tensors: Vec::new(),
+            tensor_by_handle: HashMap::new(),
             sparses: Vec::new(),
             gradients: Vec::new(),
             gradient_views: Vec::new(),
@@ -574,7 +580,7 @@ pub(crate) fn opaque_value_text(runtime: &RuntimeContext, handle: *mut c_void) -
         // byte-exact order is guaranteed).
         let mut rendered = Vec::with_capacity(set.values.len());
         for element in &set.values {
-            rendered.push(opaque_element_text(runtime, set.kind, element)?);
+            rendered.push(opaque_element_text(runtime, set.kind, *element)?);
         }
         return Some(format!("{{{}}}", rendered.join(", ")));
     }
@@ -585,19 +591,19 @@ pub(crate) fn opaque_value_text(runtime: &RuntimeContext, handle: *mut c_void) -
 fn opaque_element_text(
     runtime: &RuntimeContext,
     kind: radix_host_abi::FaberRtValueKindV1,
-    element: &array::RuntimeValue,
+    element: array::RuntimeValue,
 ) -> Option<String> {
     Some(match (kind, element) {
         (radix_host_abi::VALUE_KIND_PTR, array::RuntimeValue::Ptr(element_handle)) => {
             // Text payload (arena handle or static text-literal descriptor)
             // quotes it (`"prima"`), matching `Vec<String>` Debug shape.
-            let payload = format::find_text(runtime, *element_handle)
+            let payload = format::find_text(runtime, element_handle)
                 .map(|text| text.value.clone())
                 .or_else(|| format::text_value(element_handle.cast()));
             format!("{:?}", payload?)
         }
         (radix_host_abi::VALUE_KIND_I1, array::RuntimeValue::I1(value)) => {
-            format!("{:?}", *value != 0)
+            format!("{:?}", value != 0)
         }
         (radix_host_abi::VALUE_KIND_I8, array::RuntimeValue::I8(value)) => {
             format!("{value}")
@@ -623,12 +629,8 @@ fn opaque_element_text(
         (radix_host_abi::VALUE_KIND_U64, array::RuntimeValue::U64(value)) => {
             format!("{value}")
         }
-        (radix_host_abi::VALUE_KIND_F32, array::RuntimeValue::F32(value)) => {
-            display_fractus(*value)
-        }
-        (radix_host_abi::VALUE_KIND_F64, array::RuntimeValue::F64(value)) => {
-            display_fractus(*value)
-        }
+        (radix_host_abi::VALUE_KIND_F32, array::RuntimeValue::F32(value)) => display_fractus(value),
+        (radix_host_abi::VALUE_KIND_F64, array::RuntimeValue::F64(value)) => display_fractus(value),
         _ => return None,
     })
 }
