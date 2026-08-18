@@ -28,6 +28,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         "call" => call(&args[1..]),
         "wasm-call" => wasm_call(&args[1..]),
         "component-call" => component_call(&args[1..]),
+        "device-execute" => device_execute(&args[1..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -119,10 +120,32 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     Ok(())
 }
 
+fn device_execute(args: &[String]) -> Result<ExitCode, String> {
+    let parsed = faber_host_macos_arm64::device_execute::parse_device_execute_args(args)?;
+    match faber_host_macos_arm64::device_execute::run_device_execute(&parsed) {
+        Ok(receipt) => {
+            let json = faber_host_macos_arm64::device_execute::receipt_to_json(&receipt)
+                .map_err(|error| error.to_string())?;
+            std::io::Write::write_all(&mut std::io::stdout(), &json)
+                .map_err(|error| format!("failed to write JSON: {error}"))?;
+            println!();
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            print_json(&error)?;
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
 fn print_usage() {
     println!("usage:");
     println!("  faber-host-macos-arm64 manifest");
     println!("  faber-host-macos-arm64 call <name> [json-object]");
     println!("  faber-host-macos-arm64 wasm-call <module> <export> <route-code>");
     println!("  faber-host-macos-arm64 component-call <component> <export> <route-code>");
+    println!(
+        "  faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json>"
+    );
 }

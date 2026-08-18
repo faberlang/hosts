@@ -125,6 +125,17 @@ impl DeviceBufferRole {
             Self::InOut => "in-out",
         }
     }
+
+    /// Parse a role from its stable spelling.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "input" => Some(Self::Input),
+            "output" => Some(Self::Output),
+            "in-out" => Some(Self::InOut),
+            _ => None,
+        }
+    }
 }
 
 /// How long a buffer's storage lives in the device program (S2-4).
@@ -156,6 +167,17 @@ impl DeviceBufferLifetime {
             Self::PerProgram => "per-program",
             Self::PerStep => "per-step",
             Self::ObservationPoint => "observation-point",
+        }
+    }
+
+    /// Parse a lifetime from its stable spelling.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "per-program" => Some(Self::PerProgram),
+            "per-step" => Some(Self::PerStep),
+            "observation-point" => Some(Self::ObservationPoint),
+            _ => None,
         }
     }
 }
@@ -193,6 +215,17 @@ impl DeviceBufferInitialization {
             Self::KernelInitialized => "kernel-initialized",
         }
     }
+
+    /// Parse an initialization policy from its stable spelling.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "zero-fill" => Some(Self::ZeroFill),
+            "host-provided" => Some(Self::HostProvided),
+            "kernel-initialized" => Some(Self::KernelInitialized),
+            _ => None,
+        }
+    }
 }
 
 /// Program execution-lifetime regime (S2-4), mirroring the radix S1-1
@@ -208,6 +241,27 @@ pub enum DeviceProgramLifetime {
     SingleRun,
     /// Repeating training step; per-step buffers recycle between iterations.
     RepeatingStep,
+}
+
+impl DeviceProgramLifetime {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Self::SingleRun => "single-run",
+            Self::RepeatingStep => "repeating-step",
+        }
+    }
+
+    /// Parse a program lifetime from its stable spelling.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "single-run" => Some(Self::SingleRun),
+            "repeating-step" => Some(Self::RepeatingStep),
+            _ => None,
+        }
+    }
 }
 
 /// One typed buffer slot of a kernel.
@@ -1108,8 +1162,11 @@ impl DeviceDescriptor {
                 // change the receipt.
                 let mut slots: Vec<&DescriptorBuffer> = kernel.buffers.iter().collect();
                 slots.sort_by(|left, right| {
-                    (left.buffer_id, left.version, left.binding)
-                        .cmp(&(right.buffer_id, right.version, right.binding))
+                    (left.buffer_id, left.version, left.binding).cmp(&(
+                        right.buffer_id,
+                        right.version,
+                        right.binding,
+                    ))
                 });
                 for slot in slots {
                     push_u32(&mut bytes, slot.buffer_id);

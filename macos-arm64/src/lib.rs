@@ -11,6 +11,7 @@ pub mod composite_host;
 pub mod cuda_host;
 pub mod cuda_launch_adapter;
 pub mod device_descriptor;
+pub mod device_execute;
 pub mod device_host;
 pub mod device_registry;
 pub mod kernel;
