@@ -9,7 +9,7 @@ license = "MIT"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-faber = { package = "faber-runtime", path = "../../faber/runtime/rust" }
+faber = { path = "../../faber/runtime/rust" }
 # S3-U3 re-point (faber-target-runtime inventory §3.4): the C ABI symbol/layout
 # authority is radix-host-abi (compiler-owned). The LLVM host side of the ABI
 # symbols lives in this crate; the historical `faber::host_abi` carrier module
