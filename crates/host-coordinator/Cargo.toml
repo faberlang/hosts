@@ -10,8 +10,8 @@ publish = false
 pedantic = "deny"
 
 [dependencies]
-# GENRUST-CONTRACT: the faber/runtime/rust package (alias faber). The
+# GENRUST-CONTRACT: the faber/runtime/rust package (crate name faber). The
 # coordinator consumes Valor/frame carriers only — no device session behavior
-# enters the runtime contract (C2), and no faber-runtime dependency remains.
-faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
+# enters the runtime contract (C2).
+faber = { path = "../../../faber/runtime/rust" }
 sha2 = "0.10"

@@ -11,7 +11,7 @@ pedantic = "deny"
 [dev-dependencies]
 aleator = { path = "../aleator" }
 consolum = { path = "../consolum" }
-faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
+faber = { path = "../../../faber/runtime/rust" }
 host-kernel = { path = "../host-kernel" }
 processus = { path = "../processus" }
 solum = { path = "../solum" }
