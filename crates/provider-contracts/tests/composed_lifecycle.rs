@@ -130,6 +130,7 @@ const PROCESSUS_ROUTES: &[&str] = &[
 const SOLUM_ROUTES: &[&str] = &[
     "solum:lege",
     "solum:hauri",
+    "solum:digestio",
     "solum:hauriet",
     "solum:partem",
     "solum:inveni",
@@ -334,6 +335,7 @@ fn public_fixture(route: &str, workspace: &mut TestWorkspace) -> DispatchFixture
 
         "solum:lege"
         | "solum:hauri"
+        | "solum:digestio"
         | "solum:hauriet"
         | "solum:carpe"
         | "solum:carpiet"
@@ -666,6 +668,6 @@ fn composed_kernel_registers_unique_provider_identities_and_routes() {
         }
     }
 
-    assert_eq!(admitted_routes.len(), 80);
+    assert_eq!(admitted_routes.len(), 81);
     std::env::remove_var(format!("FABER_PROVIDER_CONTRACTS_{}", std::process::id()));
 }

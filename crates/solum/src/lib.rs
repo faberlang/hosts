@@ -5,6 +5,7 @@ use host_kernel::{
     DispatchContext, HostError, HostResult, Kernel, Provider, ProviderRegistration, ProviderReply,
     RequestFrame,
 };
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -59,6 +60,7 @@ impl Provider for Solum {
         match request.route.as_str() {
             "solum:lege" => read_text(&request.opener, request.target.as_deref()),
             "solum:hauri" | "solum:hauriet" => read_bytes(&request.opener),
+            "solum:digestio" => digest_file(&request.opener),
             "solum:partem" => read_byte_range(&request.opener),
             "solum:inveni" => find_text_range(&request.opener),
             "solum:carpe" | "solum:carpiet" => read_lines(&request.opener),
@@ -131,6 +133,39 @@ fn read_bytes(opener: &Valor) -> HostResult<ProviderReply> {
     let bytes = fs::read(&path)
         .map_err(|error| HostError::internal(format!("solum:hauri failed: {error}")))?;
     Ok(ProviderReply::byte(bytes))
+}
+
+/// SHA-256 of the file at `via`, streamed so large artifacts are not loaded whole.
+///
+/// The hex body is the 64-digit lowercase digest Gradus admission takes as
+/// `digestio`. The algorithm name (`sha-256`) stays with the caller.
+fn digest_file(opener: &Valor) -> HostResult<ProviderReply> {
+    let path = string_arg(opener, 0, "via")?;
+    let mut file = File::open(&path)
+        .map_err(|error| HostError::internal(format!("solum:digestio open failed: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|error| HostError::internal(format!("solum:digestio read failed: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(ProviderReply::item(Valor::Textus(hex_lower(
+        hasher.finalize().as_slice(),
+    ))))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 fn read_byte_range(opener: &Valor) -> HostResult<ProviderReply> {
@@ -560,9 +595,10 @@ mod tests {
         let mut kernel = Kernel::new();
         register(&mut kernel).expect("register solum");
         let calls = &kernel.manifest().providers[0].calls;
-        assert_eq!(calls.len(), 45);
+        assert_eq!(calls.len(), 46);
         assert!(calls.iter().any(|call| call.route == "solum:modum"));
         assert!(calls.iter().any(|call| call.route == "solum:vincula"));
+        assert!(calls.iter().any(|call| call.route == "solum:digestio"));
         assert!(!calls.iter().any(|call| call.route == "solum:fundet"));
         assert!(!calls.iter().any(|call| call.route == "solum:leget"));
     }
@@ -911,6 +947,89 @@ mod tests {
             home_value(None, None),
             Err("no home directory environment variable")
         );
+    }
+
+    // FIPS 180-4 SHA-256("abc") — the pinned file-digest oracle.
+    const FIPS_ABC_SHA256: &str =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn digestio_of_known_file_matches_fips_180_4_abc() {
+        let provider = Solum::new().expect("provider");
+        let path = std::env::temp_dir().join(format!(
+            "faber-public-solum-digestio-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"abc").expect("fixture");
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "digestio-abc".into(),
+                    route: "solum:digestio".into(),
+                    opener: Valor::Textus(path.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect("solum:digestio");
+        assert!(
+            matches!(
+                reply.contents.as_slice(),
+                [ProviderContent::Item(Valor::Textus(hex))] if hex == FIPS_ABC_SHA256
+            ),
+            "solum:digestio must return the pinned SHA-256 hex, got {reply:?}"
+        );
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn digestio_of_empty_file_matches_fips_180_4_empty() {
+        let provider = Solum::new().expect("provider");
+        let path = std::env::temp_dir().join(format!(
+            "faber-public-solum-digestio-empty-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"").expect("fixture");
+        let reply = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "digestio-empty".into(),
+                    route: "solum:digestio".into(),
+                    opener: Valor::Textus(path.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect("solum:digestio empty");
+        assert!(matches!(
+            reply.contents.as_slice(),
+            [ProviderContent::Item(Valor::Textus(hex))]
+                if hex == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn digestio_missing_path_is_internal_error() {
+        let provider = Solum::new().expect("provider");
+        let missing = std::env::temp_dir().join(format!(
+            "faber-public-solum-digestio-missing-{}",
+            std::process::id()
+        ));
+        assert!(!missing.exists());
+        let error = provider
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "digestio-missing".into(),
+                    route: "solum:digestio".into(),
+                    opener: Valor::Textus(missing.to_string_lossy().into_owned()),
+                    target: None,
+                },
+                &context(),
+            )
+            .expect_err("missing file must fail");
+        assert_eq!(error.code, "E_INTERNAL");
+        assert!(error.message.contains("solum:digestio"));
     }
 
     #[test]

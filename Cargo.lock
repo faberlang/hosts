@@ -1469,6 +1469,7 @@ version = "0.1.0"
 dependencies = [
  "faber-runtime",
  "host-kernel",
+ "sha2",
  "tempfile",
 ]
 
