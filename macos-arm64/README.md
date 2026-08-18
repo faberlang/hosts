@@ -48,6 +48,7 @@ cargo run -p faber-host-macos-arm64 -- call host:echo '{"value":"salve"}'
 cargo run -p faber-host-macos-arm64 -- call pg:query '{}'
 cargo run -p faber-host-macos-arm64 -- wasm-call macos-arm64/tests/fixtures/core-route-proof.wat route 1
 cargo run -p faber-host-macos-arm64 -- component-call macos-arm64/tests/fixtures/route-proof.wat route 1
+cargo run -p faber-host-macos-arm64 -- device-execute --backend metal --descriptor descriptor.json --module module.bin --inputs inputs.json
 ```
 
 The `manifest` command emits a JSON capability manifest containing built-in
@@ -72,6 +73,12 @@ ABI is intentionally tiny: route code `1` maps to `host:echo`, and route code
 `Frame`, routes it through the same `HostKernel`, and prints the routed response
 frame as JSON. This proves the Wasm/component boundary without committing the
 final Faber WIT world or string ABI.
+
+The `device-execute` command runs a packed device descriptor through the
+composite host (`create_program_session` / `session.execute`). The descriptor
+and inputs are JSON files; the module image is a raw file. Success prints a
+receipt JSON and exits 0. Host failures print a structured error JSON and
+exit 2.
 
 ## Frame Topology
 
