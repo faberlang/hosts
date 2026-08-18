@@ -6,14 +6,14 @@
 
 use super::array::{store_array, RuntimeValue};
 use super::option::store_option;
-use super::tensor::store_tensor;
+use super::tensor::store_tensor_from_parts;
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
-use radix_host_abi::{VALUE_KIND_I64, VALUE_KIND_PTR};
-use crate::abi::FaberRtContextV1;
 use faber::{Intervallum, IntervallumKind};
+use radix_host_abi::{VALUE_KIND_I64, VALUE_KIND_PTR};
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -260,6 +260,6 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_materialize_tensor(
         let values = interval.ad_lista();
         let len = i64::try_from(values.len()).unwrap_or(0);
         let data = values.into_iter().map(RuntimeValue::I64).collect();
-        store_tensor(runtime, VALUE_KIND_I64, vec![len], data)
+        store_tensor_from_parts(runtime, VALUE_KIND_I64, vec![len], data)
     })
 }

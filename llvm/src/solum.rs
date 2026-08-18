@@ -4,12 +4,12 @@ use super::array::{store_array, RuntimeValue};
 use super::format::{store_text, text_value};
 use super::valor_aggregate::store_octeti;
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR,
     STATUS_OK,
 };
 use radix_host_abi::VALUE_KIND_PTR;
-use crate::abi::FaberRtContextV1;
 use std::io::{self, BufRead};
 
 #[no_mangle]

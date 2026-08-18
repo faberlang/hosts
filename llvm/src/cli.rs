@@ -16,11 +16,9 @@ use super::format::store_text_owned;
 use super::option::store_option;
 use super::valor_aggregate::store_octeti;
 use super::{RuntimeContext, StableBox};
-use crate::abi::{FaberRtPtrResultV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC};
-use radix_host_abi::{VALUE_KIND_I1,
-    VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT,
-};
 use crate::abi::FaberRtContextV1;
+use crate::abi::{FaberRtPtrResultV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC};
+use radix_host_abi::{VALUE_KIND_I1, VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT};
 use std::ffi::c_void;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};

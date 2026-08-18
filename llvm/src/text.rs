@@ -1,17 +1,17 @@
 //! First-order Unicode text queries and transformations for LLVM-host handles.
 
-use super::array::{RuntimeArray, RuntimeValue};
+use super::array::{store_array, RuntimeValue};
 use super::format::{store_text, text_value};
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
     STATUS_PANIC,
 };
-use radix_host_abi::{VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32,
-    VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64,
-    VALUE_KIND_U8,
+use radix_host_abi::{
+    VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8,
+    VALUE_KIND_PTR, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
 };
-use crate::abi::FaberRtContextV1;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{self, AssertUnwindSafe};
 
@@ -200,13 +200,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_split(
             values.push(RuntimeValue::Ptr(result.value));
         }
         let runtime = unsafe { &mut *context.cast::<RuntimeContext>() };
-        let array = super::StableBox::new(RuntimeArray {
-            kind: VALUE_KIND_PTR,
-            values,
-        });
-        let handle = array.handle();
-        runtime.arrays.push(array);
-        FaberRtPtrResultV1::success(handle)
+        store_array(runtime, VALUE_KIND_PTR, values)
     })
 }
 

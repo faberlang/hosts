@@ -1,11 +1,11 @@
 //! Scalar template formatting and runtime-owned LLVM text handles.
 
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
     STATUS_PANIC, STATUS_UNSUPPORTED,
 };
-use crate::abi::FaberRtContextV1;
 use faber::{display_bivalens, display_fractus};
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};

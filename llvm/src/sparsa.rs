@@ -6,14 +6,14 @@
 use super::array::{find_array, read_value, write_value, RuntimeValue};
 use super::tensor::{find_tensor, store_tensor_from_parts, tensor_to_runtime_values};
 use super::RuntimeContext;
+use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
-use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_F32, VALUE_KIND_F64,
-    VALUE_KIND_I32, VALUE_KIND_I64,
-};
-use crate::abi::FaberRtContextV1;
 use faber::{Sparsa, Tensor};
+use radix_host_abi::{
+    FaberRtValueKindV1, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I32, VALUE_KIND_I64,
+};
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -100,7 +100,7 @@ fn shape_from_array(array: &super::array::RuntimeArray) -> Option<Vec<i64>> {
         .values
         .iter()
         .map(|value| match value {
-            RuntimeValue::I64(dim) => Some(*dim),
+            RuntimeValue::I64(dim) => Some(dim),
             _ => None,
         })
         .collect()
