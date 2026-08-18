@@ -1,4 +1,4 @@
-//! Target-specific loopback HTTP/1.1 provider for the generic `http:*` family.
+//! Target-specific HTTP/1.1 provider for the generic `http:*` family.
 //!
 //! The provider exposes only the manifest contract. Framework routing,
 //! middleware, and request/response application semantics remain Faber code.
@@ -19,13 +19,16 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const MAX_CONFIGURED_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const ACCEPT_BACKLOG: i32 = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_ID_PREFIX: &str = "http-";
 
 pub struct Http {
@@ -35,9 +38,13 @@ pub struct Http {
 
 struct HttpState {
     listeners: Mutex<HashMap<i64, Arc<ListenerState>>>,
-    pending: Mutex<BTreeMap<String, PendingRequest>>,
+    connections: Mutex<HashMap<i64, Arc<ConnectionSlot>>>,
+    requests: Mutex<HashMap<String, i64>>,
+    writers: Mutex<HashMap<i64, i64>>,
     next_listener: AtomicI64,
     next_request: AtomicU64,
+    next_connection: AtomicI64,
+    next_writer: AtomicI64,
 }
 
 struct ListenerState {
@@ -46,9 +53,23 @@ struct ListenerState {
     stopped: AtomicBool,
 }
 
-struct PendingRequest {
+struct ConnectionSlot {
+    id: i64,
     listener: i64,
+    closer: TcpStream,
+    inner: Mutex<Connection>,
+}
+
+struct Connection {
     stream: TcpStream,
+    leftover: Vec<u8>,
+    phase: Phase,
+}
+
+enum Phase {
+    Idle,
+    Pending { request_id: String },
+    Streaming { request_id: String, writer: i64 },
 }
 
 struct RequestParts {
@@ -66,6 +87,12 @@ struct ParsedHeaders {
     content_length: usize,
 }
 
+enum PollRead {
+    Ready(RequestParts),
+    Idle,
+    Closed,
+}
+
 impl Http {
     /// Create a new [`Http`] provider.
     ///
@@ -77,9 +104,13 @@ impl Http {
             registration: ProviderRegistration::new(host_kernel::parse_manifest(manifest_json())?),
             state: Arc::new(HttpState {
                 listeners: Mutex::new(HashMap::new()),
-                pending: Mutex::new(BTreeMap::new()),
+                connections: Mutex::new(HashMap::new()),
+                requests: Mutex::new(HashMap::new()),
+                writers: Mutex::new(HashMap::new()),
                 next_listener: AtomicI64::new(1),
                 next_request: AtomicU64::new(1),
+                next_connection: AtomicI64::new(1),
+                next_writer: AtomicI64::new(1),
             }),
         })
     }
@@ -114,6 +145,9 @@ impl Provider for Http {
             "http:listen" => self.listen(&request.opener),
             "http:accept" => self.accept(&request.opener, context),
             "http:respond" => self.respond(&request.opener),
+            "http:respond_open" => self.respond_open(&request.opener),
+            "http:respond_chunk" => self.respond_chunk(&request.opener, context),
+            "http:respond_finish" => self.respond_finish(&request.opener, context),
             "http:stop" => self.stop(&request.opener),
             other => Err(HostError::no_route(format!(
                 "no built-in http syscall registered for {other}"
@@ -125,20 +159,33 @@ impl Provider for Http {
 impl Http {
     fn listen(&self, opener: &Valor) -> HostResult<ProviderReply> {
         let values = list_args(opener, "http:listen")?;
-        if !(1..=2).contains(&values.len()) {
+        if !(1..=3).contains(&values.len()) {
             return Err(HostError::invalid_args(
-                "http:listen requires [port] or [port, max_body_bytes]",
+                "http:listen requires [port], [port, max_body_bytes], or [port, max_body_bytes, bind_host]",
             ));
         }
         let port = integer_arg(&values[0], "port")?;
         let port = u16::try_from(port)
             .map_err(|_| HostError::invalid_args("http:listen port must be between 0 and 65535"))?;
-        let max_body_bytes = match values.get(1) {
-            Some(value) => bounded_body_size(integer_arg(value, "max_body_bytes")?)?,
-            None => DEFAULT_MAX_BODY_BYTES,
+        let (max_body_bytes, bind_host) = match values.len() {
+            1 => (DEFAULT_MAX_BODY_BYTES, DEFAULT_BIND_HOST.to_owned()),
+            2 => match &values[1] {
+                Valor::Textus(host) | Valor::Instans(host) => {
+                    (DEFAULT_MAX_BODY_BYTES, parse_bind_host(host)?)
+                }
+                other => (
+                    bounded_body_size(integer_arg(other, "max_body_bytes")?)?,
+                    DEFAULT_BIND_HOST.to_owned(),
+                ),
+            },
+            _ => (
+                bounded_body_size(integer_arg(&values[1], "max_body_bytes")?)?,
+                parse_bind_host(&text_arg(&values[2], "bind_host")?)?,
+            ),
         };
-        let listener = TcpListener::bind(("127.0.0.1", port))
+        let listener = TcpListener::bind((bind_host.as_str(), port))
             .map_err(|error| HostError::internal(format!("http:listen bind failed: {error}")))?;
+        apply_accept_backlog(&listener)?;
         listener
             .set_nonblocking(true)
             .map_err(|error| HostError::internal(format!("http:listen setup failed: {error}")))?;
@@ -168,27 +215,12 @@ impl Http {
             if listener.stopped.load(Ordering::SeqCst) {
                 return Err(HostError::invalid_args("http:accept listener is stopped"));
             }
+            if let Some(request) = self.poll_idle_connection(handle, &listener, context)? {
+                return Ok(ProviderReply::item(request));
+            }
             match listener.listener.accept() {
                 Ok((stream, _peer)) => {
-                    let (parts, stream) = read_request(
-                        stream,
-                        listener.max_body_bytes,
-                        &listener.stopped,
-                        context,
-                        &self.state.next_request,
-                    )?;
-                    let mut pending = lock(&self.state.pending, "http pending requests")?;
-                    if listener.stopped.load(Ordering::SeqCst) {
-                        return Err(HostError::invalid_args("http:accept listener is stopped"));
-                    }
-                    let request = request_carrier(&parts);
-                    pending.insert(
-                        parts.id.clone(),
-                        PendingRequest {
-                            listener: handle,
-                            stream,
-                        },
-                    );
+                    let request = self.admit_connection(handle, stream, &listener, context)?;
                     return Ok(ProviderReply::item(request));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -201,6 +233,111 @@ impl Http {
         }
     }
 
+    fn admit_connection(
+        &self,
+        listener_handle: i64,
+        stream: TcpStream,
+        listener: &ListenerState,
+        context: &DispatchContext,
+    ) -> HostResult<Valor> {
+        let closer = stream
+            .try_clone()
+            .map_err(|error| HostError::internal(format!("http:accept clone failed: {error}")))?;
+        let mut connection = Connection {
+            stream,
+            leftover: Vec::new(),
+            phase: Phase::Idle,
+        };
+        let parts = read_request(
+            &mut connection,
+            listener.max_body_bytes,
+            &listener.stopped,
+            context,
+            &self.state.next_request,
+        )?;
+        if listener.stopped.load(Ordering::SeqCst) {
+            return Err(HostError::invalid_args("http:accept listener is stopped"));
+        }
+        let connection_id = self.state.next_connection.fetch_add(1, Ordering::SeqCst);
+        let request_id = parts.id.clone();
+        let slot = Arc::new(ConnectionSlot {
+            id: connection_id,
+            listener: listener_handle,
+            closer,
+            inner: Mutex::new({
+                connection.phase = Phase::Pending {
+                    request_id: request_id.clone(),
+                };
+                connection
+            }),
+        });
+        {
+            let mut connections = lock(&self.state.connections, "http connections")?;
+            connections.insert(connection_id, slot);
+        }
+        {
+            let mut requests = lock(&self.state.requests, "http requests")?;
+            requests.insert(request_id, connection_id);
+        }
+        Ok(request_carrier(&parts, connection_id))
+    }
+
+    fn poll_idle_connection(
+        &self,
+        listener_handle: i64,
+        listener: &ListenerState,
+        context: &DispatchContext,
+    ) -> HostResult<Option<Valor>> {
+        let idle = {
+            let connections = lock(&self.state.connections, "http connections")?;
+            connections
+                .values()
+                .filter(|slot| slot.listener == listener_handle)
+                .filter_map(|slot| {
+                    let connection = slot.inner.try_lock().ok()?;
+                    matches!(connection.phase, Phase::Idle).then(|| Arc::clone(slot))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut closed = Vec::new();
+        for slot in idle {
+            let outcome = {
+                let mut connection = lock(&slot.inner, "http connection")?;
+                if !matches!(connection.phase, Phase::Idle) {
+                    continue;
+                }
+                poll_request(
+                    &mut connection,
+                    listener.max_body_bytes,
+                    &listener.stopped,
+                    context,
+                    &self.state.next_request,
+                    false,
+                )?
+            };
+            match outcome {
+                PollRead::Ready(parts) => {
+                    let request_id = parts.id.clone();
+                    {
+                        let mut connection = lock(&slot.inner, "http connection")?;
+                        connection.phase = Phase::Pending {
+                            request_id: request_id.clone(),
+                        };
+                    }
+                    let mut requests = lock(&self.state.requests, "http requests")?;
+                    requests.insert(request_id, slot.id);
+                    return Ok(Some(request_carrier(&parts, slot.id)));
+                }
+                PollRead::Closed => closed.push(slot.id),
+                PollRead::Idle => {}
+            }
+        }
+        for connection_id in closed {
+            self.drop_connection(connection_id)?;
+        }
+        Ok(None)
+    }
+
     fn respond(&self, opener: &Valor) -> HostResult<ProviderReply> {
         let values = list_args(opener, "http:respond")?;
         if values.len() != 4 {
@@ -209,36 +346,155 @@ impl Http {
             ));
         }
         let request_id = text_arg(&values[0], "request_id")?;
-        let status = integer_arg(&values[1], "status")?;
-        let status = u16::try_from(status)
-            .ok()
-            .filter(|status| (100..=599).contains(status))
-            .ok_or_else(|| {
-                HostError::invalid_args("http:respond status must be between 100 and 599")
-            })?;
+        let status = status_arg(&values[1], "http:respond")?;
         let headers = response_headers(&values[2])?;
         let body = bytes_value(&values[3], "body")?;
-        let mut pending = lock(&self.state.pending, "http pending requests")?;
-        let mut request = pending.remove(&request_id).ok_or_else(|| {
-            HostError::invalid_args(format!("http:respond unknown request {request_id}"))
-        })?;
-        drop(pending);
+        let connection_id = self.take_request(&request_id)?;
+        let slot = self.take_connection(connection_id)?;
+        let mut connection = lock(&slot.inner, "http connection")?;
+        match &connection.phase {
+            Phase::Pending {
+                request_id: pending,
+            } if pending == &request_id => {}
+            _ => {
+                return Err(HostError::invalid_args(format!(
+                    "http:respond unknown request {request_id}"
+                )));
+            }
+        }
+        connection.phase = Phase::Idle;
+        let write_result =
+            write_oneshot(&mut connection.stream, status, &request_id, &headers, &body);
+        let _ = slot.closer.shutdown(Shutdown::Both);
+        let _ = connection.stream.shutdown(Shutdown::Both);
+        write_result?;
+        Ok(ProviderReply::vacuum())
+    }
 
-        request
-            .stream
-            .set_nonblocking(false)
-            .map_err(|error| HostError::internal(format!("http:respond setup failed: {error}")))?;
-        request
-            .stream
-            .set_write_timeout(Some(WRITE_TIMEOUT))
-            .map_err(|error| {
-                HostError::internal(format!("http:respond timeout setup failed: {error}"))
-            })?;
-        let response = format_response(status, &request_id, &headers, &body);
-        let write_result = request.stream.write_all(&response);
-        let _ = request.stream.shutdown(Shutdown::Both);
-        write_result
-            .map_err(|error| HostError::internal(format!("http:respond write failed: {error}")))?;
+    fn respond_open(&self, opener: &Valor) -> HostResult<ProviderReply> {
+        let values = list_args(opener, "http:respond_open")?;
+        if values.len() != 3 {
+            return Err(HostError::invalid_args(
+                "http:respond_open requires [request_id, status, headers]",
+            ));
+        }
+        let request_id = text_arg(&values[0], "request_id")?;
+        let status = status_arg(&values[1], "http:respond_open")?;
+        let headers = response_headers(&values[2])?;
+        let connection_id = self.take_request(&request_id)?;
+        let slot = self.connection(connection_id)?;
+        let writer = self.state.next_writer.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut connection = lock(&slot.inner, "http connection")?;
+            match &connection.phase {
+                Phase::Pending {
+                    request_id: pending,
+                } if pending == &request_id => {}
+                _ => {
+                    self.restore_request(request_id.clone(), connection_id)?;
+                    return Err(HostError::invalid_args(format!(
+                        "http:respond_open unknown request {request_id}"
+                    )));
+                }
+            }
+            let head = format_chunked_open(status, &request_id, &headers);
+            if let Err(error) = write_blocking(&mut connection.stream, &head) {
+                let _ = slot.closer.shutdown(Shutdown::Both);
+                let _ = connection.stream.shutdown(Shutdown::Both);
+                drop(connection);
+                self.drop_connection(connection_id)?;
+                return Err(error);
+            }
+            connection.phase = Phase::Streaming { request_id, writer };
+        }
+        let mut writers = lock(&self.state.writers, "http writers")?;
+        writers.insert(writer, connection_id);
+        Ok(ProviderReply::item(Valor::Numerus(writer)))
+    }
+
+    fn respond_chunk(
+        &self,
+        opener: &Valor,
+        context: &DispatchContext,
+    ) -> HostResult<ProviderReply> {
+        let values = list_args(opener, "http:respond_chunk")?;
+        if values.len() != 2 {
+            return Err(HostError::invalid_args(
+                "http:respond_chunk requires [writer, bytes]",
+            ));
+        }
+        let writer = integer_arg(&values[0], "writer")?;
+        let bytes = bytes_value(&values[1], "bytes")?;
+        if bytes.is_empty() {
+            return Err(HostError::invalid_args(
+                "http:respond_chunk bytes must not be empty",
+            ));
+        }
+        let slot = self.writer_connection(writer)?;
+        let frame = format_chunk(&bytes);
+        {
+            let mut connection = lock(&slot.inner, "http connection")?;
+            match connection.phase {
+                Phase::Streaming {
+                    writer: open_writer,
+                    ..
+                } if open_writer == writer => {}
+                _ => {
+                    return Err(HostError::invalid_args(format!(
+                        "http:respond_chunk unknown writer {writer}"
+                    )));
+                }
+            }
+            self.write_all_backpressure(&mut connection.stream, &frame, slot.listener, context)?;
+        }
+        Ok(ProviderReply::vacuum())
+    }
+
+    fn respond_finish(
+        &self,
+        opener: &Valor,
+        context: &DispatchContext,
+    ) -> HostResult<ProviderReply> {
+        let values = list_args(opener, "http:respond_finish")?;
+        if values.len() != 2 {
+            return Err(HostError::invalid_args(
+                "http:respond_finish requires [writer, keep_alive]",
+            ));
+        }
+        let writer = integer_arg(&values[0], "writer")?;
+        let keep_alive = bool_arg(&values[1], "keep_alive")?;
+        let slot = self.take_writer(writer)?;
+        {
+            let mut connection = lock(&slot.inner, "http connection")?;
+            match connection.phase {
+                Phase::Streaming {
+                    writer: open_writer,
+                    ..
+                } if open_writer == writer => {}
+                _ => {
+                    return Err(HostError::invalid_args(format!(
+                        "http:respond_finish unknown writer {writer}"
+                    )));
+                }
+            }
+            self.write_all_backpressure(
+                &mut connection.stream,
+                b"0\r\n\r\n",
+                slot.listener,
+                context,
+            )?;
+            if keep_alive {
+                connection.phase = Phase::Idle;
+                connection.stream.set_nonblocking(true).map_err(|error| {
+                    HostError::internal(format!("http:respond_finish setup failed: {error}"))
+                })?;
+            } else {
+                let _ = slot.closer.shutdown(Shutdown::Both);
+                let _ = connection.stream.shutdown(Shutdown::Both);
+                drop(connection);
+                self.drop_connection(slot.id)?;
+            }
+        }
         Ok(ProviderReply::vacuum())
     }
 
@@ -250,22 +506,168 @@ impl Http {
         }
         .ok_or_else(|| HostError::invalid_args(format!("http:stop unknown listener {handle}")))?;
         listener.stopped.store(true, Ordering::SeqCst);
-        let mut pending = lock(&self.state.pending, "http pending requests")?;
-        let request_ids = pending
-            .iter()
-            .filter(|(_, request)| request.listener == handle)
-            .map(|(request_id, _)| request_id.clone())
-            .collect::<Vec<_>>();
-        let requests = request_ids
-            .into_iter()
-            .filter_map(|request_id| pending.remove(&request_id))
-            .map(|request| request.stream)
-            .collect::<Vec<_>>();
-        drop(pending);
-        for stream in requests {
-            let _ = stream.shutdown(Shutdown::Both);
+        let slots = {
+            let mut connections = lock(&self.state.connections, "http connections")?;
+            let ids = connections
+                .iter()
+                .filter_map(|(id, slot)| (slot.listener == handle).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| connections.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let mut request_ids = Vec::new();
+        let mut writer_ids = Vec::new();
+        for slot in &slots {
+            let _ = slot.closer.shutdown(Shutdown::Both);
+            if let Ok(connection) = slot.inner.lock() {
+                match &connection.phase {
+                    Phase::Pending { request_id } => request_ids.push(request_id.clone()),
+                    Phase::Streaming {
+                        request_id, writer, ..
+                    } => {
+                        request_ids.push(request_id.clone());
+                        writer_ids.push(*writer);
+                    }
+                    Phase::Idle => {}
+                }
+            }
+        }
+        {
+            let mut requests = lock(&self.state.requests, "http requests")?;
+            for request_id in request_ids {
+                requests.remove(&request_id);
+            }
+        }
+        {
+            let mut writers = lock(&self.state.writers, "http writers")?;
+            for writer in writer_ids {
+                writers.remove(&writer);
+            }
         }
         Ok(ProviderReply::vacuum())
+    }
+
+    fn take_request(&self, request_id: &str) -> HostResult<i64> {
+        let mut requests = lock(&self.state.requests, "http requests")?;
+        requests.remove(request_id).ok_or_else(|| {
+            HostError::invalid_args(format!("http:respond unknown request {request_id}"))
+        })
+    }
+
+    fn restore_request(&self, request_id: String, connection_id: i64) -> HostResult<()> {
+        let mut requests = lock(&self.state.requests, "http requests")?;
+        requests.insert(request_id, connection_id);
+        Ok(())
+    }
+
+    fn connection(&self, connection_id: i64) -> HostResult<Arc<ConnectionSlot>> {
+        let connections = lock(&self.state.connections, "http connections")?;
+        connections.get(&connection_id).cloned().ok_or_else(|| {
+            HostError::invalid_args(format!("http unknown connection {connection_id}"))
+        })
+    }
+
+    fn take_connection(&self, connection_id: i64) -> HostResult<Arc<ConnectionSlot>> {
+        let mut connections = lock(&self.state.connections, "http connections")?;
+        connections.remove(&connection_id).ok_or_else(|| {
+            HostError::invalid_args(format!("http unknown connection {connection_id}"))
+        })
+    }
+
+    fn writer_connection(&self, writer: i64) -> HostResult<Arc<ConnectionSlot>> {
+        let connection_id = {
+            let writers = lock(&self.state.writers, "http writers")?;
+            *writers.get(&writer).ok_or_else(|| {
+                HostError::invalid_args(format!("http:respond_chunk unknown writer {writer}"))
+            })?
+        };
+        self.connection(connection_id)
+    }
+
+    fn take_writer(&self, writer: i64) -> HostResult<Arc<ConnectionSlot>> {
+        let connection_id = {
+            let mut writers = lock(&self.state.writers, "http writers")?;
+            writers.remove(&writer).ok_or_else(|| {
+                HostError::invalid_args(format!("http:respond_finish unknown writer {writer}"))
+            })?
+        };
+        self.connection(connection_id)
+    }
+
+    fn drop_connection(&self, connection_id: i64) -> HostResult<()> {
+        if let Some(slot) = {
+            let mut connections = lock(&self.state.connections, "http connections")?;
+            connections.remove(&connection_id)
+        } {
+            self.forget_connection_indexes(&slot)?;
+        }
+        Ok(())
+    }
+
+    fn forget_connection_indexes(&self, slot: &ConnectionSlot) -> HostResult<()> {
+        let (request_id, writer) = {
+            let connection = lock(&slot.inner, "http connection")?;
+            match &connection.phase {
+                Phase::Pending { request_id } => (Some(request_id.clone()), None),
+                Phase::Streaming {
+                    request_id, writer, ..
+                } => (Some(request_id.clone()), Some(*writer)),
+                Phase::Idle => (None, None),
+            }
+        };
+        if let Some(request_id) = request_id {
+            lock(&self.state.requests, "http requests")?.remove(&request_id);
+        }
+        if let Some(writer) = writer {
+            lock(&self.state.writers, "http writers")?.remove(&writer);
+        }
+        Ok(())
+    }
+
+    fn listener_is_stopped(&self, handle: i64) -> HostResult<bool> {
+        let listeners = lock(&self.state.listeners, "http listeners")?;
+        Ok(listeners
+            .get(&handle)
+            .is_none_or(|listener| listener.stopped.load(Ordering::SeqCst)))
+    }
+
+    fn write_all_backpressure(
+        &self,
+        stream: &mut TcpStream,
+        mut bytes: &[u8],
+        listener: i64,
+        context: &DispatchContext,
+    ) -> HostResult<()> {
+        stream.set_nonblocking(true).map_err(|error| {
+            HostError::internal(format!("http stream write setup failed: {error}"))
+        })?;
+        let deadline = Instant::now() + STREAM_WRITE_TIMEOUT;
+        while !bytes.is_empty() {
+            if context.cancellation.is_cancelled() {
+                return Err(HostError::cancelled());
+            }
+            if self.listener_is_stopped(listener)? {
+                return Err(HostError::invalid_args("http listener is stopped"));
+            }
+            if Instant::now() >= deadline {
+                return Err(HostError::internal(
+                    "http write timed out under backpressure",
+                ));
+            }
+            match stream.write(bytes) {
+                Ok(0) => return Err(HostError::internal("http write closed")),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(POLL_INTERVAL);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(HostError::internal(format!("http write failed: {error}")));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -288,86 +690,105 @@ impl RequestParts {
 }
 
 fn read_request(
-    mut stream: TcpStream,
+    connection: &mut Connection,
     max_body_bytes: usize,
     stopped: &AtomicBool,
     context: &DispatchContext,
     next_request: &AtomicU64,
-) -> HostResult<(RequestParts, TcpStream)> {
-    stream
-        .set_nonblocking(true)
-        .map_err(|error| HostError::internal(format!("http:accept setup failed: {error}")))?;
-    let mut bytes = Vec::new();
-    let header_end = loop {
-        check_read_state(stopped, context)?;
-        let mut chunk = [0_u8; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => {
+) -> HostResult<RequestParts> {
+    loop {
+        match poll_request(
+            connection,
+            max_body_bytes,
+            stopped,
+            context,
+            next_request,
+            true,
+        )? {
+            PollRead::Ready(parts) => return Ok(parts),
+            PollRead::Idle => {
+                check_read_state(stopped, context)?;
+                thread::sleep(POLL_INTERVAL);
+            }
+            PollRead::Closed => {
                 return Err(HostError::invalid_args(
                     "http:accept request ended before headers",
-                ))
+                ));
             }
-            Ok(count) => {
-                bytes.extend_from_slice(&chunk[..count]);
-                if let Some(end) = find_header_end(&bytes) {
-                    break end;
-                }
-                if bytes.len() > MAX_HEADER_BYTES {
-                    return Err(HostError::invalid_args(
-                        "http:accept request headers exceed limit",
-                    ));
-                }
+        }
+    }
+}
+
+fn poll_request(
+    connection: &mut Connection,
+    max_body_bytes: usize,
+    stopped: &AtomicBool,
+    context: &DispatchContext,
+    next_request: &AtomicU64,
+    block: bool,
+) -> HostResult<PollRead> {
+    connection
+        .stream
+        .set_nonblocking(true)
+        .map_err(|error| HostError::internal(format!("http:accept setup failed: {error}")))?;
+    loop {
+        if let Some(end) = find_header_end(&connection.leftover) {
+            let ParsedHeaders {
+                method,
+                path,
+                headers,
+                content_length,
+            } = parse_headers(&connection.leftover[..end])?;
+            if content_length > max_body_bytes {
+                return Err(HostError::invalid_args(format!(
+                    "http:accept request body exceeds max_body_bytes {max_body_bytes}"
+                )));
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
+            let body_start = end + 4;
+            let needed = body_start + content_length;
+            if connection.leftover.len() >= needed {
+                let body = connection.leftover[body_start..needed].to_vec();
+                connection.leftover.drain(..needed);
+                let id = format!(
+                    "{REQUEST_ID_PREFIX}{}",
+                    next_request.fetch_add(1, Ordering::SeqCst)
+                );
+                return Ok(PollRead::Ready(RequestParts::new(
+                    id, method, path, headers, body,
+                )));
+            }
+        } else if connection.leftover.len() > MAX_HEADER_BYTES {
+            return Err(HostError::invalid_args(
+                "http:accept request headers exceed limit",
+            ));
+        }
+        let mut chunk = [0_u8; 4096];
+        match connection.stream.read(&mut chunk) {
+            Ok(0) => {
+                if connection.leftover.is_empty() {
+                    return Ok(PollRead::Closed);
+                }
+                return Err(HostError::invalid_args(
+                    "http:accept request ended before headers",
+                ));
+            }
+            Ok(count) => connection.leftover.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if block {
+                    check_read_state(stopped, context)?;
+                    thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+                return Ok(PollRead::Idle);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
                 return Err(HostError::internal(format!(
                     "http:accept read failed: {error}"
-                )))
-            }
-        }
-    };
-
-    let ParsedHeaders {
-        method,
-        path,
-        headers,
-        content_length,
-    } = parse_headers(&bytes[..header_end])?;
-    if content_length > max_body_bytes {
-        return Err(HostError::invalid_args(format!(
-            "http:accept request body exceeds max_body_bytes {max_body_bytes}"
-        )));
-    }
-    let body_start = header_end + 4;
-    while bytes.len() < body_start + content_length {
-        check_read_state(stopped, context)?;
-        let mut chunk = [0_u8; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => {
-                return Err(HostError::invalid_args(
-                    "http:accept request ended before body",
-                ))
-            }
-            Ok(count) => {
-                bytes.extend_from_slice(&chunk[..count]);
-                if bytes.len() > body_start + content_length {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
-            Err(error) => {
-                return Err(HostError::internal(format!(
-                    "http:accept body read failed: {error}"
-                )))
+                )));
             }
         }
     }
-    let body = bytes[body_start..body_start + content_length].to_vec();
-    let id = format!(
-        "{REQUEST_ID_PREFIX}{}",
-        next_request.fetch_add(1, Ordering::SeqCst)
-    );
-    Ok((RequestParts::new(id, method, path, headers, body), stream))
 }
 
 fn check_read_state(stopped: &AtomicBool, context: &DispatchContext) -> HostResult<()> {
@@ -447,13 +868,14 @@ fn parse_headers(bytes: &[u8]) -> HostResult<ParsedHeaders> {
     })
 }
 
-fn request_carrier(parts: &RequestParts) -> Valor {
+fn request_carrier(parts: &RequestParts, connection: i64) -> Valor {
     let mut fields = BTreeMap::new();
     fields.insert("id".to_owned(), Valor::Textus(parts.id.clone()));
     fields.insert("method".to_owned(), Valor::Textus(parts.method.clone()));
     fields.insert("path".to_owned(), Valor::Textus(parts.path.clone()));
     fields.insert("headers".to_owned(), headers_value(&parts.headers));
     fields.insert("body".to_owned(), Valor::Octeti(parts.body.clone()));
+    fields.insert("connection".to_owned(), Valor::Numerus(connection));
     Valor::Tabula(fields)
 }
 
@@ -493,9 +915,12 @@ fn header_value(value: &Valor) -> HostResult<(String, String)> {
             "HTTP header name or value is malformed",
         ));
     }
-    if name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("content-length") {
+    if name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+    {
         return Err(HostError::invalid_args(
-            "HTTP connection and content-length headers are provider-owned",
+            "HTTP connection, content-length, and transfer-encoding headers are provider-owned",
         ));
     }
     Ok((name, value))
@@ -513,6 +938,22 @@ fn format_response(
         body.len()
     )
     .into_bytes();
+    append_headers(&mut response, headers);
+    response.extend_from_slice(body);
+    response
+}
+
+fn format_chunked_open(status: u16, request_id: &str, headers: &[(String, String)]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {status} {}\r\ntransfer-encoding: chunked\r\nx-faber-request-id: {request_id}\r\n",
+        reason_phrase(status),
+    )
+    .into_bytes();
+    append_headers(&mut response, headers);
+    response
+}
+
+fn append_headers(response: &mut Vec<u8>, headers: &[(String, String)]) {
     for (name, value) in headers {
         response.extend_from_slice(name.as_bytes());
         response.extend_from_slice(b": ");
@@ -520,8 +961,37 @@ fn format_response(
         response.extend_from_slice(b"\r\n");
     }
     response.extend_from_slice(b"\r\n");
-    response.extend_from_slice(body);
-    response
+}
+
+fn format_chunk(data: &[u8]) -> Vec<u8> {
+    let mut frame = format!("{:x}\r\n", data.len()).into_bytes();
+    frame.extend_from_slice(data);
+    frame.extend_from_slice(b"\r\n");
+    frame
+}
+
+fn write_oneshot(
+    stream: &mut TcpStream,
+    status: u16,
+    request_id: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> HostResult<()> {
+    write_blocking(stream, &format_response(status, request_id, headers, body))
+}
+
+fn write_blocking(stream: &mut TcpStream, bytes: &[u8]) -> HostResult<()> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| HostError::internal(format!("http write setup failed: {error}")))?;
+    stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|error| {
+            HostError::internal(format!("http write timeout setup failed: {error}"))
+        })?;
+    stream
+        .write_all(bytes)
+        .map_err(|error| HostError::internal(format!("http write failed: {error}")))
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -565,6 +1035,23 @@ fn integer_arg(value: &Valor, name: &str) -> HostResult<i64> {
     }
 }
 
+fn bool_arg(value: &Valor, name: &str) -> HostResult<bool> {
+    match value {
+        Valor::Bivalens(value) => Ok(*value),
+        _ => Err(HostError::invalid_args(format!("{name} must be bivalens"))),
+    }
+}
+
+fn status_arg(value: &Valor, route: &str) -> HostResult<u16> {
+    let status = integer_arg(value, "status")?;
+    u16::try_from(status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+        .ok_or_else(|| {
+            HostError::invalid_args(format!("{route} status must be between 100 and 599"))
+        })
+}
+
 fn text_arg(value: &Valor, name: &str) -> HostResult<String> {
     match value {
         Valor::Textus(value) | Valor::Instans(value) => Ok(value.clone()),
@@ -603,6 +1090,15 @@ fn bounded_body_size(value: i64) -> HostResult<usize> {
     Ok(value)
 }
 
+fn parse_bind_host(host: &str) -> HostResult<String> {
+    if host.is_empty() || host.contains(['\0', '\r', '\n']) {
+        return Err(HostError::invalid_args(
+            "http:listen bind_host is malformed",
+        ));
+    }
+    Ok(host.to_owned())
+}
+
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -635,6 +1131,25 @@ fn is_token_byte(byte: u8) -> bool {
             | b'|'
             | b'~'
     )
+}
+
+fn apply_accept_backlog(listener: &TcpListener) -> HostResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `listener` is an open TCP socket. A second listen(2) updates
+        // the accept backlog on Darwin and Linux; excess SYNs are refused.
+        let result = unsafe { libc::listen(listener.as_raw_fd(), ACCEPT_BACKLOG) };
+        if result != 0 {
+            return Err(HostError::internal(format!(
+                "http:listen backlog failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = listener;
+    Ok(())
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> HostResult<MutexGuard<'a, T>> {

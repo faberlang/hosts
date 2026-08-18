@@ -770,6 +770,7 @@ version = "0.1.0"
 dependencies = [
  "faber-runtime",
  "host-kernel",
+ "libc",
  "ureq",
 ]
 
@@ -1207,7 +1208,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radix-host-abi"
-version = "0.82.0"
+version = "0.83.0"
 
 [[package]]
 name = "rayon"

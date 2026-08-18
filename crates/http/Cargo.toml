@@ -12,3 +12,6 @@ pedantic = "deny"
 faber = { package = "faber-runtime", path = "../../../faber/runtime/rust" }
 host-kernel = { path = "../host-kernel" }
 ureq = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
