@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-const MAX_RANGE_READ_BYTES: usize = 1024 * 1024;
+const MAX_RANGE_READ_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Solum {
     registration: ProviderRegistration,
