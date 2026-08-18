@@ -4,10 +4,13 @@
   "owner": "faberlang",
   "prefixes": ["http"],
   "calls": [
-    {"route": "http:listen", "summary": "Bind a loopback HTTP/1.1 listener and return its handle.", "opener": "lista<valor>", "result": "numerus"},
+    {"route": "http:listen", "summary": "Bind an HTTP/1.1 listener and return its handle.", "opener": "lista<valor>", "result": "numerus"},
     {"route": "http:accept", "summary": "Accept one bounded HTTP/1.1 request and return its carrier.", "opener": "numerus", "result": "valor"},
     {"route": "http:respond", "summary": "Write one HTTP response for a pending request.", "opener": "lista<valor>", "result": "vacuum"},
-    {"route": "http:stop", "summary": "Stop a loopback HTTP listener and close pending requests.", "opener": "numerus", "result": "vacuum"}
+    {"route": "http:respond_open", "summary": "Begin a chunked HTTP response and return its writer handle.", "opener": "lista<valor>", "result": "numerus"},
+    {"route": "http:respond_chunk", "summary": "Write one chunked frame; blocks under backpressure.", "opener": "lista<valor>", "result": "vacuum"},
+    {"route": "http:respond_finish", "summary": "Finish a chunked response and apply keep-alive policy.", "opener": "lista<valor>", "result": "vacuum"},
+    {"route": "http:stop", "summary": "Stop an HTTP listener and close its connections.", "opener": "numerus", "result": "vacuum"}
   ],
   "native_dependencies": []
 }
