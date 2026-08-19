@@ -10,12 +10,16 @@
 //!   --backend metal|cuda|auto \
 //!   --descriptor <descriptor.json> \
 //!   --module <module.bin> \
-//!   --inputs <inputs.json>
+//!   --inputs <inputs.json> \
+//!   [--weights <model.gguf> --weight-map <map.json>]
 //! ```
 //!
 //! `--backend` is optional; when omitted the descriptor's `backend` field
 //! is the explicit selection. The module image is a raw file (not encoded
-//! in the descriptor JSON). Inputs are `{ "<buffer-id>": [f32, ...] }`.
+//! in the descriptor JSON). `--inputs` is `{ "<buffer-id>": [f32, ...] }`
+//! for tiny per-step values (tokens, rope, synthesized tables). Packed
+//! weights are not JSON: `--weights` is the GGUF file and `--weight-map`
+//! names byte ranges inside it (`offset` / `len` / `elems` per buffer id).
 //!
 //! Success prints a receipt JSON and exits 0. A host failure prints a
 //! [`HostError`] JSON and exits 2. Usage / parse failures exit 64.
@@ -48,8 +52,12 @@ pub struct DeviceExecuteArgs {
     pub descriptor: PathBuf,
     /// Raw module-image path (MSL source or PTX).
     pub module: PathBuf,
-    /// Inputs JSON path (`{ "<id>": [f32, ...] }`).
+    /// Inputs JSON path (`{ "<id>": [f32, ...] }`) — tiny per-step values.
     pub inputs: PathBuf,
+    /// Optional GGUF file the child maps for packed-weight buffers.
+    pub weights: Option<PathBuf>,
+    /// Optional `{ "<id>": { offset, len, elems } }` map into `--weights`.
+    pub weight_map: Option<PathBuf>,
 }
 
 /// Parse `device-execute` CLI flags. Unknown or missing flags are usage
@@ -59,6 +67,8 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
     let mut descriptor = None;
     let mut module = None;
     let mut inputs = None;
+    let mut weights = None;
+    let mut weight_map = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -78,22 +88,41 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
                 let value = next_flag_value(args, &mut index, "--inputs")?;
                 inputs = Some(PathBuf::from(value));
             }
+            "--weights" => {
+                let value = next_flag_value(args, &mut index, "--weights")?;
+                weights = Some(PathBuf::from(value));
+            }
+            "--weight-map" => {
+                let value = next_flag_value(args, &mut index, "--weight-map")?;
+                weight_map = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unknown device-execute argument: {other}")),
         }
         index += 1;
+    }
+    match (&weights, &weight_map) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => {
+            return Err(format!(
+                "--weights and --weight-map must be passed together; {}",
+                usage_text()
+            ));
+        }
     }
     Ok(DeviceExecuteArgs {
         backend,
         descriptor: descriptor.ok_or_else(|| usage_text().to_owned())?,
         module: module.ok_or_else(|| usage_text().to_owned())?,
         inputs: inputs.ok_or_else(|| usage_text().to_owned())?,
+        weights,
+        weight_map,
     })
 }
 
 /// Usage line for the command.
 #[must_use]
 pub fn usage_text() -> &'static str {
-    "usage: faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json>"
+    "usage: faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
 }
 
 /// Load files, validate the descriptor, construct the composite host, and
@@ -104,12 +133,35 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let descriptor_bytes = read_file(&args.descriptor)?;
     let module_image = read_file(&args.module)?;
     let inputs_bytes = read_file(&args.inputs)?;
+    let weight_map_bytes = match &args.weight_map {
+        Some(path) => Some(read_file(path)?),
+        None => None,
+    };
+    let gguf_bytes = match &args.weights {
+        Some(path) => Some(read_file(path)?),
+        None => None,
+    };
+    let mut inputs = match (gguf_bytes.as_deref(), weight_map_bytes.as_deref()) {
+        (Some(gguf), Some(map_json)) => {
+            let map = weight_map_from_json(map_json)?;
+            inputs_from_gguf(gguf, &map)?
+        }
+        _ => BTreeMap::new(),
+    };
     let file_read_us = elapsed_us(read_started);
     let descriptor_started = Instant::now();
     let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
     let descriptor_decode_us = elapsed_us(descriptor_started);
     let inputs_started = Instant::now();
-    let inputs = inputs_from_json(&inputs_bytes)?;
+    let json_inputs = inputs_from_json(&inputs_bytes)?;
+    for (id, values) in json_inputs {
+        if inputs.contains_key(&id) {
+            return Err(HostError::invalid_args(format!(
+                "device-execute buffer {id} is in both --weight-map and --inputs"
+            )));
+        }
+        inputs.insert(id, values);
+    }
     let json_decode_us = elapsed_us(inputs_started);
     descriptor.validate()?;
     let selection = args
@@ -193,6 +245,97 @@ pub fn inputs_from_json(bytes: &[u8]) -> HostResult<BTreeMap<u32, Vec<f32>>> {
         inputs.insert(id, parsed);
     }
     Ok(inputs)
+}
+
+/// One GGUF byte range copied into a host f32 buffer (`elems` logical f32s).
+///
+/// Packed Q4_K words occupy the prefix as raw bits; the tail is zero pad
+/// so `copy_in_f32` sees the MIR logical element count. This is a file
+/// map, not a weight codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightFileRange {
+    /// Byte offset into `--weights`.
+    pub offset: u64,
+    /// Packed-byte length to copy.
+    pub len: u64,
+    /// Logical f32 element count of the host buffer.
+    pub elems: u64,
+}
+
+/// Decode `{ "<buffer-id>": { "offset", "len", "elems" } }`.
+pub fn weight_map_from_json(bytes: &[u8]) -> HostResult<BTreeMap<u32, WeightFileRange>> {
+    let wire: BTreeMap<String, WeightFileRange> =
+        serde_json::from_slice(bytes).map_err(|error| {
+            HostError::invalid_args(format!(
+                "device-execute weight-map JSON is invalid: {error}"
+            ))
+        })?;
+    let mut map = BTreeMap::new();
+    for (key, range) in wire {
+        let id = key.parse::<u32>().map_err(|_| {
+            HostError::invalid_args(format!(
+                "device-execute weight-map key `{key}` is not a buffer id"
+            ))
+        })?;
+        map.insert(id, range);
+    }
+    Ok(map)
+}
+
+/// Encode a weight map as `{ "<buffer-id>": { offset, len, elems } }`.
+pub fn weight_map_to_json(map: &BTreeMap<u32, WeightFileRange>) -> HostResult<Vec<u8>> {
+    let wire: BTreeMap<String, WeightFileRange> = map
+        .iter()
+        .map(|(id, range)| (id.to_string(), *range))
+        .collect();
+    serde_json::to_vec(&wire).map_err(|error| {
+        HostError::internal(format!(
+            "device-execute failed to encode weight-map: {error}"
+        ))
+    })
+}
+
+/// Copy GGUF byte ranges into host f32 buffers (prefix copy, zero pad).
+pub fn inputs_from_gguf(
+    gguf: &[u8],
+    map: &BTreeMap<u32, WeightFileRange>,
+) -> HostResult<BTreeMap<u32, Vec<f32>>> {
+    let mut inputs = BTreeMap::new();
+    for (id, range) in map {
+        let start = usize::try_from(range.offset).map_err(|_| {
+            HostError::invalid_args(format!("device-execute weight-map[{id}] offset overflows"))
+        })?;
+        let len = usize::try_from(range.len).map_err(|_| {
+            HostError::invalid_args(format!("device-execute weight-map[{id}] len overflows"))
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            HostError::invalid_args(format!("device-execute weight-map[{id}] range overflows"))
+        })?;
+        let slice = gguf.get(start..end).ok_or_else(|| {
+            HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] range [{start}, {end}) exceeds {} bytes",
+                gguf.len()
+            ))
+        })?;
+        inputs.insert(*id, packed_bytes_as_f32_padded(slice, range.elems));
+    }
+    Ok(inputs)
+}
+
+fn packed_bytes_as_f32_padded(bytes: &[u8], logical_elems: u64) -> Vec<f32> {
+    let mut padded = bytes.to_vec();
+    while padded.len() % 4 != 0 {
+        padded.push(0);
+    }
+    let mut values: Vec<f32> = padded
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let want = logical_elems as usize;
+    if values.len() < want {
+        values.resize(want, 0.0);
+    }
+    values
 }
 
 /// Encode inputs as `{ "<buffer-id>": [f32, ...] }`.
@@ -295,7 +438,7 @@ pub struct DeviceExecuteReceipt {
     /// Descriptor JSON decode wall.
     #[serde(default)]
     pub descriptor_decode_us: u64,
-    /// Inputs JSON decode wall (packed weights ride this file).
+    /// Inputs JSON decode wall (tiny per-step values only).
     #[serde(default)]
     pub json_decode_us: u64,
     /// Composite-host construction wall (Metal device admit).

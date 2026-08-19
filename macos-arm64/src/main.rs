@@ -146,6 +146,6 @@ fn print_usage() {
     println!("  faber-host-macos-arm64 wasm-call <module> <export> <route-code>");
     println!("  faber-host-macos-arm64 component-call <component> <export> <route-code>");
     println!(
-        "  faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json>"
+        "  faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
     );
 }

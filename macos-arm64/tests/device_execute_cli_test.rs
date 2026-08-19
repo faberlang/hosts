@@ -11,8 +11,9 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use faber_host_macos_arm64::device_execute::{
-    descriptor_from_json, descriptor_to_json, inputs_from_json, inputs_to_json,
-    parse_device_execute_args, receipt_to_json, DeviceExecuteReceipt,
+    descriptor_from_json, descriptor_to_json, inputs_from_gguf, inputs_from_json, inputs_to_json,
+    parse_device_execute_args, receipt_to_json, weight_map_from_json, weight_map_to_json,
+    DeviceExecuteReceipt, WeightFileRange,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
@@ -131,6 +132,74 @@ fn parse_device_execute_args_rejects_unknown_flags() {
     ];
     let err = parse_device_execute_args(&args).expect_err("unknown flag");
     assert!(err.contains("--surprise"), "{err}");
+}
+
+#[test]
+fn parse_device_execute_args_requires_weights_and_map_together() {
+    let args = [
+        "--descriptor".to_owned(),
+        "d.json".to_owned(),
+        "--module".to_owned(),
+        "m.bin".to_owned(),
+        "--inputs".to_owned(),
+        "i.json".to_owned(),
+        "--weights".to_owned(),
+        "model.gguf".to_owned(),
+    ];
+    let err = parse_device_execute_args(&args).expect_err("weights without map");
+    assert!(err.contains("--weight-map"), "{err}");
+}
+
+#[test]
+fn parse_device_execute_args_accepts_weights_and_map() {
+    let args = [
+        "--descriptor".to_owned(),
+        "d.json".to_owned(),
+        "--module".to_owned(),
+        "m.bin".to_owned(),
+        "--inputs".to_owned(),
+        "i.json".to_owned(),
+        "--weights".to_owned(),
+        "model.gguf".to_owned(),
+        "--weight-map".to_owned(),
+        "map.json".to_owned(),
+    ];
+    let parsed = parse_device_execute_args(&args).expect("valid flags");
+    assert_eq!(
+        parsed.weights.as_deref(),
+        Some(std::path::Path::new("model.gguf"))
+    );
+    assert_eq!(
+        parsed.weight_map.as_deref(),
+        Some(std::path::Path::new("map.json"))
+    );
+}
+
+#[test]
+fn gguf_weight_map_copies_prefix_and_zero_pads() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+    file.extend_from_slice(&1.0f32.to_le_bytes());
+    file.extend_from_slice(&2.0f32.to_le_bytes());
+    file.extend_from_slice(&u32::to_le_bytes(0xff81_0000));
+    let map = BTreeMap::from([(
+        7,
+        WeightFileRange {
+            offset: 4,
+            len: 12,
+            elems: 4,
+        },
+    )]);
+    let json = weight_map_to_json(&map).expect("encode");
+    let decoded = weight_map_from_json(&json).expect("decode");
+    assert_eq!(decoded, map);
+    let inputs = inputs_from_gguf(&file, &map).expect("fill");
+    let values = inputs.get(&7).expect("buffer 7");
+    assert_eq!(values.len(), 4);
+    assert_eq!(values[0], 1.0);
+    assert_eq!(values[1], 2.0);
+    assert_eq!(values[2].to_bits(), 0xff81_0000);
+    assert_eq!(values[3], 0.0);
 }
 
 #[test]
