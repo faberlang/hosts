@@ -92,6 +92,14 @@ pub struct DeviceExecutionReceipt {
     /// provenance hash. Backend-entry-inclusive (S5A-U3); not a
     /// semantic-identity claim — the A10 complete-program SHA is.
     pub program_graph_hash: String,
+    /// Host→device copy-in wall (µs) inside this execution. Packed-weight
+    /// upload on the SingleRun spawn path lives here.
+    pub copy_in_us: u64,
+    /// Kernel encode + step-boundary submit + blocking wait (µs). This is
+    /// the true GPU step time (W8-U1: one submit/wait after every encode).
+    pub gpu_encode_submit_wait_us: u64,
+    /// Observation readback wall (µs) after the step-boundary wait.
+    pub readback_us: u64,
 }
 
 /// The completion boundary of one execution (R9).
