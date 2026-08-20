@@ -8,6 +8,7 @@
 //! terminal success or failure.
 
 pub mod frame_data;
+pub mod library;
 pub mod valor_wire;
 
 mod error;
