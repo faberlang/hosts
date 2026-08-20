@@ -40,6 +40,17 @@ pub struct DeviceExecutionReceipt {
     pub allocated_buffers: Vec<u32>,
     /// Version-keyed buffer allocations carried by the descriptor.
     pub allocated_buffer_versions: Vec<(u32, u32)>,
+    /// Temporary PerStep/ObservationPoint handles allocated by this step's
+    /// pool checkout. PerProgram allocations are not included.
+    pub pool_allocations: usize,
+    /// Temporary PerStep/ObservationPoint handles checked out from the
+    /// session-scoped pool for this step. PerProgram residency is not a pool
+    /// claim.
+    pub pool_reuses: usize,
+    /// Temporary handles returned to the session-scoped pool at this step's
+    /// boundary. A return is not a device free and is therefore not included
+    /// in [`DeviceExecutionReceipt::releases`].
+    pub pool_returns: usize,
     /// Program execution-lifetime regime (S2-4).
     pub program_lifetime: DeviceProgramLifetime,
     /// `PerProgram` buffer ids: allocated once per session, released at program
@@ -76,8 +87,8 @@ pub struct DeviceExecutionReceipt {
     /// Device→host readbacks actually performed (the declared observation
     /// points — observation-only readback, F6).
     pub readbacks: usize,
-    /// Observed buffer releases this execution (read-then-release plus the
-    /// step-boundary `PerStep` recycle).
+    /// Observed device buffer frees this execution. Temporary pool returns are
+    /// reported separately by `pool_returns`; they are not frees.
     pub releases: usize,
     /// The completion boundary this execution guarantees (R9): the explicit
     /// step-boundary sync after the last launch, at which every declared
