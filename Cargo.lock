@@ -486,6 +486,7 @@ dependencies = [
  "faber",
  "host-coordinator",
  "host-kernel",
+ "http",
  "hygiene-ratchet",
  "libloading",
  "metal",

@@ -12,6 +12,7 @@ host-coordinator = { path = "../crates/host-coordinator" }
 host-kernel = { path = "../crates/host-kernel" }
 aleator = { path = "../crates/aleator" }
 consolum = { path = "../crates/consolum" }
+http = { path = "../crates/http" }
 processus = { path = "../crates/processus" }
 solum = { path = "../crates/solum" }
 tempus = { path = "../crates/tempus" }

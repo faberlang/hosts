@@ -143,6 +143,7 @@ fn register_core_providers(kernel: &mut Kernel) -> host_kernel::HostResult<()> {
     consolum::register(kernel)?;
     solum::register(kernel)?;
     processus::register(kernel)?;
+    http::register(kernel)?;
     Ok(())
 }
 

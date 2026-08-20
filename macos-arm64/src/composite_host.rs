@@ -39,7 +39,7 @@
 //!
 //! The composite host holds the frame/kernel-effects host ([`HostKernel`])
 //! and the device component ([`CompositeDeviceState`]) as **separate fields**.
-//! Kernel effects (aleator/tempus/consolum/solum/processus + host echo) route
+//! Kernel effects (aleator/tempus/consolum/solum/processus/http + host echo) route
 //! through the kernel; device sessions are never exposed as provider routes.
 //! [`CompositeHost::execute_descriptor`] drives the device session directly
 //! and reports an A9-style receipt (selected hardware, module hash, launches,
