@@ -122,6 +122,15 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
 
 fn device_execute(args: &[String]) -> Result<ExitCode, String> {
     let parsed = faber_host_macos_arm64::device_execute::parse_device_execute_args(args)?;
+    if parsed.control {
+        return match faber_host_macos_arm64::device_execute::run_device_execute_control(&parsed) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(error) => {
+                print_json(&error)?;
+                Ok(ExitCode::from(2))
+            }
+        };
+    }
     match faber_host_macos_arm64::device_execute::run_device_execute(&parsed) {
         Ok(receipt) => {
             let json = faber_host_macos_arm64::device_execute::receipt_to_json(&receipt)
@@ -146,6 +155,6 @@ fn print_usage() {
     println!("  faber-host-macos-arm64 wasm-call <module> <export> <route-code>");
     println!("  faber-host-macos-arm64 component-call <component> <export> <route-code>");
     println!(
-        "  faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
+        "  faber-host-macos-arm64 device-execute [--control] [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
     );
 }
