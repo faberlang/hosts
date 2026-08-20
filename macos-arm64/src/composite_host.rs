@@ -382,10 +382,10 @@ impl CompositeHost {
 
     /// Prepare a resident session for one admitted model (E03-U1): validate
     /// the descriptor admits the prepared-session shape (a `RepeatingStep`
-    /// program with once-init `HostProvided` weights and device-resident
-    /// `ZeroFill` state), create the underlying [`ProgramSession`] (module
-    /// loaded once, `PerProgram` buffers allocated once), and once-init the
-    /// weights so they stay device-resident. The returned
+    /// program with once-init `HostProvided` `PerProgram` weights; a model may
+    /// also declare device-resident `ZeroFill` state), create the underlying
+    /// [`ProgramSession`] (module loaded once, `PerProgram` buffers allocated
+    /// once), and once-init the weights so they stay device-resident. The returned
     /// [`PreparedResidentSession`] reuses the resident weights across
     /// repeated decode executions and prompt-scoped resets without reload or
     /// `PerProgram` re-allocation, and reports prepare/reuse/reset/release

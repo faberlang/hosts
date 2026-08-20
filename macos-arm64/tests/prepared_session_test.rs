@@ -9,8 +9,9 @@
 //! retains allocation — deterministic replay of the first prompt after the
 //! reset matches token-for-token; (d) teardown leaves zero live handles;
 //! (e) the prepared-session receipt prints prepare/reuse/reset/release
-//! counts. The fakes prove sequencing only (real-device proofs are the
-//! EXEC-03 successor units).
+//! counts; and (f) a dense direct-loaded weight-only descriptor admits
+//! once-init weights without inventing a persistent state buffer. The fakes
+//! prove sequencing only (real-device proofs are the EXEC-03 successor units).
 
 use std::collections::BTreeMap;
 
@@ -228,6 +229,37 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
     versions
 }
 
+/// A dense-row-shaped resident descriptor: direct-loaded GGUF weight `w` is
+/// `PerProgram` + `HostProvided`, while token `t` is `PerStep`. There is no
+/// prompt-state buffer, so the adapter must not require the E03 reset axis.
+fn weight_only_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    let mut descriptor = prepared_decode_descriptor(backend);
+    descriptor.kernels = vec![DescriptorKernel {
+        entry: "add_one".to_owned(),
+        buffers: vec![
+            token_slot(2, "t", 0),
+            weights_slot(1, "w", 1),
+            logits_slot(5, "l", 2),
+        ],
+        grid: [1, 1, 1],
+        block: [4, 1, 1],
+    }];
+    descriptor.launches = vec![DescriptorLaunch {
+        id: 1,
+        kernel_index: 0,
+    }];
+    descriptor.data_flow.clear();
+    descriptor.roots = vec![1];
+    descriptor.results = vec![DescriptorResult {
+        buffer_id: 5,
+        version: 1,
+        produced_by: 1,
+        at_launch: 1,
+    }];
+    descriptor.buffer_versions = buffer_versions_for(&descriptor.kernels);
+    descriptor
+}
+
 /// Once-init weights for [`prepared_decode_descriptor`]: w = [10, 20, 30,
 /// 40]. The simulated decode then yields the expected logits below.
 fn prepared_weights() -> BTreeMap<u32, Vec<f32>> {
@@ -319,6 +351,63 @@ fn run_prompt(
         logits.push(observed);
     }
     logits
+}
+
+// ---------------------------------------------------------------------------
+// M1-U2: direct-loaded dense weights are resident even without prompt state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prepared_session_resident_dense_weights_need_no_state_buffer() {
+    let mut host = prepared_metal_composite().expect("metal composite");
+    let descriptor = weight_only_descriptor(DeviceBackend::Metal);
+    let mut prepared = host
+        .prepare_resident_session(&descriptor, &prepared_weights())
+        .expect("weight-only resident prepare");
+
+    assert_eq!(
+        prepared.session_handle_count(),
+        2,
+        "module + resident weight"
+    );
+    assert_eq!(prepared.driver_counters().module_loads, 1);
+    for token_values in prompt_a().into_iter().take(2) {
+        let receipt = prepared
+            .execute_step(&token_values)
+            .expect("resident dense step");
+        assert_eq!(receipt.copy_ins, 1, "only the PerStep token is copied");
+        assert_eq!(receipt.per_program_buffers, vec![1]);
+        assert_eq!(receipt.per_step_buffers, vec![2]);
+        assert_eq!(receipt.observation_buffers, vec![5]);
+        assert_eq!(
+            receipt
+                .resource_graph
+                .iter()
+                .find(|buffer| buffer.id == 1)
+                .map(|buffer| buffer.lifetime),
+            Some(DeviceBufferLifetime::PerProgram)
+        );
+        assert_eq!(
+            receipt
+                .resource_graph
+                .iter()
+                .find(|buffer| buffer.id == 2)
+                .map(|buffer| buffer.lifetime),
+            Some(DeviceBufferLifetime::PerStep)
+        );
+    }
+
+    assert_eq!(prepared.driver_counters().module_loads, 1);
+    assert_eq!(prepared.receipt().module_reloads, 0);
+    assert_eq!(prepared.receipt().per_program_reallocs, 0);
+    assert_eq!(prepared.reset_prompt().expect("no-op state reset"), 0);
+
+    let receipt = prepared.teardown().expect("teardown");
+    assert_eq!(receipt.counters.reuses, 2);
+    assert_eq!(receipt.module_reloads, 0);
+    assert_eq!(receipt.per_program_reallocs, 0);
+    assert_eq!(receipt.live_handles, 0);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,22 +655,6 @@ fn prepared_session_rejects_non_prepared_descriptors() {
         .prepare_resident_session(&no_weights, &prepared_weights())
         .err()
         .expect("a prepared session needs once-init weights");
-    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-
-    // No device-resident state: a prepared session needs a PerProgram +
-    // ZeroFill state buffer (the class the prompt-scoped reset clears).
-    let mut no_state = prepared_decode_descriptor(DeviceBackend::Metal);
-    for kernel in &mut no_state.kernels {
-        for buffer in &mut kernel.buffers {
-            if buffer.buffer_id == 4 {
-                buffer.initialization = DeviceBufferInitialization::HostProvided;
-            }
-        }
-    }
-    let err = host
-        .prepare_resident_session(&no_state, &prepared_weights())
-        .err()
-        .expect("a prepared session needs device-resident state");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 
     // No rejected prepare left any handle behind.

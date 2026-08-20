@@ -1454,9 +1454,6 @@ impl<'host> ProgramSession<'host> {
 struct PreparedBufferClasses {
     /// Distinct `PerProgram` + HostProvided ids (the once-init weights).
     host_provided_weights: usize,
-    /// Distinct `PerProgram` + ZeroFill ids (the device-resident state the
-    /// prompt-scoped reset clears).
-    zero_fill_state: usize,
     /// Distinct `PerStep` + `ObservationPoint` keys (allocated per reuse).
     per_execution_alloc_count: usize,
 }
@@ -1468,7 +1465,6 @@ struct PreparedBufferClasses {
 /// so counting by buffer id is unambiguous.
 fn prepared_buffer_classes(descriptor: &DeviceDescriptor) -> PreparedBufferClasses {
     let mut host_provided: BTreeSet<u32> = BTreeSet::new();
-    let mut zero_fill: BTreeSet<u32> = BTreeSet::new();
     let mut per_execution: BTreeSet<(u32, u32)> = BTreeSet::new();
     for kernel in &descriptor.kernels {
         for slot in &kernel.buffers {
@@ -1477,10 +1473,8 @@ fn prepared_buffer_classes(descriptor: &DeviceDescriptor) -> PreparedBufferClass
                     DeviceBufferInitialization::HostProvided => {
                         host_provided.insert(slot.buffer_id);
                     }
-                    DeviceBufferInitialization::ZeroFill => {
-                        zero_fill.insert(slot.buffer_id);
-                    }
-                    DeviceBufferInitialization::KernelInitialized => {}
+                    DeviceBufferInitialization::ZeroFill
+                    | DeviceBufferInitialization::KernelInitialized => {}
                 },
                 DeviceBufferLifetime::PerStep | DeviceBufferLifetime::ObservationPoint => {
                     per_execution.insert((slot.buffer_id, slot.version));
@@ -1490,7 +1484,6 @@ fn prepared_buffer_classes(descriptor: &DeviceDescriptor) -> PreparedBufferClass
     }
     PreparedBufferClasses {
         host_provided_weights: host_provided.len(),
-        zero_fill_state: zero_fill.len(),
         per_execution_alloc_count: per_execution.len(),
     }
 }
@@ -1589,17 +1582,18 @@ pub struct PreparedResidentSession<'host> {
 impl<'host> PreparedResidentSession<'host> {
     /// Prepare one resident session from an admitted descriptor (E03-U1):
     /// validate the prepared-session shape (a `RepeatingStep` program with
-    /// once-init `HostProvided` weights AND device-resident `ZeroFill`
-    /// state), create the underlying [`ProgramSession`] (module loaded once,
-    /// every `PerProgram` buffer allocated once), and once-init the weights
-    /// so they stay device-resident. The first failing oracle — a module
+    /// once-init `HostProvided` weights; an optional device-resident
+    /// `ZeroFill` state may also be declared), create the underlying
+    /// [`ProgramSession`] (module loaded once, every `PerProgram` buffer
+    /// allocated once), and once-init the weights so they stay
+    /// device-resident. The first failing oracle — a module
     /// reload or PerProgram re-allocation between reuses — is measured from
     /// the driver counters baselined here.
     ///
     /// # Errors
     /// - `E_DEVICE_DESCRIPTOR` — the descriptor is not a prepared-session
-    ///   shape (wrong backend, not `RepeatingStep`, no `HostProvided`
-    ///   weights, or no `ZeroFill` device-resident state);
+    ///   shape (wrong backend, not `RepeatingStep`, or no `HostProvided`
+    ///   `PerProgram` weights);
     /// - session-level failures (module load, allocation, once-init) bubble
     ///   through; creation/once-init failures run the error-path teardown.
     pub fn prepare(
@@ -1631,12 +1625,10 @@ impl<'host> PreparedResidentSession<'host> {
                 "a prepared resident session requires once-init weights: at least one PerProgram + HostProvided buffer",
             ));
         }
-        if classes.zero_fill_state == 0 {
-            return Err(descriptor_errors::descriptor(
-                "a prepared resident session requires device-resident state: at least one PerProgram + ZeroFill buffer (the prompt-scoped reset clears exactly this class)",
-            ));
-        }
-
+        // Dense direct-loaded models may have no persistent prompt state at
+        // all. The adapter still admits them: reset_prompt becomes a
+        // deliberate no-op, while the PerProgram + HostProvided weights keep
+        // the same once-init residency contract.
         let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
         session.init_params(weights)?;
         let counters = session.driver_counters();
