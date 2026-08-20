@@ -3,11 +3,11 @@
 //! Families:
 //! 1. The initial record decides every op family with a valid tri-state
 //!    result; no family is left without a decision.
-//! 2. Weight-consuming families (gather / quantized_matmul / logits_head) are
+//! 2. Weight-consuming families (gather / `quantized_matmul` / `logits_head`) are
 //!    `supported_with_explicit_conversion` carrying the per-class conversion
 //!    plan consumed from the S1 repack selection.
-//! 3. Pure-compute families (rms_normalization / rope / causal_masked_softmax
-//!    / silu_composition) are `supported_direct` on the frozen GI3-1 recipe
+//! 3. Pure-compute families (`rms_normalization` / rope / `causal_masked_softmax`
+//!    / `silu_composition`) are `supported_direct` on the frozen GI3-1 recipe
 //!    surface.
 //! 4. The tri-state is exactly three variants — no silent CPU fallback path
 //!    exists.
@@ -317,14 +317,14 @@ fn obj<'a>(v: &'a Valor, key: &str) -> &'a Valor {
         .unwrap_or_else(|| panic!("record missing field {key:?}"))
 }
 
-fn list<'a>(v: &'a Valor) -> &'a Vec<Valor> {
+fn list(v: &Valor) -> &Vec<Valor> {
     let Valor::Lista(items) = v else {
         panic!("expected JSON list");
     };
     items
 }
 
-fn text<'a>(v: &'a Valor) -> &'a str {
+fn text(v: &Valor) -> &str {
     let Valor::Textus(s) = v else {
         panic!("expected JSON string");
     };
@@ -445,13 +445,13 @@ fn committed_evidence_record_is_hash_accounted_and_matches_the_initial_contract(
         // The tri-state matches the family's consumed classes.
         let consumed: Vec<&str> = list(obj(f, "consumed_tensor_classes"))
             .iter()
-            .map(|c| text(c))
+            .map(text)
             .collect();
         if !consumed.is_empty() {
             assert_eq!(kind, "supported_with_explicit_conversion", "{name}");
             let plan_classes: Vec<&str> = list(obj(obj(result, "conversion_plan"), "per_class"))
                 .iter()
-                .map(|c| text(c))
+                .map(text)
                 .collect();
             assert_eq!(
                 plan_classes, consumed,

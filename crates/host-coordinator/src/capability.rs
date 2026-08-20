@@ -30,15 +30,15 @@ use crate::repack_plan::{PinnedDtype, RepackDescriptor, RepackSelection, RowIden
 // ---------------------------------------------------------------------------
 
 /// The pinned row's op families: the GI3-1 frozen recipe surface (Gather /
-/// RmsNormalization / Rope / CausalMaskedSoftmax + the verified SiLU
-/// composition) plus reuse (TiledMatMul) and the tied-head logits projection.
+/// `RmsNormalization` / Rope / `CausalMaskedSoftmax` + the verified `SiLU`
+/// composition) plus reuse (`TiledMatMul`) and the tied-head logits projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpFamily {
-    /// Embedding/gather over `token_embd.weight` (Q8_0, `[960,49152]`).
+    /// Embedding/gather over `token_embd.weight` (`Q8_0`, `[960,49152]`).
     Gather,
     /// `x/sqrt(mean(x²)+eps)·γ` over the F32 norm weights (eps 1e-5).
     RmsNormalization,
-    /// Llama-arch NORM consecutive-pair rotation (dim 64, freq_base 100000).
+    /// Llama-arch NORM consecutive-pair rotation (dim 64, `freq_base` 100000).
     Rope,
     /// Causal masked row softmax over the attention scores.
     CausalMaskedSoftmax,
@@ -308,7 +308,7 @@ pub struct CapabilityRecord {
 
 impl CapabilityRecord {
     /// The initial capability record for the pinned row (Q4 default):
-    /// weight-consuming families (Gather, QuantizedMatmul, LogitsHead) are
+    /// weight-consuming families (Gather, `QuantizedMatmul`, `LogitsHead`) are
     /// `supported_with_explicit_conversion` on the declared f32 conversion
     /// (consuming the S1 selection); pure-compute families are
     /// `supported_direct` on the frozen GI3-1 recipe surface. No variant

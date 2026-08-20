@@ -223,7 +223,7 @@ fn constraint_selection_resolves_membership_shape() {
 }
 
 /// A *degraded* member stays selectable but is flagged for the gate layer
-/// (C2 §2: "may stay in the DeviceSet but is ineligible for any placement
+/// (C2 §2: "may stay in the `DeviceSet` but is ineligible for any placement
 /// whose gate it cannot satisfy").
 #[test]
 fn degraded_member_stays_selectable_but_is_flagged_for_gates() {

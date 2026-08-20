@@ -3130,10 +3130,10 @@ fn end_of_run_observations_fail_closed_on_invalid_declarations() {
     let host_validate = |declared: Vec<DescriptorEndOfRunResult>| -> HostError {
         let mut descriptor = end_of_run_training_descriptor(DeviceBackend::Metal);
         descriptor.end_of_run_results = declared;
-        let error = descriptor
+
+        descriptor
             .validate()
-            .expect_err("an invalid end-of-run declaration must fail closed before any launch");
-        error
+            .expect_err("an invalid end-of-run declaration must fail closed before any launch")
     };
 
     // (a) A per-step result (the loss l) also declared as end-of-run: a

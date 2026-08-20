@@ -11,3 +11,6 @@ pedantic = "deny"
 faber = { path = "../../../faber/runtime/rust" }
 host-kernel = { path = "../host-kernel" }
 libc = "0.2"
+
+[dev-dependencies]
+hygiene-ratchet = { path = "../../../radix/crates/hygiene-ratchet" }

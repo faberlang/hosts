@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
 ]
 
 [[package]]
@@ -132,6 +133,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
  "libc",
 ]
 
@@ -731,6 +733,7 @@ name = "host-coordinator"
 version = "0.1.0"
 dependencies = [
  "faber",
+ "hygiene-ratchet",
  "sha2",
 ]
 
@@ -739,6 +742,7 @@ name = "host-kernel"
 version = "0.1.0"
 dependencies = [
  "faber",
+ "hygiene-ratchet",
  "serde",
  "serde_json",
 ]
@@ -749,6 +753,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
 ]
 
 [[package]]
@@ -770,6 +775,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
  "libc",
  "ureq",
 ]
@@ -1165,6 +1171,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
  "libc",
 ]
 
@@ -1470,6 +1477,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
  "sha2",
  "tempfile",
 ]
@@ -1544,6 +1552,7 @@ version = "0.1.0"
 dependencies = [
  "faber",
  "host-kernel",
+ "hygiene-ratchet",
 ]
 
 [[package]]

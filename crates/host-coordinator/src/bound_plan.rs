@@ -481,7 +481,7 @@ pub fn bind(
     };
     let bytes = plan.canonical_bytes();
     plan.bound_distributed_plan_hash =
-        format!("sha256:{}", hex_lower(&crate::repack_plan::sha256(&bytes)),);
+        format!("sha256:{}", hex_lower(&crate::repack_plan::sha256(&bytes)));
     Ok(plan)
 }
 
@@ -560,7 +560,10 @@ impl BoundDistributedPlan {
                 virtual_partition,
             } => {
                 let physical = BTreeSet::from([device.clone()]);
-                let virtual_ids: BTreeSet<_> = virtual_partition.iter().map(|p| p.id()).collect();
+                let virtual_ids: BTreeSet<_> = virtual_partition
+                    .iter()
+                    .map(super::partition::VirtualDevicePartition::id)
+                    .collect();
                 PartitionReceipt::new(
                     physical,
                     virtual_ids,
@@ -572,7 +575,10 @@ impl BoundDistributedPlan {
                 let physical: BTreeSet<_> = bindings.values().map(|b| b.device().clone()).collect();
                 let virtual_ids: BTreeSet<_> = bindings
                     .values()
-                    .filter_map(|b| b.virtual_partition().map(|p| p.id()))
+                    .filter_map(|b| {
+                        b.virtual_partition()
+                            .map(super::partition::VirtualDevicePartition::id)
+                    })
                     .collect();
                 PartitionReceipt::new(
                     physical,
@@ -673,7 +679,7 @@ fn check_constraint(
     match constraint {
         DeclaredPlacementConstraint::DistinctPhysicalDevices => {
             let distinct: BTreeSet<&PhysicalDeviceId> =
-                bindings.values().map(|b| b.device()).collect();
+                bindings.values().map(PartitionBinding::device).collect();
             if distinct.len() != bindings.len() {
                 return Err(format!(
                     "{} partition(s) must each bind a distinct physical device; {} distinct device(s) referenced",

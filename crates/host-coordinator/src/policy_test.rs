@@ -764,7 +764,7 @@ fn health_epoch_gate_rejects_stale_snapshots_and_unknown_selections() {
         &selection,
         &stale,
         &[Objective::Latency],
-        &[plan.clone()],
+        std::slice::from_ref(&plan),
     );
     assert_eq!(outcome.ranked.len(), 0);
     assert_eq!(outcome.rejected.len(), 1);
@@ -780,7 +780,7 @@ fn health_epoch_gate_rejects_stale_snapshots_and_unknown_selections() {
         &bad_selection,
         &constraints_at(&snap, budgets, DeviceHealthGeneration::initial()),
         &[Objective::Latency],
-        &[plan.clone()],
+        std::slice::from_ref(&plan),
     );
     assert_eq!(outcome.ranked.len(), 0);
     assert_eq!(outcome.rejected.len(), 1);
@@ -1084,7 +1084,13 @@ fn objectives_never_reject_a_plan_without_facts() {
         Objective::Power,
     ];
 
-    let outcome = evaluate_all(&snap, &selection, &constraints, &all_seven, &[bare.clone()]);
+    let outcome = evaluate_all(
+        &snap,
+        &selection,
+        &constraints,
+        &all_seven,
+        std::slice::from_ref(&bare),
+    );
     assert!(outcome.rejected.is_empty(), "objectives never reject");
     assert_eq!(outcome.ranked.len(), 1);
     assert_eq!(outcome.ranked[0].plan, "bare");

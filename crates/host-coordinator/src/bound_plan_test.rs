@@ -213,7 +213,7 @@ fn bind_plan(
 #[test]
 fn admit_rejects_stale_or_unadmitted_logical_hash() {
     for bad in [
-        "".to_owned(),
+        String::new(),
         "sha256:".to_owned(),
         "sha256:ABC".to_owned(),
         format!("sha256:{}", "A".repeat(64)), // uppercase hex — not the contract digest

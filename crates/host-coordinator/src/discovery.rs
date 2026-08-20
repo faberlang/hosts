@@ -255,7 +255,7 @@ impl DeviceDiscoverySnapshot {
         self.probe_utc_nanos
     }
 
-    /// Per-device facts, keyed by ordinal locator (canonical BTree order).
+    /// Per-device facts, keyed by ordinal locator (canonical `BTree` order).
     #[must_use]
     pub fn devices(&self) -> &BTreeMap<DeviceOrdinal, DeviceDiscoveryEntry> {
         &self.devices

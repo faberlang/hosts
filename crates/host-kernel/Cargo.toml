@@ -13,3 +13,6 @@ pedantic = "deny"
 faber = { path = "../../../faber/runtime/rust" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+hygiene-ratchet = { path = "../../../radix/crates/hygiene-ratchet" }
