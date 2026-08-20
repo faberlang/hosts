@@ -30,6 +30,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_ID_PREFIX: &str = "http-";
+const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
 
 pub struct Http {
     registration: ProviderRegistration,
@@ -490,7 +491,7 @@ impl Http {
             }
             self.write_all_backpressure(
                 &mut connection.stream,
-                b"0\r\n\r\n",
+                LAST_CHUNK,
                 slot.listener,
                 context,
             )?;
@@ -561,9 +562,9 @@ impl Http {
 
     fn take_request(&self, request_id: &str) -> HostResult<i64> {
         let mut requests = lock(&self.state.requests, "http requests")?;
-        requests.remove(request_id).ok_or_else(|| {
-            HostError::invalid_args(format!("http:respond unknown request {request_id}"))
-        })
+        requests
+            .remove(request_id)
+            .ok_or_else(|| HostError::invalid_args(format!("http unknown request {request_id}")))
     }
 
     fn restore_request(&self, request_id: String, connection_id: i64) -> HostResult<()> {
