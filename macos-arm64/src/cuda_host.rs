@@ -1109,11 +1109,7 @@ impl FakeCudaDriver {
             .get_mut(&out)
             .ok_or_else(|| HostError::internal("fake matmul missing out"))?;
         let (m, k, n) = (m as usize, k as usize, n as usize);
-        let (a_len, b_len, out_len) = (
-            m.checked_mul(k),
-            k.checked_mul(n),
-            m.checked_mul(n),
-        );
+        let (a_len, b_len, out_len) = (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n));
         let (Some(a_len), Some(b_len), Some(out_len)) = (a_len, b_len, out_len) else {
             return Err(HostError::internal("fake matmul plan dims overflow"));
         };

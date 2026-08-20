@@ -86,14 +86,10 @@ fn parse_rejects_wrong_schema_version() {
                      "input_buffers": 2, "output_buffers": 1, "accumulation_buffers": 0,
                      "buffers": [], "launch": { "workgroup": { "x": 1, "y": 1, "z": 1 },
                      "dispatch": { "x": 256, "y": 1, "z": 1 } } } ] }"#;
-    let err = parse_descriptor(descriptor)
-        .expect_err("v1 sidecar must fail closed on schema version");
+    let err =
+        parse_descriptor(descriptor).expect_err("v1 sidecar must fail closed on schema version");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(
-        err.message.contains("schema_version 1"),
-        "{}",
-        err.message
-    );
+    assert!(err.message.contains("schema_version 1"), "{}", err.message);
     assert!(err.message.contains("2"), "{}", err.message);
 }
 
@@ -162,8 +158,7 @@ fn parse_rejects_count_shape_contradiction() {
                      "shape": [2, 2] } ],
                      "launch": { "workgroup": { "x": 2, "y": 2, "z": 1 },
                      "dispatch": { "x": 1, "y": 1, "z": 1 } } } ] }"#;
-    let err = parse_descriptor(descriptor)
-        .expect_err("element_count must equal the shape product");
+    let err = parse_descriptor(descriptor).expect_err("element_count must equal the shape product");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
 }
 
@@ -328,11 +323,17 @@ fn execute_launches_matmul_and_matches_oracle() {
     .expect("adapter launch");
     assert_eq!(receipt.entry, "rung0_matmul_kernel");
     assert_eq!(receipt.launches, 1, "single launch authority");
-    assert_eq!(receipt.allocated_buffers, 3, "buffers sized from the descriptor");
+    assert_eq!(
+        receipt.allocated_buffers, 3,
+        "buffers sized from the descriptor"
+    );
     assert_eq!(receipt.copy_ins, 2, "two host input buffers copied in");
     assert_eq!(receipt.zero_fills, 0, "rung-0 has no accumulation buffers");
     assert_eq!(receipt.readbacks, 1, "one output buffer read back");
-    assert_eq!(receipt.releases, 4, "3 buffers + module released after the launch");
+    assert_eq!(
+        receipt.releases, 4,
+        "3 buffers + module released after the launch"
+    );
     let output = receipt
         .outputs
         .get(&2)
@@ -439,8 +440,14 @@ fn execute_rejects_non_f32_transfer_route() {
     let plan = parse_descriptor(descriptor).expect("i32 is inside the NVVM family");
     assert_eq!(plan.element_ty, NvvmElementType::I32);
     let mut session = fake_session();
-    let err = launch_descriptor(&mut session, descriptor, b"// fake PTX", &BTreeMap::new(), None)
-        .expect_err("non-f32 transfers must fail closed");
+    let err = launch_descriptor(
+        &mut session,
+        descriptor,
+        b"// fake PTX",
+        &BTreeMap::new(),
+        None,
+    )
+    .expect_err("non-f32 transfers must fail closed");
     assert_eq!(err.code, E_DEVICE_DTYPE_MISMATCH);
     assert!(err.message.contains("i32"), "{}", err.message);
     assert_eq!(session.live_handle_count(), 0);

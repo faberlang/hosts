@@ -409,9 +409,7 @@ pub fn parse_descriptor(descriptor_json: &[u8]) -> HostResult<NvvmLaunchPlan> {
         )));
     }
     if document.kernels.is_empty() {
-        return Err(errors::descriptor(
-            "nvvm descriptor declares no kernels",
-        ));
+        return Err(errors::descriptor("nvvm descriptor declares no kernels"));
     }
     if document.kernels.len() > 1 {
         return Err(errors::descriptor(format!(
@@ -548,11 +546,7 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
             buffers.len()
         )));
     }
-    for (index, (declared, buffer)) in kernel
-        .element_counts
-        .iter()
-        .zip(buffers.iter())
-        .enumerate()
+    for (index, (declared, buffer)) in kernel.element_counts.iter().zip(buffers.iter()).enumerate()
     {
         if *declared != buffer.element_count {
             return Err(errors::shape_mismatch(format!(
@@ -610,9 +604,7 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     };
     if let Some(plan) = &kernel.plan {
         match plan.kind.as_str() {
-            "tiled_matmul" => {
-                validate_tiled_matmul_plan(plan, &buffers, &block, &kernel.entry)?
-            }
+            "tiled_matmul" => validate_tiled_matmul_plan(plan, &buffers, &block, &kernel.entry)?,
             "tree_reduction" => {
                 validate_tree_reduction_plan(plan, &buffers, &block, &kernel.entry)?
             }
@@ -692,9 +684,30 @@ fn validate_tiled_matmul_plan(
             buffers.len()
         )));
     }
-    plan_buffer_position(buffers, 0, AdapterBufferRole::Input, mk, "tiled_matmul", entry)?;
-    plan_buffer_position(buffers, 1, AdapterBufferRole::ExtraInput, kn, "tiled_matmul", entry)?;
-    plan_buffer_position(buffers, 2, AdapterBufferRole::Output, mn, "tiled_matmul", entry)?;
+    plan_buffer_position(
+        buffers,
+        0,
+        AdapterBufferRole::Input,
+        mk,
+        "tiled_matmul",
+        entry,
+    )?;
+    plan_buffer_position(
+        buffers,
+        1,
+        AdapterBufferRole::ExtraInput,
+        kn,
+        "tiled_matmul",
+        entry,
+    )?;
+    plan_buffer_position(
+        buffers,
+        2,
+        AdapterBufferRole::Output,
+        mn,
+        "tiled_matmul",
+        entry,
+    )?;
     plan_workgroup_consistency(plan, block, entry)
 }
 
@@ -736,8 +749,22 @@ fn validate_tree_reduction_plan(
             buffers.len()
         )));
     }
-    plan_buffer_position(buffers, 0, AdapterBufferRole::Input, length, "tree_reduction", entry)?;
-    plan_buffer_position(buffers, 1, AdapterBufferRole::Output, partials, "tree_reduction", entry)?;
+    plan_buffer_position(
+        buffers,
+        0,
+        AdapterBufferRole::Input,
+        length,
+        "tree_reduction",
+        entry,
+    )?;
+    plan_buffer_position(
+        buffers,
+        1,
+        AdapterBufferRole::Output,
+        partials,
+        "tree_reduction",
+        entry,
+    )?;
     plan_workgroup_consistency(plan, block, entry)
 }
 
@@ -906,20 +933,18 @@ pub fn execute_launch_plan(
                 readbacks += 1;
             }
         }
-        let oracle_check = oracle.map(|expected| {
-            match outputs.values().next() {
-                Some(values) => {
-                    let (matched, max_abs_delta) = expected.matches(values);
-                    OracleCheck {
-                        matched,
-                        max_abs_delta,
-                    }
+        let oracle_check = oracle.map(|expected| match outputs.values().next() {
+            Some(values) => {
+                let (matched, max_abs_delta) = expected.matches(values);
+                OracleCheck {
+                    matched,
+                    max_abs_delta,
                 }
-                None => OracleCheck {
-                    matched: false,
-                    max_abs_delta: f64::INFINITY,
-                },
             }
+            None => OracleCheck {
+                matched: false,
+                max_abs_delta: f64::INFINITY,
+            },
         });
         Ok(AdapterLaunchReceipt {
             entry: plan.entry.clone(),

@@ -12,13 +12,13 @@
 //! program_lifetime) is the focus; every already-hashed field is re-flipped
 //! as a control.
 
-use host_coordinator::DeviceBackend;
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
     DescriptorKernel, DescriptorLaunch, DescriptorResult, DeviceBufferInitialization,
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime,
 };
+use host_coordinator::DeviceBackend;
 
 /// The S2-4 lifetime the constructor derives from ABI facts (Input →
 /// PerProgram, Output → ObservationPoint, InOut → PerStep).
@@ -40,13 +40,7 @@ fn initialization_for_role(role: DeviceBufferRole) -> DeviceBufferInitialization
 }
 
 /// One typed buffer slot (F1: one distinct semantic value per buffer id).
-fn slot(
-    id: u32,
-    name: &str,
-    role: DeviceBufferRole,
-    binding: u32,
-    count: u64,
-) -> DescriptorBuffer {
+fn slot(id: u32, name: &str, role: DeviceBufferRole, binding: u32, count: u64) -> DescriptorBuffer {
     DescriptorBuffer {
         buffer_id: id,
         buffer_name: name.to_owned(),
@@ -67,12 +61,9 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
     let mut versions = Vec::new();
     for kernel in kernels {
         for slot in &kernel.buffers {
-            if versions
-                .iter()
-                .any(|version: &DescriptorBufferVersion| {
-                    version.buffer_id == slot.buffer_id && version.version == slot.version
-                })
-            {
+            if versions.iter().any(|version: &DescriptorBufferVersion| {
+                version.buffer_id == slot.buffer_id && version.version == slot.version
+            }) {
                 continue;
             }
             versions.push(DescriptorBufferVersion {
@@ -294,10 +285,8 @@ fn identity_order_invariance_buffer_declarations() {
     let declared = base_descriptor();
     let mut reversed = base_descriptor();
     reversed.kernels[0].buffers.reverse();
-    assert_eq!(
-        declared.program_graph_hash(),
-        reversed.program_graph_hash()
-    );}
+    assert_eq!(declared.program_graph_hash(), reversed.program_graph_hash());
+}
 
 /// The launch SEQUENCE is the execution schedule and IS part of the graph
 /// identity: reordering launches changes the receipt. Declaration-order
