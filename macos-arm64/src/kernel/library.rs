@@ -166,6 +166,220 @@ fn row_major_strides(dims: &[u64]) -> Vec<u64> {
     strides
 }
 
+/// Layout family for the fused attention library body.
+///
+/// `Grouped` is the canonical `[kv_group, q_head, query, head_dim]` query and
+/// output layout with `[kv_group, sequence, head_dim]` key/value layout.
+/// `Strided` keeps those logical axes while allowing a caller to bind views
+/// with arbitrary positive strides.  The arithmetic is shared by both
+/// layouts; only the bind facts change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CausalAttentionLayout {
+    /// Canonical group-major, sequence-major storage.
+    Grouped,
+    /// Explicit strides describe each input and output view.
+    Strided,
+}
+
+/// Bind facts for one shape-generic `CausalAttention` library invocation.
+///
+/// One invocation owns one KV-group batch.  Its `q_per_kv` query heads use
+/// separate softmax accumulators, while the body is independent of model
+/// dimensions.  Query tensors are logically
+/// `[kv_batch, q_per_kv, query_seq, head_dim]`; key and value tensors are
+/// `[kv_batch, seq_block, head_dim]`.  The causal window is the final
+/// `query_seq` rows of the KV block, which covers both prompt and one-token
+/// decode calls without a model-specific position argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalAttentionBind {
+    /// Head width used by the dot product and `1/sqrt(head_dim)` scale.
+    pub head_dim: u64,
+    /// Number of key/value sequence rows in this invocation.
+    pub seq_block: u64,
+    /// Number of query heads sharing each KV head.
+    pub q_per_kv: u64,
+    /// Number of KV groups in the bound batch.
+    pub kv_batch: u64,
+    /// Number of query rows.  They address the final rows of `seq_block`.
+    pub query_seq: u64,
+    /// Query strides for logical `[group, q_head, query, dim]` axes.
+    pub q_strides: [u64; 4],
+    /// Key strides for logical `[group, sequence, dim]` axes.
+    pub k_strides: [u64; 3],
+    /// Value strides for logical `[group, sequence, dim]` axes.
+    pub v_strides: [u64; 3],
+    /// Output strides for logical `[group, q_head, query, dim]` axes.
+    pub output_strides: [u64; 4],
+    /// Logical storage family for this bind.
+    pub layout: CausalAttentionLayout,
+    /// Backend-neutral dispatch grid carried into the plan record.
+    pub grid: [u32; 3],
+}
+
+impl CausalAttentionBind {
+    /// Construct canonical grouped storage for one prompt or decode block.
+    #[must_use]
+    pub fn grouped(
+        head_dim: u64,
+        seq_block: u64,
+        q_per_kv: u64,
+        kv_batch: u64,
+        query_seq: u64,
+        grid: [u32; 3],
+    ) -> Self {
+        let q_row = q_per_kv.saturating_mul(query_seq).saturating_mul(head_dim);
+        let q_head = query_seq.saturating_mul(head_dim);
+        let k_row = seq_block.saturating_mul(head_dim);
+        let q_strides = [q_row, q_head, head_dim, 1];
+        let k_strides = [k_row, head_dim, 1];
+        Self {
+            head_dim,
+            seq_block,
+            q_per_kv,
+            kv_batch,
+            query_seq,
+            q_strides,
+            k_strides,
+            v_strides: k_strides,
+            output_strides: q_strides,
+            layout: CausalAttentionLayout::Grouped,
+            grid,
+        }
+    }
+
+    /// Construct a strided attention bind while retaining the same logical
+    /// axes as [`Self::grouped`].
+    #[must_use]
+    pub fn strided(
+        head_dim: u64,
+        seq_block: u64,
+        q_per_kv: u64,
+        kv_batch: u64,
+        query_seq: u64,
+        q_strides: [u64; 4],
+        k_strides: [u64; 3],
+        v_strides: [u64; 3],
+        output_strides: [u64; 4],
+        grid: [u32; 3],
+    ) -> Self {
+        Self {
+            head_dim,
+            seq_block,
+            q_per_kv,
+            kv_batch,
+            query_seq,
+            q_strides,
+            k_strides,
+            v_strides,
+            output_strides,
+            layout: CausalAttentionLayout::Strided,
+            grid,
+        }
+    }
+
+    /// Validate the attention shape and all bound physical views before any
+    /// input or output buffer is touched.
+    pub fn validate(&self) -> Result<(), KernelBodyError> {
+        if self.head_dim == 0
+            || self.seq_block == 0
+            || self.q_per_kv == 0
+            || self.kv_batch == 0
+            || self.query_seq == 0
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "causal attention bind has a zero dimension",
+            ));
+        }
+        if self.query_seq > self.seq_block {
+            return Err(KernelBodyError::InvalidBind(
+                "causal attention query rows exceed the sequence block",
+            ));
+        }
+        if self.grid.iter().any(|axis| *axis == 0) {
+            return Err(KernelBodyError::InvalidBind(
+                "causal attention bind has a zero dispatch axis",
+            ));
+        }
+        if self
+            .q_strides
+            .iter()
+            .chain(self.k_strides.iter())
+            .chain(self.v_strides.iter())
+            .chain(self.output_strides.iter())
+            .any(|stride| *stride == 0)
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "causal attention bind has a zero stride",
+            ));
+        }
+        let q_head =
+            self.query_seq
+                .checked_mul(self.head_dim)
+                .ok_or(KernelBodyError::InvalidBind(
+                    "causal attention query stride overflow",
+                ))?;
+        let q_group = self
+            .q_per_kv
+            .checked_mul(q_head)
+            .ok_or(KernelBodyError::InvalidBind(
+                "causal attention query stride overflow",
+            ))?;
+        let k_group =
+            self.seq_block
+                .checked_mul(self.head_dim)
+                .ok_or(KernelBodyError::InvalidBind(
+                    "causal attention KV stride overflow",
+                ))?;
+        let expected_q = [q_group, q_head, self.head_dim, 1];
+        let expected_k = [k_group, self.head_dim, 1];
+        if matches!(self.layout, CausalAttentionLayout::Grouped)
+            && (self.q_strides != expected_q
+                || self.k_strides != expected_k
+                || self.v_strides != self.k_strides
+                || self.output_strides != self.q_strides)
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped causal attention bind has non-canonical strides",
+            ));
+        }
+        attention_span(
+            &[self.kv_batch, self.q_per_kv, self.query_seq, self.head_dim],
+            &self.q_strides,
+        )?;
+        attention_span(
+            &[self.kv_batch, self.seq_block, self.head_dim],
+            &self.k_strides,
+        )?;
+        attention_span(
+            &[self.kv_batch, self.seq_block, self.head_dim],
+            &self.v_strides,
+        )?;
+        attention_span(
+            &[self.kv_batch, self.q_per_kv, self.query_seq, self.head_dim],
+            &self.output_strides,
+        )?;
+        Ok(())
+    }
+}
+
+fn attention_span(dims: &[u64], strides: &[u64]) -> Result<u64, KernelBodyError> {
+    if dims.len() != strides.len() {
+        return Err(KernelBodyError::InvalidBind(
+            "causal attention dimensions and strides have different ranks",
+        ));
+    }
+    dims.iter()
+        .zip(strides)
+        .try_fold(1u64, |span, (dim, stride)| {
+            dim.checked_sub(1)
+                .and_then(|last| last.checked_mul(*stride))
+                .and_then(|last| span.checked_add(last))
+        })
+        .ok_or(KernelBodyError::InvalidBind(
+            "causal attention physical span overflow",
+        ))
+}
+
 /// Errors returned before a body performs a read or write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelBodyError {
@@ -520,6 +734,172 @@ pub fn causal_softmax(
     })?;
     Ok(())
 }
+
+fn attention_offset(coordinates: &[u64], strides: &[u64]) -> Result<usize, KernelBodyError> {
+    if coordinates.len() != strides.len() {
+        return Err(KernelBodyError::InvalidBind(
+            "causal attention coordinate rank does not match its strides",
+        ));
+    }
+    let offset = coordinates
+        .iter()
+        .zip(strides)
+        .try_fold(0u64, |offset, (coordinate, stride)| {
+            coordinate
+                .checked_mul(*stride)
+                .and_then(|term| offset.checked_add(term))
+        })
+        .ok_or(KernelBodyError::InvalidBind(
+            "causal attention element offset overflow",
+        ))?;
+    checked_usize(offset)
+}
+
+fn ensure_attention_buffer(
+    bind: &CausalAttentionBind,
+    name: &'static str,
+    dims: &[u64],
+    strides: &[u64],
+    len: usize,
+) -> Result<(), KernelBodyError> {
+    let required = attention_span(dims, strides)?;
+    if required > len as u64 {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: name,
+            required,
+            actual: len,
+        });
+    }
+    // Keep the bind in this helper's contract: the dimensions and strides are
+    // never inferred from the supplied slice length.
+    bind.validate()
+}
+
+/// Fused causal attention over every query head in each KV group.
+///
+/// The body performs the existing M3 operation order in one library call:
+/// dot-product scores, scale by `1/sqrt(head_dim)`, causal mask, stable
+/// softmax, and the value/context reduction.  `shared_max` and `shared_sum`
+/// model the device threadgroup's per-head shared-memory accumulators.  They
+/// are indexed by `q_head`, never shared between query heads, so a head's
+/// softmax cannot observe another head's score or value.
+///
+/// The function is the host reference for the plan-selected library entry.
+/// It is intentionally not wired into the legacy descriptor decomposition;
+/// M4-U2 owns the selection that makes this entry reachable from a device
+/// plan.
+pub fn causal_attention(
+    bind: &CausalAttentionBind,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    bind.validate()?;
+    let q_dims = [bind.kv_batch, bind.q_per_kv, bind.query_seq, bind.head_dim];
+    let kv_dims = [bind.kv_batch, bind.seq_block, bind.head_dim];
+    ensure_attention_buffer(bind, "q", &q_dims, &bind.q_strides, q.len())?;
+    ensure_attention_buffer(bind, "k", &kv_dims, &bind.k_strides, k.len())?;
+    ensure_attention_buffer(bind, "v", &kv_dims, &bind.v_strides, v.len())?;
+    ensure_attention_buffer(bind, "output", &q_dims, &bind.output_strides, output.len())?;
+
+    let scale = 1.0f32 / (bind.head_dim as f32).sqrt();
+    let head_dim = checked_usize(bind.head_dim)?;
+    let seq_block = checked_usize(bind.seq_block)?;
+    let q_per_kv = checked_usize(bind.q_per_kv)?;
+    let kv_batch = checked_usize(bind.kv_batch)?;
+    let query_seq = checked_usize(bind.query_seq)?;
+    let query_start = seq_block - query_seq;
+
+    // These vectors stand in for threadgroup shared memory on the Metal
+    // materializer.  There is one max and one sum slot for every q head in the
+    // group, rather than one accumulator for the whole group.
+    let mut shared_max = vec![0.0f32; q_per_kv];
+    let mut shared_sum = vec![0.0f32; q_per_kv];
+    let mut scores = vec![0.0f32; seq_block];
+
+    for group in 0..kv_batch {
+        for q_head in 0..q_per_kv {
+            for query in 0..query_seq {
+                let query_position = query_start + query;
+                let visible = (query_position + 1).min(seq_block);
+                let mut row_max = f32::NEG_INFINITY;
+
+                for token in 0..visible {
+                    let mut dot = 0.0f32;
+                    for dimension in 0..head_dim {
+                        let q_offset = attention_offset(
+                            &[group as u64, q_head as u64, query as u64, dimension as u64],
+                            &bind.q_strides,
+                        )?;
+                        let k_offset = attention_offset(
+                            &[group as u64, token as u64, dimension as u64],
+                            &bind.k_strides,
+                        )?;
+                        dot += q[q_offset] * k[k_offset];
+                    }
+                    let score = dot * scale;
+                    scores[token] = score;
+                    row_max = row_max.max(score);
+                }
+                shared_max[q_head] = row_max;
+
+                let mut row_sum = 0.0f32;
+                for token in 0..visible {
+                    row_sum += (scores[token] - shared_max[q_head]).exp();
+                }
+                shared_sum[q_head] = row_sum;
+
+                for dimension in 0..head_dim {
+                    let mut context = 0.0f32;
+                    for token in 0..visible {
+                        let probability =
+                            (scores[token] - shared_max[q_head]).exp() / shared_sum[q_head];
+                        let v_offset = attention_offset(
+                            &[group as u64, token as u64, dimension as u64],
+                            &bind.v_strides,
+                        )?;
+                        context += probability * v[v_offset];
+                    }
+                    let output_offset = attention_offset(
+                        &[group as u64, q_head as u64, query as u64, dimension as u64],
+                        &bind.output_strides,
+                    )?;
+                    output[output_offset] = context;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The plan-path library selections currently materialized by this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryKernel {
+    /// Scale + causal scores + softmax + context for one KV-group batch.
+    CausalAttention,
+}
+
+/// Dispatch one plan-selected library kernel.
+///
+/// Keeping this narrow dispatcher separate from the legacy descriptor
+/// executor prevents a second, dead attention route before M4-U2's planner
+/// selection lands.
+pub fn dispatch(
+    kernel: LibraryKernel,
+    bind: &CausalAttentionBind,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        LibraryKernel::CausalAttention => causal_attention(bind, q, k, v, output),
+    }
+}
+
+/// Compatibility alias for callers that name the fused body explicitly.
+pub use causal_attention as causal_attention_fused;
 
 /// Compatibility aliases using the names used by the MIR recipes.
 pub use causal_softmax as causal_masked_softmax;

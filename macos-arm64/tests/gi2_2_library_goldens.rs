@@ -3,16 +3,20 @@
 //! The fixtures are byte-for-byte copies of the read-only
 //! `faber-prefill-oracle/testdata/gi2-2-op-goldens` tree.  These tests call the
 //! parameterized host bodies directly and compare their f32 values, never
-//! emitted MSL text.  Dense and attention fixtures remain in the copied tree
-//! for their later M3/M4 owners; M2 covers the bodies that M2-U1 parameterized.
+//! emitted MSL text.  Dense remains in the copied tree for its later
+//! projection owner; the attention fixture is exercised by the M4-U1 fused
+//! library body.
 
 use faber_host_macos_arm64::device_descriptor::sha256_hex;
-use faber_host_macos_arm64::kernel::library::{self, BindDescriptor, BindLayout};
+use faber_host_macos_arm64::kernel::library::{
+    self, BindDescriptor, BindLayout, CausalAttentionBind, LibraryKernel,
+};
 use serde::Deserialize;
 
 const RMS_NORM_GOLDEN: &str = include_str!("fixtures/gi2-2-op-goldens/rms_norm.json");
 const RESIDUAL_GOLDEN: &str = include_str!("fixtures/gi2-2-op-goldens/residual.json");
 const ROPE_GOLDEN: &str = include_str!("fixtures/gi2-2-op-goldens/rope.json");
+const ATTENTION_GOLDEN: &str = include_str!("fixtures/gi2-2-op-goldens/attention.json");
 const SWIGLU_GOLDEN: &str = include_str!("fixtures/gi2-2-op-goldens/swiglu.json");
 
 // The GI2-2 producer's f32 comparison band is 1e-6.  A fixture may override
@@ -173,6 +177,67 @@ fn rope_golden_matches_parameterized_body() {
 
     library::rope(&bind, &input, &cos, &sin, &mut actual).expect("parameterized RoPE body");
     assert_numeric(&golden, &actual);
+}
+
+#[test]
+fn causal_attention_golden_matches_fused_library_dispatch() {
+    let golden = golden(ATTENTION_GOLDEN);
+    let q = tensor_values(input(&golden, "q"));
+    let k = tensor_values(input(&golden, "k"));
+    let v = tensor_values(input(&golden, "v"));
+    // The pinned M3 buffers are sequence-major for KV: [sequence, group,
+    // head_dim].  The fused body receives that fact through the bind rather
+    // than baking the fixture's storage order into its arithmetic.
+    let bind = CausalAttentionBind::strided(
+        64,
+        9,
+        3,
+        5,
+        1,
+        [192, 64, 64, 1],
+        [64, 320, 1],
+        [64, 320, 1],
+        [192, 64, 64, 1],
+        [5, 1, 1],
+    );
+    let mut actual = vec![0.0; q.len()];
+
+    library::dispatch(
+        LibraryKernel::CausalAttention,
+        &bind,
+        &q,
+        &k,
+        &v,
+        &mut actual,
+    )
+    .expect("plan-path CausalAttention library dispatch");
+    assert_numeric(&golden, &actual);
+}
+
+#[test]
+fn causal_attention_keeps_query_head_softmax_accumulators_independent() {
+    let bind = CausalAttentionBind::grouped(2, 3, 2, 1, 1, [2, 1, 1]);
+    let q = [1.0, 0.0, 0.0, 1.0];
+    let mut perturbed_q = q;
+    perturbed_q[0] = 4.0;
+    let k = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let mut original = [0.0; 4];
+    let mut perturbed = [0.0; 4];
+
+    library::causal_attention(&bind, &q, &k, &v, &mut original).expect("original attention");
+    library::causal_attention(&bind, &perturbed_q, &k, &v, &mut perturbed)
+        .expect("perturbed attention");
+    assert_ne!(
+        &original[..2],
+        &perturbed[..2],
+        "the selected head must change"
+    );
+    assert_eq!(
+        &original[2..],
+        &perturbed[2..],
+        "a q head perturbation leaked into another head"
+    );
 }
 
 #[test]
