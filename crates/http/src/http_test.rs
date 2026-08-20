@@ -816,6 +816,131 @@ fn listen_bind_host_and_empty_host_are_honored() {
     assert_eq!(error.code, "E_INVALID_ARGS");
 }
 
+#[test]
+fn listen_two_arg_text_is_bind_host() {
+    let provider = Http::new().expect("provider");
+    let port = free_port();
+    let handle = provider
+        .dispatch(
+            &request(
+                "http:listen",
+                Valor::Lista(vec![
+                    Valor::Numerus(i64::from(port)),
+                    Valor::Textus("127.0.0.1".into()),
+                ]),
+            ),
+            &context(),
+        )
+        .expect("listen [port, bind_host]");
+    let [ProviderContent::Item(Valor::Numerus(handle))] = handle.contents.as_slice() else {
+        panic!("two-arg bind_host listen must return a handle");
+    };
+    TcpStream::connect(("127.0.0.1", port)).expect("connect two-arg bind_host");
+    provider
+        .dispatch(&request("http:stop", Valor::Numerus(*handle)), &context())
+        .expect("stop two-arg bind_host listener");
+}
+
+#[test]
+fn accept_backlog_is_bounded() {
+    assert_eq!(ACCEPT_BACKLOG, 32);
+}
+
+/// H1 golden frames (`norma/src/http/chunked.fab` describe "chunked").
+/// Provider `format_chunk` emits one frame; `LAST_CHUNK` is finish.
+#[test]
+fn chunked_framing_matches_h1_golden_vectors() {
+    let cases: &[(&str, &[&[u8]], &[u8])] = &[
+        (
+            "serialize hello golden",
+            &[b"hello"],
+            b"5\r\nhello\r\n0\r\n\r\n",
+        ),
+        ("roundtrip empty", &[], b"0\r\n\r\n"),
+        (
+            "parse multi-chunk concatenates",
+            &[b"hel", b"lo"],
+            b"3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n",
+        ),
+    ];
+    for (name, frames, want) in cases {
+        let mut got = Vec::new();
+        for frame in *frames {
+            got.extend_from_slice(&format_chunk(frame));
+        }
+        got.extend_from_slice(LAST_CHUNK);
+        assert_eq!(&got, want, "{name}");
+    }
+    let sixteen = [b'x'; 16];
+    let mut sixteen_wire = format_chunk(&sixteen);
+    sixteen_wire.extend_from_slice(LAST_CHUNK);
+    assert_eq!(
+        sixteen_wire, b"10\r\nxxxxxxxxxxxxxxxx\r\n0\r\n\r\n",
+        "roundtrip sixteen bytes uses two hex digits"
+    );
+
+    let head = format_chunked_open(
+        200,
+        "http-1",
+        &[("content-type".into(), "text/plain".into())],
+    );
+    let head = String::from_utf8(head).expect("ascii head");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{head}"
+    );
+    assert!(head.contains("x-faber-request-id: http-1"), "{head}");
+    assert!(head.contains("content-type: text/plain"), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length:"),
+        "{head}"
+    );
+    assert!(head.ends_with("\r\n\r\n"), "{head}");
+}
+
+#[test]
+fn streaming_routes_fail_closed_on_bad_handles_and_bounds() {
+    let provider = Http::new().expect("provider");
+    let cases: &[(&str, Valor)] = &[
+        (
+            "http:respond_open",
+            Valor::Lista(vec![
+                Valor::Textus("http-no-such-request".into()),
+                Valor::Numerus(200),
+                headers(&[("content-type", "text/plain")]),
+            ]),
+        ),
+        (
+            "http:respond_chunk",
+            Valor::Lista(vec![Valor::Numerus(0), Valor::Octeti(Vec::new())]),
+        ),
+        (
+            "http:respond_chunk",
+            Valor::Lista(vec![Valor::Numerus(9999), Valor::Octeti(b"x".to_vec())]),
+        ),
+        (
+            "http:respond_finish",
+            Valor::Lista(vec![Valor::Numerus(9999), Valor::Bivalens(false)]),
+        ),
+        (
+            "http:respond_open",
+            Valor::Lista(vec![
+                Valor::Textus("http-no-such-request".into()),
+                Valor::Numerus(200),
+                headers(&[("transfer-encoding", "chunked")]),
+            ]),
+        ),
+    ];
+    for (route, opener) in cases {
+        let error = provider
+            .dispatch(&request(route, opener.clone()), &context())
+            .expect_err(route);
+        assert_eq!(error.code, "E_INVALID_ARGS", "{route}: {}", error.message);
+    }
+}
+
 struct EchoFixture {
     port: u16,
     connections: Arc<AtomicU64>,
