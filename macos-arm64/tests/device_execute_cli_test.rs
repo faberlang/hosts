@@ -12,8 +12,8 @@ use faber_host_macos_arm64::device_descriptor::{
 };
 use faber_host_macos_arm64::device_execute::{
     descriptor_from_json, descriptor_to_json, inputs_from_gguf, inputs_from_json, inputs_to_json,
-    parse_device_execute_args, receipt_to_json, weight_map_from_json, weight_map_to_json,
-    DeviceExecuteReceipt, WeightFileRange,
+    parse_control_request, parse_device_execute_args, receipt_to_json, weight_map_from_json,
+    weight_map_to_json, DeviceExecuteControlVerb, DeviceExecuteReceipt, WeightFileRange,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
@@ -218,6 +218,54 @@ fn parse_device_execute_args_accepts_explicit_backend() {
     assert_eq!(
         parsed.backend,
         Some(faber_host_macos_arm64::composite_host::DeviceSelection::Metal)
+    );
+    assert!(!parsed.control);
+}
+
+#[test]
+fn parse_device_execute_args_accepts_control_owner_flag() {
+    let args = [
+        "--control".to_owned(),
+        "--descriptor".to_owned(),
+        "d.json".to_owned(),
+        "--module".to_owned(),
+        "m.bin".to_owned(),
+        "--inputs".to_owned(),
+        "i.json".to_owned(),
+    ];
+    let parsed = parse_device_execute_args(&args).expect("valid control flags");
+    assert!(parsed.control);
+}
+
+#[test]
+fn control_protocol_accepts_lifecycle_verbs_and_lossless_inputs() {
+    let load = parse_control_request(br#"{"op":"load"}"#).expect("load");
+    assert_eq!(load.verb, DeviceExecuteControlVerb::Load);
+    let step =
+        parse_control_request(br#"{"op":"step","inputs":{"2":["0xff810000"]}}"#).expect("step");
+    assert_eq!(step.verb, DeviceExecuteControlVerb::Step);
+    assert_eq!(step.inputs.expect("inputs")[&2][0].to_bits(), 0xff81_0000);
+    for (raw, expected) in [
+        (
+            br#"{"op":"reset"}"#.as_slice(),
+            DeviceExecuteControlVerb::Reset,
+        ),
+        (
+            br#"{"op":"release"}"#.as_slice(),
+            DeviceExecuteControlVerb::Release,
+        ),
+    ] {
+        assert_eq!(parse_control_request(raw).expect("verb").verb, expected);
+    }
+}
+
+#[test]
+fn control_protocol_rejects_unknown_verb_with_structured_error() {
+    let error = parse_control_request(br#"{"op":"compile"}"#).expect_err("unknown verb");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error.message.contains("load, step, reset, release"),
+        "{error}"
     );
 }
 

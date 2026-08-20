@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::composite_host::{
     CompositeHost, CompositeHostConfig, DeviceExecutionReceipt, DeviceSelection,
+    PreparedResidentSession,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -58,6 +60,60 @@ pub struct DeviceExecuteArgs {
     pub weights: Option<PathBuf>,
     /// Optional `{ "<id>": { offset, len, elems } }` map into `--weights`.
     pub weight_map: Option<PathBuf>,
+    /// Keep the host process alive and accept load/step/reset/release JSON
+    /// commands on stdin. The default remains the legacy one-shot command.
+    pub control: bool,
+}
+
+/// Lifecycle facts returned by the explicit resident-session control entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DeviceExecuteLifecycle {
+    /// Sessions admitted by `load`.
+    pub prepares: usize,
+    /// Steps executed through the admitted session.
+    pub reuses: usize,
+    /// Resident-state resets (zero for the M1 no-KV graph).
+    pub resets: usize,
+    /// Explicit releases.
+    pub releases: usize,
+    /// Module reloads after load.
+    pub module_reloads: usize,
+    /// PerProgram allocations after load.
+    pub per_program_reallocs: usize,
+    /// Device handles still owned by the session.
+    pub live_handles: usize,
+}
+
+/// One response from the explicit resident-session control protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceExecuteControlReceipt {
+    /// The accepted operation (`load`, `step`, `reset`, or `release`).
+    pub operation: String,
+    /// Session lifecycle evidence after the operation.
+    pub lifecycle: DeviceExecuteLifecycle,
+    /// Number of declared physical kernel bodies in the loaded descriptor.
+    #[serde(default)]
+    pub kernel_count: usize,
+    /// Number of state buffers cleared by `reset`.
+    #[serde(default)]
+    pub reset_cleared: usize,
+    /// Device execution facts for a `step`; absent for control-only verbs.
+    #[serde(default)]
+    pub receipt: Option<DeviceExecuteReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceExecuteControlVerb {
+    Load,
+    Step,
+    Reset,
+    Release,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceExecuteControlRequest {
+    pub verb: DeviceExecuteControlVerb,
+    pub inputs: Option<BTreeMap<u32, Vec<f32>>>,
 }
 
 /// Parse `device-execute` CLI flags. Unknown or missing flags are usage
@@ -69,6 +125,7 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
     let mut inputs = None;
     let mut weights = None;
     let mut weight_map = None;
+    let mut control = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -96,6 +153,7 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
                 let value = next_flag_value(args, &mut index, "--weight-map")?;
                 weight_map = Some(PathBuf::from(value));
             }
+            "--control" => control = true,
             other => return Err(format!("unknown device-execute argument: {other}")),
         }
         index += 1;
@@ -116,13 +174,54 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
         inputs: inputs.ok_or_else(|| usage_text().to_owned())?,
         weights,
         weight_map,
+        control,
     })
 }
 
 /// Usage line for the command.
 #[must_use]
 pub fn usage_text() -> &'static str {
-    "usage: faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
+    "usage: faber-host-macos-arm64 device-execute [--control] [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
+}
+
+#[derive(Debug, Deserialize)]
+struct WireControlRequest {
+    op: String,
+    #[serde(default)]
+    inputs: Option<serde_json::Value>,
+}
+
+/// Decode one line of the resident-session control protocol.
+///
+/// The protocol is deliberately a local stdin/stdout stream, not HTTP. Input
+/// values use the same lossless JSON spellings as the legacy `--inputs` file.
+pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlRequest> {
+    let wire: WireControlRequest = serde_json::from_slice(bytes).map_err(|error| {
+        HostError::invalid_args(format!("device-execute control JSON is invalid: {error}"))
+    })?;
+    let verb = match wire.op.as_str() {
+        "load" => DeviceExecuteControlVerb::Load,
+        "step" => DeviceExecuteControlVerb::Step,
+        "reset" => DeviceExecuteControlVerb::Reset,
+        "release" => DeviceExecuteControlVerb::Release,
+        other => {
+            return Err(HostError::invalid_args(format!(
+                "device-execute control verb `{other}` is not one of load, step, reset, release"
+            )))
+        }
+    };
+    let inputs = wire
+        .inputs
+        .map(|value| {
+            let bytes = serde_json::to_vec(&value).map_err(|error| {
+                HostError::invalid_args(format!(
+                    "device-execute control inputs are invalid: {error}"
+                ))
+            })?;
+            inputs_from_json(&bytes)
+        })
+        .transpose()?;
+    Ok(DeviceExecuteControlRequest { verb, inputs })
 }
 
 /// Load files, validate the descriptor, construct the composite host, and
@@ -178,9 +277,13 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let session_create_us = elapsed_us(session_started);
     let load_module_us = session.load_module_us;
     let per_program_alloc_us = session.per_program_alloc_us;
+    let step_started = Instant::now();
     let receipt = session.execute(&inputs)?;
+    let step_wall_us = elapsed_us(step_started);
     session.teardown()?;
     let mut wire = DeviceExecuteReceipt::from_host(&receipt);
+    wire.kernel_count = descriptor.kernels.len();
+    wire.stage_timing = stage_timing(step_wall_us, &receipt);
     wire.file_read_us = file_read_us;
     wire.descriptor_decode_us = descriptor_decode_us;
     wire.json_decode_us = json_decode_us;
@@ -192,8 +295,192 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     Ok(wire)
 }
 
+/// Run the explicit resident-session control stream.
+///
+/// The descriptor/module/weight map are read once, then the first command must
+/// be `load`. The resulting prepared session stays owned by this one host
+/// process until an explicit `release`; each `step` only receives invocation
+/// inputs and uses the already admitted resident adapter.
+pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
+    let descriptor_bytes = read_file(&args.descriptor)?;
+    let module_image = read_file(&args.module)?;
+    let base_inputs = inputs_from_json(&read_file(&args.inputs)?)?;
+    let weight_map = match &args.weight_map {
+        Some(path) => weight_map_from_json(&read_file(path)?)?,
+        None => BTreeMap::new(),
+    };
+    let gguf = match &args.weights {
+        Some(path) => read_file(path)?,
+        None => Vec::new(),
+    };
+    let weight_inputs = if args.weights.is_some() {
+        inputs_from_gguf(&gguf, &weight_map)?
+    } else {
+        BTreeMap::new()
+    };
+    let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
+    descriptor.validate()?;
+    let selection = args
+        .backend
+        .unwrap_or_else(|| selection_for_backend(descriptor.backend));
+
+    let stdin = std::io::stdin();
+    let mut lines = BufReader::new(stdin.lock()).lines();
+    let first = lines
+        .next()
+        .transpose()
+        .map_err(|error| {
+            HostError::internal(format!("device-execute control read failed: {error}"))
+        })?
+        .ok_or_else(|| {
+            HostError::invalid_args("device-execute control requires load before end of input")
+        })?;
+    let first = parse_control_request(first.as_bytes())?;
+    if first.verb != DeviceExecuteControlVerb::Load || first.inputs.is_some() {
+        return Err(HostError::invalid_args(
+            "device-execute control stream must begin with {\\\"op\\\":\\\"load\\\"}",
+        ));
+    }
+
+    let mut host = CompositeHost::new(CompositeHostConfig {
+        selection,
+        requires_device: true,
+    })?;
+    let mut session = host.prepare_resident_session(&descriptor, &weight_inputs)?;
+    let stdout = std::io::stdout();
+    let mut stdout = std::io::BufWriter::new(stdout.lock());
+    write_control_receipt(
+        &mut stdout,
+        control_receipt("load", &session, descriptor.kernels.len(), None, 0),
+    )?;
+
+    for line in lines {
+        let line = line.map_err(|error| {
+            HostError::internal(format!("device-execute control read failed: {error}"))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = parse_control_request(line.as_bytes())?;
+        match request.verb {
+            DeviceExecuteControlVerb::Load => {
+                return Err(HostError::invalid_args(
+                    "device-execute control load is only valid once per process",
+                ));
+            }
+            DeviceExecuteControlVerb::Step => {
+                let inputs = request.inputs.unwrap_or_else(|| base_inputs.clone());
+                let started = Instant::now();
+                let host_receipt = session.execute_step(&inputs)?;
+                let wall_us = elapsed_us(started);
+                let mut receipt = DeviceExecuteReceipt::from_host(&host_receipt);
+                receipt.kernel_count = descriptor.kernels.len();
+                receipt.stage_timing = stage_timing(wall_us, &host_receipt);
+                write_control_receipt(
+                    &mut stdout,
+                    control_receipt("step", &session, descriptor.kernels.len(), Some(receipt), 0),
+                )?;
+            }
+            DeviceExecuteControlVerb::Reset => {
+                if request.inputs.is_some() {
+                    return Err(HostError::invalid_args(
+                        "device-execute control reset does not accept inputs",
+                    ));
+                }
+                let cleared = session.reset_prompt()?;
+                write_control_receipt(
+                    &mut stdout,
+                    control_receipt("reset", &session, descriptor.kernels.len(), None, cleared),
+                )?;
+            }
+            DeviceExecuteControlVerb::Release => {
+                if request.inputs.is_some() {
+                    return Err(HostError::invalid_args(
+                        "device-execute control release does not accept inputs",
+                    ));
+                }
+                let lifecycle = session.teardown()?;
+                write_control_receipt(
+                    &mut stdout,
+                    DeviceExecuteControlReceipt {
+                        operation: "release".to_owned(),
+                        lifecycle: DeviceExecuteLifecycle {
+                            prepares: lifecycle.counters.prepares,
+                            reuses: lifecycle.counters.reuses,
+                            resets: lifecycle.counters.resets,
+                            releases: lifecycle.counters.releases,
+                            module_reloads: lifecycle.module_reloads,
+                            per_program_reallocs: lifecycle.per_program_reallocs,
+                            live_handles: lifecycle.live_handles,
+                        },
+                        kernel_count: descriptor.kernels.len(),
+                        reset_cleared: 0,
+                        receipt: None,
+                    },
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    Err(HostError::invalid_args(
+        "device-execute control stream ended before explicit release",
+    ))
+}
+
+fn control_receipt(
+    operation: &str,
+    session: &PreparedResidentSession<'_>,
+    kernel_count: usize,
+    receipt: Option<DeviceExecuteReceipt>,
+    reset_cleared: usize,
+) -> DeviceExecuteControlReceipt {
+    let lifecycle = session.receipt();
+    DeviceExecuteControlReceipt {
+        operation: operation.to_owned(),
+        lifecycle: DeviceExecuteLifecycle {
+            prepares: lifecycle.counters.prepares,
+            reuses: lifecycle.counters.reuses,
+            resets: lifecycle.counters.resets,
+            releases: lifecycle.counters.releases,
+            module_reloads: lifecycle.module_reloads,
+            per_program_reallocs: lifecycle.per_program_reallocs,
+            live_handles: lifecycle.live_handles,
+        },
+        kernel_count,
+        reset_cleared,
+        receipt,
+    }
+}
+
+fn write_control_receipt(
+    stdout: &mut impl Write,
+    receipt: DeviceExecuteControlReceipt,
+) -> HostResult<()> {
+    serde_json::to_writer(&mut *stdout, &receipt).map_err(|error| {
+        HostError::internal(format!("device-execute control write failed: {error}"))
+    })?;
+    stdout.write_all(b"\n").map_err(|error| {
+        HostError::internal(format!("device-execute control write failed: {error}"))
+    })?;
+    stdout.flush().map_err(|error| {
+        HostError::internal(format!("device-execute control flush failed: {error}"))
+    })
+}
+
 fn elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn stage_timing(wall_us: u64, receipt: &DeviceExecutionReceipt) -> StageTimingReceipt {
+    let kernel_us = receipt.gpu_encode_submit_wait_us;
+    let transfer_us = receipt.copy_in_us.saturating_add(receipt.readback_us);
+    StageTimingReceipt {
+        kernel_us,
+        transfer_us,
+        host_round_trip_us: wall_us
+            .saturating_sub(kernel_us)
+            .saturating_sub(transfer_us),
+    }
 }
 
 /// Decode a descriptor JSON plus a raw module image.
@@ -465,6 +752,30 @@ pub struct DeviceExecuteReceipt {
     /// Child wall from first file read through teardown (excludes dyld).
     #[serde(default)]
     pub cli_internal_us: u64,
+    /// Number of declared physical kernel bodies in the admitted descriptor.
+    #[serde(default)]
+    pub kernel_count: usize,
+    /// Stage timing for this one-shot or control `step` operation.
+    #[serde(default)]
+    pub stage_timing: StageTimingReceipt,
+}
+
+/// Receipt timing split shared by the legacy one-shot and resident control
+/// paths. The total is the sum of the three measured columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StageTimingReceipt {
+    pub kernel_us: u64,
+    pub transfer_us: u64,
+    pub host_round_trip_us: u64,
+}
+
+impl StageTimingReceipt {
+    #[must_use]
+    pub const fn total_us(self) -> u64 {
+        self.kernel_us
+            .saturating_add(self.transfer_us)
+            .saturating_add(self.host_round_trip_us)
+    }
 }
 
 impl DeviceExecuteReceipt {
@@ -499,6 +810,8 @@ impl DeviceExecuteReceipt {
             gpu_encode_submit_wait_us: receipt.gpu_encode_submit_wait_us,
             readback_us: receipt.readback_us,
             cli_internal_us: 0,
+            kernel_count: 0,
+            stage_timing: StageTimingReceipt::default(),
         }
     }
 }
