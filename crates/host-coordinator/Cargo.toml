@@ -15,3 +15,6 @@ pedantic = "deny"
 # enters the runtime contract (C2).
 faber = { path = "../../../faber/runtime/rust" }
 sha2 = "0.10"
+
+[dev-dependencies]
+hygiene-ratchet = { path = "../../../radix/crates/hygiene-ratchet" }

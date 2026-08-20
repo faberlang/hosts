@@ -15,3 +15,6 @@ ureq = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+hygiene-ratchet = { path = "../../../radix/crates/hygiene-ratchet" }

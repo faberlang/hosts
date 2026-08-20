@@ -13,4 +13,5 @@ host-kernel = { path = "../host-kernel" }
 sha2 = "0.10"
 
 [dev-dependencies]
+hygiene-ratchet = { path = "../../../radix/crates/hygiene-ratchet" }
 tempfile = "3"
