@@ -1065,7 +1065,7 @@ impl<'host> ProgramSession<'host> {
             // at session creation and stay device-resident (S5-U6).
             let copy_started = Instant::now();
             copy_ins += copy_declared_inputs(
-                &mut self.runtime,
+                self.runtime,
                 &self.buffers,
                 &self.buffer_meta,
                 kernel,

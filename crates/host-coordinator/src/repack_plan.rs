@@ -2,8 +2,8 @@
 //!
 //! The first of the two CTO shared contracts frozen before backend fan-out
 //! (`6badaa01` S1; `correct_before_next_phase`; gi3-delivery §GI3-2). One
-//! pinned row only: SmolLM2-360M-Instruct Q4_K_M (model contract v1.0.0 —
-//! quant mix Q4_K 16 / Q5_0 176 / Q6_K 16 / Q8_0 17 / F32 65 = 290 tensors).
+//! pinned row only: SmolLM2-360M-Instruct `Q4_K_M` (model contract v1.0.0 —
+//! quant mix `Q4_K` 16 / `Q5_0` 176 / `Q6_K` 16 / `Q8_0` 17 / F32 65 = 290 tensors).
 //!
 //! CONTRACT
 //! - `QuantizedTensorLayout` stays the **stored-layout authority**: it is
@@ -31,7 +31,7 @@
 
 use sha2::{Digest, Sha256};
 
-/// Whole-file digest of the pinned SmolLM2 row.
+/// Whole-file digest of the pinned `SmolLM2` row.
 pub const PINNED_SHA256_HEX: &str =
     "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2";
 
@@ -108,7 +108,7 @@ pub struct RowIdentity {
 }
 
 impl RowIdentity {
-    /// The pinned row's identity (SmolLM2-360M-Instruct Q4_K_M).
+    /// The pinned row's identity (SmolLM2-360M-Instruct `Q4_K_M`).
     #[must_use]
     pub const fn pinned_row() -> Self {
         Self {
@@ -128,7 +128,7 @@ impl RowIdentity {
 /// Class-aggregate counts, never per-tensor claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TensorClassFacts {
-    /// The closed pinned-row GGML type (F32 / Q5_0 / Q8_0 / Q4_K / Q6_K).
+    /// The closed pinned-row GGML type (F32 / `Q5_0` / `Q8_0` / `Q4_K` / `Q6_K`).
     pub ggml_type: PinnedDtype,
     /// Tensor count of this class in the admitted file.
     pub tensor_count: u64,

@@ -516,8 +516,7 @@ impl std::fmt::Display for TransferRejection {
                 source_bytes,
             } => write!(
                 f,
-                "out-of-bounds range: transfer {transfer} declares range {:?} which exceeds the source's {source_bytes} bytes",
-                range
+                "out-of-bounds range: transfer {transfer} declares range {range:?} which exceeds the source's {source_bytes} bytes"
             ),
             Self::GenerationMismatch {
                 transfer,
@@ -922,7 +921,7 @@ impl PeerPairRegistry {
 /// to the transaction receipt (S4), never to the portable logical plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CopyPath {
-    /// Pinned host memory ↔ device over PCIe — the admitted path (T2 §2).
+    /// Pinned host memory ↔ device over `PCIe` — the admitted path (T2 §2).
     HostStaged,
     /// A per-directed-pair peer copy — only after measurement + admission
     /// (T2 §6); NOT ATTEMPTED on the acceptance host.

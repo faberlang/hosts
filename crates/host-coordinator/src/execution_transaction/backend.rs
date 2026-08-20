@@ -349,7 +349,7 @@ impl DeviceExecutionBackend for FakeExecutionBackend {
             .staged_writes
             .values()
             .filter(|write| write.partition() == partition)
-            .map(|write| write.byte_count())
+            .map(super::mirror::StagedWrite::byte_count)
             .sum();
         self.staged_total_bytes = self.staged_total_bytes.saturating_sub(retired);
         self.staged_writes

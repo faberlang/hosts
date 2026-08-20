@@ -272,7 +272,7 @@ impl ExecutionTransaction {
         let referenced: BTreeSet<LogicalPartitionId> = self
             .operations
             .iter()
-            .flat_map(|operation| operation.partitions())
+            .flat_map(super::mirror::TransactionOperation::partitions)
             .collect();
         for partition in &referenced {
             let binding = bindings

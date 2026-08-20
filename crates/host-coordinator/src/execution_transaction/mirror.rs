@@ -257,7 +257,7 @@ impl MirroredStorageLayout {
 /// portable logical plan (S4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportPathMirror {
-    /// Pinned host memory ↔ device over PCIe — the admitted path.
+    /// Pinned host memory ↔ device over `PCIe` — the admitted path.
     HostStaged,
 }
 

@@ -223,7 +223,7 @@ impl DeviceSetSelection {
 /// Shape-only constraints (backend, exclusions, member count). They select
 /// membership; they never encode priority policy (that is MD1-P1's scope,
 /// C2 §1: gates reject, objectives rank only gate-passing plans).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceSetConstraints {
     /// Constrain every member to one backend, when declared.
     pub backend: Option<DeviceBackend>,
@@ -233,17 +233,6 @@ pub struct DeviceSetConstraints {
     pub min_count: usize,
     /// Maximum member count (`None` = unconstrained).
     pub max_count: Option<usize>,
-}
-
-impl Default for DeviceSetConstraints {
-    fn default() -> Self {
-        Self {
-            backend: None,
-            exclude: BTreeSet::new(),
-            min_count: 0,
-            max_count: None,
-        }
-    }
 }
 
 /// Why a selection could not resolve to a [`DeviceSet`].

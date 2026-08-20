@@ -77,7 +77,7 @@ fn identity_equality_and_ordering_ignore_ordinal() {
     assert_ne!(DeviceOrdinal::new(0), DeviceOrdinal::new(1));
 
     // Ordering over ids is total, ordinal-free, and stable under renaming.
-    let mut ids = vec![
+    let mut ids = [
         PhysicalDeviceId::cuda(UUID_C, None),
         at_ordinal_0.clone(),
         PhysicalDeviceId::cuda(UUID_A, Some("different-driver".to_owned())),

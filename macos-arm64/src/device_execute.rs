@@ -324,7 +324,7 @@ pub fn inputs_from_gguf(
 
 fn packed_bytes_as_f32_padded(bytes: &[u8], logical_elems: u64) -> Vec<f32> {
     let mut padded = bytes.to_vec();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push(0);
     }
     let mut values: Vec<f32> = padded

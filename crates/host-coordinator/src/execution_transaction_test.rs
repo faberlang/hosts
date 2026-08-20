@@ -36,7 +36,7 @@ use crate::partition::{
 };
 use crate::transport::{
     CopyPath, HostStagedAdapter, MeasuredRates, SourceValue, TransferBudget, TransferSpec,
-    TransportAdapter, TransportReceipt,
+    TransportAdapter,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -284,7 +284,7 @@ fn fixture_transaction() -> ExecutionTransaction {
 fn declared_write_bytes(operations: &[TransactionOperation]) -> u64 {
     operations
         .iter()
-        .flat_map(|operation| operation.staged_writes())
+        .flat_map(super::mirror::TransactionOperation::staged_writes)
         .map(|write| write.byte_count())
         .sum()
 }
@@ -458,7 +458,10 @@ fn prepare_reserves_within_admitted_budget() {
     assert_eq!(declared.len(), 4); // launch-a, transfer, broadcast, launch-b
     assert_eq!(
         declared_write_bytes(&fixture_operations()),
-        declared.values().map(|w| w.byte_count()).sum::<u64>()
+        declared
+            .values()
+            .map(super::mirror::StagedWrite::byte_count)
+            .sum::<u64>()
     );
 }
 
@@ -1116,7 +1119,7 @@ fn publish_failure_publishes_nothing() {
         .expect("abort completes teardown");
     assert!(matches!(transaction.state(), TransactionState::Aborted(_)));
     assert!(receipt.publish_summary.is_none());
-    assert!(backend.published_bytes() == 0);
+    assert_eq!(backend.published_bytes(), 0);
 }
 
 #[test]
@@ -1265,7 +1268,7 @@ fn receipt_records_reservation_executed_bytes_and_sync_events() {
     let declared_total: u64 = receipt
         .declared_write_set
         .values()
-        .map(|write| write.byte_count())
+        .map(super::mirror::StagedWrite::byte_count)
         .sum();
     assert_eq!(declared_total, declared_write_bytes(&fixture_operations()));
 
@@ -1373,14 +1376,14 @@ fn receipt_carries_the_selected_transport_records() {
     assert!(bare_receipt.selected_transports.is_none());
 }
 
-/// StagedWrite is the atomic publication unit — byte counts are the declared
+/// `StagedWrite` is the atomic publication unit — byte counts are the declared
 /// contracts of the producing operations.
 #[test]
 fn staged_writes_derive_from_operations() {
     let operations = fixture_operations();
     let writes: Vec<StagedWrite> = operations
         .iter()
-        .flat_map(|operation| operation.staged_writes())
+        .flat_map(super::mirror::TransactionOperation::staged_writes)
         .collect();
     assert_eq!(writes.len(), 4); // launch-a, transfer, broadcast, launch-b
     let launch_a = writes
@@ -1397,7 +1400,7 @@ fn staged_writes_derive_from_operations() {
     assert_eq!(transfer_write.byte_count(), TRANSFER_BYTES);
 }
 
-/// A transaction over a plan whose partition is not in the DeviceSet fails at
+/// A transaction over a plan whose partition is not in the `DeviceSet` fails at
 /// bind time (the bound plan is the authority), and the receipt taxonomy
 /// stays honest (`hardware_isolation_claimed=false`, synthetic fixture).
 #[test]

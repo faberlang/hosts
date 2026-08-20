@@ -615,21 +615,18 @@ fn prepared_session_surfaces_fail_closed_on_misuse() {
         .expect("prepare");
     let err = prepared
         .execute_step(&BTreeMap::new())
-        .err()
-        .expect("a missing per-token input must fail the resident step");
+        .expect_err("a missing per-token input must fail the resident step");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
     assert_eq!(prepared.session_handle_count(), 0);
 
     // A closed prepared session refuses further reuses and resets.
     let err = prepared
         .execute_step(&prompt_a()[0])
-        .err()
-        .expect("a closed prepared session refuses reuses");
+        .expect_err("a closed prepared session refuses reuses");
     assert_eq!(err.code, "E_INTERNAL");
     let err = prepared
         .reset_prompt()
-        .err()
-        .expect("a closed prepared session refuses resets");
+        .expect_err("a closed prepared session refuses resets");
     assert_eq!(err.code, "E_INTERNAL");
 
     // Teardown of the closed session is a safe no-op that still reports the
