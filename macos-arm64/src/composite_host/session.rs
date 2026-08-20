@@ -23,6 +23,39 @@ use super::receipt::{
 
 type BufferKey = (u32, u32);
 
+/// Session-owned storage for temporary PerStep and ObservationPoint buffers.
+///
+/// A checked-out handle is moved into [`ProgramSession::buffers`] for one
+/// execution. At the step boundary it is returned here instead of being
+/// freed, so the next execution can reuse the same device allocation. The
+/// pool is never used for PerProgram weights or state.
+#[derive(Default)]
+struct IntermediateBufferPool {
+    buffers: BTreeMap<BufferKey, DeviceHandle>,
+}
+
+impl IntermediateBufferPool {
+    fn checkout(&mut self, key: BufferKey) -> Option<DeviceHandle> {
+        self.buffers.remove(&key)
+    }
+
+    fn return_buffer(&mut self, key: BufferKey, handle: DeviceHandle) {
+        debug_assert!(self.buffers.insert(key, handle).is_none());
+    }
+
+    fn values(&self) -> impl Iterator<Item = &DeviceHandle> {
+        self.buffers.values()
+    }
+
+    fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
+    fn clear(&mut self) {
+        self.buffers.clear();
+    }
+}
+
 /// Whether an execution copies host inputs into the declared input slots.
 ///
 /// `SingleRun` executions copy per call (the one-shot-with-repeat surface);
@@ -187,8 +220,8 @@ struct SessionBufferMeta {
 /// prompt-scoped device-resident state (content cleared, allocation
 /// retained), and counts prepare/reuse/reset/release facts in its receipt.
 /// No new executor is invented — the prepared mode is exactly the
-/// `RepeatingStep` once-init mechanism plus the resident-step copy class and
-/// the state-clear operation below.
+/// `RepeatingStep` once-init mechanism plus the resident-step copy class, the
+/// session-scoped temporary buffer pool, and the state-clear operation below.
 ///
 /// # End-of-run readback (S5A-U1)
 ///
@@ -236,10 +269,14 @@ pub struct ProgramSession<'host> {
     module_hash: u64,
     /// Program execution-lifetime regime (S2-4).
     program_lifetime: DeviceProgramLifetime,
-    /// Currently-live device buffers: (buffer_id, version) → device handle.
-    /// `PerProgram` buffers are live from creation until teardown; `PerStep` and
-    /// `ObservationPoint` buffers are live only within one execution.
+    /// Currently checked-out device buffers: (buffer_id, version) → device
+    /// handle. PerProgram buffers stay checked out for the session; resident
+    /// temporary buffers move back to `intermediate_pool` at the step
+    /// boundary.
     buffers: BTreeMap<BufferKey, DeviceHandle>,
+    /// Session-scoped pool for temporary PerStep and ObservationPoint
+    /// allocations. Pool handles remain owned by this session until teardown.
+    intermediate_pool: IntermediateBufferPool,
     /// Per-version declared element count / byte length / lifetime class.
     buffer_meta: BTreeMap<BufferKey, SessionBufferMeta>,
     /// Kernel declarations cloned from the descriptor.
@@ -487,6 +524,7 @@ impl<'host> ProgramSession<'host> {
             module_hash,
             program_lifetime: descriptor.program_lifetime,
             buffers,
+            intermediate_pool: IntermediateBufferPool::default(),
             buffer_meta,
             kernels,
             launches,
@@ -586,7 +624,7 @@ impl<'host> ProgramSession<'host> {
                 "a RepeatingStep session executes through init_params + execute_step: HostProvided params are copied in exactly once at session creation and never re-copied on later steps; per-execution input copy-in is the SingleRun surface",
             ));
         }
-        let result = self.execute_inner(inputs, CopyMode::PerStep, false);
+        let result = self.execute_inner(inputs, CopyMode::PerStep, false, false);
         if result.is_err() {
             // Release-on-error on all paths (S2-3): the ordered release runs
             // before the error escapes, then the session is closed so no
@@ -789,7 +827,7 @@ impl<'host> ProgramSession<'host> {
                 "RepeatingStep weights were not once-init'd; prepare the resident session before resident steps",
             ));
         }
-        let result = self.execute_inner(token_inputs, CopyMode::ResidentStep, false);
+        let result = self.execute_inner(token_inputs, CopyMode::ResidentStep, false, true);
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
@@ -829,7 +867,8 @@ impl<'host> ProgramSession<'host> {
                 "the declared end-of-run set was already read back; the end-of-run readback runs exactly once after the final step",
             ));
         }
-        let result = self.execute_inner(&BTreeMap::new(), CopyMode::OnceInit, keep_end_of_run);
+        let result =
+            self.execute_inner(&BTreeMap::new(), CopyMode::OnceInit, keep_end_of_run, false);
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
@@ -1023,6 +1062,7 @@ impl<'host> ProgramSession<'host> {
         inputs: &BTreeMap<u32, Vec<f32>>,
         mode: CopyMode,
         keep_end_of_run: bool,
+        use_intermediate_pool: bool,
     ) -> HostResult<DeviceExecutionReceipt> {
         let mut launch_count = 0usize;
         let mut launch_ids = Vec::with_capacity(self.launches.len());
@@ -1034,11 +1074,16 @@ impl<'host> ProgramSession<'host> {
         let waits_before = self.runtime.blocking_wait_count();
         let mut copy_in_us = 0u64;
         let mut encode_us = 0u64;
+        let mut pool_returns = 0usize;
 
-        // Allocate this step's PerStep + ObservationPoint buffers (S2-4).
-        // PerProgram buffers were allocated once at session creation and
-        // stay live. A failure here runs the error-path teardown (S2-3).
-        self.allocate_step_buffers()?;
+        // Resident decode steps check out this step's PerStep +
+        // ObservationPoint buffers from the session-scoped pool. The first
+        // step allocates them; later steps reuse the same handles. The
+        // SingleRun and training-step surfaces retain their existing
+        // allocate/release cadence. PerProgram buffers were allocated once at
+        // session creation and stay live. A failure here runs the error-path
+        // teardown (S2-3).
+        let (pool_allocations, pool_reuses) = self.allocate_step_buffers(use_intermediate_pool)?;
 
         for launch in &self.launches {
             let kernel = self
@@ -1101,7 +1146,8 @@ impl<'host> ProgramSession<'host> {
         // observation points — the result rows projected from the
         // descriptor's observation facts at session creation. A buffer with
         // any other lifetime class is an undeclared readback and fails
-        // closed. Each observation is read-then-released (S2-4).
+        // closed. Resident observations are returned to the pool (M1-U4);
+        // other execution surfaces release them at the step boundary.
         let mut release_count = 0usize;
         let mut readback_count = 0usize;
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
@@ -1130,18 +1176,21 @@ impl<'host> ProgramSession<'host> {
             let values = self.runtime.readback_f32(&handle)?;
             readbacks.insert(result.buffer_id, values);
             readback_count += 1;
-            self.release_buffer(key)?;
-            release_count += 1;
+            if use_intermediate_pool {
+                self.return_buffer_to_pool(key)?;
+                pool_returns += 1;
+            } else {
+                self.release_buffer(key)?;
+                release_count += 1;
+            }
         }
         let readback_us = elapsed_us(readback_started);
 
-        // Step-boundary recycle (S2-4): PerStep buffers are released at the
-        // step boundary and re-allocated for the next execution. The FINAL
-        // step (U8/U9) keeps the declared end-of-run PerStep buffers (the
-        // final forward activations, the final gradients) live so the
-        // one-shot end-of-run readback observes them once at the declared
-        // completion boundary; every other step recycles them exactly as
-        // before.
+        // Resident steps return PerStep buffers to the session-scoped pool
+        // (M1-U4). Other execution surfaces release them at this boundary.
+        // The FINAL step (U8/U9) keeps the declared end-of-run PerStep buffers
+        // live so the one-shot end-of-run readback observes them once at the
+        // declared completion boundary.
         let mut per_step_ids: Vec<BufferKey> = self
             .buffers
             .iter()
@@ -1156,8 +1205,13 @@ impl<'host> ProgramSession<'host> {
             per_step_ids.retain(|key| !self.end_of_run_keys.contains(key));
         }
         for key in per_step_ids {
-            self.release_buffer(key)?;
-            release_count += 1;
+            if use_intermediate_pool {
+                self.return_buffer_to_pool(key)?;
+                pool_returns += 1;
+            } else {
+                self.release_buffer(key)?;
+                release_count += 1;
+            }
         }
 
         // Declared logical resource graph + data-flow edges (A10) from the
@@ -1195,6 +1249,9 @@ impl<'host> ProgramSession<'host> {
             outputs: readbacks,
             allocated_buffers: self.allocated_buffers(),
             allocated_buffer_versions: self.allocated_buffer_versions(),
+            pool_allocations,
+            pool_reuses,
+            pool_returns,
             program_lifetime: self.program_lifetime,
             per_program_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerProgram),
             per_program_buffer_versions: self
@@ -1221,13 +1278,13 @@ impl<'host> ProgramSession<'host> {
         })
     }
 
-    /// Allocate this step's `PerStep` and `ObservationPoint` buffers (S2-4);
-    /// `PerProgram` buffers are already live from session creation. Buffer ids
-    /// already live are left untouched (a `PerProgram` buffer, or a step buffer
-    /// left live by an interrupted path that has not yet run the error path,
-    /// is never double-allocated).
-    fn allocate_step_buffers(&mut self) -> HostResult<()> {
-        let to_allocate: Vec<BufferKey> = self
+    /// Allocate or check out this step's `PerStep` and `ObservationPoint`
+    /// buffers. The resident decode surface uses the session-scoped pool;
+    /// other surfaces retain allocate/release behavior. `PerProgram` buffers
+    /// are already live from session creation. Buffer ids already live are
+    /// left untouched, so an interrupted path is never double-allocated.
+    fn allocate_step_buffers(&mut self, use_intermediate_pool: bool) -> HostResult<(usize, usize)> {
+        let to_checkout: Vec<BufferKey> = self
             .buffer_meta
             .iter()
             .filter(|(key, meta)| {
@@ -1235,26 +1292,52 @@ impl<'host> ProgramSession<'host> {
             })
             .map(|(key, _)| *key)
             .collect();
-        for key in to_allocate {
+        let mut pool_allocations = 0usize;
+        let mut pool_reuses = 0usize;
+        for key in to_checkout {
             let meta = self
                 .buffer_meta
                 .get(&key)
                 .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
-            let handle = self.runtime.alloc_bytes(meta.byte_length as usize)?;
+            let handle = if use_intermediate_pool {
+                match self.intermediate_pool.checkout(key) {
+                    Some(handle) => {
+                        pool_reuses += 1;
+                        handle
+                    }
+                    None => {
+                        pool_allocations += 1;
+                        self.runtime.alloc_bytes(meta.byte_length as usize)?
+                    }
+                }
+            } else {
+                self.runtime.alloc_bytes(meta.byte_length as usize)?
+            };
             // G4 (F5): honor the carried initialization axis at every
-            // allocation — a ZeroFill step buffer (per-step accumulation
-            // state) is zeroed when it comes live.
+            // checkout — a ZeroFill step buffer (per-step accumulation state)
+            // is reset before it comes live, whether its handle was newly
+            // allocated or reused from the pool.
             if meta.initialization == DeviceBufferInitialization::ZeroFill {
                 self.runtime
                     .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
             }
             self.buffers.insert(key, handle);
         }
+        Ok((pool_allocations, pool_reuses))
+    }
+
+    /// Return one checked-out temporary buffer to the session-scoped pool.
+    /// This is the pool equivalent of the old read-then-release / step-boundary
+    /// release path: no device free occurs until session teardown.
+    fn return_buffer_to_pool(&mut self, key: BufferKey) -> HostResult<()> {
+        if let Some(handle) = self.buffers.remove(&key) {
+            self.intermediate_pool.return_buffer(key, handle);
+        }
         Ok(())
     }
 
     /// Release one live buffer by key (no-op when the key is not live). Used by
-    /// the read-then-release and step-boundary paths.
+    /// the non-resident execution surfaces and by end-of-run readback.
     fn release_buffer(&mut self, key: BufferKey) -> HostResult<()> {
         if let Some(handle) = self.buffers.remove(&key) {
             self.runtime.release(&handle)?;
@@ -1341,7 +1424,12 @@ impl<'host> ProgramSession<'host> {
     /// if one fails. Returns the first release failure, if any.
     fn release_all_handles(&mut self) -> HostResult<()> {
         let mut first_error: Option<HostError> = None;
-        let buffers: Vec<DeviceHandle> = self.buffers.values().copied().collect();
+        let buffers: Vec<DeviceHandle> = self
+            .buffers
+            .values()
+            .chain(self.intermediate_pool.values())
+            .copied()
+            .collect();
         for handle in buffers {
             if let Err(error) = self.runtime.release(&handle) {
                 first_error.get_or_insert(error);
@@ -1354,6 +1442,7 @@ impl<'host> ProgramSession<'host> {
         // `session_handle_count()` reports reality on every release path
         // (the `closed` flag already reports 0 for the error paths).
         self.buffers.clear();
+        self.intermediate_pool.clear();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1394,19 +1483,17 @@ impl<'host> ProgramSession<'host> {
         self.buffer_meta.keys().copied().collect()
     }
 
-    /// Number of live device handles the session currently holds (module +
-    /// currently-live buffers). Used by lifecycle tests to prove no reload /
-    /// no `PerProgram` realloc between executions and full release at teardown.
-    /// `PerStep` and `ObservationPoint` buffers are released at the step boundary
-    /// / after readback (S2-4), so between executions the session holds the
-    /// module + `PerProgram` buffers only. A session closed by an error-path
-    /// release (S2-3) holds no live handles and reports 0.
+    /// Number of live device handles the session currently owns (module +
+    /// checked-out buffers + pooled temporary buffers). Used by lifecycle
+    /// tests to prove stable pool residency between executions and full
+    /// release at teardown. A session closed by an error-path release (S2-3)
+    /// holds no live handles and reports 0.
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
         if self.closed {
             0
         } else {
-            self.buffers.len() + 1 // buffers + module
+            self.buffers.len() + self.intermediate_pool.len() + 1 // buffers + pool + module
         }
     }
 
@@ -1572,7 +1659,8 @@ pub struct PreparedResidentSession<'host> {
     /// for the reload/realloc derivation in [`PreparedResidentSession::receipt`].
     module_loads_at_prepare: usize,
     buffer_allocs_at_prepare: usize,
-    /// Distinct `PerStep` + `ObservationPoint` buffers allocated per reuse.
+    /// Distinct `PerStep` + `ObservationPoint` buffers allocated on the
+    /// first pool warm-up checkout.
     per_execution_alloc_count: usize,
     /// Closed after an error-path release (S2-3): every handle is gone and
     /// no further reuse/reset is possible.
@@ -1718,12 +1806,16 @@ impl<'host> PreparedResidentSession<'host> {
 
     /// The current prepared-session receipt: the lifecycle counts and the
     /// residency evidence derived from the driver counters (module reloads
-    /// and PerProgram re-allocations beyond the prepare-time baseline and
-    /// the expected per-reuse step-buffer allocations).
+    /// and PerProgram re-allocations beyond the prepare-time baseline and the
+    /// one-time pool warm-up allocations).
     #[must_use]
     pub fn receipt(&self) -> PreparedSessionReceipt {
         let counters = self.session.driver_counters();
-        let per_reuse_allocs = self.per_execution_alloc_count * self.counters.reuses;
+        // The pool allocates each temporary key once, on the first reuse, and
+        // then checks out those handles again. Subtract only that one warm-up
+        // allocation set when deriving PerProgram reallocation facts.
+        let pool_warmup_allocs =
+            usize::from(self.counters.reuses > 0) * self.per_execution_alloc_count;
         PreparedSessionReceipt {
             backend: self.backend,
             device_name: self.device_name.clone(),
@@ -1735,7 +1827,7 @@ impl<'host> PreparedResidentSession<'host> {
             per_program_reallocs: counters
                 .buffer_allocs
                 .saturating_sub(self.buffer_allocs_at_prepare)
-                .saturating_sub(per_reuse_allocs),
+                .saturating_sub(pool_warmup_allocs),
             live_handles: self.session.session_handle_count(),
         }
     }

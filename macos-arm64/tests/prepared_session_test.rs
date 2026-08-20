@@ -371,11 +371,20 @@ fn prepared_session_resident_dense_weights_need_no_state_buffer() {
         "module + resident weight"
     );
     assert_eq!(prepared.driver_counters().module_loads, 1);
-    for token_values in prompt_a().into_iter().take(2) {
+    for (index, token_values) in prompt_a().into_iter().take(2).enumerate() {
         let receipt = prepared
             .execute_step(&token_values)
             .expect("resident dense step");
         assert_eq!(receipt.copy_ins, 1, "only the PerStep token is copied");
+        assert_eq!(receipt.pool_returns, 2);
+        if index == 0 {
+            assert_eq!(receipt.pool_allocations, 2);
+            assert_eq!(receipt.pool_reuses, 0);
+        } else {
+            assert_eq!(receipt.pool_allocations, 0);
+            assert_eq!(receipt.pool_reuses, 2);
+        }
+        assert_eq!(receipt.releases, 0);
         assert_eq!(receipt.per_program_buffers, vec![1]);
         assert_eq!(receipt.per_step_buffers, vec![2]);
         assert_eq!(receipt.observation_buffers, vec![5]);
@@ -468,7 +477,7 @@ fn prepared_session_reuses_record_reload_zero_realloc_zero_identical_buffers() {
         .expect("prepare");
 
     let mut executions = Vec::new();
-    for step_token in &prompt_a() {
+    for (index, step_token) in prompt_a().iter().enumerate() {
         let receipt = prepared
             .execute_step(step_token)
             .expect("resident decode step");
@@ -476,6 +485,15 @@ fn prepared_session_reuses_record_reload_zero_realloc_zero_identical_buffers() {
             receipt.copy_ins, 1,
             "only the per-token input is copied per reuse; the once-init weights are never re-copied"
         );
+        assert_eq!(receipt.pool_returns, 3);
+        if index == 0 {
+            assert_eq!(receipt.pool_allocations, 3);
+            assert_eq!(receipt.pool_reuses, 0);
+        } else {
+            assert_eq!(receipt.pool_allocations, 0);
+            assert_eq!(receipt.pool_reuses, 3);
+        }
+        assert_eq!(receipt.releases, 0);
         assert_eq!(
             receipt.launches, 1,
             "W8-U1: three kernel encodes batch into one command-buffer submit"
@@ -509,9 +527,9 @@ fn prepared_session_reuses_record_reload_zero_realloc_zero_identical_buffers() {
         vec![(1, 1), (4, 1)]
     );
 
-    // Between reuses the session holds only module + PerProgram weights +
-    // state; the module was loaded exactly once.
-    assert_eq!(prepared.session_handle_count(), 3);
+    // Between reuses the session holds module + PerProgram weights/state +
+    // the three pooled temporary handles; the module was loaded exactly once.
+    assert_eq!(prepared.session_handle_count(), 6);
     assert_eq!(prepared.driver_counters().module_loads, 1);
 
     // The prepared-session receipt records reload = 0 and PerProgram
@@ -520,7 +538,7 @@ fn prepared_session_reuses_record_reload_zero_realloc_zero_identical_buffers() {
     assert_eq!(receipt.counters.reuses, 3);
     assert_eq!(receipt.module_reloads, 0);
     assert_eq!(receipt.per_program_reallocs, 0);
-    assert_eq!(receipt.live_handles, 3);
+    assert_eq!(receipt.live_handles, 6);
 
     prepared.teardown().expect("teardown");
     assert_eq!(host.device().expect("device").live_handle_count(), 0);
@@ -555,7 +573,7 @@ fn prepared_session_reset_clears_state_and_replay_matches_token_for_token() {
         cleared, 1,
         "exactly the device-resident state buffer (s) is cleared"
     );
-    assert_eq!(prepared.session_handle_count(), 3, "allocation retained");
+    assert_eq!(prepared.session_handle_count(), 6, "allocation retained");
     let counters = prepared.driver_counters();
     assert_eq!(
         counters.buffer_allocs, allocs_before_reset,
@@ -592,8 +610,8 @@ fn prepared_session_reset_clears_state_and_replay_matches_token_for_token() {
     let counters = host.device().expect("device").driver_counters();
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.module_releases, 1);
-    assert_eq!(counters.buffer_allocs, 2 + 3 * 6);
-    assert_eq!(counters.buffer_releases, 2 + 3 * 6);
+    assert_eq!(counters.buffer_allocs, 2 + 3);
+    assert_eq!(counters.buffer_releases, 2 + 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,11 +774,11 @@ fn prepared_session_flow_on_both_fake_backends() {
         assert_eq!(receipt.counters.reuses, 2);
         assert_eq!(receipt.module_reloads, 0);
         assert_eq!(receipt.per_program_reallocs, 0);
-        assert_eq!(receipt.live_handles, 3);
+        assert_eq!(receipt.live_handles, 6);
 
         // The prompt-scoped reset retains allocation on both lanes.
         prepared.reset_prompt().expect("reset");
-        assert_eq!(prepared.session_handle_count(), 3);
+        assert_eq!(prepared.session_handle_count(), 6);
 
         prepared.teardown().expect("teardown");
         assert_eq!(host.device().expect("device").live_handle_count(), 0);
