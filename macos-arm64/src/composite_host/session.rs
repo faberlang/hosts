@@ -22,7 +22,9 @@ use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 
 use super::receipt::{
-    CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
+    CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback,
+    KvCacheLifecycleReceipt, KvCacheMeasurement, KvCachePhaseTiming, KvCacheTimingReceipt,
+    KvCacheTimingSpan, ReceiptBuffer,
 };
 
 type BufferKey = (u32, u32);
@@ -333,10 +335,71 @@ pub struct ProgramSession<'host> {
     pub(crate) load_module_us: u64,
     /// PerProgram allocation wall at session construction.
     pub(crate) per_program_alloc_us: u64,
+    /// Latest F4H1 timing projection. The setup phase remains explicit
+    /// `not_measured` until the host has a phase-specific setup clock; the
+    /// steady-state phase is replaced after every successful step.
+    kv_cache_timing: KvCacheTimingReceipt,
 }
 
 fn elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn relative_us(origin: Instant, point: Instant) -> u64 {
+    u64::try_from(point.duration_since(origin).as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Build a host-clock span without turning an unavailable timestamp into a
+/// zero-valued observation.
+fn host_timing_span(origin: Instant, start: Instant, end: Instant) -> KvCacheTimingSpan {
+    let start_us = relative_us(origin, start);
+    let end_us = relative_us(origin, end);
+    KvCacheTimingSpan {
+        start_us: KvCacheMeasurement::measured(start_us),
+        end_us: KvCacheMeasurement::measured(end_us),
+        duration_us: KvCacheMeasurement::measured(end_us.saturating_sub(start_us)),
+    }
+}
+
+/// Project the optional per-encoder device timestamps onto one GPU-body
+/// envelope. The driver only supplies a usable body timeline when it returns
+/// one start and one duration for every encoded launch; otherwise the schema
+/// keeps the body explicitly absent.
+fn gpu_body_timing_span(launch_gpu_us: &[u64], launch_gpu_start_us: &[u64]) -> KvCacheTimingSpan {
+    if launch_gpu_us.is_empty() || launch_gpu_us.len() != launch_gpu_start_us.len() {
+        return KvCacheTimingSpan::not_measured();
+    }
+    let start_us = launch_gpu_start_us.iter().copied().min().unwrap_or(0);
+    let end_us = launch_gpu_start_us
+        .iter()
+        .copied()
+        .zip(launch_gpu_us.iter().copied())
+        .map(|(start, duration)| start.saturating_add(duration))
+        .max()
+        .unwrap_or(start_us);
+    KvCacheTimingSpan {
+        start_us: KvCacheMeasurement::measured(start_us),
+        end_us: KvCacheMeasurement::measured(end_us),
+        duration_us: KvCacheMeasurement::measured(end_us.saturating_sub(start_us)),
+    }
+}
+
+fn derived_slack_us(wall_us: u64, phase: KvCachePhaseTiming) -> KvCacheMeasurement {
+    let named_us = [
+        phase.gpu_body.duration_us,
+        phase.encode.duration_us,
+        phase.submit.duration_us,
+        phase.wait.duration_us,
+    ]
+    .into_iter()
+    .filter_map(|measurement| match measurement {
+        KvCacheMeasurement::Measured { value_us } | KvCacheMeasurement::Derived { value_us } => {
+            Some(value_us)
+        }
+        KvCacheMeasurement::NotMeasured => None,
+    })
+    .fold(0u64, u64::saturating_add);
+    KvCacheMeasurement::derived(wall_us.saturating_sub(named_us))
 }
 
 /// Copy every unique `PerStep` Input buffer once for a resident step.
@@ -627,6 +690,7 @@ impl<'host> ProgramSession<'host> {
             closed: false,
             load_module_us,
             per_program_alloc_us,
+            kv_cache_timing: KvCacheTimingReceipt::not_measured(),
         })
     }
 
@@ -1116,6 +1180,7 @@ impl<'host> ProgramSession<'host> {
         keep_end_of_run: bool,
         use_intermediate_pool: bool,
     ) -> HostResult<DeviceExecutionReceipt> {
+        let step_started = Instant::now();
         let mut launch_count = 0usize;
         let mut launch_ids = Vec::with_capacity(self.launches.len());
         let mut launch_entries = Vec::with_capacity(self.launches.len());
@@ -1147,6 +1212,7 @@ impl<'host> ProgramSession<'host> {
             copy_in_us = elapsed_us(copy_started);
         }
 
+        let encode_started = Instant::now();
         for launch in &self.launches {
             let kernel = self
                 .kernels
@@ -1195,6 +1261,7 @@ impl<'host> ProgramSession<'host> {
             launch_ids.push(launch.id);
             launch_entries.push(kernel.entry.clone());
         }
+        let encode_ended = Instant::now();
 
         // Step-boundary synchronization: Metal commits the pending command
         // buffer and waits once here. CUDA issues `cuCtxSynchronize` (launches
@@ -1203,6 +1270,7 @@ impl<'host> ProgramSession<'host> {
         // the last launch (R9).
         let submit_started = Instant::now();
         self.runtime.sync()?;
+        let submit_ended = Instant::now();
         let gpu_encode_submit_wait_us = encode_us.saturating_add(elapsed_us(submit_started));
         let launch_gpu_us = self.runtime.take_encoder_gpu_us();
         let launch_gpu_start_us = self.runtime.take_encoder_gpu_start_us();
@@ -1301,6 +1369,28 @@ impl<'host> ProgramSession<'host> {
                     .saturating_sub(waits_before),
             ),
             DeviceBackend::Cuda => (launch_count, launch_count + 1),
+        };
+
+        // F4H2: retain the live timing projection alongside the ordinary
+        // execution receipt. The runtime exposes one combined step-boundary
+        // sync clock, so it is recorded as the observed submit boundary and
+        // the independent blocking-wait span remains explicitly absent.
+        let steady_state = KvCachePhaseTiming {
+            gpu_body: gpu_body_timing_span(&launch_gpu_us, &launch_gpu_start_us),
+            encode: if launch_count == 0 {
+                KvCacheTimingSpan::not_measured()
+            } else {
+                host_timing_span(step_started, encode_started, encode_ended)
+            },
+            submit: host_timing_span(step_started, submit_started, submit_ended),
+            wait: KvCacheTimingSpan::not_measured(),
+        };
+        let wall_us = elapsed_us(step_started);
+        self.kv_cache_timing = KvCacheTimingReceipt {
+            setup_phase: self.kv_cache_timing.setup_phase,
+            steady_state,
+            slack_us: derived_slack_us(wall_us, steady_state),
+            lifecycle: self.kv_cache_timing.lifecycle,
         };
 
         Ok(DeviceExecutionReceipt {
@@ -1598,6 +1688,13 @@ impl<'host> ProgramSession<'host> {
     pub fn program_graph_hash(&self) -> &str {
         &self.program_graph_hash
     }
+
+    /// The latest live F4H1 timing projection. Prepared resident sessions
+    /// attach their current lifecycle counters before exposing this value.
+    #[must_use]
+    fn kv_cache_timing(&self) -> KvCacheTimingReceipt {
+        self.kv_cache_timing
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,6 +1778,10 @@ pub struct PreparedSessionReceipt {
     pub per_program_reallocs: usize,
     /// Live device handles at receipt time (0 after an ordered release).
     pub live_handles: usize,
+    /// F4H1 setup/steady timing and lifecycle projection. The steady phase is
+    /// replaced by each successful resident decode step; the explicit
+    /// `not_measured` values remain visible when the driver lacks a split.
+    pub timing: KvCacheTimingReceipt,
 }
 
 impl PreparedSessionReceipt {
@@ -1729,6 +1830,8 @@ pub struct PreparedResidentSession<'host> {
     /// Distinct `PerStep` + `ObservationPoint` buffers allocated on the
     /// first pool warm-up checkout.
     per_execution_alloc_count: usize,
+    /// HostProvided weights copied exactly once during preparation.
+    weight_uploads_at_prepare: usize,
     /// Closed after an error-path release (S2-3): every handle is gone and
     /// no further reuse/reset is possible.
     closed: bool,
@@ -1799,6 +1902,7 @@ impl<'host> PreparedResidentSession<'host> {
             module_loads_at_prepare: counters.module_loads,
             buffer_allocs_at_prepare: counters.buffer_allocs,
             per_execution_alloc_count: classes.per_execution_alloc_count,
+            weight_uploads_at_prepare: classes.host_provided_weights,
             closed: false,
         })
     }
@@ -1883,19 +1987,32 @@ impl<'host> PreparedResidentSession<'host> {
         // allocation set when deriving PerProgram reallocation facts.
         let pool_warmup_allocs =
             usize::from(self.counters.reuses > 0) * self.per_execution_alloc_count;
+        let module_reloads = counters
+            .module_loads
+            .saturating_sub(self.module_loads_at_prepare);
+        let per_program_reallocs = counters
+            .buffer_allocs
+            .saturating_sub(self.buffer_allocs_at_prepare)
+            .saturating_sub(pool_warmup_allocs);
+        let mut timing = self.session.kv_cache_timing();
+        timing.lifecycle = KvCacheLifecycleReceipt {
+            module_reloads: module_reloads as u64,
+            persistent_reallocations: per_program_reallocs as u64,
+            weight_uploads: self.weight_uploads_at_prepare as u64,
+            // The generic prepared resident route has no KV-prefix copy or
+            // full-cache clear operation. Keep both facts as measured zero.
+            old_prefix_copy_bytes: 0,
+            full_cache_clear_bytes: 0,
+        };
         PreparedSessionReceipt {
             backend: self.backend,
             device_name: self.device_name.clone(),
             program_graph_hash: self.program_graph_hash.clone(),
             counters: self.counters,
-            module_reloads: counters
-                .module_loads
-                .saturating_sub(self.module_loads_at_prepare),
-            per_program_reallocs: counters
-                .buffer_allocs
-                .saturating_sub(self.buffer_allocs_at_prepare)
-                .saturating_sub(pool_warmup_allocs),
+            module_reloads,
+            per_program_reallocs,
             live_handles: self.session.session_handle_count(),
+            timing,
         }
     }
 

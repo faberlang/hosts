@@ -421,6 +421,25 @@ fn prepared_session_resident_dense_weights_need_no_state_buffer() {
         );
     }
 
+    let timing = serde_json::to_value(prepared.receipt().timing).expect("timing receipt");
+    assert_eq!(
+        timing["steady_state"]["encode"]["duration_us"]["status"],
+        "measured"
+    );
+    assert_eq!(
+        timing["steady_state"]["submit"]["duration_us"]["status"],
+        "measured"
+    );
+    assert_eq!(
+        timing["steady_state"]["wait"]["duration_us"]["status"],
+        "not_measured"
+    );
+    assert_eq!(timing["lifecycle"]["module_reloads"], 0);
+    assert_eq!(timing["lifecycle"]["persistent_reallocations"], 0);
+    assert_eq!(timing["lifecycle"]["weight_uploads"], 1);
+    assert_eq!(timing["lifecycle"]["old_prefix_copy_bytes"], 0);
+    assert_eq!(timing["lifecycle"]["full_cache_clear_bytes"], 0);
+
     assert_eq!(prepared.driver_counters().module_loads, 1);
     assert_eq!(prepared.receipt().module_reloads, 0);
     assert_eq!(prepared.receipt().per_program_reallocs, 0);
