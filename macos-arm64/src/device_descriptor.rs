@@ -57,6 +57,24 @@ pub const E_NO_DEVICE_PROGRAM: &str = "E_NO_DEVICE_PROGRAM";
 ///
 /// A small typed set mirroring the emitted kernel ABI; hosts never infer an
 /// element type from module text (A3).
+///
+/// Placement-ABI `dtype: u32` (`__faber_gpu_v1_copy_in`) is the
+/// `MirScalarLayout` discriminant. Radix `placement-debt-audit` F2 owns that
+/// integer; this enum coordinates the host names onto it and does not assign
+/// a second numbering. F2 has not yet given `MirScalarLayout` `#[repr(u32)]`,
+/// so the numbers below are that enum's declaration-order discriminants:
+///
+/// | `dtype` | `MirScalarLayout` | [`DeviceDataType`] |
+/// | ------- | ----------------- | ------------------ |
+/// | 3       | `I32`             | [`Self::I32`]      |
+/// | 4       | `I64`             | [`Self::I64`]      |
+/// | 6       | `U8`              | [`Self::U8`]       |
+/// | 10      | `F16`             | [`Self::F16`]      |
+/// | 11      | `F32`             | [`Self::F32`]      |
+/// | 12      | `F64`             | [`Self::F64`]      |
+///
+/// [`Self::BF16`] has no F2 slot yet (`MirScalarLayout` has no BF16 variant).
+/// Decode via [`Self::from_placement_discriminant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceDataType {
     /// IEEE 754 single precision.
@@ -69,6 +87,10 @@ pub enum DeviceDataType {
     I64,
     /// Unsigned 8-bit integer.
     U8,
+    /// IEEE 754 binary16.
+    F16,
+    /// Brain floating point, 16-bit.
+    BF16,
 }
 
 impl DeviceDataType {
@@ -81,6 +103,8 @@ impl DeviceDataType {
             Self::I32 => "i32",
             Self::I64 => "i64",
             Self::U8 => "u8",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
         }
     }
 
@@ -93,6 +117,8 @@ impl DeviceDataType {
             "i32" => Some(Self::I32),
             "i64" => Some(Self::I64),
             "u8" => Some(Self::U8),
+            "f16" => Some(Self::F16),
+            "bf16" => Some(Self::BF16),
             _ => None,
         }
     }
@@ -104,6 +130,39 @@ impl DeviceDataType {
             Self::F32 | Self::I32 => 4,
             Self::F64 | Self::I64 => 8,
             Self::U8 => 1,
+            Self::F16 | Self::BF16 => 2,
+        }
+    }
+
+    /// Decode a placement-ABI `dtype: u32` (`MirScalarLayout` discriminant).
+    ///
+    /// Radix `placement-debt-audit` F2 owns the integer. Unmapped
+    /// discriminants (Bool/I8/I16/I128/U16/U32/U64, and any future slot)
+    /// return `None`.
+    #[must_use]
+    pub fn from_placement_discriminant(discriminant: u32) -> Option<Self> {
+        match discriminant {
+            3 => Some(Self::I32),
+            4 => Some(Self::I64),
+            6 => Some(Self::U8),
+            10 => Some(Self::F16),
+            11 => Some(Self::F32),
+            12 => Some(Self::F64),
+            _ => None,
+        }
+    }
+
+    /// Placement-ABI `dtype: u32` for this host type, when F2 names one.
+    #[must_use]
+    pub fn placement_discriminant(self) -> Option<u32> {
+        match self {
+            Self::I32 => Some(3),
+            Self::I64 => Some(4),
+            Self::U8 => Some(6),
+            Self::F16 => Some(10),
+            Self::F32 => Some(11),
+            Self::F64 => Some(12),
+            Self::BF16 => None,
         }
     }
 }
@@ -1759,5 +1818,66 @@ pub(crate) mod errors {
             message: message.into(),
             retryable: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_bf16_round_trip_spelling_and_byte_width() {
+        assert_eq!(DeviceDataType::F16.spelling(), "f16");
+        assert_eq!(
+            DeviceDataType::from_spelling("f16"),
+            Some(DeviceDataType::F16)
+        );
+        assert_eq!(DeviceDataType::F16.byte_width(), 2);
+
+        assert_eq!(DeviceDataType::BF16.spelling(), "bf16");
+        assert_eq!(
+            DeviceDataType::from_spelling("bf16"),
+            Some(DeviceDataType::BF16)
+        );
+        assert_eq!(DeviceDataType::BF16.byte_width(), 2);
+    }
+
+    #[test]
+    fn placement_discriminant_maps_to_device_data_type() {
+        // MirScalarLayout declaration-order discriminants (F2 owner).
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(3),
+            Some(DeviceDataType::I32)
+        );
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(4),
+            Some(DeviceDataType::I64)
+        );
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(6),
+            Some(DeviceDataType::U8)
+        );
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(10),
+            Some(DeviceDataType::F16)
+        );
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(11),
+            Some(DeviceDataType::F32)
+        );
+        assert_eq!(
+            DeviceDataType::from_placement_discriminant(12),
+            Some(DeviceDataType::F64)
+        );
+        assert_eq!(DeviceDataType::from_placement_discriminant(0), None);
+        assert_eq!(DeviceDataType::from_placement_discriminant(30), None);
+
+        assert_eq!(DeviceDataType::I32.placement_discriminant(), Some(3));
+        assert_eq!(DeviceDataType::I64.placement_discriminant(), Some(4));
+        assert_eq!(DeviceDataType::U8.placement_discriminant(), Some(6));
+        assert_eq!(DeviceDataType::F16.placement_discriminant(), Some(10));
+        assert_eq!(DeviceDataType::F32.placement_discriminant(), Some(11));
+        assert_eq!(DeviceDataType::F64.placement_discriminant(), Some(12));
+        assert_eq!(DeviceDataType::BF16.placement_discriminant(), None);
     }
 }
