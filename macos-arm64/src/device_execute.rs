@@ -35,6 +35,7 @@ use std::time::Instant;
 use host_coordinator::DeviceBackend;
 use serde::{Deserialize, Serialize};
 
+use crate::composite_host::invocation_binding::RopeConfig;
 use crate::composite_host::{
     CompositeHost, CompositeHostConfig, DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection,
     PreparedResidentSession, PreparedSessionReceipt,
@@ -494,10 +495,9 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
 
 /// Admit the two static programs carried by a v2 load.
 ///
-/// This seam is intentionally pure. It validates both descriptors before a
-/// host/device session is constructed and returns the identities that the
-/// later resident owner must preserve. Cursor values are not part of either
-/// identity.
+/// This seam is intentionally pure. It validates both descriptors before the
+/// paired resident owner is constructed and returns the identities that the
+/// owner must preserve. Cursor values are not part of either identity.
 pub fn admit_v2_load(
     prefill: &DeviceDescriptor,
     decode: &DeviceDescriptor,
@@ -598,8 +598,8 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let session_started = Instant::now();
     let mut session = host.create_program_session(&descriptor)?;
     let session_create_us = elapsed_us(session_started);
-    let load_module_us = session.load_module_us;
-    let per_program_alloc_us = session.per_program_alloc_us;
+    let load_module_us = session.load_module_us();
+    let per_program_alloc_us = session.per_program_alloc_us();
     let step_started = Instant::now();
     let receipt =
         session.execute_with_weight_bytes(weight_inputs.map(), weight_inputs.byte_map())?;
@@ -622,12 +622,12 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     Ok(wire)
 }
 
-/// Run the v2 paired-program admission stream.
+/// Run the v2 paired-program control stream.
 ///
 /// D5 owns the protocol boundary: both static programs are admitted by one
-/// load, while the later executor owns device dispatch. Keeping this helper
-/// pure with respect to device work prevents a v1 single-program session from
-/// being smuggled in as a fake KV session.
+/// load. P1 constructs the paired owner after that pure admission and routes
+/// each mode-selected invoke through its real resident dispatch rail, without
+/// changing the v1 single-program path.
 fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
     let prefill_descriptor = args
         .prefill_descriptor
@@ -656,7 +656,32 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
         .session_identity
         .clone()
         .ok_or_else(|| HostError::invalid_args("protocol v2 requires --session-identity"))?;
-    let mut load = admit_v2_load(&prefill, &decode, model_identity, session_identity)?;
+
+    let json_inputs = inputs_from_json(&read_file(&args.inputs)?)?;
+    let weight_map = match &args.weight_map {
+        Some(path) => weight_map_from_json(&read_file(path)?)?,
+        None => BTreeMap::new(),
+    };
+    let mapped_weights = match &args.weights {
+        Some(path) => Some(MappedWeightFile::open(path)?),
+        None => None,
+    };
+    let mut weight_inputs = if let Some(mapped) = &mapped_weights {
+        let table = gguf_region_table(mapped.bytes(), &weight_map)?;
+        inputs_from_mapped_gguf(mapped, &weight_map, &table)?
+    } else {
+        WeightInputs::default()
+    };
+    merge_json_inputs(&mut weight_inputs, json_inputs)?;
+    let prompt_tokens = prompt_tokens_from_inputs(&prefill, weight_inputs.map())?;
+    let rope = rope_config_from_inputs(&prefill, weight_inputs.map(), prompt_tokens.len())?;
+
+    let mut load = admit_v2_load(
+        &prefill,
+        &decode,
+        model_identity.clone(),
+        session_identity.clone(),
+    )?;
     let stdin = std::io::stdin();
     let mut lines = BufReader::new(stdin.lock()).lines();
     let first = lines
@@ -677,6 +702,29 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
             "device-execute protocol v2 stream must begin with {\\\"protocol\\\":2,\\\"op\\\":\\\"load\\\"}",
         ));
     }
+
+    let selection = args
+        .backend
+        .unwrap_or_else(|| selection_for_backend(prefill.backend));
+    let mut host = CompositeHost::new(CompositeHostConfig {
+        selection,
+        requires_device: true,
+    })?;
+    retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
+    let mut paired = host.prepare_paired_session(
+        &prefill,
+        &decode,
+        prompt_tokens,
+        rope,
+        weight_inputs.map(),
+        weight_inputs.byte_map(),
+        model_identity,
+        session_identity,
+    )?;
+    load.lifecycle.live_handles = paired.live_handles();
+    load.lifecycle.module_reloads = paired.module_reloads();
+    load.lifecycle.per_program_reallocs = paired.per_program_reallocs();
+
     let stdout = std::io::stdout();
     let mut stdout = std::io::BufWriter::new(stdout.lock());
     write_control_receipt(&mut stdout, load.clone())?;
@@ -705,16 +753,24 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                         "device-execute protocol v2 invoke requires invocation facts",
                     )
                 })?;
-                if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode
-                    && request.inputs.is_some()
-                {
+                if request.inputs.is_some() {
                     return Err(HostError::invalid_args(
-                        "device-execute scalar_decode invoke carries token/position only; inputs are not accepted",
+                        "device-execute v2 invoke carries cursor facts only; load owns prefill inputs",
                     ));
                 }
+                let started = Instant::now();
+                let receipt = paired.execute_invocation(&invocation)?;
+                let wall_us = elapsed_us(started);
+                let mut wire = DeviceExecuteReceipt::from_host(&receipt);
+                wire.kernel_count = match invocation.mode {
+                    DeviceExecuteInvocationMode::Prefill => prefill.kernels.len(),
+                    DeviceExecuteInvocationMode::ScalarDecode => decode.kernels.len(),
+                };
+                wire.stage_timing = stage_timing(wall_us, &receipt);
                 load.operation = "invoke".to_owned();
-                load.lifecycle.reuses += 1;
-                load.receipt = None;
+                load.lifecycle.reuses = paired.reuses();
+                load.lifecycle.live_handles = paired.live_handles();
+                load.receipt = Some(wire);
                 write_control_receipt(&mut stdout, load.clone())?;
             }
             DeviceExecuteControlVerb::Reset => {
@@ -725,6 +781,8 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                 }
                 load.operation = "reset".to_owned();
                 load.lifecycle.resets += 1;
+                load.lifecycle.live_handles = paired.live_handles();
+                load.receipt = None;
                 write_control_receipt(&mut stdout, load.clone())?;
             }
             DeviceExecuteControlVerb::Release => {
@@ -733,9 +791,13 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                         "device-execute protocol v2 release does not accept invocation inputs",
                     ));
                 }
+                let reuses = paired.reuses();
+                paired.teardown()?;
                 load.operation = "release".to_owned();
+                load.lifecycle.reuses = reuses;
                 load.lifecycle.releases += 1;
                 load.lifecycle.live_handles = 0;
+                load.receipt = None;
                 write_control_receipt(&mut stdout, load)?;
                 return Ok(());
             }
@@ -744,6 +806,100 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
     Err(HostError::invalid_args(
         "device-execute control stream ended before explicit release",
     ))
+}
+
+fn input_id_by_name(descriptor: &DeviceDescriptor, name: &str) -> HostResult<u32> {
+    let mut found = None;
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            if slot.role != DeviceBufferRole::Input || slot.buffer_name != name {
+                continue;
+            }
+            if let Some(previous) = found {
+                if previous != slot.buffer_id {
+                    return Err(HostError::invalid_args(format!(
+                        "v2 input `{name}` has conflicting buffer identities"
+                    )));
+                }
+            } else {
+                found = Some(slot.buffer_id);
+            }
+        }
+    }
+    found.ok_or_else(|| HostError::invalid_args(format!("v2 input `{name}` is not declared")))
+}
+
+fn prompt_tokens_from_inputs(
+    descriptor: &DeviceDescriptor,
+    inputs: &BTreeMap<u32, Vec<f32>>,
+) -> HostResult<Vec<u32>> {
+    let id = input_id_by_name(
+        descriptor,
+        crate::composite_host::invocation_binding::PROMPT_TOKENS,
+    )?;
+    let values = inputs.get(&id).ok_or_else(|| {
+        HostError::invalid_args(format!(
+            "v2 prefill input `{}` is missing from the load inputs",
+            crate::composite_host::invocation_binding::PROMPT_TOKENS
+        ))
+    })?;
+    if values.is_empty() {
+        return Err(HostError::invalid_args(
+            "v2 prefill prompt_tokens must contain at least one row",
+        ));
+    }
+    Ok(values.iter().map(|value| value.to_bits()).collect())
+}
+
+fn rope_config_from_inputs(
+    descriptor: &DeviceDescriptor,
+    inputs: &BTreeMap<u32, Vec<f32>>,
+    prompt_len: usize,
+) -> HostResult<RopeConfig> {
+    let cos_id = input_id_by_name(
+        descriptor,
+        crate::composite_host::invocation_binding::ROPE_COS,
+    )?;
+    let sin_id = input_id_by_name(
+        descriptor,
+        crate::composite_host::invocation_binding::ROPE_SIN,
+    )?;
+    let cos = inputs.get(&cos_id).ok_or_else(|| {
+        HostError::invalid_args("v2 prefill rope cosine input is missing from the load inputs")
+    })?;
+    let sin = inputs.get(&sin_id).ok_or_else(|| {
+        HostError::invalid_args("v2 prefill rope sine input is missing from the load inputs")
+    })?;
+    if prompt_len == 0 || cos.len() != sin.len() || cos.len() % prompt_len != 0 {
+        return Err(HostError::invalid_args(
+            "v2 prefill RoPE inputs do not contain one equal-width row per prompt token",
+        ));
+    }
+    let row_width = cos.len() / prompt_len;
+    if row_width == 0 || row_width > (u32::MAX as usize / 2) {
+        return Err(HostError::invalid_args(
+            "v2 prefill RoPE row width is outside the host surface",
+        ));
+    }
+    let head_dim = u32::try_from(row_width * 2)
+        .map_err(|_| HostError::invalid_args("v2 prefill RoPE head dimension overflows"))?;
+    let theta = infer_rope_theta(cos, sin, row_width, prompt_len).unwrap_or(10_000.0);
+    Ok(RopeConfig { head_dim, theta })
+}
+
+fn infer_rope_theta(cos: &[f32], sin: &[f32], row_width: usize, rows: usize) -> Option<f64> {
+    if row_width < 2 || rows < 2 {
+        return None;
+    }
+    let pair = row_width - 1;
+    let angle = f64::from(sin[row_width + pair]).atan2(f64::from(cos[row_width + pair]));
+    if !angle.is_finite() || angle <= 0.0 {
+        return None;
+    }
+    let head_dim = (row_width * 2) as f64;
+    let exponent = -head_dim / (2.0 * pair as f64);
+    let theta = angle.powf(exponent);
+    (theta.is_finite() && theta > 0.0).then_some(theta)
 }
 
 /// Run the explicit resident-session control stream.

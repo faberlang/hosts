@@ -165,6 +165,8 @@ pub struct DeviceByteBuffer {
 struct SessionBufferMeta {
     /// Logical name of the first reference (resource-graph fact).
     name: String,
+    /// Stable semantic value identity carried by the descriptor (F1).
+    semantic_value: u32,
     /// Program role of the first reference (resource-graph fact).
     role: DeviceBufferRole,
     /// Element type declared by the descriptor (resource-graph fact).
@@ -286,74 +288,112 @@ struct SessionBufferMeta {
 /// `live_handle_count() == 0` and no handle survives a failed execution.
 pub struct ProgramSession<'host> {
     runtime: &'host mut DeviceRuntime,
+    inner: ProgramInner,
+}
+
+/// Program-owned device state without the exclusive runtime borrow.
+/// The paired executor holds two of these against one `&mut DeviceRuntime`.
+pub(crate) struct ProgramInner {
     backend: DeviceBackend,
     device_name: String,
     module_handle: DeviceHandle,
     module_hash: u64,
-    /// Program execution-lifetime regime (S2-4).
     program_lifetime: DeviceProgramLifetime,
-    /// Currently checked-out device buffers: (buffer_id, version) → device
-    /// handle. PerProgram buffers stay checked out for the session; resident
-    /// temporary buffers move back to `intermediate_pool` at the step
-    /// boundary.
     buffers: BTreeMap<BufferKey, DeviceHandle>,
-    /// Session-scoped pool for temporary PerStep and ObservationPoint
-    /// allocations. Pool handles remain owned by this session until teardown.
     intermediate_pool: IntermediateBufferPool,
-    /// Per-version declared element count / byte length / lifetime class.
     buffer_meta: BTreeMap<BufferKey, SessionBufferMeta>,
-    /// Kernel declarations cloned from the descriptor.
     kernels: Vec<SessionKernel>,
-    /// The ordered launch plan cloned from the descriptor.
     launches: Vec<SessionLaunch>,
-    /// Carried inter-kernel data-flow edges (A10/R2): the wire's
-    /// producer/consumer facts per buffer version, consumed by
-    /// [`ProgramSession::declared_resource_graph`] — never re-derived from
-    /// launch order.
     data_flow: Vec<DataFlowEdge>,
-    /// Declared observation points (F6): the result rows projected from the
-    /// descriptor's observation facts; the only buffers this session reads
-    /// back **within a step**.
     results: Vec<SessionResult>,
-    /// Declared end-of-run observations (S5A-U1): the result set the
-    /// session reads back ONCE at the declared completion boundary after the
-    /// step loop — never within a step. Carried by the descriptor from the
-    /// wire's `EndOfRun` cadence rows (validated before any launch); may
-    /// name `PerStep` buffers (final forward activations, final gradients)
-    /// and `PerProgram` buffers (final trainable params, read only at the
-    /// end).
     end_of_run_results: Vec<SessionEndOfRunResult>,
-    /// The version-keyed keys of [`ProgramSession::end_of_run_results`]
-    /// (the `PerStep` subset of the set stays live past the final step's
-    /// boundary so the one-shot readback can observe it).
     end_of_run_keys: BTreeSet<BufferKey>,
-    /// Whether the declared end-of-run set has been read back (read exactly
-    /// once; a second readback fails closed).
     end_of_run_read: bool,
-    /// Whether the FINAL step (`execute_final_step`) has completed, so the
-    /// declared end-of-run set is live and observable at the declared
-    /// completion boundary.
     final_step_completed: bool,
-    /// SHA-256 receipt of the carried program-graph facts the session
-    /// executes (the domain-tagged host program-graph identity, OQ1;
-    /// backend-entry-inclusive; S5A-U3 — not a semantic-identity claim).
     program_graph_hash: String,
-    /// Whether a `RepeatingStep` session's HostProvided params have been
-    /// once-init'd via [`ProgramSession::init_params`] (S5-U6). Steps
-    /// refuse until the once-init has run; a second once-init is refused
-    /// ("copied in exactly once").
     params_initialized: bool,
-    /// True after an error-path release (S2-3): every handle has been
-    /// released and the session cannot execute again.
     closed: bool,
-    /// Module-image compile + pipeline create wall at session construction.
-    pub(crate) load_module_us: u64,
-    /// PerProgram allocation wall at session construction.
-    pub(crate) per_program_alloc_us: u64,
-    /// Latest F4H1 timing projection. The setup phase remains explicit
-    /// `not_measured` until the host has a phase-specific setup clock; the
-    /// steady-state phase is replaced after every successful step.
+    load_module_us: u64,
+    per_program_alloc_us: u64,
     kv_cache_timing: KvCacheTimingReceipt,
+    /// PerProgram keys borrowed from the sibling program (weights/cache).
+    /// Release skips these so the owner can free them once.
+    shared_keys: BTreeSet<BufferKey>,
+    /// True when `module_handle` is the sibling program's module.
+    shared_module: bool,
+}
+
+/// One shareable PerProgram handle from a prepared program. The sibling
+/// program binds the carried semantic identity instead of allocating a second
+/// copy. Buffer ids may differ between the two static program descriptors.
+pub(crate) struct SharedBufferOffer {
+    handle: DeviceHandle,
+    byte_length: u64,
+    role: DeviceBufferRole,
+    lifetime: DeviceBufferLifetime,
+    initialization: DeviceBufferInitialization,
+    element_ty: DeviceDataType,
+    element_count: u64,
+}
+
+/// Shareable PerProgram handles from a prepared program. The sibling program
+/// binds matching identities instead of allocating a second copy.
+pub(crate) struct SharedProgramOffer {
+    pub module_hash: u64,
+    pub module_handle: DeviceHandle,
+    pub buffers: BTreeMap<u32, SharedBufferOffer>,
+}
+
+impl ProgramInner {
+    fn shared_offer(&self) -> SharedProgramOffer {
+        let mut buffers = BTreeMap::new();
+        for (key, handle) in &self.buffers {
+            let Some(meta) = self.buffer_meta.get(key) else {
+                continue;
+            };
+            if meta.lifetime == DeviceBufferLifetime::PerProgram {
+                buffers.insert(
+                    meta.semantic_value,
+                    SharedBufferOffer {
+                        handle: *handle,
+                        byte_length: meta.byte_length,
+                        role: meta.role,
+                        lifetime: meta.lifetime,
+                        initialization: meta.initialization,
+                        element_ty: meta.element_ty,
+                        element_count: meta.element_count,
+                    },
+                );
+            }
+        }
+        SharedProgramOffer {
+            module_hash: self.module_hash,
+            module_handle: self.module_handle,
+            buffers,
+        }
+    }
+
+    pub(crate) fn owned_handle_count(&self) -> usize {
+        let owned_buffers = self
+            .buffers
+            .keys()
+            .filter(|key| !self.shared_keys.contains(key))
+            .count();
+        let module = usize::from(!self.shared_module && !self.closed);
+        if self.closed {
+            0
+        } else {
+            owned_buffers + self.intermediate_pool.len() + module
+        }
+    }
+
+    pub(crate) fn program_graph_hash(&self) -> &str {
+        &self.program_graph_hash
+    }
+
+    pub(crate) fn module_hash(&self) -> u64 {
+        self.module_hash
+    }
 }
 
 fn elapsed_us(start: Instant) -> u64 {
@@ -549,6 +589,17 @@ impl<'host> ProgramSession<'host> {
         descriptor: &DeviceDescriptor,
         device_name: String,
     ) -> HostResult<Self> {
+        Self::new_with_share(runtime, descriptor, device_name, None)
+    }
+
+    /// Prepare one program, optionally binding PerProgram weights/cache and
+    /// the module handle from an already-prepared sibling.
+    pub(crate) fn new_with_share(
+        runtime: &'host mut DeviceRuntime,
+        descriptor: &DeviceDescriptor,
+        device_name: String,
+        share: Option<&SharedProgramOffer>,
+    ) -> HostResult<Self> {
         if runtime.backend() != descriptor.backend {
             return Err(HostError {
                 code: E_DEVICE_DESCRIPTOR.to_owned(),
@@ -566,11 +617,15 @@ impl<'host> ProgramSession<'host> {
         // policy (S2-2): loaded once per program keyed by its provenance
         // hash, reused by every execution, released at teardown — repeated
         // execution does not leak, and there is no cross-session or
-        // cross-process cache.
+        // cross-process cache. A paired sibling with the same image reuses
+        // that handle so the pair loads the shared module set, not a double.
         let load_module_started = Instant::now();
-        let module_handle = runtime.load_module(&descriptor.module_image)?;
-        let load_module_us = elapsed_us(load_module_started);
         let module_hash = fnv1a64(&descriptor.module_image);
+        let (module_handle, shared_module) = match share {
+            Some(share) if share.module_hash == module_hash => (share.module_handle, true),
+            _ => (runtime.load_module(&descriptor.module_image)?, false),
+        };
+        let load_module_us = elapsed_us(load_module_started);
 
         // Allocate every distinct PerProgram buffer once (S2-4): they persist
         // for the program's lifetime. PerStep and ObservationPoint buffers
@@ -579,10 +634,13 @@ impl<'host> ProgramSession<'host> {
         // failure at any PerProgram allocation runs the error-path teardown
         // first (S2-3 release-on-error): the module and every already-
         // allocated buffer are released before the error escapes, so a
-        // failed creation leaves `live_handle_count() == 0`.
+        // failed creation leaves `live_handle_count() == 0`. Matching
+        // sibling PerProgram identities bind the existing handle.
         let mut buffers: BTreeMap<BufferKey, DeviceHandle> = BTreeMap::new();
         let mut buffer_meta: BTreeMap<BufferKey, SessionBufferMeta> = BTreeMap::new();
         let mut kernels: Vec<SessionKernel> = Vec::with_capacity(descriptor.kernels.len());
+        let mut shared_keys: BTreeSet<BufferKey> = BTreeSet::new();
+        let mut owned_handles: Vec<DeviceHandle> = Vec::new();
 
         let alloc_started = Instant::now();
         let result = (|| {
@@ -592,6 +650,7 @@ impl<'host> ProgramSession<'host> {
                     let key = (slot.buffer_id, slot.version);
                     buffer_meta.entry(key).or_insert(SessionBufferMeta {
                         name: slot.buffer_name.clone(),
+                        semantic_value: slot.semantic_value,
                         role: slot.role,
                         element_ty: slot.element_ty,
                         element_count: slot.element_count,
@@ -602,17 +661,40 @@ impl<'host> ProgramSession<'host> {
                     if !buffers.contains_key(&key)
                         && slot.lifetime == DeviceBufferLifetime::PerProgram
                     {
-                        let handle = runtime.alloc_bytes(slot.byte_length() as usize)?;
-                        // G4 (F5): honor the carried initialization axis —
-                        // ZeroFill persistent state (accumulation buffers,
-                        // optimizer state) is zeroed EXACTLY ONCE at
-                        // allocation so repeated executions accumulate onto
-                        // a defined initial state.
-                        if slot.initialization == DeviceBufferInitialization::ZeroFill {
-                            runtime
-                                .copy_in_f32(&handle, &vec![0.0; slot.element_count as usize])?;
+                        let byte_length = slot.byte_length();
+                        if let Some(shared) =
+                            share.and_then(|share| share.buffers.get(&slot.semantic_value))
+                        {
+                            if shared.byte_length != byte_length
+                                || shared.role != slot.role
+                                || shared.lifetime != slot.lifetime
+                                || shared.initialization != slot.initialization
+                                || shared.element_ty != slot.element_ty
+                                || shared.element_count != slot.element_count
+                            {
+                                return Err(descriptor_errors::descriptor(format!(
+                                    "paired program semantic value {} has incompatible PerProgram storage",
+                                    slot.semantic_value
+                                )));
+                            }
+                            buffers.insert(key, shared.handle);
+                            shared_keys.insert(key);
+                        } else {
+                            let handle = runtime.alloc_bytes(byte_length as usize)?;
+                            // G4 (F5): honor the carried initialization axis —
+                            // ZeroFill persistent state (accumulation buffers,
+                            // optimizer state) is zeroed EXACTLY ONCE at
+                            // allocation so repeated executions accumulate onto
+                            // a defined initial state.
+                            if slot.initialization == DeviceBufferInitialization::ZeroFill {
+                                runtime.copy_in_f32(
+                                    &handle,
+                                    &vec![0.0; slot.element_count as usize],
+                                )?;
+                            }
+                            buffers.insert(key, handle);
+                            owned_handles.push(handle);
                         }
-                        buffers.insert(key, handle);
                     }
                     slots.push(SessionSlot {
                         buffer_id: slot.buffer_id,
@@ -634,13 +716,14 @@ impl<'host> ProgramSession<'host> {
 
         if let Err(error) = result {
             // Error-path teardown at creation (S2-3): release every buffer
-            // allocated so far, then the module, before the error escapes.
-            // Release failures are secondary to the creation failure, but
-            // every release is still attempted.
-            for handle in buffers.values() {
+            // this program allocated, then the module if this program loaded
+            // it. Shared sibling handles stay with the owner.
+            for handle in &owned_handles {
                 drop(runtime.release(handle));
             }
-            drop(runtime.release(&module_handle));
+            if !shared_module {
+                drop(runtime.release(&module_handle));
+            }
             return Err(error);
         }
 
@@ -655,65 +738,89 @@ impl<'host> ProgramSession<'host> {
 
         Ok(Self {
             runtime,
-            backend: descriptor.backend,
-            device_name,
-            module_handle,
-            module_hash,
-            program_lifetime: descriptor.program_lifetime,
-            buffers,
-            intermediate_pool: IntermediateBufferPool::default(),
-            buffer_meta,
-            kernels,
-            launches,
-            data_flow: descriptor
-                .data_flow
-                .iter()
-                .map(|edge| DataFlowEdge {
-                    buffer_id: edge.buffer_id,
-                    version: edge.version,
-                    producer: edge.producer,
-                    consumer: edge.consumer,
-                })
-                .collect(),
-            // Declared observation points (F6): the session reads back exactly
-            // the descriptor's result rows — never a caller-selected subset
-            // and never an undeclared buffer.
-            results: descriptor
-                .results
-                .iter()
-                .map(|result| SessionResult {
-                    buffer_id: result.buffer_id,
-                    version: result.version,
-                })
-                .collect(),
-            // Declared end-of-run observations (S5A-U1): the wire's `EndOfRun`
-            // cadence set, carried by the descriptor and cloned at session
-            // creation (validated fail-closed at [`DeviceDescriptor::validate`]
-            // before any launch). The session reads the set back exactly once
-            // at the declared completion boundary after the final step; the
-            // final step keeps the PerStep subset live past the boundary.
-            end_of_run_results: descriptor
-                .end_of_run_results
-                .iter()
-                .map(|end_of_run| SessionEndOfRunResult {
-                    buffer_id: end_of_run.buffer_id,
-                    version: end_of_run.version,
-                })
-                .collect(),
-            end_of_run_keys: descriptor
-                .end_of_run_results
-                .iter()
-                .map(|end_of_run| (end_of_run.buffer_id, end_of_run.version))
-                .collect(),
-            end_of_run_read: false,
-            final_step_completed: false,
-            program_graph_hash: descriptor.program_graph_hash(),
-            params_initialized: false,
-            closed: false,
-            load_module_us,
-            per_program_alloc_us,
-            kv_cache_timing: KvCacheTimingReceipt::not_measured(),
+            inner: ProgramInner {
+                backend: descriptor.backend,
+                device_name,
+                module_handle,
+                module_hash,
+                program_lifetime: descriptor.program_lifetime,
+                buffers,
+                intermediate_pool: IntermediateBufferPool::default(),
+                buffer_meta,
+                kernels,
+                launches,
+                data_flow: descriptor
+                    .data_flow
+                    .iter()
+                    .map(|edge| DataFlowEdge {
+                        buffer_id: edge.buffer_id,
+                        version: edge.version,
+                        producer: edge.producer,
+                        consumer: edge.consumer,
+                    })
+                    .collect(),
+                results: descriptor
+                    .results
+                    .iter()
+                    .map(|result| SessionResult {
+                        buffer_id: result.buffer_id,
+                        version: result.version,
+                    })
+                    .collect(),
+                end_of_run_results: descriptor
+                    .end_of_run_results
+                    .iter()
+                    .map(|end_of_run| SessionEndOfRunResult {
+                        buffer_id: end_of_run.buffer_id,
+                        version: end_of_run.version,
+                    })
+                    .collect(),
+                end_of_run_keys: descriptor
+                    .end_of_run_results
+                    .iter()
+                    .map(|end_of_run| (end_of_run.buffer_id, end_of_run.version))
+                    .collect(),
+                end_of_run_read: false,
+                final_step_completed: false,
+                program_graph_hash: descriptor.program_graph_hash(),
+                params_initialized: false,
+                closed: false,
+                load_module_us,
+                per_program_alloc_us,
+                kv_cache_timing: KvCacheTimingReceipt::not_measured(),
+                shared_keys,
+                shared_module,
+            },
         })
+    }
+
+    /// Shareable PerProgram identities for a sibling program to bind.
+    #[must_use]
+    pub(crate) fn shared_offer(&self) -> SharedProgramOffer {
+        self.inner.shared_offer()
+    }
+
+    /// Detach program state from the exclusive runtime borrow.
+    pub(crate) fn into_inner(self) -> ProgramInner {
+        self.inner
+    }
+
+    /// Reattach detached program state to a runtime borrow.
+    pub(crate) fn from_inner<'a>(
+        runtime: &'a mut DeviceRuntime,
+        inner: ProgramInner,
+    ) -> ProgramSession<'a> {
+        ProgramSession { runtime, inner }
+    }
+
+    #[must_use]
+    pub(crate) fn load_module_us(&self) -> u64 {
+        self.inner.load_module_us
+    }
+
+    #[must_use]
+    pub(crate) fn per_program_alloc_us(&self) -> u64 {
+        self.inner.per_program_alloc_us
     }
 
     /// Resolve one declared HostProvided PerProgram weight id to its one
@@ -721,6 +828,7 @@ impl<'host> ProgramSession<'host> {
     /// payload, so the ambiguity fails closed.
     fn weight_key(&self, id: u32) -> HostResult<BufferKey> {
         let mut matches = self
+            .inner
             .buffer_meta
             .keys()
             .filter(|(buffer_id, _)| *buffer_id == id)
@@ -734,6 +842,7 @@ impl<'host> ProgramSession<'host> {
             )));
         }
         let meta = self
+            .inner
             .buffer_meta
             .get(&key)
             .ok_or_else(|| HostError::internal("session weight metadata disappeared"))?;
@@ -761,7 +870,12 @@ impl<'host> ProgramSession<'host> {
         let mut uploaded = BTreeSet::new();
         for (id, input) in weights {
             let key = self.weight_key(*id)?;
+            if self.inner.shared_keys.contains(&key) {
+                uploaded.insert(*id);
+                continue;
+            }
             let meta = self
+                .inner
                 .buffer_meta
                 .get(&key)
                 .ok_or_else(|| HostError::internal("session weight metadata disappeared"))?;
@@ -784,6 +898,7 @@ impl<'host> ProgramSession<'host> {
                 )));
             }
             let handle = self
+                .inner
                 .buffers
                 .get(&key)
                 .copied()
@@ -810,12 +925,12 @@ impl<'host> ProgramSession<'host> {
         inputs: &BTreeMap<u32, Vec<f32>>,
         weights: &BTreeMap<u32, DeviceByteBuffer>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime == DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "a RepeatingStep session executes through init_params + execute_step: byte weights are uploaded at once-init, not per execution",
             ));
@@ -829,7 +944,7 @@ impl<'host> ProgramSession<'host> {
         };
         if result.is_err() {
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         }
         result
     }
@@ -870,12 +985,12 @@ impl<'host> ProgramSession<'host> {
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime == DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "a RepeatingStep session executes through init_params + execute_step: HostProvided params are copied in exactly once at session creation and never re-copied on later steps; per-execution input copy-in is the SingleRun surface",
             ));
@@ -887,7 +1002,7 @@ impl<'host> ProgramSession<'host> {
             // stale handle can be used again. Release failures on top of the
             // stage failure are secondary — every release is still attempted.
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         }
         result
     }
@@ -913,12 +1028,12 @@ impl<'host> ProgramSession<'host> {
     ///   contradicts the declared element count;
     /// - session-level copy failures bubble through.
     pub fn init_params(&mut self, params: &BTreeMap<u32, Vec<f32>>) -> HostResult<()> {
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime != DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "once-init params are a RepeatingStep contract: a SingleRun session copies its declared host inputs per execution",
             ));
         }
-        if self.params_initialized {
+        if self.inner.params_initialized {
             return Err(HostError::internal(
                 "once-init params were already copied; a RepeatingStep session copies its HostProvided params exactly once at session creation",
             ));
@@ -926,13 +1041,13 @@ impl<'host> ProgramSession<'host> {
         let result = self.init_params_inner(params, &BTreeMap::new());
         match result {
             Ok(()) => {
-                self.params_initialized = true;
+                self.inner.params_initialized = true;
                 Ok(())
             }
             Err(error) => {
                 // Release-on-error on all paths (S2-3).
                 drop(self.release_all_handles());
-                self.closed = true;
+                self.inner.closed = true;
                 Err(error)
             }
         }
@@ -946,12 +1061,12 @@ impl<'host> ProgramSession<'host> {
         params: &BTreeMap<u32, Vec<f32>>,
         byte_params: &BTreeMap<u32, DeviceByteBuffer>,
     ) -> HostResult<()> {
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime != DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "once-init params are a RepeatingStep contract: a SingleRun session copies its declared host inputs per execution",
             ));
         }
-        if self.params_initialized {
+        if self.inner.params_initialized {
             return Err(HostError::internal(
                 "once-init params were already copied; a RepeatingStep session copies its HostProvided params exactly once at session creation",
             ));
@@ -959,12 +1074,12 @@ impl<'host> ProgramSession<'host> {
         let result = self.init_params_inner(params, byte_params);
         match result {
             Ok(()) => {
-                self.params_initialized = true;
+                self.inner.params_initialized = true;
                 Ok(())
             }
             Err(error) => {
                 drop(self.release_all_handles());
-                self.closed = true;
+                self.inner.closed = true;
                 Err(error)
             }
         }
@@ -984,7 +1099,7 @@ impl<'host> ProgramSession<'host> {
         // cannot be once-init'd from one value vector (a shape change is a
         // new version), so it fails closed.
         let mut param_ids: Vec<u32> = Vec::new();
-        for ((id, _), meta) in &self.buffer_meta {
+        for ((id, _), meta) in &self.inner.buffer_meta {
             if meta.lifetime == DeviceBufferLifetime::PerProgram
                 && meta.initialization == DeviceBufferInitialization::HostProvided
             {
@@ -1007,13 +1122,14 @@ impl<'host> ProgramSession<'host> {
         let byte_ids = self.upload_weight_bytes_inner(byte_params)?;
         for id in param_ids {
             let key = self
+                .inner
                 .buffer_meta
                 .keys()
                 .find(|(buffer_id, _)| *buffer_id == id)
                 .copied()
                 .ok_or_else(|| HostError::internal("RepeatingStep param metadata disappeared"))?;
-            let meta = &self.buffer_meta[&key];
-            if byte_ids.contains(&id) {
+            let meta = &self.inner.buffer_meta[&key];
+            if self.inner.shared_keys.contains(&key) || byte_ids.contains(&id) {
                 continue;
             }
             let values = params.get(&id).ok_or_else(|| {
@@ -1031,6 +1147,7 @@ impl<'host> ProgramSession<'host> {
                 )));
             }
             let handle = self
+                .inner
                 .buffers
                 .get(&key)
                 .copied()
@@ -1111,21 +1228,21 @@ impl<'host> ProgramSession<'host> {
     ///   its size contradicts the declared element count;
     /// - session-level failures (copy-in, launch, sync, readback) bubble
     ///   through unchanged.
-    fn execute_resident_step(
+    pub(crate) fn execute_resident_step(
         &mut self,
         token_inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime != DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "a resident step is a RepeatingStep contract: the HostProvided weights are once-init'd at prepare and never re-copied on later steps",
             ));
         }
-        if !self.params_initialized {
+        if !self.inner.params_initialized {
             return Err(HostError::internal(
                 "RepeatingStep weights were not once-init'd; prepare the resident session before resident steps",
             ));
@@ -1140,7 +1257,7 @@ impl<'host> ProgramSession<'host> {
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         }
         result
     }
@@ -1151,27 +1268,27 @@ impl<'host> ProgramSession<'host> {
     /// step boundary (the final step) or recycle like every other `PerStep`
     /// buffer (ordinary steps).
     fn execute_step_impl(&mut self, keep_end_of_run: bool) -> HostResult<DeviceExecutionReceipt> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime != DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "execute_step is a RepeatingStep surface: a SingleRun session runs the whole program per execute call",
             ));
         }
-        if !self.params_initialized {
+        if !self.inner.params_initialized {
             return Err(HostError::internal(
                 "RepeatingStep params were not once-init'd; call init_params before execute_step",
             ));
         }
-        if keep_end_of_run && self.final_step_completed {
+        if keep_end_of_run && self.inner.final_step_completed {
             return Err(HostError::internal(
                 "the final step already completed; a run has exactly one final step (its completion boundary is the declared end-of-run boundary)",
             ));
         }
-        if keep_end_of_run && self.end_of_run_read {
+        if keep_end_of_run && self.inner.end_of_run_read {
             return Err(HostError::internal(
                 "the declared end-of-run set was already read back; the end-of-run readback runs exactly once after the final step",
             ));
@@ -1186,9 +1303,9 @@ impl<'host> ProgramSession<'host> {
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         } else if keep_end_of_run {
-            self.final_step_completed = true;
+            self.inner.final_step_completed = true;
         }
         result
     }
@@ -1218,22 +1335,22 @@ impl<'host> ProgramSession<'host> {
     ///   is not live;
     /// - session-level readback failures bubble through unchanged.
     pub fn read_end_of_run(&mut self) -> HostResult<EndOfRunReadback> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
         }
-        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+        if self.inner.program_lifetime != DeviceProgramLifetime::RepeatingStep {
             return Err(HostError::internal(
                 "end-of-run readback is a RepeatingStep contract: a SingleRun session has no step loop and no end-of-run boundary",
             ));
         }
-        if self.end_of_run_read {
+        if self.inner.end_of_run_read {
             return Err(HostError::internal(
                 "the declared end-of-run set was already read back; the end-of-run readback runs exactly once after the final step",
             ));
         }
-        if !self.end_of_run_results.is_empty() && !self.final_step_completed {
+        if !self.inner.end_of_run_results.is_empty() && !self.inner.final_step_completed {
             return Err(HostError::internal(
                 "the final step has not completed; the declared end-of-run set is observable only at the declared completion boundary after the step loop",
             ));
@@ -1242,9 +1359,9 @@ impl<'host> ProgramSession<'host> {
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         } else {
-            self.end_of_run_read = true;
+            self.inner.end_of_run_read = true;
         }
         result
     }
@@ -1257,9 +1374,9 @@ impl<'host> ProgramSession<'host> {
         let mut values: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
         let mut readback_count = 0usize;
         let mut released: Vec<BufferKey> = Vec::new();
-        for end_of_run in &self.end_of_run_results {
+        for end_of_run in &self.inner.end_of_run_results {
             let key = (end_of_run.buffer_id, end_of_run.version);
-            let meta = self.buffer_meta.get(&key).ok_or_else(|| {
+            let meta = self.inner.buffer_meta.get(&key).ok_or_else(|| {
                 HostError::invalid_args(format!(
                     "declared end-of-run buffer id {} was not allocated by the session",
                     end_of_run.buffer_id
@@ -1275,6 +1392,7 @@ impl<'host> ProgramSession<'host> {
                 )));
             }
             let handle = self
+                .inner
                 .buffers
                 .get(&key)
                 .copied()
@@ -1316,7 +1434,7 @@ impl<'host> ProgramSession<'host> {
     /// - `E_INTERNAL` — the session is closed;
     /// - session-level copy failures bubble through unchanged.
     fn clear_resident_state(&mut self) -> HostResult<usize> {
-        if self.closed {
+        if self.inner.closed {
             return Err(HostError::internal(
                 "program session is closed after a failed execution; create a new session",
             ));
@@ -1325,7 +1443,7 @@ impl<'host> ProgramSession<'host> {
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
-            self.closed = true;
+            self.inner.closed = true;
         }
         result
     }
@@ -1335,10 +1453,11 @@ impl<'host> ProgramSession<'host> {
     /// buffers, without the error-path release, which the caller owns.
     fn clear_resident_state_inner(&mut self) -> HostResult<usize> {
         let keys: Vec<BufferKey> = self
+            .inner
             .buffers
             .iter()
             .filter(|(key, _)| {
-                self.buffer_meta.get(key).is_some_and(|meta| {
+                self.inner.buffer_meta.get(key).is_some_and(|meta| {
                     meta.lifetime == DeviceBufferLifetime::PerProgram
                         && meta.initialization == DeviceBufferInitialization::ZeroFill
                 })
@@ -1347,11 +1466,12 @@ impl<'host> ProgramSession<'host> {
             .collect();
         let mut cleared = 0usize;
         for key in keys {
-            let meta = self
-                .buffer_meta
-                .get(&key)
-                .ok_or_else(|| HostError::internal("session state-buffer metadata disappeared"))?;
+            let meta =
+                self.inner.buffer_meta.get(&key).ok_or_else(|| {
+                    HostError::internal("session state-buffer metadata disappeared")
+                })?;
             let handle = self
+                .inner
                 .buffers
                 .get(&key)
                 .copied()
@@ -1381,8 +1501,8 @@ impl<'host> ProgramSession<'host> {
     ) -> HostResult<DeviceExecutionReceipt> {
         let step_started = Instant::now();
         let mut launch_count = 0usize;
-        let mut launch_ids = Vec::with_capacity(self.launches.len());
-        let mut launch_entries = Vec::with_capacity(self.launches.len());
+        let mut launch_ids = Vec::with_capacity(self.inner.launches.len());
+        let mut launch_entries = Vec::with_capacity(self.inner.launches.len());
         let mut copy_ins = 0usize;
         // Snapshot Metal submit/wait counters before this step so the receipt
         // reports this execution's batch, not the session lifetime total.
@@ -1406,23 +1526,27 @@ impl<'host> ProgramSession<'host> {
         // SingleRun still copies per kernel; OnceInit copies nothing.
         if mode == CopyMode::ResidentStep {
             let copy_started = Instant::now();
-            copy_ins =
-                copy_resident_inputs(self.runtime, &self.buffers, &self.buffer_meta, inputs)?;
+            copy_ins = copy_resident_inputs(
+                self.runtime,
+                &self.inner.buffers,
+                &self.inner.buffer_meta,
+                inputs,
+            )?;
             copy_in_us = elapsed_us(copy_started);
         }
 
         let encode_started = Instant::now();
-        for launch in &self.launches {
-            let kernel = self
-                .kernels
-                .get(launch.kernel_index)
-                .ok_or_else(|| HostError::internal("session launch references missing kernel"))?;
+        for launch in &self.inner.launches {
+            let kernel =
+                self.inner.kernels.get(launch.kernel_index).ok_or_else(|| {
+                    HostError::internal("session launch references missing kernel")
+                })?;
             // Resolve buffer handles for this kernel's launch (PerProgram
             // live from creation; PerStep/ObservationPoint just allocated).
             let mut launch_buffers: Vec<DeviceHandle> = Vec::with_capacity(kernel.slots.len());
             for slot in &kernel.slots {
                 let key = (slot.buffer_id, slot.version);
-                let handle = self.buffers.get(&key).copied().ok_or_else(|| {
+                let handle = self.inner.buffers.get(&key).copied().ok_or_else(|| {
                     HostError::internal("session buffer disappeared during launch")
                 })?;
                 launch_buffers.push(handle);
@@ -1438,8 +1562,8 @@ impl<'host> ProgramSession<'host> {
                 let copy_started = Instant::now();
                 copy_ins += copy_declared_inputs(
                     self.runtime,
-                    &self.buffers,
-                    &self.buffer_meta,
+                    &self.inner.buffers,
+                    &self.inner.buffer_meta,
                     kernel,
                     inputs,
                     mode,
@@ -1450,7 +1574,7 @@ impl<'host> ProgramSession<'host> {
 
             let encode_started = Instant::now();
             self.runtime.launch_kernel(
-                &self.module_handle,
+                &self.inner.module_handle,
                 &kernel.entry,
                 &launch_buffers,
                 kernel.grid,
@@ -1484,11 +1608,11 @@ impl<'host> ProgramSession<'host> {
         let mut release_count = 0usize;
         let mut readback_count = 0usize;
         let mut readbacks: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
-        let observed: Vec<SessionResult> = self.results.clone();
+        let observed: Vec<SessionResult> = self.inner.results.clone();
         let readback_started = Instant::now();
         for result in &observed {
             let key = (result.buffer_id, result.version);
-            let meta = self.buffer_meta.get(&key).ok_or_else(|| {
+            let meta = self.inner.buffer_meta.get(&key).ok_or_else(|| {
                 HostError::invalid_args(format!(
                     "declared observation buffer id {} was not allocated by the session",
                     result.buffer_id
@@ -1502,6 +1626,7 @@ impl<'host> ProgramSession<'host> {
                 )));
             }
             let handle = self
+                .inner
                 .buffers
                 .get(&key)
                 .copied()
@@ -1525,17 +1650,19 @@ impl<'host> ProgramSession<'host> {
         // live so the one-shot end-of-run readback observes them once at the
         // declared completion boundary.
         let mut per_step_ids: Vec<BufferKey> = self
+            .inner
             .buffers
             .iter()
             .filter(|(key, _)| {
-                self.buffer_meta
+                self.inner
+                    .buffer_meta
                     .get(key)
                     .is_some_and(|meta| meta.lifetime == DeviceBufferLifetime::PerStep)
             })
             .map(|(key, _)| *key)
             .collect();
         if keep_end_of_run {
-            per_step_ids.retain(|key| !self.end_of_run_keys.contains(key));
+            per_step_ids.retain(|key| !self.inner.end_of_run_keys.contains(key));
         }
         for key in per_step_ids {
             if use_intermediate_pool {
@@ -1559,7 +1686,7 @@ impl<'host> ProgramSession<'host> {
         // encoded-kernel count (`launch_ids` / `launch_entries` still name
         // every kernel). CUDA still submits and syncs per kernel plus the
         // additive step-boundary `cuCtxSynchronize`.
-        let (launches, syncs) = match self.backend {
+        let (launches, syncs) = match self.inner.backend {
             DeviceBackend::Metal => (
                 self.runtime
                     .command_submit_count()
@@ -1586,17 +1713,17 @@ impl<'host> ProgramSession<'host> {
             wait: KvCacheTimingSpan::not_measured(),
         };
         let wall_us = elapsed_us(step_started);
-        self.kv_cache_timing = KvCacheTimingReceipt {
-            setup_phase: self.kv_cache_timing.setup_phase,
+        self.inner.kv_cache_timing = KvCacheTimingReceipt {
+            setup_phase: self.inner.kv_cache_timing.setup_phase,
             steady_state,
             slack_us: derived_slack_us(wall_us, steady_state),
-            lifecycle: self.kv_cache_timing.lifecycle,
+            lifecycle: self.inner.kv_cache_timing.lifecycle,
         };
 
         Ok(DeviceExecutionReceipt {
-            backend: self.backend,
-            device_name: self.device_name.clone(),
-            module_hash: self.module_hash,
+            backend: self.inner.backend,
+            device_name: self.inner.device_name.clone(),
+            module_hash: self.inner.module_hash,
             launches,
             launch_ids,
             launch_entries,
@@ -1607,7 +1734,7 @@ impl<'host> ProgramSession<'host> {
             pool_allocations,
             pool_reuses,
             pool_returns,
-            program_lifetime: self.program_lifetime,
+            program_lifetime: self.inner.program_lifetime,
             per_program_buffers: self.buffers_by_lifetime(DeviceBufferLifetime::PerProgram),
             per_program_buffer_versions: self
                 .buffer_versions_by_lifetime(DeviceBufferLifetime::PerProgram),
@@ -1624,9 +1751,14 @@ impl<'host> ProgramSession<'host> {
             readbacks: readback_count,
             releases: release_count,
             completion_boundary: CompletionBoundary::StepSync {
-                after_launch: self.launches.last().map(|launch| launch.id).unwrap_or(0),
+                after_launch: self
+                    .inner
+                    .launches
+                    .last()
+                    .map(|launch| launch.id)
+                    .unwrap_or(0),
             },
-            program_graph_hash: self.program_graph_hash.clone(),
+            program_graph_hash: self.inner.program_graph_hash.clone(),
             copy_in_us,
             gpu_encode_submit_wait_us,
             readback_us,
@@ -1642,10 +1774,12 @@ impl<'host> ProgramSession<'host> {
     /// left untouched, so an interrupted path is never double-allocated.
     fn allocate_step_buffers(&mut self, use_intermediate_pool: bool) -> HostResult<(usize, usize)> {
         let to_checkout: Vec<BufferKey> = self
+            .inner
             .buffer_meta
             .iter()
             .filter(|(key, meta)| {
-                meta.lifetime != DeviceBufferLifetime::PerProgram && !self.buffers.contains_key(key)
+                meta.lifetime != DeviceBufferLifetime::PerProgram
+                    && !self.inner.buffers.contains_key(key)
             })
             .map(|(key, _)| *key)
             .collect();
@@ -1653,11 +1787,12 @@ impl<'host> ProgramSession<'host> {
         let mut pool_reuses = 0usize;
         for key in to_checkout {
             let meta = self
+                .inner
                 .buffer_meta
                 .get(&key)
                 .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
             let handle = if use_intermediate_pool {
-                match self.intermediate_pool.checkout(key) {
+                match self.inner.intermediate_pool.checkout(key) {
                     Some(handle) => {
                         pool_reuses += 1;
                         handle
@@ -1678,7 +1813,7 @@ impl<'host> ProgramSession<'host> {
                 self.runtime
                     .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
             }
-            self.buffers.insert(key, handle);
+            self.inner.buffers.insert(key, handle);
         }
         Ok((pool_allocations, pool_reuses))
     }
@@ -1687,8 +1822,8 @@ impl<'host> ProgramSession<'host> {
     /// This is the pool equivalent of the old read-then-release / step-boundary
     /// release path: no device free occurs until session teardown.
     fn return_buffer_to_pool(&mut self, key: BufferKey) -> HostResult<()> {
-        if let Some(handle) = self.buffers.remove(&key) {
-            self.intermediate_pool.return_buffer(key, handle);
+        if let Some(handle) = self.inner.buffers.remove(&key) {
+            self.inner.intermediate_pool.return_buffer(key, handle);
         }
         Ok(())
     }
@@ -1696,7 +1831,7 @@ impl<'host> ProgramSession<'host> {
     /// Release one live buffer by key (no-op when the key is not live). Used by
     /// the non-resident execution surfaces and by end-of-run readback.
     fn release_buffer(&mut self, key: BufferKey) -> HostResult<()> {
-        if let Some(handle) = self.buffers.remove(&key) {
+        if let Some(handle) = self.inner.buffers.remove(&key) {
             self.runtime.release(&handle)?;
         }
         Ok(())
@@ -1705,7 +1840,8 @@ impl<'host> ProgramSession<'host> {
     /// The program's buffer ids classified by lifetime class (S2-4 receipt).
     fn buffers_by_lifetime(&self, lifetime: DeviceBufferLifetime) -> Vec<u32> {
         let mut ids = Vec::new();
-        self.buffer_meta
+        self.inner
+            .buffer_meta
             .iter()
             .filter(|(_, meta)| meta.lifetime == lifetime)
             .for_each(|((id, _), _)| {
@@ -1718,7 +1854,8 @@ impl<'host> ProgramSession<'host> {
 
     /// The program's version-keyed buffer metadata classified by lifetime.
     fn buffer_versions_by_lifetime(&self, lifetime: DeviceBufferLifetime) -> Vec<BufferKey> {
-        self.buffer_meta
+        self.inner
+            .buffer_meta
             .iter()
             .filter(|(_, meta)| meta.lifetime == lifetime)
             .map(|(key, _)| *key)
@@ -1740,6 +1877,7 @@ impl<'host> ProgramSession<'host> {
     /// (S2-4/S2-5: no undeclared readback).
     fn declared_resource_graph(&self) -> (Vec<ReceiptBuffer>, Vec<DataFlowEdge>) {
         let graph = self
+            .inner
             .buffer_meta
             .iter()
             .map(|((id, version), meta)| ReceiptBuffer {
@@ -1752,7 +1890,7 @@ impl<'host> ProgramSession<'host> {
                 version: *version,
             })
             .collect();
-        (graph, self.data_flow.clone())
+        (graph, self.inner.data_flow.clone())
     }
 
     /// Ordered teardown: release every buffer, then the module. After this
@@ -1768,7 +1906,7 @@ impl<'host> ProgramSession<'host> {
     /// The first session-level release failure bubbles through after every
     /// release has been attempted.
     pub fn teardown(mut self) -> HostResult<()> {
-        if self.closed {
+        if self.inner.closed {
             // The error path already released every handle.
             return Ok(());
         }
@@ -1781,25 +1919,30 @@ impl<'host> ProgramSession<'host> {
     /// if one fails. Returns the first release failure, if any.
     fn release_all_handles(&mut self) -> HostResult<()> {
         let mut first_error: Option<HostError> = None;
-        let buffers: Vec<DeviceHandle> = self
+        let owned: Vec<DeviceHandle> = self
+            .inner
             .buffers
-            .values()
-            .chain(self.intermediate_pool.values())
-            .copied()
+            .iter()
+            .filter(|(key, _)| !self.inner.shared_keys.contains(key))
+            .map(|(_, handle)| *handle)
+            .chain(self.inner.intermediate_pool.values().copied())
             .collect();
-        for handle in buffers {
+        for handle in owned {
             if let Err(error) = self.runtime.release(&handle) {
                 first_error.get_or_insert(error);
             }
         }
-        if let Err(error) = self.runtime.release(&self.module_handle) {
-            first_error.get_or_insert(error);
+        if !self.inner.shared_module {
+            if let Err(error) = self.runtime.release(&self.inner.module_handle) {
+                first_error.get_or_insert(error);
+            }
         }
-        // The released handles are no longer live: drop them from the map so
-        // `session_handle_count()` reports reality on every release path
-        // (the `closed` flag already reports 0 for the error paths).
-        self.buffers.clear();
-        self.intermediate_pool.clear();
+        // Shared sibling handles stay mapped on the owner; drop only this
+        // program's keys so `session_handle_count()` reports reality.
+        self.inner
+            .buffers
+            .retain(|key, _| self.inner.shared_keys.contains(key));
+        self.inner.intermediate_pool.clear();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1815,7 +1958,7 @@ impl<'host> ProgramSession<'host> {
     /// attempted.
     pub fn release(&mut self) -> HostResult<()> {
         let result = self.release_all_handles();
-        self.closed = true;
+        self.inner.closed = true;
         result
     }
 
@@ -1826,7 +1969,7 @@ impl<'host> ProgramSession<'host> {
     #[must_use]
     pub fn allocated_buffers(&self) -> Vec<u32> {
         let mut ids = Vec::new();
-        for (id, _) in self.buffer_meta.keys() {
+        for (id, _) in self.inner.buffer_meta.keys() {
             if ids.last() != Some(id) {
                 ids.push(*id);
             }
@@ -1837,7 +1980,7 @@ impl<'host> ProgramSession<'host> {
     /// The program's version-keyed buffer allocations.
     #[must_use]
     pub fn allocated_buffer_versions(&self) -> Vec<(u32, u32)> {
-        self.buffer_meta.keys().copied().collect()
+        self.inner.buffer_meta.keys().copied().collect()
     }
 
     /// Number of live device handles the session currently owns (module +
@@ -1847,11 +1990,7 @@ impl<'host> ProgramSession<'host> {
     /// holds no live handles and reports 0.
     #[must_use]
     pub fn session_handle_count(&self) -> usize {
-        if self.closed {
-            0
-        } else {
-            self.buffers.len() + self.intermediate_pool.len() + 1 // buffers + pool + module
-        }
+        self.inner.owned_handle_count()
     }
 
     /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
@@ -1867,13 +2006,13 @@ impl<'host> ProgramSession<'host> {
     /// The backend this session speaks for.
     #[must_use]
     pub fn backend(&self) -> DeviceBackend {
-        self.backend
+        self.inner.backend
     }
 
     /// The FNV-1a provenance hash of the loaded module.
     #[must_use]
     pub fn module_hash(&self) -> u64 {
-        self.module_hash
+        self.inner.module_hash
     }
 
     /// The SHA-256 program-graph receipt of the descriptor this session
@@ -1886,14 +2025,14 @@ impl<'host> ProgramSession<'host> {
     /// semantic identity.
     #[must_use]
     pub fn program_graph_hash(&self) -> &str {
-        &self.program_graph_hash
+        &self.inner.program_graph_hash
     }
 
     /// The latest live F4H1 timing projection. Prepared resident sessions
     /// attach their current lifecycle counters before exposing this value.
     #[must_use]
     fn kv_cache_timing(&self) -> KvCacheTimingReceipt {
-        self.kv_cache_timing
+        self.inner.kv_cache_timing
     }
 }
 
@@ -2184,7 +2323,7 @@ impl<'host> PreparedResidentSession<'host> {
         &mut self,
         token_inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        if self.closed {
+        if self.session.inner.closed {
             return Err(HostError::internal(
                 "prepared resident session is closed after a failure; prepare a new session",
             ));
@@ -2196,7 +2335,7 @@ impl<'host> PreparedResidentSession<'host> {
                 Ok(receipt)
             }
             Err(error) => {
-                self.closed = true;
+                self.session.inner.closed = true;
                 Err(error)
             }
         }
@@ -2216,7 +2355,7 @@ impl<'host> PreparedResidentSession<'host> {
     /// - `E_INTERNAL` — the prepared session is closed;
     /// - session-level copy failures bubble through unchanged.
     pub fn reset_prompt(&mut self) -> HostResult<usize> {
-        if self.closed {
+        if self.session.inner.closed {
             return Err(HostError::internal(
                 "prepared resident session is closed after a failure; prepare a new session",
             ));
@@ -2228,7 +2367,7 @@ impl<'host> PreparedResidentSession<'host> {
                 Ok(cleared)
             }
             Err(error) => {
-                self.closed = true;
+                self.session.inner.closed = true;
                 Err(error)
             }
         }
@@ -2264,9 +2403,9 @@ impl<'host> PreparedResidentSession<'host> {
             full_cache_clear_bytes: 0,
         };
         PreparedSessionReceipt {
-            backend: self.backend,
-            device_name: self.device_name.clone(),
-            program_graph_hash: self.program_graph_hash.clone(),
+            backend: self.session.inner.backend,
+            device_name: self.session.inner.device_name.clone(),
+            program_graph_hash: self.session.inner.program_graph_hash.clone(),
             counters: self.counters,
             module_reloads,
             per_program_reallocs,
@@ -2305,7 +2444,7 @@ impl<'host> PreparedResidentSession<'host> {
     /// The first session-level release failure bubbles through after every
     /// release has been attempted.
     pub fn teardown(mut self) -> HostResult<PreparedSessionReceipt> {
-        if !self.closed {
+        if !self.session.inner.closed {
             self.session.release()?;
         }
         self.counters.releases += 1;

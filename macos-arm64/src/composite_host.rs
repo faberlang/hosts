@@ -48,6 +48,7 @@
 pub mod inference_state;
 pub mod invocation_binding;
 mod invocation_program;
+mod paired_session;
 mod receipt;
 mod residency;
 mod session;
@@ -58,6 +59,7 @@ pub use inference_state::{
     SessionInspection, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
     E_KV_STALE,
 };
+pub use paired_session::PairedProgramSession;
 pub use receipt::{
     CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
 };
@@ -72,6 +74,8 @@ pub use host_coordinator::DeviceBackend;
 
 use crate::device_descriptor::{errors as descriptor_errors, DeviceDescriptor};
 use crate::device_host::DeviceRuntime;
+
+use self::invocation_binding::RopeConfig;
 use crate::kernel::{HostKernel, HostResult};
 use crate::manifest::CapabilityManifest;
 use crate::Frame;
@@ -351,6 +355,40 @@ impl CompositeHost {
             )
         })?;
         ProgramSession::new(runtime, descriptor, device_name)
+    }
+
+    /// Prepare paired prefill and scalar-decode programs over one runtime and
+    /// one semantic PerProgram model/cache owner. The returned executor
+    /// selects its program explicitly from each v2 invocation mode.
+    pub fn prepare_paired_session(
+        &mut self,
+        prefill: &DeviceDescriptor,
+        decode: &DeviceDescriptor,
+        prompt_tokens: Vec<u32>,
+        rope: RopeConfig,
+        weights: &BTreeMap<u32, Vec<f32>>,
+        byte_weights: &BTreeMap<u32, DeviceByteBuffer>,
+        model_identity: impl Into<String>,
+        session_identity: impl Into<String>,
+    ) -> HostResult<PairedProgramSession<'_>> {
+        let device_name = self.device_name().to_owned();
+        let runtime = self.device_mut().ok_or_else(|| {
+            descriptor_errors::no_device_program(
+                "composite host has no device session; paired programs cannot execute",
+            )
+        })?;
+        PairedProgramSession::prepare(
+            runtime,
+            prefill,
+            decode,
+            prompt_tokens,
+            rope,
+            weights,
+            byte_weights,
+            model_identity.into(),
+            session_identity.into(),
+            device_name,
+        )
     }
 
     /// Execute a typed device descriptor through the device session.
