@@ -61,7 +61,7 @@ pub use receipt::{
     CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
 };
 pub use session::{
-    KvCacheBindingSession, PreparedResidentSession, PreparedSessionCounters,
+    DeviceByteBuffer, KvCacheBindingSession, PreparedResidentSession, PreparedSessionCounters,
     PreparedSessionReceipt, ProgramSession,
 };
 

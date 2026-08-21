@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
-use faber_host_macos_arm64::composite_host::{CompositeHost, InferenceSessionState};
+use faber_host_macos_arm64::composite_host::{
+    CompositeHost, DeviceByteBuffer, InferenceSessionState,
+};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DescriptorLaunch,
     DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
@@ -19,6 +21,7 @@ use faber_host_macos_arm64::device_execute::{
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::metal_host::MappedWeightFile;
+use faber_host_macos_arm64::{CudaHostSession, FakeCudaDriver};
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde_json::Value;
@@ -116,6 +119,37 @@ fn add_inputs() -> BTreeMap<u32, Vec<f32>> {
     BTreeMap::from([(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])])
 }
 
+fn packed_weight_descriptor(backend: DeviceBackend) -> DeviceDescriptor {
+    let mut descriptor = elementwise_add_descriptor();
+    descriptor.backend = backend;
+    for kernel in &mut descriptor.kernels {
+        for buffer in &mut kernel.buffers {
+            buffer.element_count = 9;
+        }
+    }
+    for version in &mut descriptor.buffer_versions {
+        version.element_count = 9;
+    }
+    descriptor
+}
+
+fn fake_runtime(backend: DeviceBackend) -> DeviceRuntime {
+    match backend {
+        DeviceBackend::Metal => DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(
+                FakeMetalDriver::default().with_known_entry("addita"),
+            ))
+            .expect("fake Metal admit"),
+        ),
+        DeviceBackend::Cuda => DeviceRuntime::Cuda(
+            CudaHostSession::with_driver(Box::new(
+                FakeCudaDriver::default().with_known_entry("addita"),
+            ))
+            .expect("fake CUDA admit"),
+        ),
+    }
+}
+
 #[test]
 fn parse_device_execute_args_requires_the_three_paths() {
     let err = parse_device_execute_args(&[]).expect_err("missing flags");
@@ -179,7 +213,7 @@ fn parse_device_execute_args_accepts_weights_and_map() {
 }
 
 #[test]
-fn gguf_weight_map_admits_native_packed_region() {
+fn gguf_weight_map_admits_raw_packed_region() {
     let mut file = Vec::new();
     file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
     file.extend_from_slice(&1.0f32.to_le_bytes());
@@ -197,11 +231,9 @@ fn gguf_weight_map_admits_native_packed_region() {
     let decoded = weight_map_from_json(&json).expect("decode");
     assert_eq!(decoded, map);
     let inputs = inputs_from_gguf(&file, &map).expect("fill");
-    let values = inputs.get(&7).expect("buffer 7");
-    assert_eq!(values.len(), 3);
-    assert_eq!(values[0], 1.0);
-    assert_eq!(values[1], 2.0);
-    assert_eq!(values[2].to_bits(), 0xff81_0000);
+    let values = &inputs.byte_map()[&7];
+    assert_eq!(values.dtype, DeviceDataType::U8);
+    assert_eq!(values.bytes, file[4..16]);
 }
 
 #[test]
@@ -567,7 +599,43 @@ fn wire_execute_on_fake_metal_returns_observation_outputs() {
 }
 
 #[test]
-fn mmap_region_table_aliases_native_packed_words() {
+fn packed_weight_bytes_reach_session_buffers_on_both_fake_backends() {
+    let packed: Vec<u8> = (0..34).collect();
+    let expected: Vec<f32> = packed
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            f32::from_le_bytes(word)
+        })
+        .collect();
+    let weights = BTreeMap::from([(
+        1,
+        DeviceByteBuffer {
+            bytes: packed,
+            dtype: DeviceDataType::U8,
+        },
+    )]);
+    let inputs = BTreeMap::from([(2, vec![0.0; 9])]);
+
+    for backend in [DeviceBackend::Metal, DeviceBackend::Cuda] {
+        let descriptor = packed_weight_descriptor(backend);
+        let runtime = fake_runtime(backend);
+        let mut host = CompositeHost::with_device(runtime, "fake-packed-device").expect("host");
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("session create");
+        let receipt = session
+            .execute_with_weight_bytes(&inputs, &weights)
+            .expect("packed weight execute");
+        assert_eq!(receipt.outputs.get(&3), Some(&expected));
+        session.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
+}
+
+#[test]
+fn mmap_region_table_aliases_raw_packed_bytes() {
     let mut file = Vec::new();
     file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
     file.extend_from_slice(&1.0f32.to_le_bytes());
@@ -590,13 +658,11 @@ fn mmap_region_table_aliases_native_packed_words() {
     assert_eq!(table.abs_ends, vec![16]);
     let owned = inputs_from_gguf(&file, &map).expect("owned");
     let aliased = inputs_from_mapped_gguf(&mapped, &map, &table).expect("mapped");
-    let values = aliased.map().get(&7).expect("buffer 7");
-    let owned_values = owned.get(&7).expect("owned 7");
-    assert_eq!(values.len(), owned_values.len());
-    for (left, right) in values.iter().zip(owned_values) {
-        assert_eq!(left.to_bits(), right.to_bits());
-    }
-    assert_eq!(values[2].to_bits(), 0xff81_0000);
+    let values = &aliased.byte_map()[&7];
+    let owned_values = &owned.byte_map()[&7];
+    assert_eq!(values.dtype, DeviceDataType::U8);
+    assert_eq!(values.bytes, owned_values.bytes);
+    assert_eq!(values.bytes, file[4..16]);
     drop(aliased);
     drop(mapped);
     let _ = fs::remove_file(&path);
@@ -626,7 +692,11 @@ fn mmap_region_table_parses_gguf_data_start() {
     assert_eq!(table.abs_starts, vec![32]);
     assert_eq!(table.abs_ends, vec![36]);
     let aliased = inputs_from_mapped_gguf(&mapped, &map, &table).expect("mapped");
-    assert_eq!(aliased.map().get(&1), Some(&vec![3.0]));
+    assert_eq!(
+        aliased.byte_map()[&1].bytes,
+        file[32..36],
+        "GGUF data bytes stay raw"
+    );
     drop(aliased);
     drop(mapped);
     let _ = fs::remove_file(&path);

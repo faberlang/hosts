@@ -15,7 +15,9 @@
 
 use std::collections::BTreeMap;
 
-use faber_host_macos_arm64::composite_host::{CompositeHost, PreparedResidentSession};
+use faber_host_macos_arm64::composite_host::{
+    CompositeHost, DeviceByteBuffer, PreparedResidentSession,
+};
 use faber_host_macos_arm64::device_descriptor::{
     fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
     DescriptorLaunch, DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime,
@@ -366,6 +368,51 @@ fn run_prompt(
         logits.push(observed);
     }
     logits
+}
+
+// ---------------------------------------------------------------------------
+// DSB-4b: packed bytes once-init directly into the resident session buffers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prepared_session_accepts_raw_weight_bytes_on_both_fake_backends() {
+    let bytes: Vec<u8> = [10.0_f32, 20.0, 30.0, 40.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let byte_weights = BTreeMap::from([(
+        1,
+        DeviceByteBuffer {
+            bytes,
+            dtype: DeviceDataType::U8,
+        },
+    )]);
+
+    for (backend, mut host) in [
+        (
+            DeviceBackend::Metal,
+            prepared_metal_composite().expect("fake metal composite"),
+        ),
+        (
+            DeviceBackend::Cuda,
+            prepared_cuda_composite().expect("fake cuda composite"),
+        ),
+    ] {
+        let descriptor = prepared_decode_descriptor(backend);
+        let mut prepared = PreparedResidentSession::prepare_with_weight_bytes(
+            &mut host,
+            &descriptor,
+            &BTreeMap::new(),
+            &byte_weights,
+        )
+        .expect("raw byte prepare");
+        let receipt = prepared
+            .execute_step(&prompt_a()[0])
+            .expect("resident step");
+        assert_eq!(receipt.outputs.get(&5), Some(&vec![11.0, 20.0, 30.0, 40.0]));
+        prepared.teardown().expect("teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

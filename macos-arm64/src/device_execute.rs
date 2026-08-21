@@ -34,7 +34,7 @@ use host_coordinator::DeviceBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::composite_host::{
-    CompositeHost, CompositeHostConfig, DeviceExecutionReceipt, DeviceSelection,
+    CompositeHost, CompositeHostConfig, DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection,
     PreparedResidentSession, PreparedSessionReceipt,
 };
 use crate::device_descriptor::{
@@ -43,7 +43,7 @@ use crate::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime,
 };
-use crate::device_host::DeviceRuntime;
+use crate::device_host::DeviceSession;
 use crate::kernel::{HostError, HostResult};
 use crate::metal_host::{process_resident_bytes, MappedWeightFile, MappedWeightPaging};
 
@@ -606,7 +606,8 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let load_module_us = session.load_module_us;
     let per_program_alloc_us = session.per_program_alloc_us;
     let step_started = Instant::now();
-    let receipt = session.execute(weight_inputs.map())?;
+    let receipt =
+        session.execute_with_weight_bytes(weight_inputs.map(), weight_inputs.byte_map())?;
     let step_wall_us = elapsed_us(step_started);
     session.teardown()?;
     let mut wire = DeviceExecuteReceipt::from_host(&receipt);
@@ -816,7 +817,12 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
         requires_device: true,
     })?;
     retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
-    let mut session = host.prepare_resident_session(&descriptor, weight_inputs.map())?;
+    let mut session = PreparedResidentSession::prepare_with_weight_bytes(
+        &mut host,
+        &descriptor,
+        weight_inputs.map(),
+        weight_inputs.byte_map(),
+    )?;
     let stdout = std::io::stdout();
     let mut stdout = std::io::BufWriter::new(stdout.lock());
     let mut load_receipt = control_receipt("load", &session, descriptor.kernels.len(), None, 0);
@@ -1100,13 +1106,14 @@ pub fn weight_map_to_json(map: &BTreeMap<u32, WeightFileRange>) -> HostResult<Ve
     })
 }
 
-/// Admit GGUF byte ranges as native packed host regions (prefix copy, 4-byte
-/// align only). Logical-F32 padding is not an admitted path.
+/// Admit GGUF byte ranges as raw dtype-tagged weight regions. The source
+/// bytes stay bytes all the way to the session-owned PerProgram allocation;
+/// the old f32 reinterpretation path is deliberately not used.
 pub fn inputs_from_gguf(
     gguf: &[u8],
     map: &BTreeMap<u32, WeightFileRange>,
-) -> HostResult<BTreeMap<u32, Vec<f32>>> {
-    let mut inputs = BTreeMap::new();
+) -> HostResult<WeightInputs> {
+    let mut inputs = WeightInputs::default();
     for (id, range) in map {
         let start = usize::try_from(range.offset).map_err(|_| {
             HostError::invalid_args(format!("device-execute weight-map[{id}] offset overflows"))
@@ -1123,16 +1130,27 @@ pub fn inputs_from_gguf(
                 gguf.len()
             ))
         })?;
-        let packed_elems = packed_f32_count(range.len);
-        if packed_elems != range.elems {
-            return Err(HostError::invalid_args(format!(
-                "device-execute weight-map[{id}] elems {} is not the native packed width {packed_elems} (len {})",
-                range.elems, range.len
-            )));
-        }
-        inputs.insert(*id, packed_bytes_as_native_region(slice));
+        validate_packed_range(*id, range)?;
+        inputs.insert_bytes_owned(
+            *id,
+            DeviceByteBuffer {
+                bytes: slice.to_vec(),
+                dtype: DeviceDataType::U8,
+            },
+        );
     }
     Ok(inputs)
+}
+
+fn validate_packed_range(id: u32, range: &WeightFileRange) -> HostResult<()> {
+    let packed_elems = packed_f32_count(range.len);
+    if packed_elems != range.elems {
+        return Err(HostError::invalid_args(format!(
+            "device-execute weight-map[{id}] elems {} is not the native packed width {packed_elems} (len {})",
+            range.elems, range.len
+        )));
+    }
+    Ok(())
 }
 
 /// Gradus region table: `data_start` plus the admitted `abs_starts` /
@@ -1145,20 +1163,21 @@ pub struct GgufRegionTable {
     pub abs_ends: Vec<u64>,
 }
 
-/// Host-side weight map whose `Vec<f32>` values may alias a retained mmap.
-///
-/// Aliased entries are forgotten on drop so `Vec` does not free the mapping.
-#[derive(Default)]
+/// Host-side inputs for one device-execute request. JSON invocation values
+/// remain f32 values; GGUF weight-map entries are raw dtype-tagged bytes and
+/// may alias a retained mmap.
+#[derive(Debug, Default)]
 pub struct WeightInputs {
     values: BTreeMap<u32, Vec<f32>>,
-    aliased: BTreeSet<u32>,
+    bytes: BTreeMap<u32, DeviceByteBuffer>,
+    aliased_bytes: BTreeSet<u32>,
 }
 
 impl Drop for WeightInputs {
     fn drop(&mut self) {
-        for id in std::mem::take(&mut self.aliased) {
-            if let Some(values) = self.values.remove(&id) {
-                std::mem::forget(values);
+        for id in std::mem::take(&mut self.aliased_bytes) {
+            if let Some(values) = self.bytes.remove(&id) {
+                std::mem::forget(values.bytes);
             }
         }
     }
@@ -1171,12 +1190,34 @@ impl WeightInputs {
     }
 
     #[must_use]
+    pub fn byte_map(&self) -> &BTreeMap<u32, DeviceByteBuffer> {
+        &self.bytes
+    }
+
+    #[must_use]
     pub fn contains(&self, id: u32) -> bool {
-        self.values.contains_key(&id)
+        self.values.contains_key(&id) || self.bytes.contains_key(&id)
     }
 
     fn insert_owned(&mut self, id: u32, values: Vec<f32>) {
         self.values.insert(id, values);
+    }
+
+    fn insert_bytes_owned(&mut self, id: u32, values: DeviceByteBuffer) {
+        self.bytes.insert(id, values);
+    }
+
+    fn insert_bytes_aliased(&mut self, id: u32, bytes: &[u8]) {
+        let values =
+            unsafe { Vec::from_raw_parts(bytes.as_ptr() as *mut u8, bytes.len(), bytes.len()) };
+        self.bytes.insert(
+            id,
+            DeviceByteBuffer {
+                bytes: values,
+                dtype: DeviceDataType::U8,
+            },
+        );
+        self.aliased_bytes.insert(id);
     }
 }
 
@@ -1223,8 +1264,9 @@ pub fn gguf_region_table(
     })
 }
 
-/// Admit mapped GGUF ranges as native packed regions without copying when
-/// the slice is 4-byte aligned. Unaligned tails fall back to an owned pad.
+/// Admit mapped GGUF ranges as raw dtype-tagged byte regions without copying.
+/// The retained mmap keeps the aliased bytes live until the device session has
+/// finished uploading them; CUDA copies from the same raw slice.
 pub fn inputs_from_mapped_gguf(
     mapped: &MappedWeightFile,
     map: &BTreeMap<u32, WeightFileRange>,
@@ -1255,38 +1297,10 @@ pub fn inputs_from_mapped_gguf(
                 bytes.len()
             ))
         })?;
-        let packed_elems = packed_f32_count(range.len);
-        if packed_elems != range.elems {
-            return Err(HostError::invalid_args(format!(
-                "device-execute weight-map[{id}] elems {} is not the native packed width {packed_elems} (len {})",
-                range.elems, range.len
-            )));
-        }
-        match alias_f32_region(slice) {
-            Some(values) => {
-                inputs.aliased.insert(*id);
-                inputs.values.insert(*id, values);
-            }
-            None => {
-                inputs
-                    .values
-                    .insert(*id, packed_bytes_as_native_region(slice));
-            }
-        }
+        validate_packed_range(*id, range)?;
+        inputs.insert_bytes_aliased(*id, slice);
     }
     Ok(inputs)
-}
-
-fn alias_f32_region(bytes: &[u8]) -> Option<Vec<f32>> {
-    let packed = packed_f32_count(bytes.len() as u64) as usize;
-    let packed_bytes = packed.saturating_mul(4);
-    if packed == 0 || packed_bytes > bytes.len() {
-        return None;
-    }
-    if (bytes.as_ptr() as usize) % std::mem::align_of::<f32>() != 0 {
-        return None;
-    }
-    Some(unsafe { Vec::from_raw_parts(bytes.as_ptr() as *mut f32, packed, packed) })
 }
 
 fn gguf_data_start(bytes: &[u8]) -> HostResult<Option<u64>> {
@@ -1399,8 +1413,10 @@ fn retain_mapped_weights(
     let Some(mapped) = mapped else {
         return Ok(());
     };
-    if let Some(DeviceRuntime::Metal(session)) = host.device_mut() {
-        session.retain_mapped_file(mapped.clone())?;
+    if let Some(runtime) = host.device_mut() {
+        if runtime.supports_mapped_weight_retention() {
+            runtime.retain_mapped_weight_file(mapped.clone())?;
+        }
     }
     Ok(())
 }
@@ -1416,17 +1432,6 @@ fn mapped_paging(mapped: &MappedWeightFile) -> MappedWeightPaging {
 
 fn packed_f32_count(len: u64) -> u64 {
     len.div_ceil(4).max(1)
-}
-
-fn packed_bytes_as_native_region(bytes: &[u8]) -> Vec<f32> {
-    let mut padded = bytes.to_vec();
-    while !padded.len().is_multiple_of(4) {
-        padded.push(0);
-    }
-    padded
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 /// Encode inputs as `{ "<buffer-id>": [f32, ...] }`.

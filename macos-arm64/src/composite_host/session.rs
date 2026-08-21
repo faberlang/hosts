@@ -144,6 +144,21 @@ struct SessionEndOfRunResult {
     version: u32,
 }
 
+/// Raw bytes supplied for a session-owned HostProvided weight buffer.
+///
+/// The dtype tag describes the byte transfer only. Packed GGUF regions use
+/// [`DeviceDataType::U8`] because their quantized representation is not an
+/// element type in the descriptor vocabulary; the bytes are never converted
+/// through an intermediate `Vec<f32>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceByteBuffer {
+    /// Exact source bytes. A session may add only the descriptor's admitted
+    /// one-to-three-byte packed tail when the allocation is word-rounded.
+    pub bytes: Vec<u8>,
+    /// Dtype tag carried to the neutral device transfer surface.
+    pub dtype: DeviceDataType,
+}
+
 /// Per-version metadata captured at session creation for input validation,
 /// lifetime-distinct allocation/release (S2-4), and the A10 declared
 /// resource graph (S2-8).
@@ -463,10 +478,17 @@ fn copy_declared_inputs(
     kernel: &SessionKernel,
     inputs: &BTreeMap<u32, Vec<f32>>,
     mode: CopyMode,
+    byte_inputs: &BTreeSet<u32>,
 ) -> HostResult<usize> {
     let mut copies = 0usize;
     for slot in &kernel.slots {
         if slot.role != DeviceBufferRole::Input {
+            continue;
+        }
+        // Packed weight inputs were uploaded directly against their private
+        // PerProgram session buffers before this launch loop. Do not ask the
+        // legacy f32 map to re-marshal them.
+        if byte_inputs.contains(&slot.buffer_id) {
             continue;
         }
         let is_per_step = buffer_meta
@@ -694,6 +716,116 @@ impl<'host> ProgramSession<'host> {
         })
     }
 
+    /// Resolve one declared HostProvided PerProgram weight id to its one
+    /// session allocation. Multiple content versions cannot share one upload
+    /// payload, so the ambiguity fails closed.
+    fn weight_key(&self, id: u32) -> HostResult<BufferKey> {
+        let mut matches = self
+            .buffer_meta
+            .keys()
+            .filter(|(buffer_id, _)| *buffer_id == id)
+            .copied();
+        let key = matches.next().ok_or_else(|| {
+            HostError::internal(format!("session weight buffer {id} disappeared"))
+        })?;
+        if matches.next().is_some() {
+            return Err(HostError::internal(format!(
+                "session weight buffer {id} carries multiple content versions; one byte payload cannot select between them"
+            )));
+        }
+        let meta = self
+            .buffer_meta
+            .get(&key)
+            .ok_or_else(|| HostError::internal("session weight metadata disappeared"))?;
+        if meta.lifetime != DeviceBufferLifetime::PerProgram
+            || meta.initialization != DeviceBufferInitialization::HostProvided
+        {
+            return Err(descriptor_errors::descriptor(format!(
+                "session byte upload buffer {id} is not a HostProvided PerProgram weight"
+            )));
+        }
+        Ok(key)
+    }
+
+    /// Upload packed weight bytes directly into the session's private
+    /// PerProgram allocations. The neutral device surface receives the raw
+    /// bytes and dtype tag; only the descriptor's one-to-three-byte word tail
+    /// may be zero-filled to reach a word-rounded allocation.
+    fn upload_weight_bytes_inner(
+        &mut self,
+        weights: &BTreeMap<u32, DeviceByteBuffer>,
+    ) -> HostResult<BTreeSet<u32>> {
+        let mut uploaded = BTreeSet::new();
+        for (id, input) in weights {
+            let key = self.weight_key(*id)?;
+            let meta = self
+                .buffer_meta
+                .get(&key)
+                .ok_or_else(|| HostError::internal("session weight metadata disappeared"))?;
+            let expected = usize::try_from(meta.byte_length).map_err(|_| {
+                HostError::internal(format!("session weight buffer {id} byte length overflows"))
+            })?;
+            if input.bytes.len() > expected || expected - input.bytes.len() >= 4 {
+                return Err(descriptor_errors::shape_mismatch(format!(
+                    "weight buffer `{}` (id {id}) expects {expected} bytes, got {}",
+                    meta.name,
+                    input.bytes.len()
+                )));
+            }
+            if input.bytes.len() % input.dtype.byte_width() != 0 {
+                return Err(descriptor_errors::shape_mismatch(format!(
+                    "weight buffer `{}` (id {id}) has {} bytes, not aligned to dtype `{}`",
+                    meta.name,
+                    input.bytes.len(),
+                    input.dtype.spelling()
+                )));
+            }
+            let handle = self
+                .buffers
+                .get(&key)
+                .copied()
+                .ok_or_else(|| HostError::internal("session weight buffer disappeared"))?;
+            let mut bytes = input.bytes.clone();
+            bytes.resize(expected, 0);
+            self.runtime.copy_in_bytes(&handle, &bytes, input.dtype)?;
+            uploaded.insert(*id);
+        }
+        Ok(uploaded)
+    }
+
+    /// Upload raw bytes for declared HostProvided PerProgram weights and run
+    /// one SingleRun execution. The ordinary f32 input map remains available
+    /// for invocation inputs; byte-uploaded slots are skipped by the legacy
+    /// per-kernel f32 copy loop.
+    pub fn execute_with_weight_bytes(
+        &mut self,
+        inputs: &BTreeMap<u32, Vec<f32>>,
+        weights: &BTreeMap<u32, DeviceByteBuffer>,
+    ) -> HostResult<DeviceExecutionReceipt> {
+        if self.closed {
+            return Err(HostError::internal(
+                "program session is closed after a failed execution; create a new session",
+            ));
+        }
+        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "a RepeatingStep session executes through init_params + execute_step: byte weights are uploaded at once-init, not per execution",
+            ));
+        }
+        let byte_inputs = self.upload_weight_bytes_inner(weights);
+        let result = match byte_inputs {
+            Ok(byte_inputs) => {
+                self.execute_inner(inputs, CopyMode::PerStep, false, false, &byte_inputs)
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            drop(self.release_all_handles());
+            self.closed = true;
+        }
+        result
+    }
+
     /// Execute the ordered launch sequence once (one step) on the `SingleRun`
     /// surface: copies the declared host inputs into their input slots for
     /// this execution, then reuses the session's module and `PerProgram`
@@ -740,7 +872,7 @@ impl<'host> ProgramSession<'host> {
                 "a RepeatingStep session executes through init_params + execute_step: HostProvided params are copied in exactly once at session creation and never re-copied on later steps; per-execution input copy-in is the SingleRun surface",
             ));
         }
-        let result = self.execute_inner(inputs, CopyMode::PerStep, false, false);
+        let result = self.execute_inner(inputs, CopyMode::PerStep, false, false, &BTreeSet::new());
         if result.is_err() {
             // Release-on-error on all paths (S2-3): the ordered release runs
             // before the error escapes, then the session is closed so no
@@ -783,7 +915,7 @@ impl<'host> ProgramSession<'host> {
                 "once-init params were already copied; a RepeatingStep session copies its HostProvided params exactly once at session creation",
             ));
         }
-        let result = self.init_params_inner(params);
+        let result = self.init_params_inner(params, &BTreeMap::new());
         match result {
             Ok(()) => {
                 self.params_initialized = true;
@@ -798,10 +930,46 @@ impl<'host> ProgramSession<'host> {
         }
     }
 
+    /// Once-init a mixed set of ordinary f32 and packed-byte HostProvided
+    /// PerProgram weights. Byte entries use the neutral dtype-tagged transfer
+    /// surface and are never converted into f32 values.
+    pub fn init_params_with_weight_bytes(
+        &mut self,
+        params: &BTreeMap<u32, Vec<f32>>,
+        byte_params: &BTreeMap<u32, DeviceByteBuffer>,
+    ) -> HostResult<()> {
+        if self.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(HostError::internal(
+                "once-init params are a RepeatingStep contract: a SingleRun session copies its declared host inputs per execution",
+            ));
+        }
+        if self.params_initialized {
+            return Err(HostError::internal(
+                "once-init params were already copied; a RepeatingStep session copies its HostProvided params exactly once at session creation",
+            ));
+        }
+        let result = self.init_params_inner(params, byte_params);
+        match result {
+            Ok(()) => {
+                self.params_initialized = true;
+                Ok(())
+            }
+            Err(error) => {
+                drop(self.release_all_handles());
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
     /// The once-init body of [`ProgramSession::init_params`]: the copy loop
     /// over the declared HostProvided `PerProgram` params, without the
     /// error-path release, which the caller owns.
-    fn init_params_inner(&mut self, params: &BTreeMap<u32, Vec<f32>>) -> HostResult<()> {
+    fn init_params_inner(
+        &mut self,
+        params: &BTreeMap<u32, Vec<f32>>,
+        byte_params: &BTreeMap<u32, DeviceByteBuffer>,
+    ) -> HostResult<()> {
         // The declared param set: every distinct buffer id whose storage is
         // PerProgram and HostProvided (the F5 axis is carried, never
         // re-derived from role). A second content version of the same id
@@ -821,6 +989,14 @@ impl<'host> ProgramSession<'host> {
                 param_ids.push(*id);
             }
         }
+        for id in byte_params.keys() {
+            if params.contains_key(id) {
+                return Err(HostError::invalid_args(format!(
+                    "RepeatingStep param buffer {id} was supplied as both f32 and byte weights"
+                )));
+            }
+        }
+        let byte_ids = self.upload_weight_bytes_inner(byte_params)?;
         for id in param_ids {
             let key = self
                 .buffer_meta
@@ -829,6 +1005,9 @@ impl<'host> ProgramSession<'host> {
                 .copied()
                 .ok_or_else(|| HostError::internal("RepeatingStep param metadata disappeared"))?;
             let meta = &self.buffer_meta[&key];
+            if byte_ids.contains(&id) {
+                continue;
+            }
             let values = params.get(&id).ok_or_else(|| {
                 descriptor_errors::shape_mismatch(format!(
                     "RepeatingStep param `{}` (id {id}) is not provided at once-init; every HostProvided PerProgram buffer must receive its declared values exactly once",
@@ -943,7 +1122,13 @@ impl<'host> ProgramSession<'host> {
                 "RepeatingStep weights were not once-init'd; prepare the resident session before resident steps",
             ));
         }
-        let result = self.execute_inner(token_inputs, CopyMode::ResidentStep, false, true);
+        let result = self.execute_inner(
+            token_inputs,
+            CopyMode::ResidentStep,
+            false,
+            true,
+            &BTreeSet::new(),
+        );
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
@@ -983,8 +1168,13 @@ impl<'host> ProgramSession<'host> {
                 "the declared end-of-run set was already read back; the end-of-run readback runs exactly once after the final step",
             ));
         }
-        let result =
-            self.execute_inner(&BTreeMap::new(), CopyMode::OnceInit, keep_end_of_run, false);
+        let result = self.execute_inner(
+            &BTreeMap::new(),
+            CopyMode::OnceInit,
+            keep_end_of_run,
+            false,
+            &BTreeSet::new(),
+        );
         if result.is_err() {
             // Release-on-error on all paths (S2-3).
             drop(self.release_all_handles());
@@ -1179,6 +1369,7 @@ impl<'host> ProgramSession<'host> {
         mode: CopyMode,
         keep_end_of_run: bool,
         use_intermediate_pool: bool,
+        byte_inputs: &BTreeSet<u32>,
     ) -> HostResult<DeviceExecutionReceipt> {
         let step_started = Instant::now();
         let mut launch_count = 0usize;
@@ -1244,6 +1435,7 @@ impl<'host> ProgramSession<'host> {
                     kernel,
                     inputs,
                     mode,
+                    byte_inputs,
                 )?;
                 copy_in_us = copy_in_us.saturating_add(elapsed_us(copy_started));
             }
@@ -1889,6 +2081,65 @@ impl<'host> PreparedResidentSession<'host> {
         // the same once-init residency contract.
         let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
         session.init_params(weights)?;
+        let counters = session.driver_counters();
+        Ok(Self {
+            program_graph_hash: descriptor.program_graph_hash(),
+            backend: descriptor.backend,
+            device_name,
+            session,
+            counters: PreparedSessionCounters {
+                prepares: 1,
+                ..PreparedSessionCounters::default()
+            },
+            module_loads_at_prepare: counters.module_loads,
+            buffer_allocs_at_prepare: counters.buffer_allocs,
+            per_execution_alloc_count: classes.per_execution_alloc_count,
+            weight_uploads_at_prepare: classes.host_provided_weights,
+            closed: false,
+        })
+    }
+
+    /// Prepare a resident session while preserving packed weight bytes all the
+    /// way into the private ProgramSession buffers. This convenience keeps the
+    /// existing CompositeHost f32 API intact for ordinary callers while the
+    /// device-execute weight path uses the neutral byte surface.
+    pub fn prepare_with_weight_bytes(
+        host: &'host mut super::CompositeHost,
+        descriptor: &DeviceDescriptor,
+        weights: &BTreeMap<u32, Vec<f32>>,
+        byte_weights: &BTreeMap<u32, DeviceByteBuffer>,
+    ) -> HostResult<Self> {
+        let device_name = host.device_name().to_owned();
+        let runtime = host.device_mut().ok_or_else(|| {
+            descriptor_errors::no_device_program(
+                "composite host has no device session; a device descriptor cannot be prepared",
+            )
+        })?;
+        descriptor.validate()?;
+        if runtime.backend() != descriptor.backend {
+            return Err(HostError {
+                code: E_DEVICE_DESCRIPTOR.to_owned(),
+                message: format!(
+                    "device descriptor targets backend `{}` but the composite host's device session is `{}`",
+                    descriptor.backend.spelling(),
+                    runtime.backend().spelling()
+                ),
+                retryable: false,
+            });
+        }
+        if descriptor.program_lifetime != DeviceProgramLifetime::RepeatingStep {
+            return Err(descriptor_errors::descriptor(
+                "a prepared resident session is a RepeatingStep contract: its HostProvided weights are once-init'd at prepare and never re-copied; a SingleRun program is not a prepared session",
+            ));
+        }
+        let classes = prepared_buffer_classes(descriptor);
+        if classes.host_provided_weights == 0 {
+            return Err(descriptor_errors::descriptor(
+                "a prepared resident session requires once-init weights: at least one PerProgram + HostProvided buffer",
+            ));
+        }
+        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
+        session.init_params_with_weight_bytes(weights, byte_weights)?;
         let counters = session.driver_counters();
         Ok(Self {
             program_graph_hash: descriptor.program_graph_hash(),

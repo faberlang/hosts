@@ -27,7 +27,7 @@ use crate::device_descriptor::{
 };
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
-use crate::metal_host::{MetalHandleId, MetalHostSession, MetalLaunchBinding};
+use crate::metal_host::{MappedWeightFile, MetalHandleId, MetalHostSession, MetalLaunchBinding};
 
 /// Stable host error code for a device handle that does not belong to the
 /// runtime's backend session (cross-backend misuse or an unparsable handle).
@@ -128,6 +128,18 @@ impl DeviceRuntime {
         match self {
             Self::Metal(_) => DeviceBackend::Metal,
             Self::Cuda(_) => DeviceBackend::Cuda,
+        }
+    }
+
+    /// Retain mapped weight storage when this runtime declares that capability.
+    /// The caller must gate this operation with
+    /// [`DeviceSession::supports_mapped_weight_retention`]. CUDA has no mapped
+    /// retention path, so its arm is an inert safety net rather than an
+    /// admission decision.
+    pub fn retain_mapped_weight_file(&mut self, file: MappedWeightFile) -> HostResult<()> {
+        match self {
+            Self::Metal(session) => session.retain_mapped_file(file),
+            Self::Cuda(_) => Ok(()),
         }
     }
 
