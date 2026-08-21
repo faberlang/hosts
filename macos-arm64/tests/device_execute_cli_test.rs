@@ -561,6 +561,9 @@ fn wire_execute_on_fake_metal_returns_observation_outputs() {
     assert_eq!(parsed["backend"], "metal");
     assert_eq!(parsed["launches"], 1);
     assert_eq!(parsed["outputs"]["3"], Value::from(vec![4.0, 6.0]));
+    for field in ["encode_us", "submit_us", "wait_us"] {
+        assert!(parsed.get(field).is_some(), "missing {field} phase field");
+    }
 }
 
 #[test]

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::composite_host::{
     CompositeHost, CompositeHostConfig, DeviceExecutionReceipt, DeviceSelection,
-    PreparedResidentSession,
+    PreparedResidentSession, PreparedSessionReceipt,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -844,7 +844,11 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                 let started = Instant::now();
                 let host_receipt = session.execute_step(&inputs)?;
                 let wall_us = elapsed_us(started);
-                let mut receipt = DeviceExecuteReceipt::from_host(&host_receipt);
+                let timing = session.receipt();
+                let mut receipt = DeviceExecuteReceipt::from_host_with_phase_timing(
+                    &host_receipt,
+                    f4h1_phase_timing(&timing),
+                );
                 receipt.kernel_count = descriptor.kernels.len();
                 receipt.stage_timing = stage_timing(wall_us, &host_receipt);
                 write_control_receipt(
@@ -965,6 +969,35 @@ fn stage_timing(wall_us: u64, receipt: &DeviceExecutionReceipt) -> StageTimingRe
         host_round_trip_us: wall_us
             .saturating_sub(kernel_us)
             .saturating_sub(transfer_us),
+    }
+}
+
+/// Numeric phase values carried from the F4H1 steady-state receipt.
+#[derive(Debug, Clone, Copy, Default)]
+struct DevicePhaseTiming {
+    encode_us: u64,
+    submit_us: u64,
+    wait_us: u64,
+}
+
+/// Project one F4H1 measurement onto the numeric compatibility wire.
+///
+/// `NotMeasured` stays the wire's zero value. Measured and derived values are
+/// copied from the receipt; this helper never recomputes a phase from another
+/// timing field.
+fn f4h1_measurement_us<T: Serialize>(measurement: T) -> u64 {
+    serde_json::to_value(measurement)
+        .ok()
+        .and_then(|value| value.get("value_us").and_then(serde_json::Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn f4h1_phase_timing(receipt: &PreparedSessionReceipt) -> DevicePhaseTiming {
+    let phase = &receipt.timing.steady_state;
+    DevicePhaseTiming {
+        encode_us: f4h1_measurement_us(phase.encode.duration_us),
+        submit_us: f4h1_measurement_us(phase.submit.duration_us),
+        wait_us: f4h1_measurement_us(phase.wait.duration_us),
     }
 }
 
@@ -1536,7 +1569,16 @@ pub struct DeviceExecuteReceipt {
     /// Host→device copy-in wall (packed-weight upload on SingleRun).
     #[serde(default)]
     pub copy_in_us: u64,
-    /// Kernel encode + submit + blocking wait (true GPU step time).
+    /// Host command encoding wall copied from the F4H1 steady-state phase.
+    #[serde(default)]
+    pub encode_us: u64,
+    /// Command-buffer or driver submit wall copied from the F4H1 steady-state phase.
+    #[serde(default)]
+    pub submit_us: u64,
+    /// Blocking device wait wall copied from the F4H1 steady-state phase.
+    #[serde(default)]
+    pub wait_us: u64,
+    /// Deprecated fused encode + submit + wait wall. Prefer the phase fields.
     #[serde(default)]
     pub gpu_encode_submit_wait_us: u64,
     /// Per-encoder GPU timestamps in launch order (µs). Empty when unsampled.
@@ -1588,9 +1630,20 @@ impl StageTimingReceipt {
 }
 
 impl DeviceExecuteReceipt {
-    /// Project the host receipt onto the CLI wire.
+    /// Project the host receipt onto the CLI wire without an F4H1 phase
+    /// projection. This is retained for one-shot callers whose public host
+    /// receipt predates the prepared-session timing projection.
     #[must_use]
     pub fn from_host(receipt: &DeviceExecutionReceipt) -> Self {
+        Self::from_host_with_phase_timing(receipt, DevicePhaseTiming::default())
+    }
+
+    /// Project the host receipt and the F4H1 phase values onto the CLI wire.
+    #[must_use]
+    fn from_host_with_phase_timing(
+        receipt: &DeviceExecutionReceipt,
+        timing: DevicePhaseTiming,
+    ) -> Self {
         Self {
             backend: receipt.backend.spelling().to_owned(),
             device_name: receipt.device_name.clone(),
@@ -1624,6 +1677,9 @@ impl DeviceExecuteReceipt {
             load_module_us: 0,
             per_program_alloc_us: 0,
             copy_in_us: receipt.copy_in_us,
+            encode_us: timing.encode_us,
+            submit_us: timing.submit_us,
+            wait_us: timing.wait_us,
             gpu_encode_submit_wait_us: receipt.gpu_encode_submit_wait_us,
             launch_gpu_us: receipt.launch_gpu_us.clone(),
             launch_gpu_start_us: receipt.launch_gpu_start_us.clone(),
