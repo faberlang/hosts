@@ -21,8 +21,9 @@ pub mod syscall_import;
 pub mod wasm;
 
 pub use cuda_host::{
-    probe_cuda_environment, CudaEnvReport, CudaHandleId, CudaHostSession, FakeCudaDriver,
-    E_CUDA_INVALID_HANDLE, E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED,
+    discover_cuda_snapshot, enumerate_cuda_physical_devices, probe_cuda_environment, CudaEnvReport,
+    CudaHandleId, CudaHostSession, CudaPhysicalDevice, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
+    E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED,
 };
 pub use cuda_launch_adapter::{
     launch_descriptor, parse_descriptor, AdapterBufferRole, AdapterLaunchReceipt, NumericOracle,
@@ -32,6 +33,7 @@ pub use cuda_launch_adapter::{
 pub use kernel::{Conversation, Direction, Frame, HostError, HostKernel, Status};
 pub use manifest::{CapabilityManifest, RegisteredProvider, SyscallManifest};
 pub use metal_host::{
-    probe_metal_environment, FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession,
+    discover_metal_snapshot, enumerate_metal_physical_devices, probe_metal_environment,
+    FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession, MetalPhysicalDevice,
     E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };

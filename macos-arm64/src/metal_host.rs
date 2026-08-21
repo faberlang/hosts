@@ -14,6 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use faber::Valor;
+use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
+use host_coordinator::discovery::{
+    ComputeCapability, DeviceCapabilities, DeviceDiscoveryEntry, DeviceDiscoverySnapshot,
+    DeviceHealth, DeviceMemory, DtypeSurface, ProbeProvenance,
+};
 #[cfg(target_os = "macos")]
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePassDescriptor,
@@ -279,7 +284,7 @@ fn per_op_timing_wanted() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetalEnvReport {
     pub admitted: bool,
-    /// Present when the system default Metal device is detected. M1 has no
+    /// Present when at least one Metal device is enumerated. M1 has no
     /// binding, so this carries a fixed marker string; M2 fills the real
     /// device name from the binding.
     pub mtl_device: Option<String>,
@@ -287,6 +292,91 @@ pub struct MetalEnvReport {
     /// admission is driven by the device probe, not by framework presence.
     pub metal_framework_paths: Vec<String>,
     pub reason: String,
+}
+
+/// One enumerated Metal physical device. The ordinal is a locator only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetalPhysicalDevice {
+    /// Enumeration-order locator — never identity.
+    pub ordinal: u32,
+    /// `MTLDevice.registryID` as a decimal string.
+    pub registry_id: String,
+    /// Device name from the Metal binding.
+    pub device_model: Option<String>,
+    /// `recommendedMaxWorkingSetSize` bytes (unified memory has no separate
+    /// nvidia-smi-style tool total).
+    pub api_total_bytes: u64,
+}
+
+impl MetalPhysicalDevice {
+    /// Convert this probe row into a host-coordinator discovery entry.
+    #[must_use]
+    pub fn to_discovery_entry(&self) -> DeviceDiscoveryEntry {
+        DeviceDiscoveryEntry {
+            ordinal: DeviceOrdinal::new(self.ordinal),
+            identity: PhysicalDeviceId::metal(self.registry_id.clone()),
+            device_model: self.device_model.clone(),
+            capabilities: DeviceCapabilities {
+                compute_capability: ComputeCapability { major: 0, minor: 0 },
+                sm_count: 0,
+                dtype_surface: DtypeSurface::empty(),
+            },
+            memory: DeviceMemory {
+                tool_report_total_mib: None,
+                api_total_bytes: self.api_total_bytes,
+            },
+            health: DeviceHealth::Healthy,
+            health_generation: DeviceHealthGeneration::initial(),
+            probe_provenance: ProbeProvenance {
+                probe: "MTLCopyAllDevices".to_owned(),
+                tool_versions: "Metal framework".to_owned(),
+            },
+        }
+    }
+}
+
+/// Enumerate every locally attached Metal device into identity/memory facts.
+///
+/// Returns an empty list when this OS is not macOS or no Metal device is
+/// attached. Never a product-run claim.
+pub fn enumerate_metal_physical_devices() -> HostResult<Vec<MetalPhysicalDevice>> {
+    Ok(metal_devices_from_system())
+}
+
+/// Timestamped discovery snapshot of every locally attached Metal device.
+pub fn discover_metal_snapshot(probe_utc_nanos: u64) -> HostResult<DeviceDiscoverySnapshot> {
+    let devices = enumerate_metal_physical_devices()?;
+    Ok(DeviceDiscoverySnapshot::from_enumerated(
+        probe_utc_nanos,
+        devices.iter().map(MetalPhysicalDevice::to_discovery_entry),
+    ))
+}
+
+fn metal_devices_from_system() -> Vec<MetalPhysicalDevice> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Device::all()
+            .into_iter()
+            .enumerate()
+            .map(|(index, device)| MetalPhysicalDevice {
+                ordinal: index as u32,
+                registry_id: device.registry_id().to_string(),
+                device_model: {
+                    let name = device.name();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.to_owned())
+                    }
+                },
+                api_total_bytes: device.recommended_max_working_set_size(),
+            })
+            .collect()
+    }
 }
 
 /// Opaque host-owned handle identity carried at the Frame control boundary.
@@ -949,25 +1039,26 @@ fn compose_bind_offset(
     Ok(composed)
 }
 
-// System default Metal device probe. The `metal` crate (gfx-rs) manages the
-// `MTLCreateSystemDefaultDevice` framework link; the probe fills the real
-// device name from the binding (M2).
+// Metal device probe. Enumeration uses `MTLCopyAllDevices` (`Device::all`);
+// the probe fills the real device name from the first enumerated device (M2).
 
 /// Probe this machine for a loadable Metal device stack without claiming a run.
 pub fn probe_metal_environment() -> MetalEnvReport {
     let metal_framework_paths = detect_metal_framework_paths();
 
-    #[cfg(target_os = "macos")]
-    let mtl_device = Device::system_default().map(|device| device.name().to_owned());
-    #[cfg(not(target_os = "macos"))]
-    let mtl_device: Option<String> = None;
+    let enumerated = metal_devices_from_system();
+    let mtl_device = enumerated
+        .first()
+        .and_then(|device| device.device_model.clone());
 
-    let admitted = mtl_device.is_some();
+    let admitted = !enumerated.is_empty();
     let reason = if admitted {
-        "Metal default device present; SystemMetalDriver can compile MSL and launch add_one"
-            .to_owned()
+        format!(
+            "Metal enumerated {} device(s); SystemMetalDriver can compile MSL and launch add_one",
+            enumerated.len()
+        )
     } else {
-        "no Metal default device detected (MTLCreateSystemDefaultDevice returned null, or this OS is not macOS); Metal product execution is not admitted".to_owned()
+        "no Metal device enumerated (MTLCopyAllDevices was empty, or this OS is not macOS); Metal product execution is not admitted".to_owned()
     };
     MetalEnvReport {
         admitted,
@@ -1457,7 +1548,7 @@ impl FakeMetalDriver {
 
 /// Live Metal driver: real gfx-rs `metal` binding (M2).
 ///
-/// Owns the system default Metal device, a command queue, compiled compute
+/// Owns the first enumerated Metal device, a command queue, compiled compute
 /// pipelines (MSL compiled at runtime via `new_library_with_source`), and
 /// `StorageModeShared` buffers. Mirrors `SystemCudaDriver`'s method shape but
 /// actually executes on the Apple GPU; MSL compile/pipeline/launch failures
@@ -1514,6 +1605,7 @@ struct MetalModule {
 /// store the intra-page remainder here so `set_buffer` still names the
 /// tensor start. KV-B6 launch-binding offsets add on top of this remainder;
 /// they must not replace it.
+#[cfg(target_os = "macos")]
 struct MetalBufferSlot {
     buffer: Buffer,
     region_offset: u64,
@@ -1522,22 +1614,21 @@ struct MetalBufferSlot {
 #[cfg(target_os = "macos")]
 impl MetalDriver for SystemMetalDriver {
     fn discover(&mut self) -> HostResult<MetalEnvReport> {
-        match Device::system_default() {
-            Some(device) => {
-                let name = device.name().to_owned();
-                self.device = Some(device);
-                Ok(MetalEnvReport {
-                    admitted: true,
-                    mtl_device: Some(name),
-                    metal_framework_paths: detect_metal_framework_paths(),
-                    reason: "system default Metal device present; SystemMetalDriver admits"
-                        .to_owned(),
-                })
-            }
-            None => Err(metal_unavailable(
-                "no Metal default device (MTLCreateSystemDefaultDevice returned null)",
-            )),
+        let mut devices = Device::all();
+        if devices.is_empty() {
+            return Err(metal_unavailable(
+                "no Metal device enumerated (MTLCopyAllDevices returned empty)",
+            ));
         }
+        let name = devices[0].name().to_owned();
+        let count = devices.len();
+        self.device = Some(devices.remove(0));
+        Ok(MetalEnvReport {
+            admitted: true,
+            mtl_device: Some(name),
+            metal_framework_paths: detect_metal_framework_paths(),
+            reason: format!("Metal enumerated {count} device(s); SystemMetalDriver admits"),
+        })
     }
 
     fn create_context(&mut self) -> HostResult<()> {

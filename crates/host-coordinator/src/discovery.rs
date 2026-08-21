@@ -243,6 +243,25 @@ impl DeviceDiscoverySnapshot {
         out
     }
 
+    /// Populate a snapshot from host-enumerated entries.
+    ///
+    /// Additive seam for product hosts: entries are keyed by their own
+    /// locator ordinal so callers do not assemble the `BTreeMap` by hand.
+    /// P2P is **not** inferred from device count — this constructor records
+    /// [`P2pProbeState::NotAttempted`]. A host that actually probed directed
+    /// pairs still uses [`Self::new`].
+    #[must_use]
+    pub fn from_enumerated(
+        probe_utc_nanos: u64,
+        entries: impl IntoIterator<Item = DeviceDiscoveryEntry>,
+    ) -> Self {
+        let devices: BTreeMap<DeviceOrdinal, DeviceDiscoveryEntry> = entries
+            .into_iter()
+            .map(|entry| (entry.ordinal, entry))
+            .collect();
+        Self::new(probe_utc_nanos, devices, P2pProbeState::NotAttempted)
+    }
+
     /// Content-addressed id of this sample.
     #[must_use]
     pub fn id(&self) -> DeviceDiscoverySnapshotId {

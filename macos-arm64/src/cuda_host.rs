@@ -7,12 +7,17 @@
 //! drivers prove sequencing only.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use faber::Valor;
+use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
+use host_coordinator::discovery::{
+    ComputeCapability, DeviceCapabilities, DeviceDiscoveryEntry, DeviceDiscoverySnapshot,
+    DeviceHealth, DeviceMemory, DtypeSurface, ProbeProvenance,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::device_descriptor::DeviceDataType;
@@ -496,6 +501,289 @@ pub fn probe_cuda_environment() -> CudaEnvReport {
     }
 }
 
+/// One enumerated CUDA physical device. The ordinal is a locator only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudaPhysicalDevice {
+    /// Enumeration-order locator — never identity.
+    pub ordinal: u32,
+    /// nvidia-smi PCI UUID (`GPU-…` prefix included) when the tool report
+    /// exists; otherwise `GPU-` plus the driver UUID.
+    pub pci_uuid: String,
+    /// Driver API UUID without the `GPU-` prefix, when `cuDeviceGetUuid` succeeds.
+    pub driver_uuid: Option<String>,
+    /// `cuDeviceGetName` model string.
+    pub device_model: Option<String>,
+    /// nvidia-smi `memory.total` (MiB). Distinct from the driver byte total.
+    pub tool_report_total_mib: Option<u64>,
+    /// `cuDeviceTotalMem` total, bytes.
+    pub api_total_bytes: u64,
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`.
+    pub compute_capability_major: u32,
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`.
+    pub compute_capability_minor: u32,
+    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+    pub sm_count: u32,
+    /// nvidia-smi driver version, when present.
+    pub driver_version: Option<String>,
+}
+
+impl CudaPhysicalDevice {
+    /// Convert this probe row into a host-coordinator discovery entry.
+    #[must_use]
+    pub fn to_discovery_entry(&self) -> DeviceDiscoveryEntry {
+        let tool_versions = match &self.driver_version {
+            Some(version) => format!("driver {version} / CUDA Driver API"),
+            None => "CUDA Driver API".to_owned(),
+        };
+        DeviceDiscoveryEntry {
+            ordinal: DeviceOrdinal::new(self.ordinal),
+            identity: PhysicalDeviceId::cuda(self.pci_uuid.clone(), self.driver_uuid.clone()),
+            device_model: self.device_model.clone(),
+            capabilities: DeviceCapabilities {
+                compute_capability: ComputeCapability {
+                    major: self.compute_capability_major,
+                    minor: self.compute_capability_minor,
+                },
+                sm_count: self.sm_count,
+                dtype_surface: DtypeSurface::empty(),
+            },
+            memory: DeviceMemory {
+                tool_report_total_mib: self.tool_report_total_mib,
+                api_total_bytes: self.api_total_bytes,
+            },
+            health: DeviceHealth::Healthy,
+            health_generation: DeviceHealthGeneration::initial(),
+            probe_provenance: ProbeProvenance {
+                probe: "cuDeviceGetCount + nvidia-smi".to_owned(),
+                tool_versions,
+            },
+        }
+    }
+}
+
+/// Enumerate every locally attached CUDA device into identity/memory facts.
+///
+/// Returns an empty list when the machine does not admit a CUDA stack. A
+/// present-but-broken driver fails closed (`E_CUDA_UNAVAILABLE`).
+pub fn enumerate_cuda_physical_devices() -> HostResult<Vec<CudaPhysicalDevice>> {
+    Ok(enumerate_cuda_devices_with_handles()?
+        .into_iter()
+        .map(|row| row.facts)
+        .collect())
+}
+
+/// Timestamped discovery snapshot of every locally attached CUDA device.
+pub fn discover_cuda_snapshot(probe_utc_nanos: u64) -> HostResult<DeviceDiscoverySnapshot> {
+    let devices = enumerate_cuda_physical_devices()?;
+    Ok(DeviceDiscoverySnapshot::from_enumerated(
+        probe_utc_nanos,
+        devices.iter().map(CudaPhysicalDevice::to_discovery_entry),
+    ))
+}
+
+struct EnumeratedCudaDevice {
+    handle: i32,
+    facts: CudaPhysicalDevice,
+}
+
+struct NvidiaSmiGpu {
+    index: u32,
+    uuid: String,
+    memory_mib: Option<u64>,
+    driver_version: Option<String>,
+}
+
+fn query_nvidia_smi_gpus() -> Vec<NvidiaSmiGpu> {
+    let Some(output) = Command::new("nvidia-smi")
+        .arg("--query-gpu=index,uuid,memory.total,driver_version")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().filter_map(parse_nvidia_smi_gpu).collect()
+}
+
+fn parse_nvidia_smi_gpu(line: &str) -> Option<NvidiaSmiGpu> {
+    let mut parts = line.split(',').map(str::trim);
+    let index = parts.next()?.parse().ok()?;
+    let uuid = parts.next().filter(|text| !text.is_empty())?.to_owned();
+    let memory_mib = parts.next().and_then(|text| text.parse().ok());
+    let driver_version = parts
+        .next()
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned);
+    Some(NvidiaSmiGpu {
+        index,
+        uuid,
+        memory_mib,
+        driver_version,
+    })
+}
+
+fn enumerate_cuda_devices_with_handles() -> HostResult<Vec<EnumeratedCudaDevice>> {
+    let report = probe_cuda_environment();
+    if !report.admitted {
+        return Ok(Vec::new());
+    }
+    let library = load_libcuda(&report)?;
+    let api = unsafe { resolve_cuda_api(&library) }?;
+    let result = unsafe { (api.cu_init)(0) };
+    if result != CUDA_SUCCESS {
+        return Err(cuda_unavailable(format!(
+            "cuInit failed with CUDA result {result} after dlopen; driver present but unusable"
+        )));
+    }
+    let smi = query_nvidia_smi_gpus();
+    enumerate_cuda_devices_with_api(&api, &smi)
+}
+
+fn enumerate_cuda_devices_with_api(
+    api: &CudaDriverApi,
+    smi: &[NvidiaSmiGpu],
+) -> HostResult<Vec<EnumeratedCudaDevice>> {
+    let mut count: i32 = 0;
+    let result = unsafe { (api.cu_device_get_count)(&mut count) };
+    if result != CUDA_SUCCESS {
+        return Err(cuda_unavailable(format!(
+            "cuDeviceGetCount failed with CUDA result {result}"
+        )));
+    }
+    if count < 0 {
+        return Err(cuda_unavailable(
+            "cuDeviceGetCount returned a negative device count",
+        ));
+    }
+    let mut devices = Vec::with_capacity(count as usize);
+    for ordinal in 0..count {
+        devices.push(identify_cuda_device(api, ordinal, smi)?);
+    }
+    Ok(devices)
+}
+
+fn identify_cuda_device(
+    api: &CudaDriverApi,
+    ordinal: i32,
+    smi: &[NvidiaSmiGpu],
+) -> HostResult<EnumeratedCudaDevice> {
+    let mut handle: i32 = 0;
+    let result = unsafe { (api.cu_device_get)(&mut handle, ordinal) };
+    if result != CUDA_SUCCESS {
+        return Err(cuda_unavailable(format!(
+            "cuDeviceGet({ordinal}) failed with CUDA result {result}"
+        )));
+    }
+    let driver_uuid = cuda_device_uuid(api, handle);
+    let smi_row = smi.iter().find(|row| row.index == ordinal as u32);
+    let pci_uuid = match smi_row {
+        Some(row) => row.uuid.clone(),
+        None => match &driver_uuid {
+            Some(uuid) => format!("GPU-{uuid}"),
+            None => {
+                return Err(cuda_unavailable(format!(
+                    "CUDA ordinal {ordinal} produced no PCI UUID and no driver UUID"
+                )));
+            }
+        },
+    };
+    Ok(EnumeratedCudaDevice {
+        handle,
+        facts: CudaPhysicalDevice {
+            ordinal: ordinal as u32,
+            pci_uuid,
+            driver_uuid,
+            device_model: cuda_device_name(api, handle),
+            tool_report_total_mib: smi_row.and_then(|row| row.memory_mib),
+            api_total_bytes: cuda_device_total_mem(api, handle).unwrap_or(0),
+            compute_capability_major: cuda_device_attribute(
+                api,
+                handle,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .unwrap_or(0),
+            compute_capability_minor: cuda_device_attribute(
+                api,
+                handle,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            )
+            .unwrap_or(0),
+            sm_count: cuda_device_attribute(api, handle, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .unwrap_or(0),
+            driver_version: smi_row.and_then(|row| row.driver_version.clone()),
+        },
+    })
+}
+
+fn cuda_device_uuid(api: &CudaDriverApi, handle: i32) -> Option<String> {
+    let mut uuid = CuUuid { bytes: [0u8; 16] };
+    let result = unsafe { (api.cu_device_get_uuid)(&mut uuid, handle) };
+    if result != CUDA_SUCCESS {
+        return None;
+    }
+    Some(format_cuda_uuid(&uuid.bytes))
+}
+
+fn cuda_device_name(api: &CudaDriverApi, handle: i32) -> Option<String> {
+    let mut name: [c_char; 256] = [0; 256];
+    let result = unsafe { (api.cu_device_get_name)(name.as_mut_ptr(), name.len() as i32, handle) };
+    if result != CUDA_SUCCESS {
+        return None;
+    }
+    name[255] = 0;
+    let cstr = unsafe { CStr::from_ptr(name.as_ptr()) };
+    let text = cstr.to_string_lossy();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.into_owned())
+    }
+}
+
+fn cuda_device_total_mem(api: &CudaDriverApi, handle: i32) -> Option<u64> {
+    let mut bytes: usize = 0;
+    let result = unsafe { (api.cu_device_total_mem)(&mut bytes, handle) };
+    if result == CUDA_SUCCESS {
+        Some(bytes as u64)
+    } else {
+        None
+    }
+}
+
+fn cuda_device_attribute(api: &CudaDriverApi, handle: i32, attribute: i32) -> Option<u32> {
+    let mut value: i32 = 0;
+    let result = unsafe { (api.cu_device_get_attribute)(&mut value, attribute, handle) };
+    if result == CUDA_SUCCESS && value >= 0 {
+        Some(value as u32)
+    } else {
+        None
+    }
+}
+
+fn format_cuda_uuid(bytes: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 /// Live-environment driver over the real CUDA Driver API (G2).
 ///
 /// Dynamically loads `libcuda.so.1` via `libloading` — the one justified
@@ -525,6 +813,9 @@ struct SystemCudaDriver {
     /// call. CUDA current-context state is thread-local; reassert it so the
     /// one-shot proof is not sensitive to driver calls that disturb it.
     context: Option<OpaqueHandle>,
+    /// First enumerated `CUdevice` handle from the per-ordinal discover loop.
+    /// Locator only; identity lives on [`CudaPhysicalDevice`].
+    enumerated_device: Option<i32>,
     next_token: u64,
 }
 
@@ -557,6 +848,12 @@ impl CudaDriver for SystemCudaDriver {
                 "cuInit failed with CUDA result {result} after dlopen; driver present but unusable"
             )));
         }
+        let smi = query_nvidia_smi_gpus();
+        let enumerated = enumerate_cuda_devices_with_api(&api, &smi)?;
+        let first = enumerated
+            .first()
+            .ok_or_else(|| cuda_unavailable("cuDeviceGetCount returned 0 devices after cuInit"))?;
+        self.enumerated_device = Some(first.handle);
         self._library = Some(library);
         self.api = Some(api);
         Ok(report)
@@ -564,13 +861,9 @@ impl CudaDriver for SystemCudaDriver {
 
     fn create_context(&mut self) -> HostResult<()> {
         let api = self.loaded_api()?;
-        let mut device: i32 = 0;
-        let mut result = unsafe { (api.cu_device_get)(&mut device, 0) };
-        if result != CUDA_SUCCESS {
-            return Err(cuda_driver(format!(
-                "cuDeviceGet failed with CUDA result {result}"
-            )));
-        }
+        let device = self
+            .enumerated_device
+            .ok_or_else(|| cuda_driver("SystemCudaDriver has no enumerated CUDA device"))?;
         // cuDevicePrimaryCtxRetain: the modern (non-deprecated) path. cuCtxCreate
         // is deprecated in CUDA 12+ headers but functional in 13.2; the retained
         // primary context is made current for this thread, so every subsequent
@@ -578,7 +871,7 @@ impl CudaDriver for SystemCudaDriver {
         // outlives the one-shot proof process; teardown (cuDevicePrimaryCtxRelease /
         // cuCtxDestroy) is deferred and recorded here, not silent.
         let mut context: *mut c_void = std::ptr::null_mut();
-        result = unsafe { (api.cu_device_primary_ctx_retain)(&mut context, device) };
+        let mut result = unsafe { (api.cu_device_primary_ctx_retain)(&mut context, device) };
         if result != CUDA_SUCCESS {
             return Err(cuda_driver(format!(
                 "cuDevicePrimaryCtxRetain failed with CUDA result {result}"
@@ -839,6 +1132,18 @@ impl SystemCudaDriver {
 /// `CUresult` success code (`cudaError_t`); any non-zero value is an error.
 const CUDA_SUCCESS: i32 = 0;
 
+/// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+/// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`.
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+/// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`.
+const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+
+#[repr(C)]
+struct CuUuid {
+    bytes: [u8; 16],
+}
+
 /// `CUresult` for a symbol/entry not found (`CUDA_ERROR_NOT_FOUND`): the
 /// real-driver signal for an unknown kernel entry (`cuModuleGetFunction`).
 /// Value 500 is the CUDA 12+ renumbering (verified against the CUDA 13.2
@@ -854,7 +1159,12 @@ const CUDA_ERROR_NOT_FOUND: i32 = 500;
 #[derive(Clone, Copy)]
 struct CudaDriverApi {
     cu_init: unsafe extern "C" fn(u32) -> i32,
+    cu_device_get_count: unsafe extern "C" fn(*mut i32) -> i32,
     cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> i32,
+    cu_device_get_uuid: unsafe extern "C" fn(*mut CuUuid, i32) -> i32,
+    cu_device_get_name: unsafe extern "C" fn(*mut c_char, i32, i32) -> i32,
+    cu_device_total_mem: unsafe extern "C" fn(*mut usize, i32) -> i32,
+    cu_device_get_attribute: unsafe extern "C" fn(*mut i32, i32, i32) -> i32,
     cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, i32) -> i32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
@@ -904,7 +1214,12 @@ unsafe fn resolve_cuda_api(library: &libloading::Library) -> HostResult<CudaDriv
     unsafe {
         Ok(CudaDriverApi {
             cu_init: resolve_symbol(library, b"cuInit\0")?,
+            cu_device_get_count: resolve_symbol(library, b"cuDeviceGetCount\0")?,
             cu_device_get: resolve_symbol(library, b"cuDeviceGet\0")?,
+            cu_device_get_uuid: resolve_symbol(library, b"cuDeviceGetUuid\0")?,
+            cu_device_get_name: resolve_symbol(library, b"cuDeviceGetName\0")?,
+            cu_device_total_mem: resolve_symbol(library, b"cuDeviceTotalMem_v2\0")?,
+            cu_device_get_attribute: resolve_symbol(library, b"cuDeviceGetAttribute\0")?,
             cu_device_primary_ctx_retain: resolve_symbol(library, b"cuDevicePrimaryCtxRetain\0")?,
             cu_ctx_set_current: resolve_symbol(library, b"cuCtxSetCurrent\0")?,
             cu_module_load_data: resolve_symbol(library, b"cuModuleLoadData\0")?,

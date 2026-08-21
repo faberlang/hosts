@@ -228,6 +228,81 @@ fn ordinal_rename_keeps_identity_but_snapshot_records_locator() {
     assert_eq!(other.ordinal, DeviceOrdinal::new(0));
 }
 
+fn second_cuda_entry(ordinal: u32, pci_uuid: &str) -> DeviceDiscoveryEntry {
+    let mut entry = t1_entry();
+    entry.ordinal = DeviceOrdinal::new(ordinal);
+    entry.identity = PhysicalDeviceId::cuda(pci_uuid, None);
+    entry.device_model = Some("synthetic-second-cuda".to_owned());
+    entry
+}
+
+/// MD3H-H1: the populate seam keys entries by locator ordinal and carries
+/// identity/memory facts without the caller assembling the map.
+#[test]
+fn from_enumerated_populates_identity_and_memory_facts() {
+    let snap = DeviceDiscoverySnapshot::from_enumerated(PROBE_TIME, [t1_entry()]);
+    let entry = snap
+        .entry(DeviceOrdinal::new(0))
+        .expect("populate seam records ordinal 0");
+    assert_eq!(entry.backend(), DeviceBackend::Cuda);
+    assert_eq!(
+        entry.identity,
+        PhysicalDeviceId::cuda(PCI_UUID, Some(DRIVER_UUID.to_owned()))
+    );
+    assert_eq!(entry.memory.tool_report_total_mib, Some(T1_NVIDIA_SMI_MIB));
+    assert_eq!(entry.memory.api_total_bytes, T1_DRIVER_BYTES);
+    assert_eq!(snap.p2p_state(), P2pProbeState::NotAttempted);
+}
+
+/// Two same-backend devices are distinct ids in one snapshot even when the
+/// locators are adjacent (existing identity machinery; MD3H-H1).
+#[test]
+fn from_enumerated_two_same_backend_devices_are_distinguishable() {
+    let first = t1_entry();
+    let second = second_cuda_entry(1, "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let snap =
+        DeviceDiscoverySnapshot::from_enumerated(PROBE_TIME, [first.clone(), second.clone()]);
+    assert_eq!(snap.devices().len(), 2);
+    let a = &snap
+        .entry(DeviceOrdinal::new(0))
+        .expect("ordinal 0")
+        .identity;
+    let b = &snap
+        .entry(DeviceOrdinal::new(1))
+        .expect("ordinal 1")
+        .identity;
+    assert_eq!(a.backend(), DeviceBackend::Cuda);
+    assert_eq!(b.backend(), DeviceBackend::Cuda);
+    assert_ne!(a, b);
+    assert_eq!(a, &first.identity);
+    assert_eq!(b, &second.identity);
+}
+
+/// Reusing an ordinal across samples never merges identities: the later
+/// facts mint a distinct id and `change_against` reports replacement.
+#[test]
+fn from_enumerated_ordinal_reuse_never_merges_identities() {
+    let earlier = DeviceDiscoverySnapshot::from_enumerated(PROBE_TIME, [t1_entry()]);
+    let later = DeviceDiscoverySnapshot::from_enumerated(
+        PROBE_TIME + 1,
+        [second_cuda_entry(
+            0,
+            "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )],
+    );
+    let old = &earlier
+        .entry(DeviceOrdinal::new(0))
+        .expect("earlier")
+        .identity;
+    let new = &later.entry(DeviceOrdinal::new(0)).expect("later").identity;
+    assert_eq!(
+        earlier.entry(DeviceOrdinal::new(0)).map(|e| e.ordinal),
+        later.entry(DeviceOrdinal::new(0)).map(|e| e.ordinal)
+    );
+    assert_ne!(old, new);
+    assert_eq!(new.change_against(old), IdentityChange::Replaced);
+}
+
 /// A snapshot entry whose ordinal disagrees with its map key is a programmer
 /// error and fails fast.
 #[test]
