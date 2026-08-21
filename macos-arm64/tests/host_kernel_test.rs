@@ -867,6 +867,54 @@ fn aleator_seed_produces_deterministic_fractum() {
 }
 
 #[test]
+fn aleator_rng_state_is_per_kernel() {
+    let left = HostKernel::new();
+    let right = HostKernel::new();
+    let interloper = HostKernel::new();
+
+    assert_eq!(
+        left.route(&Frame::request_with("aleator:semina", Valor::Numerus(42)))
+            .status,
+        Status::Done
+    );
+    assert_eq!(
+        right
+            .route(&Frame::request_with("aleator:semina", Valor::Numerus(42)))
+            .status,
+        Status::Done
+    );
+    assert_eq!(
+        interloper
+            .route(&Frame::request_with("aleator:semina", Valor::Numerus(7)))
+            .status,
+        Status::Done
+    );
+    let _ = interloper.route(&Frame::request("aleator:fractum"));
+    let _ = interloper.route(&Frame::request("aleator:sortire"));
+
+    let from_left = [
+        left.route(&Frame::request("aleator:fractum")).data,
+        left.route(&Frame::request("aleator:fractum")).data,
+    ];
+    let from_right = [
+        right.route(&Frame::request("aleator:fractum")).data,
+        right.route(&Frame::request("aleator:fractum")).data,
+    ];
+    assert_eq!(from_left, from_right);
+
+    assert_eq!(
+        left.route(&Frame::request_with("aleator:semina", Valor::Numerus(42)))
+            .status,
+        Status::Done
+    );
+    let _ = interloper.route(&Frame::request("aleator:fractum"));
+    assert_eq!(
+        left.route(&Frame::request("aleator:fractum")).data,
+        from_left[0]
+    );
+}
+
+#[test]
 fn aleator_sortire_returns_bounded_integer() {
     let kernel = HostKernel::new();
     let sorted = kernel.route(&Frame::request_with(

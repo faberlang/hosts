@@ -18,6 +18,27 @@ fn request_frame(route: &str, opener: Valor) -> RequestFrame {
     }
 }
 
+fn item_data(reply: &ProviderReply) -> Valor {
+    match reply.contents.as_slice() {
+        [ProviderContent::Item(value)] => value.clone(),
+        other => panic!("expected item reply, got {other:?}"),
+    }
+}
+
+fn seed_provider(provider: &Aleator, context: &host_kernel::DispatchContext, n: i64) {
+    provider
+        .dispatch(&request_frame("aleator:semina", Valor::Numerus(n)), context)
+        .expect("seed");
+}
+
+fn fractum(provider: &Aleator, context: &host_kernel::DispatchContext) -> Valor {
+    item_data(
+        &provider
+            .dispatch(&request_frame("aleator:fractum", Valor::Nihil), context)
+            .expect("fractum"),
+    )
+}
+
 #[test]
 fn manifest_registers_all_canonical_routes() {
     let mut kernel = Kernel::new();
@@ -37,6 +58,47 @@ fn seed_returns_vacuum() {
         )
         .expect("seed");
     assert!(reply.contents.is_empty(), "seed reply should be vacuum");
+}
+
+#[test]
+fn same_seed_produces_the_same_fractum_stream() {
+    let (provider, context) = test_provider();
+    seed_provider(&provider, &context, 42);
+    let first = [fractum(&provider, &context), fractum(&provider, &context)];
+    seed_provider(&provider, &context, 42);
+    let second = [fractum(&provider, &context), fractum(&provider, &context)];
+    assert_eq!(first, second);
+}
+
+#[test]
+fn independent_providers_do_not_share_rng_state() {
+    let (left, context) = test_provider();
+    let right = Aleator::new().expect("right provider");
+    let interloper = Aleator::new().expect("interloper");
+
+    seed_provider(&left, &context, 42);
+    seed_provider(&right, &context, 42);
+    seed_provider(&interloper, &context, 7);
+    let _ = fractum(&interloper, &context);
+    let _ = fractum(&interloper, &context);
+
+    let from_left = [
+        fractum(&left, &context),
+        fractum(&left, &context),
+        fractum(&left, &context),
+    ];
+    let from_right = [
+        fractum(&right, &context),
+        fractum(&right, &context),
+        fractum(&right, &context),
+    ];
+    assert_eq!(from_left, from_right);
+
+    seed_provider(&left, &context, 42);
+    seed_provider(&interloper, &context, 7);
+    let _ = fractum(&interloper, &context);
+    assert_eq!(fractum(&left, &context), from_left[0]);
+    assert_ne!(fractum(&interloper, &context), from_left[0]);
 }
 
 #[test]

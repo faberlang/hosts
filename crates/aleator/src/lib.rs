@@ -15,6 +15,7 @@ const MAX_RANDOM_BYTES: usize = 1024 * 1024;
 
 pub struct Aleator {
     registration: ProviderRegistration,
+    rng: Mutex<Prng>,
 }
 
 impl Aleator {
@@ -26,7 +27,48 @@ impl Aleator {
     pub fn new() -> HostResult<Self> {
         Ok(Self {
             registration: ProviderRegistration::new(host_kernel::parse_manifest(manifest_json())?),
+            rng: Mutex::new(Prng { state: 0 }),
         })
+    }
+
+    fn rng(&self) -> MutexGuard<'_, Prng> {
+        self.rng
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn random_fraction(&self) -> f64 {
+        let bits = self.rng().next_u64() >> 11;
+        (bits as f64) / ((1_u64 << 53) as f64)
+    }
+
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
+    fn sort_integer(&self, opener: &Valor) -> HostResult<ProviderReply> {
+        let min = i64_arg(opener, 0, "min")?;
+        let max = i64_arg(opener, 1, "max")?;
+        let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+        // SAFETY: `span = hi - lo + 1` with `hi >= lo` so the result is non-negative
+        // and fits `u128`. `offset < span` crosses u128 → i128, then `lo + offset`
+        // is bounded by [lo, hi], which fits `i64` by construction.
+        let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
+        let offset = (u128::from(self.rng().next_u64()) % span) as i128;
+        Ok(ProviderReply::item(Valor::Numerus(
+            (i128::from(lo) + offset) as i64,
+        )))
+    }
+
+    fn seed(&self, opener: &Valor) -> HostResult<ProviderReply> {
+        let n = i64_arg(opener, 0, "n")?;
+        // SAFETY: `n > 0` guards the cast; negative values use `default_seed()`.
+        #[allow(clippy::cast_sign_loss)]
+        let state = if n > 0 { n as u64 } else { default_seed() };
+        self.rng().state = state;
+        Ok(ProviderReply::vacuum())
     }
 }
 
@@ -56,11 +98,11 @@ impl Provider for Aleator {
         _context: &DispatchContext,
     ) -> HostResult<ProviderReply> {
         match request.route.as_str() {
-            "aleator:fractum" => Ok(ProviderReply::item(Valor::Fractus(random_fraction()))),
-            "aleator:sortire" => sort_integer(&request.opener),
+            "aleator:fractum" => Ok(ProviderReply::item(Valor::Fractus(self.random_fraction()))),
+            "aleator:sortire" => self.sort_integer(&request.opener),
             "aleator:octetos" => random_bytes_route(&request.opener),
             "aleator:uuid" => uuid_route(),
-            "aleator:semina" => seed(&request.opener),
+            "aleator:semina" => self.seed(&request.opener),
             other => Err(HostError::no_route(format!(
                 "no built-in aleator syscall registered for {other}"
             ))),
@@ -85,38 +127,6 @@ impl Prng {
         self.state = x;
         x
     }
-}
-
-static RNG: Mutex<Prng> = Mutex::new(Prng { state: 0 });
-
-fn rng() -> MutexGuard<'static, Prng> {
-    RNG.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn random_fraction() -> f64 {
-    let bits = rng().next_u64() >> 11;
-    (bits as f64) / ((1_u64 << 53) as f64)
-}
-
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation
-)]
-fn sort_integer(opener: &Valor) -> HostResult<ProviderReply> {
-    let min = i64_arg(opener, 0, "min")?;
-    let max = i64_arg(opener, 1, "max")?;
-    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
-    // SAFETY: `span = hi - lo + 1` with `hi >= lo` so the result is non-negative
-    // and fits `u128`. `offset < span` crosses u128 → i128, then `lo + offset`
-    // is bounded by [lo, hi], which fits `i64` by construction.
-    let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
-    let offset = (u128::from(rng().next_u64()) % span) as i128;
-    Ok(ProviderReply::item(Valor::Numerus(
-        (i128::from(lo) + offset) as i64,
-    )))
 }
 
 fn random_bytes_route(opener: &Valor) -> HostResult<ProviderReply> {
@@ -155,15 +165,6 @@ fn uuid_route() -> HostResult<ProviderReply> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(ProviderReply::item(Valor::Textus(format_uuid(&bytes))))
-}
-
-fn seed(opener: &Valor) -> HostResult<ProviderReply> {
-    let n = i64_arg(opener, 0, "n")?;
-    // SAFETY: `n > 0` guards the cast; negative values use `default_seed()`.
-    #[allow(clippy::cast_sign_loss)]
-    let state = if n > 0 { n as u64 } else { default_seed() };
-    rng().state = state;
-    Ok(ProviderReply::vacuum())
 }
 
 #[allow(clippy::cast_possible_truncation)]
