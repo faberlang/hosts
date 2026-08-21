@@ -999,20 +999,26 @@ pub fn dispatch_gemv(
 
 /// Select the decode GEMV library body from executor-plan facts.
 ///
-/// `library_entry` is the M5-U2 `quantized_gemv` / `quantized_gemm` selection.
-/// `decode_gemv` is the matching uniform (`1` when M/seq is 1). Prefill keeps
-/// GEMM. The two facts must agree; a mismatch fails closed.
+/// The generic M5-U2 spellings (`quantized_gemv` / `quantized_gemm`) and the
+/// amended transformer projection entries (`QkvProjection`, `OutputProjection`,
+/// `SwiGlu`) share the same packed simdgroup body.  `decode_gemv` is the
+/// matching uniform (`1` when M/seq is 1); prefill keeps GEMM.  The two facts
+/// must agree, and unknown entries fail closed.
 pub fn select_decode_gemv(
     library_entry: Option<&str>,
     decode_gemv: u32,
 ) -> Result<Option<GemvKernel>, KernelBodyError> {
+    let transformer_projection = matches!(
+        library_entry,
+        Some("QkvProjection" | "OutputProjection" | "SwiGlu")
+    );
     let gemv_entry = library_entry == Some("quantized_gemv");
     let gemm_entry = library_entry == Some("quantized_gemm");
-    match (gemv_entry, gemm_entry, decode_gemv) {
-        (true, false, 1) => Ok(Some(GemvKernel::Quantized)),
-        (false, true, 0) => Ok(None),
-        (false, false, 0) => Ok(None),
-        (false, false, 1) if library_entry.is_none() => Ok(Some(GemvKernel::Quantized)),
+    match (gemv_entry, gemm_entry, transformer_projection, decode_gemv) {
+        (true, false, false, 1) | (false, false, true, 1) => Ok(Some(GemvKernel::Quantized)),
+        (false, true, false, 0) | (false, false, true, 0) => Ok(None),
+        (false, false, false, 0) => Ok(None),
+        (false, false, false, 1) if library_entry.is_none() => Ok(Some(GemvKernel::Quantized)),
         _ => Err(KernelBodyError::InvalidBind(
             "decode GEMV selection disagrees with library_entry",
         )),
@@ -1274,11 +1280,10 @@ fn ensure_attention_buffer(
 /// Fused causal attention over every query head in each KV group.
 ///
 /// The body performs the existing M3 operation order in one library call:
-/// dot-product scores, scale by `1/sqrt(head_dim)`, causal mask, stable
-/// softmax, and the value/context reduction.  `shared_max` and `shared_sum`
-/// model the device threadgroup's per-head shared-memory accumulators.  They
-/// are indexed by `q_head`, never shared between query heads, so a head's
-/// softmax cannot observe another head's score or value.
+/// dot-product scores, scale by `1/sqrt(head_dim)`, causal mask, online
+/// softmax, and the value/context reduction.  The running max, sum, and
+/// per-dimension context accumulators are scoped to one query head, so a
+/// head's softmax cannot observe another head's score or value.
 ///
 /// The function is the host reference for the plan-selected library entry.
 /// It is intentionally not wired into the legacy descriptor decomposition;
@@ -1307,19 +1312,18 @@ pub fn causal_attention(
     let query_seq = checked_usize(bind.query_seq)?;
     let query_start = seq_block - query_seq;
 
-    // These vectors stand in for threadgroup shared memory on the Metal
-    // materializer.  There is one max and one sum slot for every q head in the
-    // group, rather than one accumulator for the whole group.
-    let mut shared_max = vec![0.0f32; q_per_kv];
-    let mut shared_sum = vec![0.0f32; q_per_kv];
-    let mut scores = vec![0.0f32; seq_block];
-
+    // Online softmax is the host reference for the streaming Metal body.  It
+    // keeps one accumulator per output dimension and never materializes the
+    // query-by-sequence score tile.  The max/sum rescale is the standard flash
+    // recurrence and preserves per-head independence.
     for group in 0..kv_batch {
         for q_head in 0..q_per_kv {
             for query in 0..query_seq {
                 let query_position = query_start + query;
                 let visible = (query_position + 1).min(seq_block);
                 let mut row_max = f32::NEG_INFINITY;
+                let mut row_sum = 0.0f32;
+                let mut context = vec![0.0f32; head_dim];
 
                 for token in 0..visible {
                     let mut dot = 0.0f32;
@@ -1335,33 +1339,26 @@ pub fn causal_attention(
                         dot += q[q_offset] * k[k_offset];
                     }
                     let score = dot * scale;
-                    scores[token] = score;
-                    row_max = row_max.max(score);
-                }
-                shared_max[q_head] = row_max;
-
-                let mut row_sum = 0.0f32;
-                for token in 0..visible {
-                    row_sum += (scores[token] - shared_max[q_head]).exp();
-                }
-                shared_sum[q_head] = row_sum;
-
-                for dimension in 0..head_dim {
-                    let mut context = 0.0f32;
-                    for token in 0..visible {
-                        let probability =
-                            (scores[token] - shared_max[q_head]).exp() / shared_sum[q_head];
+                    let next_max = row_max.max(score);
+                    let old_scale = (row_max - next_max).exp();
+                    let token_scale = (score - next_max).exp();
+                    row_sum = row_sum * old_scale + token_scale;
+                    for (dimension, value) in context.iter_mut().enumerate() {
                         let v_offset = attention_offset(
                             &[group as u64, token as u64, dimension as u64],
                             &bind.v_strides,
                         )?;
-                        context += probability * v[v_offset];
+                        *value = *value * old_scale + token_scale * v[v_offset];
                     }
+                    row_max = next_max;
+                }
+
+                for (dimension, value) in context.into_iter().enumerate() {
                     let output_offset = attention_offset(
                         &[group as u64, q_head as u64, query as u64, dimension as u64],
                         &bind.output_strides,
                     )?;
-                    output[output_offset] = context;
+                    output[output_offset] = value / row_sum;
                 }
             }
         }
