@@ -15,8 +15,10 @@ use std::path::Path;
 use faber::Valor;
 #[cfg(target_os = "macos")]
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePassDescriptor,
+    ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor, Device,
+    MTLCommandBufferStatus, MTLCounterSamplingPoint, MTLResourceOptions, MTLSize,
+    MTLStorageMode, NSRange,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,14 @@ pub const E_METAL_DRIVER: &str = "E_METAL_DRIVER";
 /// path. Matches the emitted `add_one` entry of the U2 proof fixture
 /// (input@0, output@1, extent@2).
 const ELEMENTWISE_ADD_ENTRY: &[u8] = b"add_one";
+/// Timestamp sample slots (two per encoder: start + end). 2048 covers the
+/// dense 419/315 census with headroom.
+const TIMESTAMP_SAMPLE_CAPACITY: u64 = 2048;
+
+fn per_op_timing_wanted() -> bool {
+    matches!(std::env::var("FABER_SPAWN_TIMING").as_deref(), Ok("1"))
+        || matches!(std::env::var("FABER_PER_OP_TIMING").as_deref(), Ok("1"))
+}
 
 /// Read-only environment admission report (never a product run claim).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +128,11 @@ pub trait MetalDriver: Send {
     fn blocking_wait_count(&self) -> usize {
         0
     }
+    /// Per-encoder GPU timestamps from the last committed step, in µs.
+    /// Empty when the step did not sample timestamps.
+    fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
@@ -198,6 +213,11 @@ impl MetalHostSession {
     #[must_use]
     pub fn blocking_wait_count(&self) -> usize {
         self.driver.blocking_wait_count()
+    }
+
+    /// Per-encoder GPU timestamps from the last committed step (µs).
+    pub fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
+        self.driver.take_encoder_gpu_us()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<MetalHandleId> {
@@ -880,6 +900,14 @@ struct SystemMetalDriver {
     deferred_free: Vec<u64>,
     command_submits: usize,
     blocking_waits: usize,
+    /// Timestamp counter sample buffer for per-encoder GPU times.
+    timestamp_buffer: Option<CounterSampleBuffer>,
+    /// Encoders sampled on the pending command buffer.
+    encoder_sample_count: usize,
+    /// Last committed step's per-encoder GPU times (µs).
+    last_encoder_gpu_us: Vec<u64>,
+    /// Timestamp counters were probed and are unavailable on this device.
+    timestamp_unavailable: bool,
 }
 
 /// A compiled Metal compute module: a compute pipeline per declared `kernel
@@ -1107,12 +1135,40 @@ impl MetalDriver for SystemMetalDriver {
                 .as_ref()
                 .ok_or_else(|| metal_unavailable("SystemMetalDriver has no command queue"))?;
             self.pending = Some(queue.new_command_buffer().to_owned());
+            self.encoder_sample_count = 0;
         }
         let command_buffer = self
             .pending
             .as_ref()
-            .ok_or_else(|| metal_driver("launch: pending command buffer missing after ensure"))?;
-        let encoder = command_buffer.new_compute_command_encoder();
+            .ok_or_else(|| metal_driver("launch: pending command buffer missing after ensure"))?
+            .to_owned();
+        let sampled = per_op_timing_wanted()
+            && self.ensure_timestamp_buffer()
+            && (self.encoder_sample_count as u64)
+                .saturating_mul(2)
+                .saturating_add(1)
+                < TIMESTAMP_SAMPLE_CAPACITY;
+        let encoder = if sampled {
+            let start = (self.encoder_sample_count as u64).saturating_mul(2);
+            let end = start.saturating_add(1);
+            let descriptor = ComputePassDescriptor::new();
+            let sample_buffer = self
+                .timestamp_buffer
+                .as_ref()
+                .ok_or_else(|| metal_driver("launch: timestamp sample buffer missing"))?;
+            let attachment = descriptor.sample_buffer_attachments().object_at(0);
+            if let Some(attachment) = attachment {
+                attachment.set_sample_buffer(sample_buffer);
+                attachment.set_start_of_encoder_sample_index(start);
+                attachment.set_end_of_encoder_sample_index(end);
+                self.encoder_sample_count += 1;
+                command_buffer.compute_command_encoder_with_descriptor(descriptor)
+            } else {
+                command_buffer.new_compute_command_encoder()
+            }
+        } else {
+            command_buffer.new_compute_command_encoder()
+        };
         encoder.set_compute_pipeline_state(&pipeline);
         for (index, buffer) in bound.iter().enumerate() {
             encoder.set_buffer(index as u64, Some(buffer), 0);
@@ -1165,16 +1221,94 @@ impl MetalDriver for SystemMetalDriver {
     fn blocking_wait_count(&self) -> usize {
         self.blocking_waits
     }
+
+    fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.last_encoder_gpu_us)
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl SystemMetalDriver {
+    fn ensure_timestamp_buffer(&mut self) -> bool {
+        if self.timestamp_buffer.is_some() {
+            return true;
+        }
+        if self.timestamp_unavailable {
+            return false;
+        }
+        let Some(device) = self.device.as_ref() else {
+            self.timestamp_unavailable = true;
+            return false;
+        };
+        if !device.supports_counter_sampling(MTLCounterSamplingPoint::AtStageBoundary) {
+            self.timestamp_unavailable = true;
+            return false;
+        }
+        let Some(counter_set) = device
+            .counter_sets()
+            .into_iter()
+            .find(|set| set.name() == "timestamp")
+        else {
+            self.timestamp_unavailable = true;
+            return false;
+        };
+        let descriptor = CounterSampleBufferDescriptor::new();
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_sample_count(TIMESTAMP_SAMPLE_CAPACITY);
+        descriptor.set_counter_set(&counter_set);
+        match device.new_counter_sample_buffer_with_descriptor(&descriptor) {
+            Ok(buffer) => {
+                self.timestamp_buffer = Some(buffer);
+                true
+            }
+            Err(_) => {
+                self.timestamp_unavailable = true;
+                false
+            }
+        }
+    }
+
     /// Commit the pending step command buffer and block until it completes.
     /// No-op when the step has nothing pending (already flushed).
     fn commit_pending(&mut self) -> HostResult<()> {
         let Some(command_buffer) = self.pending.take() else {
             return Ok(());
         };
+        let encoder_count = self.encoder_sample_count;
+        self.encoder_sample_count = 0;
+        self.last_encoder_gpu_us.clear();
+        let dest = if encoder_count > 0 {
+            match (self.device.as_ref(), self.timestamp_buffer.as_ref()) {
+                (Some(device), Some(sample_buffer)) => {
+                    let sample_count = (encoder_count as u64).saturating_mul(2);
+                    let dest = device.new_buffer(
+                        sample_count.saturating_mul(8),
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let blit = command_buffer.new_blit_command_encoder();
+                    blit.resolve_counters(
+                        sample_buffer,
+                        NSRange::new(0, sample_count),
+                        &dest,
+                        0,
+                    );
+                    blit.end_encoding();
+                    Some(dest)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut cpu_start = 0u64;
+        let mut gpu_start = 0u64;
+        let mut cpu_end = 0u64;
+        let mut gpu_end = 0u64;
+        if dest.is_some() {
+            if let Some(device) = self.device.as_ref() {
+                device.sample_timestamps(&mut cpu_start, &mut gpu_start);
+            }
+        }
         command_buffer.commit();
         command_buffer.wait_until_completed();
         self.command_submits += 1;
@@ -1185,8 +1319,55 @@ impl SystemMetalDriver {
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(metal_driver("Metal command buffer did not complete"));
         }
+        if dest.is_some() {
+            if let Some(device) = self.device.as_ref() {
+                device.sample_timestamps(&mut cpu_end, &mut gpu_end);
+            }
+        }
+        if let Some(dest) = dest {
+            self.last_encoder_gpu_us = convert_encoder_gpu_us(
+                &dest,
+                encoder_count,
+                cpu_start,
+                cpu_end,
+                gpu_start,
+                gpu_end,
+            );
+        }
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn convert_encoder_gpu_us(
+    dest: &Buffer,
+    encoder_count: usize,
+    cpu_start: u64,
+    cpu_end: u64,
+    gpu_start: u64,
+    gpu_end: u64,
+) -> Vec<u64> {
+    let cpu_span = cpu_end.saturating_sub(cpu_start);
+    let gpu_span = gpu_end.saturating_sub(gpu_start);
+    if encoder_count == 0 || cpu_span == 0 || gpu_span == 0 {
+        return Vec::new();
+    }
+    let sample_count = encoder_count.saturating_mul(2);
+    let samples =
+        unsafe { std::slice::from_raw_parts(dest.contents().cast::<u64>(), sample_count) };
+    let mut out = Vec::with_capacity(encoder_count);
+    for index in 0..encoder_count {
+        let begin = samples[index * 2] as f64;
+        let end = samples[index * 2 + 1] as f64;
+        let nanoseconds = (end - begin) / (gpu_span as f64) * (cpu_span as f64);
+        let micros = nanoseconds / 1000.0;
+        out.push(if micros.is_finite() && micros > 0.0 {
+            micros.round() as u64
+        } else {
+            0
+        });
+    }
+    out
 }
 
 /// Every `kernel void <name>` entry point in an MSL module, in source order.
