@@ -714,6 +714,12 @@ pub struct DeviceExecuteReceipt {
     pub launch_entries: Vec<String>,
     /// Host→device copy-ins.
     pub copy_ins: usize,
+    /// Temporary PerStep/ObservationPoint handles allocated by this step.
+    #[serde(default)]
+    pub pool_allocations: usize,
+    /// Temporary handles reused from the session-scoped pool this step.
+    #[serde(default)]
+    pub pool_reuses: usize,
     /// Declared observation outputs (`buffer id` → f32 values).
     pub outputs: BTreeMap<String, Vec<f32>>,
     /// Allocated program-level buffer ids.
@@ -796,6 +802,8 @@ impl DeviceExecuteReceipt {
             launch_ids: receipt.launch_ids.clone(),
             launch_entries: receipt.launch_entries.clone(),
             copy_ins: receipt.copy_ins,
+            pool_allocations: receipt.pool_allocations,
+            pool_reuses: receipt.pool_reuses,
             outputs: receipt
                 .outputs
                 .iter()
