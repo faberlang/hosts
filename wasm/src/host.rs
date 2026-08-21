@@ -10,8 +10,7 @@ use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
 use crate::config::RunConfig;
 use crate::error::HostError;
 use crate::imports::{
-    bind_external_imports, link_v1_imports, preflight_imports, preflight_package_imports,
-    HostState,
+    bind_external_imports, link_v1_imports, preflight_imports, preflight_package_imports, HostState,
 };
 use crate::outcome::RunOutcome;
 
@@ -132,12 +131,7 @@ impl WasmRtV1Host {
     /// [`RunOutcome::LinkFailed`] (a provider not yet instantiated or a
     /// declared-signature conflict).
     #[must_use]
-    pub fn run_package(
-        &self,
-        entry: &[u8],
-        siblings: &[&[u8]],
-        config: &RunConfig,
-    ) -> RunOutcome {
+    pub fn run_package(&self, entry: &[u8], siblings: &[&[u8]], config: &RunConfig) -> RunOutcome {
         let entry_module = match Module::new(&self.engine, entry) {
             Ok(module) => module,
             Err(error) => {
@@ -177,8 +171,7 @@ impl WasmRtV1Host {
                     message: format!("link failed: {error:#}"),
                 };
             }
-            if let Err(error) = bind_external_imports(&mut linker, &mut store, module, &providers)
-            {
+            if let Err(error) = bind_external_imports(&mut linker, &mut store, module, &providers) {
                 return RunOutcome::LinkFailed {
                     message: format!("link failed: {error:#}"),
                 };
@@ -208,7 +201,8 @@ impl WasmRtV1Host {
                 message: format!("link failed: {error:#}"),
             };
         }
-        if let Err(error) = bind_external_imports(&mut linker, &mut store, &entry_module, &providers)
+        if let Err(error) =
+            bind_external_imports(&mut linker, &mut store, &entry_module, &providers)
         {
             return RunOutcome::LinkFailed {
                 message: format!("link failed: {error:#}"),

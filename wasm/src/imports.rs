@@ -75,9 +75,7 @@ pub(crate) const LEGACY_CEDE_ROWS: &[(&str, ValType, ValType)] = &[
 
 /// True for the closed cede (yield) field grammar (U6-B exception).
 fn is_cede_yield_field(field: &str) -> bool {
-    LEGACY_CEDE_ROWS
-        .iter()
-        .any(|(name, _, _)| *name == field)
+    LEGACY_CEDE_ROWS.iter().any(|(name, _, _)| *name == field)
 }
 
 /// The module's callable-table export the P5 cursor-stream host resolves the
@@ -1054,9 +1052,10 @@ pub(crate) fn preflight_package_imports(
             }
             let field = import.name();
             let canonical = external_canonical_symbol(field);
-            let resolvable = export_sets.iter().enumerate().any(|(other, set)| {
-                other != index && other != 0 && set.contains(&canonical)
-            });
+            let resolvable = export_sets
+                .iter()
+                .enumerate()
+                .any(|(other, set)| other != index && other != 0 && set.contains(&canonical));
             if !resolvable {
                 return Err(RunOutcome::ImportRejected {
                     module: FABER_EXTERNAL_IMPORT_MODULE.to_owned(),
@@ -4125,10 +4124,17 @@ fn bind_cursor_stream(
     if declared.is_empty() {
         return Ok(());
     }
-    let signature = declared.pop().expect("declared cursor-stream imports are non-empty");
+    let signature = declared
+        .pop()
+        .expect("declared cursor-stream imports are non-empty");
     let same_shape = |left: &FuncType, right: &FuncType| {
-        left.params().map(|ty| ty.to_string()).eq(right.params().map(|ty| ty.to_string()))
-            && left.results().map(|ty| ty.to_string()).eq(right.results().map(|ty| ty.to_string()))
+        left.params()
+            .map(|ty| ty.to_string())
+            .eq(right.params().map(|ty| ty.to_string()))
+            && left
+                .results()
+                .map(|ty| ty.to_string())
+                .eq(right.results().map(|ty| ty.to_string()))
     };
     if declared.iter().any(|other| !same_shape(other, &signature)) {
         return Err(wasmtime::Error::msg(format!(
@@ -4312,7 +4318,9 @@ fn bind_cede_fields(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Erro
                 };
                 let value = match (&arg_ty, params.first()) {
                     (ValType::I64, Some(Val::I64(value))) => RuntimeValue::I64(*value),
-                    (ValType::F64, Some(Val::F64(bits))) => RuntimeValue::F64(f64::from_bits(*bits)),
+                    (ValType::F64, Some(Val::F64(bits))) => {
+                        RuntimeValue::F64(f64::from_bits(*bits))
+                    }
                     _ => {
                         return Err(wasmtime::Error::msg(format!(
                             "`{field}`: unexpected cede yield carrier"
