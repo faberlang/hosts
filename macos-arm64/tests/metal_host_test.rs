@@ -2,13 +2,17 @@
 //! M4 C5 API parity closure).
 
 use faber::Valor;
-use faber_host_macos_arm64::device_descriptor::E_DEVICE_ENTRY_MISMATCH;
-use faber_host_macos_arm64::metal_host::MappedWeightFile;
+use faber_host_macos_arm64::device_descriptor::{
+    DescriptorRuntimeSource, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
+};
+use faber_host_macos_arm64::device_host::DeviceLaunchBinding;
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
+use faber_host_macos_arm64::metal_host::{MappedWeightFile, MetalHandleId, MetalLaunchBinding};
 use faber_host_macos_arm64::{
     probe_metal_environment, FakeMetalDriver, MetalHostSession, E_METAL_INVALID_HANDLE,
     E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };
+use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
 #[test]
 fn probe_reports_structured_admission_without_claiming_product_run() {
@@ -553,6 +557,381 @@ fn system_driver_mmap_unaligned_region_uses_page_remainder() {
         values,
         vec![7.0, 8.0],
         "page remainder still names tensor start"
+    );
+    drop(mapped);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Observation copy: dest[i] = src[i] from the bound view.
+const OBSERVA_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void observa(
+    device const float* x [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+  y[id] = x[id];
+}
+"#;
+
+fn b4_binding(
+    handle: MetalHandleId,
+    len_bytes: u64,
+    binding_index: u32,
+    byte_offset: u64,
+    view_span: u64,
+) -> DeviceLaunchBinding {
+    DeviceLaunchBinding {
+        handle: DeviceHandle {
+            backend: DeviceBackend::Metal,
+            kind: DeviceHandleKind::Buffer { len_bytes },
+            id: handle.0,
+        },
+        binding_index,
+        byte_offset,
+        view_span,
+        runtime_source: DescriptorRuntimeSource::Constant,
+    }
+}
+
+fn metal_from_b4(binding: DeviceLaunchBinding) -> MetalLaunchBinding {
+    MetalLaunchBinding {
+        handle: MetalHandleId(binding.handle.id),
+        binding_index: binding.binding_index,
+        byte_offset: binding.byte_offset,
+        view_span: binding.view_span,
+    }
+}
+
+fn bind_copy(
+    src: MetalHandleId,
+    src_len: u64,
+    src_offset: u64,
+    dest: MetalHandleId,
+    dest_len: u64,
+) -> [MetalLaunchBinding; 2] {
+    [
+        metal_from_b4(b4_binding(src, src_len, 0, src_offset, dest_len)),
+        metal_from_b4(b4_binding(dest, dest_len, 1, 0, dest_len)),
+    ]
+}
+
+#[test]
+fn b6_same_allocation_binds_row_0_and_row_n_through_launch_binding_api() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let row_bytes = 16u64;
+    let cache = session.alloc_bytes(32).expect("cache");
+    let out = session.alloc_bytes(16).expect("out");
+    session
+        .copy_in_f32(cache, &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])
+        .expect("rows");
+    let allocs_before = session.driver_counters().buffer_allocs;
+    let handles_before = session.live_handle_count();
+
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cache, 32, 0, out, row_bytes),
+            [1, 1, 1],
+            [4, 1, 1],
+        )
+        .expect("row 0");
+    session.sync().expect("sync row 0");
+    assert_eq!(
+        session.readback_f32(out).expect("row 0 readback"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cache, 32, row_bytes, out, row_bytes),
+            [1, 1, 1],
+            [4, 1, 1],
+        )
+        .expect("row N");
+    session.sync().expect("sync row N");
+    assert_eq!(
+        session.readback_f32(out).expect("row N readback"),
+        vec![10.0, 20.0, 30.0, 40.0],
+        "same allocation bound at a nonzero offset must read row N"
+    );
+    assert_eq!(
+        session.driver_counters().buffer_allocs,
+        allocs_before,
+        "bound launch must not allocate a per-kernel temp or cache copy"
+    );
+    assert_eq!(
+        session.live_handle_count(),
+        handles_before,
+        "row 0 and row N reuse the same handles"
+    );
+}
+
+#[test]
+fn b6_one_cursor_upload_serves_the_whole_step() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let cursor = session.alloc_bytes(16).expect("cursor");
+    let dest_pos = session.alloc_bytes(4).expect("position");
+    let dest_len = session.alloc_bytes(4).expect("valid_len");
+    session
+        .copy_in_f32(
+            cursor,
+            &[
+                f32::from_bits(7),
+                f32::from_bits(11),
+                f32::from_bits(1),
+                f32::from_bits(3),
+            ],
+        )
+        .expect("one cursor upload");
+    let allocs_before = session.driver_counters().buffer_allocs;
+
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cursor, 16, 0, dest_pos, 4),
+            [1, 1, 1],
+            [1, 1, 1],
+        )
+        .expect("position field");
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cursor, 16, 4, dest_len, 4),
+            [1, 1, 1],
+            [1, 1, 1],
+        )
+        .expect("valid_len field");
+    session.sync().expect("one step barrier");
+
+    assert_eq!(session.readback_f32(dest_pos).expect("pos")[0].to_bits(), 7);
+    assert_eq!(
+        session.readback_f32(dest_len).expect("len")[0].to_bits(),
+        11
+    );
+    assert_eq!(
+        session.driver_counters().buffer_allocs,
+        allocs_before,
+        "the same uploaded cursor serves both kernels; no per-kernel temp"
+    );
+    assert_eq!(session.command_submit_count(), 1);
+    assert_eq!(session.blocking_wait_count(), 1);
+}
+
+#[test]
+fn b6_legacy_offset_zero_wrapper_stays_green() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = session.alloc_bytes(8).expect("a");
+    let b = session.alloc_bytes(8).expect("b");
+    let out = session.alloc_bytes(8).expect("out");
+    session.copy_in_f32(a, &[1.0, 2.0]).expect("copy a");
+    session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
+    session
+        .launch_kernel(module, "add_one", &[a, b, out], 1, 2)
+        .expect("legacy offset-zero wrapper");
+    assert_eq!(session.readback_f32(out).expect("readback"), vec![4.0, 6.0]);
+
+    session
+        .launch_kernel_bound(
+            module,
+            "add_one",
+            &[
+                metal_from_b4(b4_binding(a, 8, 0, 0, 8)),
+                metal_from_b4(b4_binding(b, 8, 1, 0, 8)),
+                metal_from_b4(b4_binding(out, 8, 2, 0, 8)),
+            ],
+            [1, 1, 1],
+            [2, 1, 1],
+        )
+        .expect("B4 offset-zero bound launch");
+    assert_eq!(
+        session.readback_f32(out).expect("bound readback"),
+        vec![4.0, 6.0]
+    );
+}
+
+#[test]
+fn b6_launch_binding_offset_past_span_fails_closed() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let cache = session.alloc_bytes(16).expect("cache");
+    let out = session.alloc_bytes(8).expect("out");
+    let err = session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cache, 16, 16, out, 8),
+            [1, 1, 1],
+            [2, 1, 1],
+        )
+        .expect_err("offset past the allocation must fail closed");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+}
+
+#[test]
+fn b6_mapped_region_composes_page_remainder_with_binding_offset() {
+    let mut session =
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit");
+    let mut bytes = vec![0u8; 64];
+    bytes[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&2.0f32.to_le_bytes());
+    bytes[24..28].copy_from_slice(&3.0f32.to_le_bytes());
+    let path = {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "faber-b6-metal-compose-fake-{}",
+            std::process::id()
+        ));
+        path
+    };
+    std::fs::write(&path, &bytes).expect("write");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    session
+        .retain_mapped_file(mapped.clone())
+        .expect("retain mapping");
+    let module = session
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let region = session.alloc_bytes(16).expect("mapped region");
+    session
+        .copy_in_packed_bytes(region, &mapped.bytes()[16..32])
+        .expect("mmap unaligned admit");
+    let echoed = session.readback_f32(region).expect("logical start");
+    assert_eq!(
+        echoed[..1],
+        [2.0],
+        "page remainder still names the admitted tensor start"
+    );
+    let out = session.alloc_bytes(4).expect("out");
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(region, 16, 8, out, 4),
+            [1, 1, 1],
+            [1, 1, 1],
+        )
+        .expect("nonzero launch offset over mapped region");
+    session.sync().expect("sync");
+    let values = session.readback_f32(out).expect("composed read");
+    assert_eq!(
+        values,
+        vec![3.0],
+        "composed bind must be remainder+offset (file[24]=3), not remainder (2) or offset-only (1)"
+    );
+    drop(mapped);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn system_driver_same_allocation_binds_row_0_and_row_n() {
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    let module = session
+        .load_module(OBSERVA_MSL.as_bytes())
+        .expect("runtime MSL compile");
+    let cache = session.alloc_bytes(32).expect("cache");
+    let out = session.alloc_bytes(16).expect("out");
+    session
+        .copy_in_f32(cache, &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])
+        .expect("rows");
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cache, 32, 0, out, 16),
+            [1, 1, 1],
+            [4, 1, 1],
+        )
+        .expect("row 0");
+    session.sync().expect("sync row 0");
+    assert_eq!(
+        session.readback_f32(out).expect("row 0"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(cache, 32, 16, out, 16),
+            [1, 1, 1],
+            [4, 1, 1],
+        )
+        .expect("row N");
+    session.sync().expect("sync row N");
+    assert_eq!(
+        session.readback_f32(out).expect("row N"),
+        vec![10.0, 20.0, 30.0, 40.0]
+    );
+}
+
+#[test]
+fn system_driver_mapped_region_composes_page_remainder_with_binding_offset() {
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    let mut bytes = vec![0u8; 64];
+    bytes[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&2.0f32.to_le_bytes());
+    bytes[24..28].copy_from_slice(&3.0f32.to_le_bytes());
+    let path = {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "faber-b6-metal-compose-live-{}",
+            std::process::id()
+        ));
+        path
+    };
+    std::fs::write(&path, &bytes).expect("write");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    session
+        .retain_mapped_file(mapped.clone())
+        .expect("retain mapping");
+    let module = session
+        .load_module(OBSERVA_MSL.as_bytes())
+        .expect("runtime MSL compile");
+    let region = session.alloc_bytes(16).expect("mapped region");
+    session
+        .copy_in_packed_bytes(region, &mapped.bytes()[16..32])
+        .expect("mmap unaligned admit");
+    let out = session.alloc_bytes(4).expect("out");
+    session
+        .launch_kernel_bound(
+            module,
+            "observa",
+            &bind_copy(region, 16, 8, out, 4),
+            [1, 1, 1],
+            [1, 1, 1],
+        )
+        .expect("composed setBuffer offset");
+    session.sync().expect("sync");
+    let values = session.readback_f32(out).expect("composed read");
+    assert_eq!(
+        values,
+        vec![3.0],
+        "live setBuffer must add the launch offset to the mmap page remainder"
     );
     drop(mapped);
     let _ = std::fs::remove_file(&path);

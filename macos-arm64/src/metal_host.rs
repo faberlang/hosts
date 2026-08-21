@@ -23,6 +23,7 @@ use metal::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::device_descriptor::errors;
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
@@ -292,6 +293,22 @@ pub struct MetalEnvReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MetalHandleId(pub u64);
 
+/// One Metal launch binding. Frozen B4 shape minus the typed runtime source
+/// (that tag is host-level): handle, binding index, byte offset, view span.
+/// `set_buffer` uses `region_offset + byte_offset`; the offset must add to
+/// the mmap page remainder, never replace it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalLaunchBinding {
+    /// Live Metal buffer for this binding.
+    pub handle: MetalHandleId,
+    /// Declared binding index. Never dropped before launch.
+    pub binding_index: u32,
+    /// Byte offset into the allocation (static envelope).
+    pub byte_offset: u64,
+    /// View span in bytes for this binding.
+    pub view_span: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetalHandleKind {
     Module,
@@ -320,11 +337,37 @@ pub trait MetalDriver: Send {
     /// (or an explicit `sync` / readback) commits the pending command buffer
     /// once at the step boundary. The system driver routes the legacy
     /// elementwise-add path through this so there is exactly one encode site.
+    /// Offset-zero caller path: each buffer binds at its mmap page remainder
+    /// (0 for ordinary allocs).
     fn launch_kernel(
         &mut self,
         module: u64,
         entry: &[u8],
         buffers: &[u64],
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+    ) -> HostResult<()> {
+        let zeros = vec![0u64; buffers.len()];
+        self.launch_kernel_bound(
+            module, entry, buffers, &zeros, &zeros, grid_x, grid_y, grid_z, block_x, block_y,
+            block_z,
+        )
+    }
+    /// Bound launch: `byte_offsets` are B4 launch-binding offsets, added to
+    /// each buffer's mmap page remainder at `set_buffer`. `view_spans` bound
+    /// the composed range; a zero span skips the extra span check (legacy).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_kernel_bound(
+        &mut self,
+        module: u64,
+        entry: &[u8],
+        buffers: &[u64],
+        byte_offsets: &[u64],
+        view_spans: &[u64],
         grid_x: u32,
         grid_y: u32,
         grid_z: u32,
@@ -607,6 +650,66 @@ impl MetalHostSession {
         )
     }
 
+    /// Launch with explicit B4 bindings. Binding indices select dispatch
+    /// slots and are not dropped. Each `byte_offset` is added to the
+    /// buffer's mmap page remainder at `set_buffer`; it does not replace it.
+    /// Encoding does not copy cache data or allocate a per-kernel temp.
+    pub fn launch_kernel_bound(
+        &mut self,
+        module: MetalHandleId,
+        entry: &str,
+        bindings: &[MetalLaunchBinding],
+        grid: [u32; 3],
+        block: [u32; 3],
+    ) -> HostResult<()> {
+        self.require_admitted()?;
+        let module_token = self.module_token(module)?;
+        if entry.is_empty() {
+            return Err(HostError::invalid_args("Metal kernel entry name is empty"));
+        }
+        let ordered = ordered_launch_bindings(bindings)?;
+        let mut tokens = Vec::with_capacity(ordered.len());
+        let mut offsets = Vec::with_capacity(ordered.len());
+        let mut spans = Vec::with_capacity(ordered.len());
+        for binding in &ordered {
+            let (token, len_bytes) = self.buffer_token(binding.handle)?;
+            if binding.view_span == 0 {
+                return Err(errors::descriptor(format!(
+                    "launch binding index {} has a zero view span",
+                    binding.binding_index
+                )));
+            }
+            let Some(end) = binding.byte_offset.checked_add(binding.view_span) else {
+                return Err(errors::shape_mismatch(format!(
+                    "launch binding index {} overflows its static envelope",
+                    binding.binding_index
+                )));
+            };
+            if end > len_bytes as u64 {
+                return Err(errors::shape_mismatch(format!(
+                    "launch binding index {} spans {} bytes from offset {} but the allocation is {len_bytes} bytes",
+                    binding.binding_index, binding.view_span, binding.byte_offset
+                )));
+            }
+            tokens.push(token);
+            offsets.push(binding.byte_offset);
+            spans.push(binding.view_span);
+        }
+        self.driver.launch_kernel_bound(
+            module_token,
+            entry.as_bytes(),
+            &tokens,
+            &offsets,
+            &spans,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+        )
+    }
+
     /// Commit the pending step command buffer and wait once. A no-op when
     /// nothing is pending (already flushed, or no encodes this step).
     pub fn sync(&mut self) -> HostResult<()> {
@@ -742,6 +845,68 @@ fn expect_fake_arity(buffers: &[u64], count: usize, what: &str) -> HostResult<()
     Ok(())
 }
 
+/// Bindings placed at their declared indices. Gaps and duplicates fail
+/// closed so an index cannot be validated and then dropped.
+fn ordered_launch_bindings(bindings: &[MetalLaunchBinding]) -> HostResult<Vec<MetalLaunchBinding>> {
+    let mut slots: Vec<Option<MetalLaunchBinding>> = vec![None; bindings.len()];
+    for binding in bindings {
+        let index = binding.binding_index as usize;
+        if index >= slots.len() {
+            return Err(errors::abi_mismatch(format!(
+                "launch binding index {} is outside 0..{}",
+                binding.binding_index,
+                bindings.len()
+            )));
+        }
+        if slots[index].is_some() {
+            return Err(errors::abi_mismatch(format!(
+                "launch binding index {} is declared twice",
+                binding.binding_index
+            )));
+        }
+        slots[index] = Some(*binding);
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            binding.ok_or_else(|| {
+                errors::abi_mismatch(format!(
+                    "launch binding index {index} was validated then dropped before launch"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Compose the mmap page remainder with a B4 launch-binding offset.
+/// The binding offset adds to the remainder; it must not replace it.
+fn compose_bind_offset(
+    region_offset: u64,
+    binding_offset: u64,
+    view_span: u64,
+    buffer_len: u64,
+) -> HostResult<u64> {
+    let composed = region_offset.checked_add(binding_offset).ok_or_else(|| {
+        errors::shape_mismatch(
+            "launch binding offset overflows when added to the mmap page remainder",
+        )
+    })?;
+    let end = if view_span == 0 {
+        composed
+    } else {
+        composed.checked_add(view_span).ok_or_else(|| {
+            errors::shape_mismatch("launch binding span overflows its static envelope")
+        })?
+    };
+    if composed > buffer_len || end > buffer_len {
+        return Err(errors::shape_mismatch(format!(
+            "launch binding composed offset {composed} span {view_span} exceeds buffer length {buffer_len} (region remainder {region_offset})"
+        )));
+    }
+    Ok(composed)
+}
+
 // System default Metal device probe. The `metal` crate (gfx-rs) manages the
 // `MTLCreateSystemDefaultDevice` framework link; the probe fills the real
 // device name from the binding (M2).
@@ -781,11 +946,19 @@ fn detect_metal_framework_paths() -> Vec<String> {
     candidates
 }
 
+/// Sequencing-only fake storage: owned bytes plus the mmap page remainder
+/// used at bind time (0 for ordinary allocs).
+struct FakeBufferSlot {
+    bytes: Vec<u8>,
+    region_offset: u64,
+}
+
 /// Sequencing-only fake driver for unit tests. Not product Metal evidence.
 #[derive(Default)]
 pub struct FakeMetalDriver {
     next_token: u64,
-    buffers: BTreeMap<u64, Vec<u8>>,
+    buffers: BTreeMap<u64, FakeBufferSlot>,
+    maps: Vec<MappedWeightFile>,
     modules: BTreeMap<u64, Vec<u8>>,
     force_unavailable: bool,
     /// Entry names the loaded module's function table declares. Empty means
@@ -853,6 +1026,23 @@ impl FakeMetalDriver {
         Ok(())
     }
 
+    fn slot(&self, token: u64, what: &str) -> HostResult<&FakeBufferSlot> {
+        self.buffers
+            .get(&token)
+            .ok_or_else(|| HostError::internal(format!("fake {what} missing buffer")))
+    }
+
+    fn view_from(&self, token: u64, binding_offset: u64, what: &str) -> HostResult<&[u8]> {
+        let slot = self.slot(token, what)?;
+        let start = compose_bind_offset(
+            slot.region_offset,
+            binding_offset,
+            0,
+            slot.bytes.len() as u64,
+        )? as usize;
+        Ok(&slot.bytes[start..])
+    }
+
     /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
     /// the legacy elementwise-add path and the generalized `launch_kernel`
     /// (the emitted kernel is the same add shape), mirroring the CUDA fake.
@@ -860,34 +1050,34 @@ impl FakeMetalDriver {
         &mut self,
         module: u64,
         a: u64,
+        a_off: u64,
         b: u64,
+        b_off: u64,
         out: u64,
+        out_off: u64,
     ) -> HostResult<()> {
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake launch missing module"));
         }
-        let a_bytes = self
-            .buffers
-            .get(&a)
-            .ok_or_else(|| HostError::internal("fake launch missing a"))?
-            .clone();
-        let b_bytes = self
-            .buffers
-            .get(&b)
-            .ok_or_else(|| HostError::internal("fake launch missing b"))?
-            .clone();
+        let a_bytes = self.view_from(a, a_off, "launch a")?.to_vec();
+        let b_bytes = self.view_from(b, b_off, "launch b")?.to_vec();
+        let out_start = {
+            let slot = self.slot(out, "launch out")?;
+            compose_bind_offset(slot.region_offset, out_off, 0, slot.bytes.len() as u64)? as usize
+        };
         let out_buf = self
             .buffers
             .get_mut(&out)
             .ok_or_else(|| HostError::internal("fake launch missing out"))?;
-        if a_bytes.len() != b_bytes.len() || a_bytes.len() != out_buf.len() {
+        let out_view = &mut out_buf.bytes[out_start..];
+        if a_bytes.len() != b_bytes.len() || a_bytes.len() != out_view.len() {
             return Err(HostError::invalid_args("fake launch length mismatch"));
         }
         let len = a_bytes.len() / 4;
         for i in 0..len {
             let ai = read_f32_at(&a_bytes, i);
             let bi = read_f32_at(&b_bytes, i);
-            write_f32_at(out_buf, i, ai + bi);
+            write_f32_at(out_view, i, ai + bi);
         }
         Ok(())
     }
@@ -896,50 +1086,68 @@ impl FakeMetalDriver {
     /// emitted elementwise accumulation into a persistent buffer. Repeated
     /// launches accumulate onto the previous device contents (the host's
     /// ZeroFill initialization defines the first state exactly once).
-    fn simulate_accumulate(&mut self, module: u64, a: u64, acc: u64) -> HostResult<()> {
+    fn simulate_accumulate(
+        &mut self,
+        module: u64,
+        a: u64,
+        a_off: u64,
+        acc: u64,
+        acc_off: u64,
+    ) -> HostResult<()> {
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake launch missing module"));
         }
-        let a_bytes = self
-            .buffers
-            .get(&a)
-            .ok_or_else(|| HostError::internal("fake accumulate missing a"))?
-            .clone();
+        let a_bytes = self.view_from(a, a_off, "accumulate a")?.to_vec();
+        let acc_start = {
+            let slot = self.slot(acc, "accumulate acc")?;
+            compose_bind_offset(slot.region_offset, acc_off, 0, slot.bytes.len() as u64)? as usize
+        };
         let acc_buf = self
             .buffers
             .get_mut(&acc)
             .ok_or_else(|| HostError::internal("fake accumulate missing acc"))?;
-        if a_bytes.len() != acc_buf.len() {
+        let acc_view = &mut acc_buf.bytes[acc_start..];
+        if a_bytes.len() != acc_view.len() {
             return Err(HostError::invalid_args("fake accumulate length mismatch"));
         }
         let len = a_bytes.len() / 4;
         for i in 0..len {
             let ai = read_f32_at(&a_bytes, i);
-            let acc_i = read_f32_at(acc_buf, i);
-            write_f32_at(acc_buf, i, acc_i + ai);
+            let acc_i = read_f32_at(acc_view, i);
+            write_f32_at(acc_view, i, acc_i + ai);
         }
         Ok(())
     }
 
     /// Simulate a copy kernel: `out[i] = src[i]` — the observation kernel
-    /// that reads a persistent accumulation buffer into a readback slot.
-    fn simulate_copy(&mut self, module: u64, src: u64, out: u64) -> HostResult<()> {
+    /// that reads a persistent allocation (or a bound view of it) into a
+    /// readback slot. Dest remaining storage is the write width so a smaller
+    /// dest can sample a row of a larger source at a nonzero offset.
+    fn simulate_copy(
+        &mut self,
+        module: u64,
+        src: u64,
+        src_off: u64,
+        out: u64,
+        out_off: u64,
+    ) -> HostResult<()> {
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake copy missing module"));
         }
-        let src_bytes = self
-            .buffers
-            .get(&src)
-            .ok_or_else(|| HostError::internal("fake copy missing src"))?
-            .clone();
+        let src_bytes = self.view_from(src, src_off, "copy src")?.to_vec();
+        let out_start = {
+            let slot = self.slot(out, "copy out")?;
+            compose_bind_offset(slot.region_offset, out_off, 0, slot.bytes.len() as u64)? as usize
+        };
         let out_buf = self
             .buffers
             .get_mut(&out)
             .ok_or_else(|| HostError::internal("fake copy missing out"))?;
-        if src_bytes.len() != out_buf.len() {
+        let out_view = &mut out_buf.bytes[out_start..];
+        if src_bytes.len() < out_view.len() {
             return Err(HostError::invalid_args("fake copy length mismatch"));
         }
-        out_buf.copy_from_slice(&src_bytes);
+        out_view.copy_from_slice(&src_bytes[..out_view.len()]);
         Ok(())
     }
 }
@@ -977,20 +1185,44 @@ impl MetalDriver for FakeMetalDriver {
         self.buffer_allocs += 1;
         let token = self.next_token;
         self.next_token += 1;
-        self.buffers.insert(token, vec![0; len_bytes]);
+        self.buffers.insert(
+            token,
+            FakeBufferSlot {
+                bytes: vec![0; len_bytes],
+                region_offset: 0,
+            },
+        );
         Ok(token)
     }
 
     fn copy_in(&mut self, token: u64, bytes: &[u8]) -> HostResult<()> {
         self.maybe_fail(FakeFailureStage::CopyIn)?;
-        let buffer = self
+        if !self.buffers.contains_key(&token) {
+            return Err(HostError::internal("fake copy_in missing buffer"));
+        }
+        if let Some(wrap) = mapped_wrap_for(&self.maps, bytes) {
+            let page = unsafe { std::slice::from_raw_parts(wrap.ptr.cast::<u8>(), wrap.page_len) };
+            let slot = self
+                .buffers
+                .get_mut(&token)
+                .ok_or_else(|| HostError::internal("fake copy_in missing buffer"))?;
+            slot.bytes = page.to_vec();
+            slot.region_offset = wrap.offset;
+            return Ok(());
+        }
+        let slot = self
             .buffers
             .get_mut(&token)
             .ok_or_else(|| HostError::internal("fake copy_in missing buffer"))?;
-        if buffer.len() != bytes.len() {
+        if slot.region_offset != 0 {
+            return Err(HostError::invalid_args(
+                "Metal mmap-backed region is read-only",
+            ));
+        }
+        if slot.bytes.len() != bytes.len() {
             return Err(HostError::invalid_args("fake copy_in size mismatch"));
         }
-        buffer.copy_from_slice(bytes);
+        slot.bytes.copy_from_slice(bytes);
         Ok(())
     }
 
@@ -1007,16 +1239,18 @@ impl MetalDriver for FakeMetalDriver {
         // Encode-only: the CPU fake applies the write now (later kernels in
         // the same step must observe it) and defers the submit/wait count
         // until `sync` / readback flush.
-        self.simulate_elementwise_add(module, a, b, out)?;
+        self.simulate_elementwise_add(module, a, 0, b, 0, out, 0)?;
         self.pending_encodes += 1;
         Ok(())
     }
 
-    fn launch_kernel(
+    fn launch_kernel_bound(
         &mut self,
         module: u64,
         entry: &[u8],
         buffers: &[u64],
+        byte_offsets: &[u64],
+        view_spans: &[u64],
         _grid_x: u32,
         _grid_y: u32,
         _grid_z: u32,
@@ -1025,6 +1259,24 @@ impl MetalDriver for FakeMetalDriver {
         _block_z: u32,
     ) -> HostResult<()> {
         self.maybe_fail(FakeFailureStage::Launch)?;
+        if buffers.len() != byte_offsets.len() || buffers.len() != view_spans.len() {
+            return Err(HostError::invalid_args(
+                "fake launch_kernel_bound offset/span arity mismatch",
+            ));
+        }
+        for (token, (binding_offset, view_span)) in buffers
+            .iter()
+            .zip(byte_offsets.iter().zip(view_spans.iter()))
+        {
+            let slot = self.slot(*token, "launch")?;
+            compose_bind_offset(
+                slot.region_offset,
+                *binding_offset,
+                *view_span,
+                slot.bytes.len() as u64,
+            )?;
+        }
+        let offset_at = |index: usize| byte_offsets.get(index).copied().unwrap_or(0);
         // When the harness declares the module's function table, an unknown
         // entry fails closed before dispatch (mirrors the compiled-pipeline
         // entry lookup on the real lane).
@@ -1046,7 +1298,7 @@ impl MetalDriver for FakeMetalDriver {
                 2,
                 "'accumulate' simulates the 2-buffer kernel (a, acc)",
             )?;
-            self.simulate_accumulate(module, buffers[0], buffers[1])?;
+            self.simulate_accumulate(module, buffers[0], offset_at(0), buffers[1], offset_at(1))?;
             self.pending_encodes += 1;
             return Ok(());
         }
@@ -1056,7 +1308,7 @@ impl MetalDriver for FakeMetalDriver {
                 2,
                 "'observa' simulates the 2-buffer kernel (src, out)",
             )?;
-            self.simulate_copy(module, buffers[0], buffers[1])?;
+            self.simulate_copy(module, buffers[0], offset_at(0), buffers[1], offset_at(1))?;
             self.pending_encodes += 1;
             return Ok(());
         }
@@ -1065,7 +1317,15 @@ impl MetalDriver for FakeMetalDriver {
             3,
             "simulates the 3-buffer elementwise-add kernel (a, b, out)",
         )?;
-        self.simulate_elementwise_add(module, buffers[0], buffers[1], buffers[2])?;
+        self.simulate_elementwise_add(
+            module,
+            buffers[0],
+            offset_at(0),
+            buffers[1],
+            offset_at(1),
+            buffers[2],
+            offset_at(2),
+        )?;
         self.pending_encodes += 1;
         Ok(())
     }
@@ -1081,14 +1341,19 @@ impl MetalDriver for FakeMetalDriver {
         // one wait if anything is still pending, then the host copy.
         self.flush_pending();
         self.maybe_fail(FakeFailureStage::Readback)?;
-        let buffer = self
+        let slot = self
             .buffers
             .get(&token)
             .ok_or_else(|| HostError::internal("fake copy_out missing buffer"))?;
-        if buffer.len() != len_bytes {
-            return Err(HostError::internal("fake copy_out size mismatch"));
+        let offset = slot.region_offset as usize;
+        match offset.checked_add(len_bytes) {
+            Some(end) if end <= slot.bytes.len() => Ok(slot.bytes[offset..end].to_vec()),
+            _ => Err(HostError::internal("fake copy_out size mismatch")),
         }
-        Ok(buffer.clone())
+    }
+
+    fn retain_mapped_file(&mut self, file: MappedWeightFile) {
+        self.maps.push(file);
     }
 
     fn free(&mut self, token: u64) -> HostResult<()> {
@@ -1389,11 +1654,13 @@ impl MetalDriver for SystemMetalDriver {
         result
     }
 
-    fn launch_kernel(
+    fn launch_kernel_bound(
         &mut self,
         module: u64,
         entry: &[u8],
         buffers: &[u64],
+        byte_offsets: &[u64],
+        view_spans: &[u64],
         grid_x: u32,
         grid_y: u32,
         grid_z: u32,
@@ -1418,6 +1685,11 @@ impl MetalDriver for SystemMetalDriver {
                 "launch: all grid and block dimensions must be non-zero",
             ));
         }
+        if buffers.len() != byte_offsets.len() || buffers.len() != view_spans.len() {
+            return Err(metal_driver(
+                "launch: binding offset/span arity does not match the buffer slice",
+            ));
+        }
         // Metal caps threads per threadgroup; a block shape whose volume
         // exceeds the pipeline limit fails closed rather than being clamped,
         // because clamping would flatten the block shape and break 2D/3D
@@ -1432,15 +1704,25 @@ impl MetalDriver for SystemMetalDriver {
             )));
         }
         // Retain buffer handles so the encoder bind does not borrow `self`.
+        // Composed offset = mmap page remainder + B4 launch-binding offset.
         let mut bound = Vec::with_capacity(buffers.len());
         let mut offsets = Vec::with_capacity(buffers.len());
-        for token in buffers {
+        for (token, (binding_offset, view_span)) in buffers
+            .iter()
+            .zip(byte_offsets.iter().zip(view_spans.iter()))
+        {
             let slot = self
                 .buffers
                 .get(token)
                 .ok_or_else(|| metal_driver("launch: unknown buffer token"))?;
+            let composed = compose_bind_offset(
+                slot.region_offset,
+                *binding_offset,
+                *view_span,
+                slot.buffer.length(),
+            )?;
             bound.push(slot.buffer.clone());
-            offsets.push(slot.region_offset);
+            offsets.push(composed);
         }
         if self.pending.is_none() {
             let queue = self
@@ -1484,9 +1766,7 @@ impl MetalDriver for SystemMetalDriver {
         };
         encoder.set_compute_pipeline_state(&pipeline);
         for (index, (buffer, offset)) in bound.iter().zip(offsets).enumerate() {
-            // Offset-zero caller path: `offset` is the mmap page remainder
-            // (0 for ordinary allocs). KV-B6 launch-binding offsets add on
-            // top of this remainder and must not replace it.
+            // `offset` is mmap page remainder + launch-binding offset.
             encoder.set_buffer(index as u64, Some(buffer), offset);
         }
         // Each threadgroup carries exactly one block now that the volume is
@@ -1554,53 +1834,56 @@ impl MetalDriver for SystemMetalDriver {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct MmapWrap {
     ptr: *const std::ffi::c_void,
     page_len: usize,
     offset: u64,
 }
 
-#[cfg(target_os = "macos")]
-impl SystemMetalDriver {
-    /// Page-round a slice that sits inside a retained mapping so it can wrap
-    /// as `newBufferWithBytesNoCopy` (pointer and length page-aligned).
-    fn mmap_wrap_for(&self, bytes: &[u8]) -> Option<MmapWrap> {
-        if bytes.is_empty() {
+/// Page-round a slice that sits inside a retained mapping so it can wrap
+/// as `newBufferWithBytesNoCopy` (pointer and length page-aligned).
+fn mapped_wrap_for(maps: &[MappedWeightFile], bytes: &[u8]) -> Option<MmapWrap> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let ptr = bytes.as_ptr();
+    for mapped in maps {
+        if !mapped.contains(ptr, bytes.len()) {
+            continue;
+        }
+        let page = mapped.page_size();
+        if page == 0 || !page.is_power_of_two() {
             return None;
         }
-        let ptr = bytes.as_ptr();
-        for mapped in &self.maps {
-            if !mapped.contains(ptr, bytes.len()) {
-                continue;
-            }
-            let page = mapped.page_size();
-            if page == 0 || !page.is_power_of_two() {
-                return None;
-            }
-            let addr = ptr as usize;
-            let page_addr = addr & !(page - 1);
-            let map_start = mapped.as_ptr() as usize;
-            let map_end = map_start.saturating_add(mapped.mapped_len());
-            if page_addr < map_start {
-                return None;
-            }
-            let offset = addr - page_addr;
-            // Cover the packed f32-word width (1–3 byte pad) so copy_out of
-            // the handle length still sits inside the no-copy buffer.
-            let region_len = bytes.len().div_ceil(4).saturating_mul(4).max(bytes.len());
-            let need = offset.saturating_add(region_len);
-            let page_len = need.div_ceil(page).saturating_mul(page);
-            if page_addr.saturating_add(page_len) > map_end {
-                return None;
-            }
-            return Some(MmapWrap {
-                ptr: page_addr as *const std::ffi::c_void,
-                page_len,
-                offset: offset as u64,
-            });
+        let addr = ptr as usize;
+        let page_addr = addr & !(page - 1);
+        let map_start = mapped.as_ptr() as usize;
+        let map_end = map_start.saturating_add(mapped.mapped_len());
+        if page_addr < map_start {
+            return None;
         }
-        None
+        let offset = addr - page_addr;
+        // Cover the packed f32-word width (1–3 byte pad) so copy_out of
+        // the handle length still sits inside the no-copy buffer.
+        let region_len = bytes.len().div_ceil(4).saturating_mul(4).max(bytes.len());
+        let need = offset.saturating_add(region_len);
+        let page_len = need.div_ceil(page).saturating_mul(page);
+        if page_addr.saturating_add(page_len) > map_end {
+            return None;
+        }
+        return Some(MmapWrap {
+            ptr: page_addr as *const std::ffi::c_void,
+            page_len,
+            offset: offset as u64,
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+impl SystemMetalDriver {
+    fn mmap_wrap_for(&self, bytes: &[u8]) -> Option<MmapWrap> {
+        mapped_wrap_for(&self.maps, bytes)
     }
 
     fn ensure_timestamp_buffer(&mut self) -> bool {
