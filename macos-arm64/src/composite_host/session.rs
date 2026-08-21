@@ -1203,6 +1203,7 @@ impl<'host> ProgramSession<'host> {
         let submit_started = Instant::now();
         self.runtime.sync()?;
         let gpu_encode_submit_wait_us = encode_us.saturating_add(elapsed_us(submit_started));
+        let launch_gpu_us = self.runtime.take_encoder_gpu_us();
 
         // Observation-only readback (F6): read back exactly the DECLARED
         // observation points — the result rows projected from the
@@ -1337,6 +1338,7 @@ impl<'host> ProgramSession<'host> {
             copy_in_us,
             gpu_encode_submit_wait_us,
             readback_us,
+            launch_gpu_us,
         })
     }
 

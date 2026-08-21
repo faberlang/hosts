@@ -111,6 +111,10 @@ pub struct DeviceExecutionReceipt {
     pub gpu_encode_submit_wait_us: u64,
     /// Observation readback wall (µs) after the step-boundary wait.
     pub readback_us: u64,
+    /// Per-encoder GPU timestamps in launch order (µs). Empty when the
+    /// step did not sample timestamps. Length matches `launch_entries`
+    /// when present.
+    pub launch_gpu_us: Vec<u64>,
 }
 
 /// The completion boundary of one execution (R9).
