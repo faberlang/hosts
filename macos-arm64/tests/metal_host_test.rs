@@ -3,6 +3,7 @@
 
 use faber::Valor;
 use faber_host_macos_arm64::device_descriptor::E_DEVICE_ENTRY_MISMATCH;
+use faber_host_macos_arm64::metal_host::MappedWeightFile;
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     probe_metal_environment, FakeMetalDriver, MetalHostSession, E_METAL_INVALID_HANDLE,
@@ -453,4 +454,106 @@ fn system_driver_accumulates_persistent_buffer_across_repeated_launches() {
         vec![2.0, 4.0, 6.0, 8.0],
         "two launches accumulate 2a"
     );
+}
+
+#[test]
+fn mmap_weight_file_is_read_only_lazy_mapping() {
+    let mut bytes = vec![0u8; 64];
+    bytes[16..20].copy_from_slice(&7.0f32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&8.0f32.to_le_bytes());
+    let path = {
+        let mut path = std::env::temp_dir();
+        path.push(format!("faber-m5-u3-metal-mmap-{}", std::process::id()));
+        path
+    };
+    std::fs::write(&path, &bytes).expect("write");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    assert_eq!(mapped.len(), 64);
+    assert!(mapped.page_size().is_power_of_two());
+    assert!(mapped.mapped_len() >= mapped.len());
+    assert_eq!(&mapped.bytes()[16..24], &bytes[16..24]);
+    drop(mapped);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn system_driver_admits_mmap_region_without_copy_and_launches() {
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    let mut bytes = vec![0u8; 64];
+    let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    for (index, value) in input.iter().enumerate() {
+        let off = index * 4;
+        bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let path = {
+        let mut path = std::env::temp_dir();
+        path.push(format!("faber-m5-u3-metal-launch-{}", std::process::id()));
+        path
+    };
+    std::fs::write(&path, &bytes).expect("write");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    session
+        .retain_mapped_file(mapped.clone())
+        .expect("retain mapping");
+
+    let module = session
+        .load_module(ADD_ONE_MSL.as_bytes())
+        .expect("runtime MSL compile");
+    let a = session.alloc_bytes(16 * 4).expect("alloc a");
+    let b = session.alloc_bytes(16 * 4).expect("alloc b");
+    let out = session.alloc_bytes(16 * 4).expect("alloc out");
+    session
+        .copy_in_packed_bytes(a, &mapped.bytes()[..64])
+        .expect("mmap admit");
+    session
+        .launch_elementwise_add_f32(module, a, b, out)
+        .expect("launch add_one");
+    session.sync().expect("sync");
+    let values = session.readback_f32(out).expect("readback");
+    let expected: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+    assert_eq!(
+        values, expected,
+        "mmap-backed input launched at offset zero"
+    );
+    let echoed = session.readback_f32(a).expect("readback mmap region");
+    assert_eq!(echoed, input, "no-copy region matches the mapped file");
+    drop(mapped);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn system_driver_mmap_unaligned_region_uses_page_remainder() {
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+    let mut bytes = vec![0u8; 64];
+    bytes[16..20].copy_from_slice(&7.0f32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&8.0f32.to_le_bytes());
+    let path = {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "faber-m5-u3-metal-unaligned-{}",
+            std::process::id()
+        ));
+        path
+    };
+    std::fs::write(&path, &bytes).expect("write");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    session
+        .retain_mapped_file(mapped.clone())
+        .expect("retain mapping");
+    let buffer = session.alloc_bytes(8).expect("alloc region");
+    session
+        .copy_in_packed_bytes(buffer, &mapped.bytes()[16..24])
+        .expect("mmap unaligned admit");
+    let values = session.readback_f32(buffer).expect("readback");
+    assert_eq!(
+        values,
+        vec![7.0, 8.0],
+        "page remainder still names tensor start"
+    );
+    drop(mapped);
+    let _ = std::fs::remove_file(&path);
 }

@@ -24,7 +24,7 @@
 //! Success prints a receipt JSON and exits 0. A host failure prints a
 //! [`HostError`] JSON and exits 2. Usage / parse failures exit 64.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -43,7 +43,9 @@ use crate::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime,
 };
+use crate::device_host::DeviceRuntime;
 use crate::kernel::{HostError, HostResult};
+use crate::metal_host::{process_resident_bytes, MappedWeightFile, MappedWeightPaging};
 
 /// CLI flags for `device-execute`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +102,15 @@ pub struct DeviceExecuteControlReceipt {
     /// Device execution facts for a `step`; absent for control-only verbs.
     #[serde(default)]
     pub receipt: Option<DeviceExecuteReceipt>,
+    /// mmap paging facts after `load` (zero on other verbs).
+    #[serde(default)]
+    pub mmap: MappedWeightPaging,
+    /// Gradus `data_start` of the mapped GGUF (0 when the file is not GGUF).
+    #[serde(default)]
+    pub mmap_data_start: u64,
+    /// Number of admitted `abs_starts`/`abs_ends` regions.
+    #[serde(default)]
+    pub mmap_regions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,17 +247,22 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
         Some(path) => Some(read_file(path)?),
         None => None,
     };
-    let gguf_bytes = match &args.weights {
-        Some(path) => Some(read_file(path)?),
+    let mapped_weights = match &args.weights {
+        Some(path) => Some(MappedWeightFile::open(path)?),
         None => None,
     };
-    let mut inputs = match (gguf_bytes.as_deref(), weight_map_bytes.as_deref()) {
-        (Some(gguf), Some(map_json)) => {
-            let map = weight_map_from_json(map_json)?;
-            inputs_from_gguf(gguf, &map)?
-        }
-        _ => BTreeMap::new(),
-    };
+    let mut weight_inputs = WeightInputs::default();
+    let mut mmap_paging = MappedWeightPaging::default();
+    let mut mmap_data_start = 0u64;
+    let mut mmap_regions = 0usize;
+    if let (Some(mapped), Some(map_json)) = (&mapped_weights, weight_map_bytes.as_deref()) {
+        let map = weight_map_from_json(map_json)?;
+        let table = gguf_region_table(mapped.bytes(), &map)?;
+        weight_inputs = inputs_from_mapped_gguf(mapped, &map, &table)?;
+        mmap_paging = mapped_paging(mapped);
+        mmap_data_start = table.data_start;
+        mmap_regions = table.abs_starts.len();
+    }
     let file_read_us = elapsed_us(read_started);
     let descriptor_started = Instant::now();
     let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
@@ -254,12 +270,12 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let inputs_started = Instant::now();
     let json_inputs = inputs_from_json(&inputs_bytes)?;
     for (id, values) in json_inputs {
-        if inputs.contains_key(&id) {
+        if weight_inputs.contains(id) {
             return Err(HostError::invalid_args(format!(
                 "device-execute buffer {id} is in both --weight-map and --inputs"
             )));
         }
-        inputs.insert(id, values);
+        weight_inputs.insert_owned(id, values);
     }
     let json_decode_us = elapsed_us(inputs_started);
     descriptor.validate()?;
@@ -272,13 +288,14 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
         requires_device: true,
     })?;
     let host_construct_us = elapsed_us(host_started);
+    retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
     let session_started = Instant::now();
     let mut session = host.create_program_session(&descriptor)?;
     let session_create_us = elapsed_us(session_started);
     let load_module_us = session.load_module_us;
     let per_program_alloc_us = session.per_program_alloc_us;
     let step_started = Instant::now();
-    let receipt = session.execute(&inputs)?;
+    let receipt = session.execute(weight_inputs.map())?;
     let step_wall_us = elapsed_us(step_started);
     session.teardown()?;
     let mut wire = DeviceExecuteReceipt::from_host(&receipt);
@@ -292,6 +309,9 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     wire.load_module_us = load_module_us;
     wire.per_program_alloc_us = per_program_alloc_us;
     wire.cli_internal_us = elapsed_us(cli_started);
+    wire.mmap = mmap_paging;
+    wire.mmap_data_start = mmap_data_start;
+    wire.mmap_regions = mmap_regions;
     Ok(wire)
 }
 
@@ -309,14 +329,21 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
         Some(path) => weight_map_from_json(&read_file(path)?)?,
         None => BTreeMap::new(),
     };
-    let gguf = match &args.weights {
-        Some(path) => read_file(path)?,
-        None => Vec::new(),
+    let mapped_weights = match &args.weights {
+        Some(path) => Some(MappedWeightFile::open(path)?),
+        None => None,
     };
-    let weight_inputs = if args.weights.is_some() {
-        inputs_from_gguf(&gguf, &weight_map)?
+    let mut mmap_paging = MappedWeightPaging::default();
+    let mut mmap_data_start = 0u64;
+    let mut mmap_regions = 0usize;
+    let weight_inputs = if let Some(mapped) = &mapped_weights {
+        let table = gguf_region_table(mapped.bytes(), &weight_map)?;
+        mmap_paging = mapped_paging(mapped);
+        mmap_data_start = table.data_start;
+        mmap_regions = table.abs_starts.len();
+        inputs_from_mapped_gguf(mapped, &weight_map, &table)?
     } else {
-        BTreeMap::new()
+        WeightInputs::default()
     };
     let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
     descriptor.validate()?;
@@ -346,13 +373,15 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
         selection,
         requires_device: true,
     })?;
-    let mut session = host.prepare_resident_session(&descriptor, &weight_inputs)?;
+    retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
+    let mut session = host.prepare_resident_session(&descriptor, weight_inputs.map())?;
     let stdout = std::io::stdout();
     let mut stdout = std::io::BufWriter::new(stdout.lock());
-    write_control_receipt(
-        &mut stdout,
-        control_receipt("load", &session, descriptor.kernels.len(), None, 0),
-    )?;
+    let mut load_receipt = control_receipt("load", &session, descriptor.kernels.len(), None, 0);
+    load_receipt.mmap = mmap_paging;
+    load_receipt.mmap_data_start = mmap_data_start;
+    load_receipt.mmap_regions = mmap_regions;
+    write_control_receipt(&mut stdout, load_receipt)?;
 
     for line in lines {
         let line = line.map_err(|error| {
@@ -416,6 +445,9 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                         kernel_count: descriptor.kernels.len(),
                         reset_cleared: 0,
                         receipt: None,
+                        mmap: MappedWeightPaging::default(),
+                        mmap_data_start: 0,
+                        mmap_regions: 0,
                     },
                 )?;
                 return Ok(());
@@ -449,6 +481,9 @@ fn control_receipt(
         kernel_count,
         reset_cleared,
         receipt,
+        mmap: MappedWeightPaging::default(),
+        mmap_data_start: 0,
+        mmap_regions: 0,
     }
 }
 
@@ -617,6 +652,285 @@ pub fn inputs_from_gguf(
     Ok(inputs)
 }
 
+/// Gradus region table: `data_start` plus the admitted `abs_starts` /
+/// `abs_ends` ranges. Weight-map offsets are already absolute file offsets
+/// (`data_start + relative_offset`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufRegionTable {
+    pub data_start: u64,
+    pub abs_starts: Vec<u64>,
+    pub abs_ends: Vec<u64>,
+}
+
+/// Host-side weight map whose `Vec<f32>` values may alias a retained mmap.
+///
+/// Aliased entries are forgotten on drop so `Vec` does not free the mapping.
+#[derive(Default)]
+pub struct WeightInputs {
+    values: BTreeMap<u32, Vec<f32>>,
+    aliased: BTreeSet<u32>,
+}
+
+impl Drop for WeightInputs {
+    fn drop(&mut self) {
+        for id in std::mem::take(&mut self.aliased) {
+            if let Some(values) = self.values.remove(&id) {
+                std::mem::forget(values);
+            }
+        }
+    }
+}
+
+impl WeightInputs {
+    #[must_use]
+    pub fn map(&self) -> &BTreeMap<u32, Vec<f32>> {
+        &self.values
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: u32) -> bool {
+        self.values.contains_key(&id)
+    }
+
+    fn insert_owned(&mut self, id: u32, values: Vec<f32>) {
+        self.values.insert(id, values);
+    }
+}
+
+/// Build the region table from a mapped GGUF (or a raw fixture file).
+///
+/// A GGUF v3 file supplies `data_start` from the header table end aligned
+/// to 32. Ranges that start before `data_start` or past the file fail
+/// closed. Non-GGUF fixtures use `data_start = 0` so existing packed-map
+/// tests keep their byte offsets.
+pub fn gguf_region_table(
+    bytes: &[u8],
+    map: &BTreeMap<u32, WeightFileRange>,
+) -> HostResult<GgufRegionTable> {
+    let data_start = match gguf_data_start(bytes)? {
+        Some(start) => start,
+        None => 0,
+    };
+    let file_len = bytes.len() as u64;
+    let mut abs_starts = Vec::with_capacity(map.len());
+    let mut abs_ends = Vec::with_capacity(map.len());
+    for (id, range) in map {
+        let start = range.offset;
+        let end = start.checked_add(range.len).ok_or_else(|| {
+            HostError::invalid_args(format!("device-execute weight-map[{id}] range overflows"))
+        })?;
+        if start < data_start {
+            return Err(HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] offset {start} is before GGUF data_start {data_start}"
+            )));
+        }
+        if end > file_len {
+            return Err(HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] range [{start}, {end}) exceeds {} bytes",
+                bytes.len()
+            )));
+        }
+        abs_starts.push(start);
+        abs_ends.push(end);
+    }
+    Ok(GgufRegionTable {
+        data_start,
+        abs_starts,
+        abs_ends,
+    })
+}
+
+/// Admit mapped GGUF ranges as native packed regions without copying when
+/// the slice is 4-byte aligned. Unaligned tails fall back to an owned pad.
+pub fn inputs_from_mapped_gguf(
+    mapped: &MappedWeightFile,
+    map: &BTreeMap<u32, WeightFileRange>,
+    table: &GgufRegionTable,
+) -> HostResult<WeightInputs> {
+    let bytes = mapped.bytes();
+    let mut inputs = WeightInputs::default();
+    for (id, range) in map {
+        if range.offset < table.data_start {
+            return Err(HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] offset {} is before GGUF data_start {}",
+                range.offset, table.data_start
+            )));
+        }
+        let start = usize::try_from(range.offset).map_err(|_| {
+            HostError::invalid_args(format!("device-execute weight-map[{id}] offset overflows"))
+        })?;
+        let end = start
+            .checked_add(usize::try_from(range.len).map_err(|_| {
+                HostError::invalid_args(format!("device-execute weight-map[{id}] len overflows"))
+            })?)
+            .ok_or_else(|| {
+                HostError::invalid_args(format!("device-execute weight-map[{id}] range overflows"))
+            })?;
+        let slice = bytes.get(start..end).ok_or_else(|| {
+            HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] range [{start}, {end}) exceeds {} bytes",
+                bytes.len()
+            ))
+        })?;
+        let packed_elems = packed_f32_count(range.len);
+        if packed_elems != range.elems {
+            return Err(HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] elems {} is not the native packed width {packed_elems} (len {})",
+                range.elems, range.len
+            )));
+        }
+        match alias_f32_region(slice) {
+            Some(values) => {
+                inputs.aliased.insert(*id);
+                inputs.values.insert(*id, values);
+            }
+            None => {
+                inputs
+                    .values
+                    .insert(*id, packed_bytes_as_native_region(slice));
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+fn alias_f32_region(bytes: &[u8]) -> Option<Vec<f32>> {
+    let packed = packed_f32_count(bytes.len() as u64) as usize;
+    let packed_bytes = packed.saturating_mul(4);
+    if packed == 0 || packed_bytes > bytes.len() {
+        return None;
+    }
+    if (bytes.as_ptr() as usize) % std::mem::align_of::<f32>() != 0 {
+        return None;
+    }
+    Some(unsafe { Vec::from_raw_parts(bytes.as_ptr() as *mut f32, packed, packed) })
+}
+
+fn gguf_data_start(bytes: &[u8]) -> HostResult<Option<u64>> {
+    if bytes.len() < 24 || &bytes[..4] != b"GGUF" {
+        return Ok(None);
+    }
+    let version = read_u32_at(bytes, 4, "GGUF version")?;
+    if version != 3 {
+        return Err(HostError::invalid_args(format!(
+            "device-execute GGUF version {version} is not v3"
+        )));
+    }
+    let n_tensors = read_u64_at(bytes, 8, "GGUF tensor count")?;
+    let n_kv = read_u64_at(bytes, 16, "GGUF metadata count")?;
+    let mut off = 24usize;
+    for _ in 0..n_kv {
+        off = skip_gguf_kv(bytes, off)?;
+    }
+    for _ in 0..n_tensors {
+        off = skip_gguf_tensor_info(bytes, off)?;
+    }
+    const ALIGN: usize = 32;
+    let data_start = off.div_ceil(ALIGN).saturating_mul(ALIGN);
+    if data_start > bytes.len() {
+        return Err(HostError::invalid_args(
+            "device-execute GGUF data_start is past the mapped file",
+        ));
+    }
+    Ok(Some(data_start as u64))
+}
+
+fn skip_gguf_string(bytes: &[u8], off: usize) -> HostResult<usize> {
+    let len = read_u64_at(bytes, off, "GGUF string length")?;
+    let start = off + 8;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| HostError::invalid_args("device-execute GGUF string overflows"))?;
+    if end > bytes.len() {
+        return Err(HostError::invalid_args(
+            "device-execute GGUF string exceeds the mapped file",
+        ));
+    }
+    Ok(end)
+}
+
+fn skip_gguf_kv(bytes: &[u8], off: usize) -> HostResult<usize> {
+    let after_key = skip_gguf_string(bytes, off)?;
+    let tag = read_u32_at(bytes, after_key, "GGUF metadata type")?;
+    skip_gguf_value(bytes, after_key + 4, tag)
+}
+
+fn skip_gguf_tensor_info(bytes: &[u8], off: usize) -> HostResult<usize> {
+    let after_name = skip_gguf_string(bytes, off)?;
+    let ndims = read_u32_at(bytes, after_name, "GGUF tensor ndims")?;
+    let mut next = after_name + 4;
+    for _ in 0..ndims {
+        read_u64_at(bytes, next, "GGUF tensor dim")?;
+        next += 8;
+    }
+    read_u32_at(bytes, next, "GGUF tensor type")?;
+    next += 4;
+    read_u64_at(bytes, next, "GGUF tensor offset")?;
+    Ok(next + 8)
+}
+
+fn skip_gguf_value(bytes: &[u8], off: usize, tag: u32) -> HostResult<usize> {
+    match tag {
+        0 | 1 | 7 => Ok(off + 1),
+        2 | 3 => Ok(off + 2),
+        4 | 5 | 6 => Ok(off + 4),
+        8 => skip_gguf_string(bytes, off),
+        10 | 11 | 12 => Ok(off + 8),
+        9 => {
+            let elem = read_u32_at(bytes, off, "GGUF array elem type")?;
+            let count = read_u64_at(bytes, off + 4, "GGUF array count")?;
+            let mut next = off + 12;
+            for _ in 0..count {
+                next = skip_gguf_value(bytes, next, elem)?;
+            }
+            Ok(next)
+        }
+        other => Err(HostError::invalid_args(format!(
+            "device-execute GGUF metadata type {other} is unhandled"
+        ))),
+    }
+}
+
+fn read_u32_at(bytes: &[u8], off: usize, what: &str) -> HostResult<u32> {
+    let slice = bytes.get(off..off + 4).ok_or_else(|| {
+        HostError::invalid_args(format!("device-execute {what} exceeds the mapped file"))
+    })?;
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(slice);
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64_at(bytes: &[u8], off: usize, what: &str) -> HostResult<u64> {
+    let slice = bytes.get(off..off + 8).ok_or_else(|| {
+        HostError::invalid_args(format!("device-execute {what} exceeds the mapped file"))
+    })?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(slice);
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn retain_mapped_weights(
+    host: &mut CompositeHost,
+    mapped: Option<&MappedWeightFile>,
+) -> HostResult<()> {
+    let Some(mapped) = mapped else {
+        return Ok(());
+    };
+    if let Some(DeviceRuntime::Metal(session)) = host.device_mut() {
+        session.retain_mapped_file(mapped.clone())?;
+    }
+    Ok(())
+}
+
+fn mapped_paging(mapped: &MappedWeightFile) -> MappedWeightPaging {
+    MappedWeightPaging {
+        page_size: mapped.page_size() as u64,
+        mapped_len: mapped.mapped_len() as u64,
+        file_len: mapped.len() as u64,
+        rss_bytes: process_resident_bytes(),
+    }
+}
+
 fn packed_f32_count(len: u64) -> u64 {
     len.div_ceil(4).max(1)
 }
@@ -778,6 +1092,15 @@ pub struct DeviceExecuteReceipt {
     /// Stage timing for this one-shot or control `step` operation.
     #[serde(default)]
     pub stage_timing: StageTimingReceipt,
+    /// mmap paging facts when `--weights` was mapped rather than copied.
+    #[serde(default)]
+    pub mmap: MappedWeightPaging,
+    /// Gradus `data_start` of the mapped GGUF (0 when the file is not GGUF).
+    #[serde(default)]
+    pub mmap_data_start: u64,
+    /// Number of admitted `abs_starts`/`abs_ends` regions.
+    #[serde(default)]
+    pub mmap_regions: usize,
 }
 
 /// Receipt timing split shared by the legacy one-shot and resident control
@@ -836,6 +1159,9 @@ impl DeviceExecuteReceipt {
             cli_internal_us: 0,
             kernel_count: 0,
             stage_timing: StageTimingReceipt::default(),
+            mmap: MappedWeightPaging::default(),
+            mmap_data_start: 0,
+            mmap_regions: 0,
         }
     }
 }

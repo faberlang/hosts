@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use faber::Valor;
 #[cfg(target_os = "macos")]
@@ -34,6 +35,231 @@ pub const E_METAL_UNSUPPORTED: &str = "E_METAL_UNSUPPORTED";
 pub const E_METAL_INVALID_HANDLE: &str = "E_METAL_INVALID_HANDLE";
 /// Driver-level failure after admission.
 pub const E_METAL_DRIVER: &str = "E_METAL_DRIVER";
+
+/// Read-only mmap of a GGUF (or any) weight file.
+///
+/// The mapping is `PROT_READ` / `MAP_SHARED`. Pages stay lazy until a CPU
+/// or GPU read; Metal no-copy buffers hold a clone of this handle so the
+/// mapping outlives every admitted region.
+#[derive(Clone, Debug)]
+pub struct MappedWeightFile {
+    inner: Arc<MappedWeightInner>,
+}
+
+#[derive(Debug)]
+struct MappedWeightInner {
+    ptr: *mut u8,
+    /// Logical file length (GGUF bytes).
+    file_len: usize,
+    /// Kernel mapping length (`page_ceil(file_len)`). The last page past
+    /// `file_len` is zero-filled.
+    mapped_len: usize,
+    page_size: usize,
+}
+
+unsafe impl Send for MappedWeightInner {}
+unsafe impl Sync for MappedWeightInner {}
+
+impl Drop for MappedWeightInner {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.mapped_len > 0 {
+            unsafe {
+                unix_mmap::munmap(self.ptr, self.mapped_len);
+            }
+        }
+    }
+}
+
+impl MappedWeightFile {
+    /// Map `path` read-only. Empty files fail closed.
+    pub fn open(path: &Path) -> HostResult<Self> {
+        unix_mmap::map_file(path)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.file_len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.file_len == 0
+    }
+
+    #[must_use]
+    pub fn page_size(&self) -> usize {
+        self.inner.page_size
+    }
+
+    #[must_use]
+    pub fn mapped_len(&self) -> usize {
+        self.inner.mapped_len
+    }
+
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.inner.ptr as *const u8
+    }
+
+    /// File bytes. Does not touch pages until the caller reads them.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.inner.ptr, self.inner.file_len) }
+    }
+
+    /// True when `[ptr, ptr+len)` sits inside this mapping, including the
+    /// last-page pad past `file_len`.
+    #[must_use]
+    pub fn contains(&self, ptr: *const u8, len: usize) -> bool {
+        let start = self.inner.ptr as usize;
+        let end = start.saturating_add(self.inner.mapped_len);
+        let p = ptr as usize;
+        let q = p.saturating_add(len);
+        p >= start && q >= p && q <= end
+    }
+}
+
+/// Host paging facts recorded on mmap admission (M5-U3 receipt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MappedWeightPaging {
+    pub page_size: u64,
+    pub mapped_len: u64,
+    pub file_len: u64,
+    /// Process resident bytes after the mmap syscall, before a GPU touch.
+    pub rss_bytes: u64,
+}
+
+/// Current process resident size. Zero when the host cannot sample it.
+#[must_use]
+pub fn process_resident_bytes() -> u64 {
+    unix_mmap::resident_bytes()
+}
+
+/// Host page size used for no-copy MTLBuffer rounding.
+#[must_use]
+pub fn mapped_page_size() -> usize {
+    unix_mmap::page_size()
+}
+
+mod unix_mmap {
+    use super::{HostError, HostResult, MappedWeightFile, MappedWeightInner};
+    use std::fs::File;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    const PROT_READ: i32 = 1;
+    const MAP_SHARED: i32 = 1;
+    #[cfg(target_os = "macos")]
+    const SC_PAGESIZE: i32 = 29;
+    #[cfg(not(target_os = "macos"))]
+    const SC_PAGESIZE: i32 = 30;
+
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        pub(super) fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn sysconf(name: i32) -> i64;
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+
+    #[repr(C)]
+    struct TimeVal {
+        tv_sec: i64,
+        tv_usec: i32,
+        _pad: i32,
+    }
+
+    #[repr(C)]
+    struct Rusage {
+        ru_utime: TimeVal,
+        ru_stime: TimeVal,
+        ru_maxrss: i64,
+        _rest: [i64; 14],
+    }
+
+    pub(super) fn page_size() -> usize {
+        let value = unsafe { sysconf(SC_PAGESIZE) };
+        if value > 0 {
+            value as usize
+        } else {
+            4096
+        }
+    }
+
+    pub(super) fn resident_bytes() -> u64 {
+        let mut usage = unsafe { std::mem::zeroed::<Rusage>() };
+        if unsafe { getrusage(0, &mut usage) } != 0 {
+            return 0;
+        }
+        let rss = usage.ru_maxrss;
+        if rss <= 0 {
+            return 0;
+        }
+        // Darwin documents ru_maxrss in bytes; Linux uses kilobytes.
+        #[cfg(target_os = "macos")]
+        {
+            rss as u64
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (rss as u64).saturating_mul(1024)
+        }
+    }
+
+    pub(super) fn map_file(path: &Path) -> HostResult<MappedWeightFile> {
+        let file = File::open(path).map_err(|error| {
+            HostError::invalid_args(format!(
+                "Metal mmap failed to open {}: {error}",
+                path.display()
+            ))
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|error| {
+                HostError::invalid_args(format!(
+                    "Metal mmap failed to stat {}: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        let file_len = usize::try_from(file_len).map_err(|_| {
+            HostError::invalid_args(format!(
+                "Metal mmap file {} is larger than the host address space",
+                path.display()
+            ))
+        })?;
+        if file_len == 0 {
+            return Err(HostError::invalid_args(format!(
+                "Metal mmap file {} is empty",
+                path.display()
+            )));
+        }
+        let page = page_size();
+        let mapped_len = file_len.div_ceil(page).saturating_mul(page).max(page);
+        #[cfg(unix)]
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            file.as_raw_fd()
+        };
+        #[cfg(not(unix))]
+        let fd: i32 = -1;
+        let ptr = unsafe { mmap(std::ptr::null_mut(), file_len, PROT_READ, MAP_SHARED, fd, 0) };
+        if ptr.is_null() || ptr == !0usize as *mut u8 {
+            return Err(HostError::internal(format!(
+                "Metal mmap of {} ({file_len} bytes) failed",
+                path.display()
+            )));
+        }
+        drop(file);
+        Ok(MappedWeightFile {
+            inner: Arc::new(MappedWeightInner {
+                ptr,
+                file_len,
+                mapped_len,
+                page_size: page,
+            }),
+        })
+    }
+}
 
 /// Default kernel entry for the legacy `launch_elementwise_add_f32` session
 /// path. Matches the emitted `add_one` entry of the U2 proof fixture
@@ -138,6 +364,9 @@ pub trait MetalDriver: Send {
     fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
         Vec::new()
     }
+    /// Keep a read-only weight mapping alive for no-copy MTLBuffer admission.
+    /// Fake drivers ignore it (they still memcpy into simulated storage).
+    fn retain_mapped_file(&mut self, _file: MappedWeightFile) {}
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
@@ -254,11 +483,21 @@ impl MetalHostSession {
         self.copy_in_packed_bytes(buffer, f32_slice_as_bytes(values))
     }
 
+    /// Keep a GGUF mmap alive for the session so packed-region `copy_in`
+    /// can wrap the mapped pages instead of uploading them.
+    pub fn retain_mapped_file(&mut self, file: MappedWeightFile) -> HostResult<()> {
+        self.require_admitted()?;
+        self.driver.retain_mapped_file(file);
+        Ok(())
+    }
+
     /// Admit a native packed region into a Metal buffer.
     ///
-    /// Packed bytes copy as-is. A 1–3 byte tail may be zero-padded so the
-    /// buffer's f32-word width matches; a shorter logical-F32 expansion is
-    /// not admitted.
+    /// Bytes that sit inside a retained mmap become a no-copy MTLBuffer
+    /// (page-rounded wrap; bind offset is the intra-page remainder). Other
+    /// bytes copy as-is. A 1–3 byte tail may be zero-padded so the buffer's
+    /// f32-word width matches; a shorter logical-F32 expansion is not
+    /// admitted.
     pub fn copy_in_packed_bytes(&mut self, buffer: MetalHandleId, bytes: &[u8]) -> HostResult<()> {
         self.require_admitted()?;
         let (token, len_bytes) = self.buffer_token(buffer)?;
@@ -271,9 +510,16 @@ impl MetalHostSession {
                 bytes.len()
             )));
         }
-        let mut padded = vec![0u8; len_bytes];
-        padded[..bytes.len()].copy_from_slice(bytes);
-        self.driver.copy_in(token, &padded)
+        // 1–3 byte short: mmap-backed slices wrap without padding so the
+        // pointer stays inside the mapping. Owned slices still pad.
+        match self.driver.copy_in(token, bytes) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let mut padded = vec![0u8; len_bytes];
+                padded[..bytes.len()].copy_from_slice(bytes);
+                self.driver.copy_in(token, &padded)
+            }
+        }
     }
 
     pub fn launch_elementwise_add_f32(
@@ -900,7 +1146,9 @@ struct SystemMetalDriver {
     device: Option<Device>,
     queue: Option<CommandQueue>,
     modules: BTreeMap<u64, MetalModule>,
-    buffers: BTreeMap<u64, Buffer>,
+    buffers: BTreeMap<u64, MetalBufferSlot>,
+    /// Read-only GGUF mappings that no-copy buffers reference.
+    maps: Vec<MappedWeightFile>,
     next_token: u64,
     /// Open command buffer for the current step. Created on the first
     /// encode; committed and waited at `sync` / readback flush.
@@ -932,6 +1180,17 @@ struct SystemMetalDriver {
 #[cfg(target_os = "macos")]
 struct MetalModule {
     pipelines: BTreeMap<String, ComputePipelineState>,
+}
+
+/// One Metal buffer plus the bind offset of the admitted region.
+///
+/// Ordinary allocs use offset 0. mmap wraps page-round the mapping and
+/// store the intra-page remainder here so `set_buffer` still names the
+/// tensor start. KV-B6 launch-binding offsets add on top of this remainder;
+/// they must not replace it.
+struct MetalBufferSlot {
+    buffer: Buffer,
+    region_offset: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -1006,19 +1265,53 @@ impl MetalDriver for SystemMetalDriver {
         let buffer = device.new_buffer(len_bytes as u64, MTLResourceOptions::StorageModeShared);
         let token = self.next_token;
         self.next_token += 1;
-        self.buffers.insert(token, buffer);
+        self.buffers.insert(
+            token,
+            MetalBufferSlot {
+                buffer,
+                region_offset: 0,
+            },
+        );
         Ok(token)
     }
 
     fn copy_in(&mut self, token: u64, bytes: &[u8]) -> HostResult<()> {
-        let buffer = self
+        if !self.buffers.contains_key(&token) {
+            return Err(metal_driver("copy_in: unknown buffer token"));
+        }
+        if let Some(wrap) = self.mmap_wrap_for(bytes) {
+            let device = self
+                .device
+                .as_ref()
+                .ok_or_else(|| metal_unavailable("SystemMetalDriver has no device"))?;
+            let buffer = device.new_buffer_with_bytes_no_copy(
+                wrap.ptr,
+                wrap.page_len as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            self.buffers.insert(
+                token,
+                MetalBufferSlot {
+                    buffer,
+                    region_offset: wrap.offset,
+                },
+            );
+            return Ok(());
+        }
+        let slot = self
             .buffers
             .get(&token)
             .ok_or_else(|| metal_driver("copy_in: unknown buffer token"))?;
-        if buffer.length() as usize != bytes.len() {
+        if slot.region_offset != 0 {
+            return Err(HostError::invalid_args(
+                "Metal mmap-backed region is read-only",
+            ));
+        }
+        if slot.buffer.length() as usize != bytes.len() {
             return Err(HostError::invalid_args("Metal copy_in size mismatch"));
         }
-        let destination = buffer.contents().cast::<u8>();
+        let destination = slot.buffer.contents().cast::<u8>();
         // Safe: the buffer length is exactly `bytes.len()` (checked above), and
         // shared-memory storage is host-accessible.
         unsafe {
@@ -1067,7 +1360,13 @@ impl MetalDriver for SystemMetalDriver {
         };
         let extent_token = self.next_token;
         self.next_token += 1;
-        self.buffers.insert(extent_token, extent_buffer);
+        self.buffers.insert(
+            extent_token,
+            MetalBufferSlot {
+                buffer: extent_buffer,
+                region_offset: 0,
+            },
+        );
 
         let result = self.launch_kernel(
             module,
@@ -1134,13 +1433,14 @@ impl MetalDriver for SystemMetalDriver {
         }
         // Retain buffer handles so the encoder bind does not borrow `self`.
         let mut bound = Vec::with_capacity(buffers.len());
+        let mut offsets = Vec::with_capacity(buffers.len());
         for token in buffers {
-            let buffer = self
+            let slot = self
                 .buffers
                 .get(token)
-                .ok_or_else(|| metal_driver("launch: unknown buffer token"))?
-                .clone();
-            bound.push(buffer);
+                .ok_or_else(|| metal_driver("launch: unknown buffer token"))?;
+            bound.push(slot.buffer.clone());
+            offsets.push(slot.region_offset);
         }
         if self.pending.is_none() {
             let queue = self
@@ -1183,8 +1483,11 @@ impl MetalDriver for SystemMetalDriver {
             command_buffer.new_compute_command_encoder()
         };
         encoder.set_compute_pipeline_state(&pipeline);
-        for (index, buffer) in bound.iter().enumerate() {
-            encoder.set_buffer(index as u64, Some(buffer), 0);
+        for (index, (buffer, offset)) in bound.iter().zip(offsets).enumerate() {
+            // Offset-zero caller path: `offset` is the mmap page remainder
+            // (0 for ordinary allocs). KV-B6 launch-binding offsets add on
+            // top of this remainder and must not replace it.
+            encoder.set_buffer(index as u64, Some(buffer), offset);
         }
         // Each threadgroup carries exactly one block now that the volume is
         // guaranteed to fit, so the grid needs no widening along x.
@@ -1204,21 +1507,28 @@ impl MetalDriver for SystemMetalDriver {
         // Coalesce readback behind the same step-boundary flush: if the
         // caller skipped `sync`, the pending buffer commits here once.
         self.commit_pending()?;
-        let buffer = self
+        let slot = self
             .buffers
             .get(&token)
             .ok_or_else(|| metal_driver("copy_out: unknown buffer token"))?;
-        if buffer.length() as usize != len_bytes {
-            return Err(HostError::internal("Metal copy_out size mismatch"));
+        let offset = slot.region_offset as usize;
+        let buffer_len = slot.buffer.length() as usize;
+        match offset.checked_add(len_bytes) {
+            Some(end) if end <= buffer_len => {}
+            _ => return Err(HostError::internal("Metal copy_out size mismatch")),
         }
         let mut output = vec![0u8; len_bytes];
-        let source = buffer.contents().cast::<u8>();
-        // Safe: the buffer length is exactly `len_bytes` (checked above), and
+        let source = slot.buffer.contents().cast::<u8>();
+        // Safe: `offset + len_bytes` fits the buffer (checked above), and
         // shared-memory storage is host-readable after the flush wait.
         unsafe {
-            std::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), len_bytes);
+            std::ptr::copy_nonoverlapping(source.add(offset), output.as_mut_ptr(), len_bytes);
         }
         Ok(output)
+    }
+
+    fn retain_mapped_file(&mut self, file: MappedWeightFile) {
+        self.maps.push(file);
     }
 
     fn free(&mut self, token: u64) -> HostResult<()> {
@@ -1245,7 +1555,54 @@ impl MetalDriver for SystemMetalDriver {
 }
 
 #[cfg(target_os = "macos")]
+struct MmapWrap {
+    ptr: *const std::ffi::c_void,
+    page_len: usize,
+    offset: u64,
+}
+
+#[cfg(target_os = "macos")]
 impl SystemMetalDriver {
+    /// Page-round a slice that sits inside a retained mapping so it can wrap
+    /// as `newBufferWithBytesNoCopy` (pointer and length page-aligned).
+    fn mmap_wrap_for(&self, bytes: &[u8]) -> Option<MmapWrap> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let ptr = bytes.as_ptr();
+        for mapped in &self.maps {
+            if !mapped.contains(ptr, bytes.len()) {
+                continue;
+            }
+            let page = mapped.page_size();
+            if page == 0 || !page.is_power_of_two() {
+                return None;
+            }
+            let addr = ptr as usize;
+            let page_addr = addr & !(page - 1);
+            let map_start = mapped.as_ptr() as usize;
+            let map_end = map_start.saturating_add(mapped.mapped_len());
+            if page_addr < map_start {
+                return None;
+            }
+            let offset = addr - page_addr;
+            // Cover the packed f32-word width (1–3 byte pad) so copy_out of
+            // the handle length still sits inside the no-copy buffer.
+            let region_len = bytes.len().div_ceil(4).saturating_mul(4).max(bytes.len());
+            let need = offset.saturating_add(region_len);
+            let page_len = need.div_ceil(page).saturating_mul(page);
+            if page_addr.saturating_add(page_len) > map_end {
+                return None;
+            }
+            return Some(MmapWrap {
+                ptr: page_addr as *const std::ffi::c_void,
+                page_len,
+                offset: offset as u64,
+            });
+        }
+        None
+    }
+
     fn ensure_timestamp_buffer(&mut self) -> bool {
         if self.timestamp_buffer.is_some() {
             return true;

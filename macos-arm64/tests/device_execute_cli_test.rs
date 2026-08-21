@@ -11,11 +11,13 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use faber_host_macos_arm64::device_execute::{
-    descriptor_from_json, descriptor_to_json, inputs_from_gguf, inputs_from_json, inputs_to_json,
-    parse_control_request, parse_device_execute_args, receipt_to_json, weight_map_from_json,
-    weight_map_to_json, DeviceExecuteControlVerb, DeviceExecuteReceipt, WeightFileRange,
+    descriptor_from_json, descriptor_to_json, gguf_region_table, inputs_from_gguf,
+    inputs_from_json, inputs_from_mapped_gguf, inputs_to_json, parse_control_request,
+    parse_device_execute_args, receipt_to_json, weight_map_from_json, weight_map_to_json,
+    DeviceExecuteControlVerb, DeviceExecuteReceipt, WeightFileRange,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
+use faber_host_macos_arm64::metal_host::MappedWeightFile;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde_json::Value;
@@ -444,6 +446,97 @@ fn wire_execute_on_fake_metal_returns_observation_outputs() {
     assert_eq!(parsed["backend"], "metal");
     assert_eq!(parsed["launches"], 1);
     assert_eq!(parsed["outputs"]["3"], Value::from(vec![4.0, 6.0]));
+}
+
+#[test]
+fn mmap_region_table_aliases_native_packed_words() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+    file.extend_from_slice(&1.0f32.to_le_bytes());
+    file.extend_from_slice(&2.0f32.to_le_bytes());
+    file.extend_from_slice(&u32::to_le_bytes(0xff81_0000));
+    let path = unique_temp("mmap-packed.bin");
+    fs::write(&path, &file).expect("write fixture");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    let map = BTreeMap::from([(
+        7,
+        WeightFileRange {
+            offset: 4,
+            len: 12,
+            elems: 3,
+        },
+    )]);
+    let table = gguf_region_table(mapped.bytes(), &map).expect("region table");
+    assert_eq!(table.data_start, 0, "non-GGUF fixture uses data_start 0");
+    assert_eq!(table.abs_starts, vec![4]);
+    assert_eq!(table.abs_ends, vec![16]);
+    let owned = inputs_from_gguf(&file, &map).expect("owned");
+    let aliased = inputs_from_mapped_gguf(&mapped, &map, &table).expect("mapped");
+    let values = aliased.map().get(&7).expect("buffer 7");
+    let owned_values = owned.get(&7).expect("owned 7");
+    assert_eq!(values.len(), owned_values.len());
+    for (left, right) in values.iter().zip(owned_values) {
+        assert_eq!(left.to_bits(), right.to_bits());
+    }
+    assert_eq!(values[2].to_bits(), 0xff81_0000);
+    drop(aliased);
+    drop(mapped);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn mmap_region_table_parses_gguf_data_start() {
+    let mut file = b"GGUF".to_vec();
+    file.extend_from_slice(&3u32.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes());
+    file.resize(32, 0);
+    file.extend_from_slice(&3.0f32.to_le_bytes());
+    let path = unique_temp("mmap-gguf.bin");
+    fs::write(&path, &file).expect("write gguf");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    let map = BTreeMap::from([(
+        1,
+        WeightFileRange {
+            offset: 32,
+            len: 4,
+            elems: 1,
+        },
+    )]);
+    let table = gguf_region_table(mapped.bytes(), &map).expect("region table");
+    assert_eq!(table.data_start, 32);
+    assert_eq!(table.abs_starts, vec![32]);
+    assert_eq!(table.abs_ends, vec![36]);
+    let aliased = inputs_from_mapped_gguf(&mapped, &map, &table).expect("mapped");
+    assert_eq!(aliased.map().get(&1), Some(&vec![3.0]));
+    drop(aliased);
+    drop(mapped);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn mmap_region_table_rejects_range_before_data_start() {
+    let mut file = b"GGUF".to_vec();
+    file.extend_from_slice(&3u32.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes());
+    file.resize(36, 0);
+    let map = BTreeMap::from([(
+        1,
+        WeightFileRange {
+            offset: 8,
+            len: 4,
+            elems: 1,
+        },
+    )]);
+    let err = gguf_region_table(&file, &map).expect_err("header range is not a data region");
+    assert!(err.message.contains("data_start"), "{}", err.message);
+}
+
+fn unique_temp(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("faber-m5-u3-{}-{name}", std::process::id()));
+    path
 }
 
 #[test]
