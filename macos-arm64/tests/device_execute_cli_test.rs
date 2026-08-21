@@ -176,7 +176,7 @@ fn parse_device_execute_args_accepts_weights_and_map() {
 }
 
 #[test]
-fn gguf_weight_map_copies_prefix_and_zero_pads() {
+fn gguf_weight_map_admits_native_packed_region() {
     let mut file = Vec::new();
     file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
     file.extend_from_slice(&1.0f32.to_le_bytes());
@@ -187,7 +187,7 @@ fn gguf_weight_map_copies_prefix_and_zero_pads() {
         WeightFileRange {
             offset: 4,
             len: 12,
-            elems: 4,
+            elems: 3,
         },
     )]);
     let json = weight_map_to_json(&map).expect("encode");
@@ -195,11 +195,29 @@ fn gguf_weight_map_copies_prefix_and_zero_pads() {
     assert_eq!(decoded, map);
     let inputs = inputs_from_gguf(&file, &map).expect("fill");
     let values = inputs.get(&7).expect("buffer 7");
-    assert_eq!(values.len(), 4);
+    assert_eq!(values.len(), 3);
     assert_eq!(values[0], 1.0);
     assert_eq!(values[1], 2.0);
     assert_eq!(values[2].to_bits(), 0xff81_0000);
-    assert_eq!(values[3], 0.0);
+}
+
+#[test]
+fn gguf_weight_map_rejects_logical_f32_padding() {
+    let file = vec![0u8; 12];
+    let map = BTreeMap::from([(
+        7,
+        WeightFileRange {
+            offset: 0,
+            len: 12,
+            elems: 4,
+        },
+    )]);
+    let err = inputs_from_gguf(&file, &map).expect_err("logical pad is not admitted");
+    assert!(
+        err.message.contains("native packed width"),
+        "{}",
+        err.message
+    );
 }
 
 #[test]
