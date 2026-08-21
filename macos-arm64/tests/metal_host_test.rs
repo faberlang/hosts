@@ -55,6 +55,10 @@ fn fake_driver_sequences_elementwise_add_without_product_label() {
 
     session.copy_in_f32(a, &[1.0, 2.0]).expect("copy a");
     session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
+    let packed = session.alloc_bytes(4).expect("alloc packed");
+    session
+        .copy_in_packed_bytes(packed, &[0x11, 0x22, 0x33])
+        .expect("packed-region 3-byte admit pads to 4");
     session
         .launch_elementwise_add_f32(module, a, b, out)
         .expect("launch");
