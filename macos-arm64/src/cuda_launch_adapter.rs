@@ -24,11 +24,14 @@
 //!    zero-filled at allocation (the host ZeroFill convention; the v2 sidecar
 //!    carries no initialization axis).
 //! 5. **Launch** — exactly one `launch_kernel_3d` call with the descriptor's
-//!    plan-driven grid/block. The plan facts (`tiled_matmul` `m/k/n` and
-//!    `workgroup_x/y`, `tree_reduction` `length`/`partials`/`workgroup_x`)
-//!    are cross-checked against the buffer contract and the launch geometry,
-//!    so a tampered descriptor cannot carry two conflicting launch
-//!    authorities (single launch authority).
+//!    plan-driven grid/block. The plan facts (`tiled_matmul` `m/k/n`/`tile`
+//!    and `workgroup_x/y`, `tree_reduction` `length`/`partials`/`workgroup_x`)
+//!    are cross-checked against the buffer contract and the launch geometry:
+//!    workgroup vs block, and grid vs the plan-derived workgroup count
+//!    (`tree_reduction` → `partials`; `tiled_matmul` →
+//!    `(ceil(N/tile), ceil(M/tile))`). A contradiction is named
+//!    `E_DEVICE_DESCRIPTOR` so a tampered descriptor cannot carry two
+//!    conflicting launch authorities (single launch authority).
 //! 6. **Sync** — the explicit step-boundary barrier after the launch.
 //! 7. **Read back** — `output` / `extra-output` buffers are read back as f32
 //!    rows; an optional numeric oracle (`|a−b| ≤ atol + rtol·|b|`) verifies
@@ -368,6 +371,7 @@ struct NvvmPlanJson {
     m: Option<u64>,
     k: Option<u64>,
     n: Option<u64>,
+    tile: Option<u32>,
     workgroup_x: Option<u32>,
     workgroup_y: Option<u32>,
     op: Option<String>,
@@ -381,6 +385,8 @@ struct NvvmPlanJson {
 /// - JSON structure / schema version / target tag / empty kernel list /
 ///   missing launch geometry / zero or `u32`-out-of-range grid/block axes →
 ///   `E_DEVICE_DESCRIPTOR`;
+/// - plan workgroup/grid facts contradicting launch geometry →
+///   `E_DEVICE_DESCRIPTOR` (single launch authority);
 /// - dtype outside the NVVM scalar family or a byte width contradicting it →
 ///   `E_DEVICE_DTYPE_MISMATCH`;
 /// - buffer count vs shape, cross-referenced counts, or plan count
@@ -589,7 +595,7 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
 
     // Plan identity: closed set only; the plan facts are the dispatch
     // authority and are cross-checked against the buffer contract and the
-    // launch geometry (single launch authority).
+    // launch geometry — block *and* grid (single launch authority).
     let plan_kind = match &kernel.plan {
         Some(plan) => {
             if !KNOWN_PLAN_KINDS.contains(&plan.kind.as_str()) {
@@ -604,9 +610,11 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     };
     if let Some(plan) = &kernel.plan {
         match plan.kind.as_str() {
-            "tiled_matmul" => validate_tiled_matmul_plan(plan, &buffers, &block, &kernel.entry)?,
+            "tiled_matmul" => {
+                validate_tiled_matmul_plan(plan, &buffers, &grid, &block, &kernel.entry)?
+            }
             "tree_reduction" => {
-                validate_tree_reduction_plan(plan, &buffers, &block, &kernel.entry)?
+                validate_tree_reduction_plan(plan, &buffers, &grid, &block, &kernel.entry)?
             }
             _ => {}
         }
@@ -638,11 +646,13 @@ fn launch_axis(value: u64, axis: &str, entry: &str) -> HostResult<u32> {
 
 /// Cross-check the `tiled_matmul` plan facts against the buffer contract and
 /// the launch geometry: positions 0/1/2 must be the `input` `M·K`,
-/// `extra-input` `K·N`, and `output` `M·N` buffers, and the plan's workgroup
-/// facts must agree with the launch workgroup (single launch authority).
+/// `extra-input` `K·N`, and `output` `M·N` buffers; the plan's workgroup
+/// facts must agree with the launch workgroup; and grid.x/y must equal
+/// `(ceil(N/tile), ceil(M/tile))` (single launch authority).
 fn validate_tiled_matmul_plan(
     plan: &NvvmPlanJson,
     buffers: &[NvvmLaunchBuffer],
+    grid: &[u32; 3],
     block: &[u32; 3],
     entry: &str,
 ) -> HostResult<()> {
@@ -659,6 +669,11 @@ fn validate_tiled_matmul_plan(
     let n = plan.n.ok_or_else(|| {
         errors::descriptor(format!(
             "nvvm descriptor plan tiled_matmul (kernel `{entry}`) is missing n"
+        ))
+    })?;
+    let tile = plan.tile.ok_or_else(|| {
+        errors::descriptor(format!(
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) is missing tile"
         ))
     })?;
     let (mk, kn, mn) = (
@@ -708,15 +723,18 @@ fn validate_tiled_matmul_plan(
         "tiled_matmul",
         entry,
     )?;
-    plan_workgroup_consistency(plan, block, entry)
+    plan_workgroup_consistency(plan, block, entry)?;
+    matmul_grid_consistency(m, n, tile, grid, entry)
 }
 
-/// Cross-check the `tree_reduction` plan facts against the buffer contract:
-/// positions 0/1 must be the `input` `length` and `output` `partials`
-/// buffers, with a known combination operator.
+/// Cross-check the `tree_reduction` plan facts against the buffer contract
+/// and the launch geometry: positions 0/1 must be the `input` `length` and
+/// `output` `partials` buffers, with a known combination operator, and
+/// `grid.x` must equal `partials` (single launch authority).
 fn validate_tree_reduction_plan(
     plan: &NvvmPlanJson,
     buffers: &[NvvmLaunchBuffer],
+    grid: &[u32; 3],
     block: &[u32; 3],
     entry: &str,
 ) -> HostResult<()> {
@@ -765,7 +783,17 @@ fn validate_tree_reduction_plan(
         "tree_reduction",
         entry,
     )?;
-    plan_workgroup_consistency(plan, block, entry)
+    plan_workgroup_consistency(plan, block, entry)?;
+    if u64::from(grid[0]) != partials {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan partials {partials} contradicts launch dispatch x {}",
+                grid[0]
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One position of a plan-shaped buffer contract: the role must match and the
@@ -804,21 +832,72 @@ fn plan_workgroup_consistency(
 ) -> HostResult<()> {
     if let Some(workgroup_x) = plan.workgroup_x {
         if workgroup_x != block[0] {
-            return Err(errors::descriptor(format!(
-                "nvvm descriptor kernel `{entry}` plan workgroup_x {workgroup_x} contradicts launch workgroup x {} (single launch authority)",
-                block[0]
-            )));
+            return Err(launch_authority_conflict(
+                entry,
+                format!(
+                    "plan workgroup_x {workgroup_x} contradicts launch workgroup x {}",
+                    block[0]
+                ),
+            ));
         }
     }
     if let Some(workgroup_y) = plan.workgroup_y {
         if workgroup_y != block[1] {
-            return Err(errors::descriptor(format!(
-                "nvvm descriptor kernel `{entry}` plan workgroup_y {workgroup_y} contradicts launch workgroup y {} (single launch authority)",
-                block[1]
-            )));
+            return Err(launch_authority_conflict(
+                entry,
+                format!(
+                    "plan workgroup_y {workgroup_y} contradicts launch workgroup y {}",
+                    block[1]
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+/// `tiled_matmul` grid.x/y must equal `(ceil(N/tile), ceil(M/tile))`.
+fn matmul_grid_consistency(
+    m: u64,
+    n: u64,
+    tile: u32,
+    grid: &[u32; 3],
+    entry: &str,
+) -> HostResult<()> {
+    if tile == 0 {
+        return Err(errors::descriptor(format!(
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) has a zero tile"
+        )));
+    }
+    let expected_x_u64 = n.div_ceil(u64::from(tile));
+    let expected_y_u64 = m.div_ceil(u64::from(tile));
+    let expected_x = u32::try_from(expected_x_u64).map_err(|_| {
+        errors::descriptor(format!(
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid x {expected_x_u64} does not fit u32"
+        ))
+    })?;
+    let expected_y = u32::try_from(expected_y_u64).map_err(|_| {
+        errors::descriptor(format!(
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid y {expected_y_u64} does not fit u32"
+        ))
+    })?;
+    if grid[0] != expected_x || grid[1] != expected_y {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan tile grid ({expected_x}, {expected_y}) contradicts launch dispatch ({}, {})",
+                grid[0], grid[1]
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Named `E_DEVICE_DESCRIPTOR` rejection when plan facts disagree with the
+/// launch geometry the adapter would dispatch.
+fn launch_authority_conflict(entry: &str, detail: impl std::fmt::Display) -> HostError {
+    errors::descriptor(format!(
+        "nvvm descriptor kernel `{entry}` {detail} (single launch authority)"
+    ))
 }
 
 /// Launch one validated plan on a session with the given PTX bytes and host

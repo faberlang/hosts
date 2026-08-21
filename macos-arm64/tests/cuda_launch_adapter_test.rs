@@ -292,6 +292,80 @@ fn parse_rejects_matmul_plan_launch_authority_conflict() {
     );
 }
 
+/// F1.1 tree-reduction sidecar: stored length 8192, 256-wide workgroups,
+/// 32 partials. `dispatch.x` is the caller-supplied grid axis.
+fn tree_reduction_f11_descriptor(dispatch_x: u64) -> String {
+    format!(
+        r#"{{"schema_version": 2, "target": "llvm-nvvm",
+      "kernels": [ {{ "entry": "reduce_sum", "element_type": "f32", "element_byte_width": 4,
+                     "element_count": 8192, "element_counts": [8192, 32], "input_buffers": 1,
+                     "output_buffers": 1, "accumulation_buffers": 0,
+                     "buffers": [ {{ "role": "input", "binding": 0, "element_count": 8192,
+                     "shape": [8192] }}, {{ "role": "output", "binding": 1, "element_count": 32,
+                     "shape": [32] }} ],
+                     "launch": {{ "workgroup": {{ "x": 256, "y": 1, "z": 1 }},
+                     "dispatch": {{ "x": {dispatch_x}, "y": 1, "z": 1 }} }},
+                     "plan": {{ "kind": "tree_reduction", "op": "sum", "length": 8192,
+                     "partials": 32, "workgroup_x": 256 }} }} ] }}"#
+    )
+}
+
+#[test]
+fn parse_rejects_reduction_f11_grid_authority_conflict() {
+    // F1.1: dispatch.x copies the stored length (8192) instead of partials
+    // (32). The adapter must reject the contradiction by named
+    // E_DEVICE_DESCRIPTOR — not launch 8192 blocks.
+    let descriptor = tree_reduction_f11_descriptor(8192);
+    let err = parse_descriptor(descriptor.as_bytes())
+        .expect_err("F1.1 dispatch.x=8192 vs partials=32 must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        err.message.contains("single launch authority"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("8192"), "{}", err.message);
+    assert!(err.message.contains("32"), "{}", err.message);
+}
+
+#[test]
+fn parse_accepts_reduction_plan_with_partials_grid() {
+    // Valid plan: grid.x == partials == 32, the launch the adapter must
+    // dispatch (32 blocks × 256 threads, not 8192).
+    let plan = parse_descriptor(tree_reduction_f11_descriptor(32).as_bytes())
+        .expect("grid.x == partials is a valid tree_reduction launch");
+    assert_eq!(plan.entry, "reduce_sum");
+    assert_eq!(plan.plan_kind.as_deref(), Some("tree_reduction"));
+    assert_eq!(plan.grid, [32, 1, 1], "valid plan launches 32 blocks");
+    assert_eq!(plan.block, [256, 1, 1]);
+}
+
+#[test]
+fn parse_rejects_matmul_plan_grid_authority_conflict() {
+    // Rung-0 M=2,N=2,tile=8 → expected grid (ceil(2/8), ceil(2/8)) = (1,1).
+    // A 2×2 dispatch contradicts the plan-derived tile grid.
+    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+      "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
+                     "element_count": 6, "element_counts": [6, 6, 4], "input_buffers": 2,
+                     "output_buffers": 1, "accumulation_buffers": 0,
+                     "buffers": [ { "role": "input", "binding": 0, "element_count": 6,
+                     "shape": [2, 3] }, { "role": "extra-input", "binding": 1,
+                     "element_count": 6, "shape": [3, 2] }, { "role": "output",
+                     "binding": 2, "element_count": 4, "shape": [2, 2] } ],
+                     "launch": { "workgroup": { "x": 8, "y": 8, "z": 1 },
+                     "dispatch": { "x": 2, "y": 2, "z": 1 } },
+                     "plan": { "kind": "tiled_matmul", "m": 2, "k": 3, "n": 2,
+                     "tile": 8, "workgroup_x": 8, "workgroup_y": 8 } } ] }"#;
+    let err = parse_descriptor(descriptor)
+        .expect_err("tiled_matmul grid must match ceil(n/tile)×ceil(m/tile)");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        err.message.contains("single launch authority"),
+        "{}",
+        err.message
+    );
+}
+
 #[test]
 fn parse_rejects_unknown_plan_kind() {
     let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
