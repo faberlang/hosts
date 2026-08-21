@@ -1,6 +1,6 @@
 # GOAL: device-session-byte-surface — dtype-tagged bytes both directions; packed weights reach every backend
 
-**Status**: planned — pre-implementation; drafted 2026-08-21 from campaign evidence F3.2; not lowered
+**Status**: active — all 4 units landed (DSB-1 9f21984, DSB-2 199bb67, DSB-3 563ea2b, DSB-4b 4774bcc); closeout audit 111e7de7 verdict residual: P2 zero-copy mmap admission unreachable on CLI weight path (upload clones before copy_in; repair dispatched) + P2 stale ledger (this flip). Neutrality/capability-gating/F4H2 survival/tail rejection/mapping all verified clean
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.2, parent-verified)
@@ -83,10 +83,10 @@ f32/f64/i32/i64/u8) cannot even name f16/bf16 that `DtypeSurface`
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | trait + metal |
-| 2 | pending | — | — | cuda bytes |
-| 3 | pending | — | — | dtype vocab |
-| 4 | pending | — | — | neutral upload |
+| 1 | done | 2bbf9903 | 9f21984 | neutral trait byte surface + Metal fold; transitional CUDA |
+| 2 | done | 17e8460e | 199bb67 | CUDA raw-byte H2D/D2H; dtype-width tail rejection named |
+| 3 | done | 078d7322 | 563ea2b | DeviceDataType F16/BF16 + discriminant mapping (BF16 slotless documented) |
+| 4 | done | 63b94a3b (rescope 4b) | 4774bcc | packed uploads both backends through session buffers; capability-gated retention; boundary stop honored then Mind-extended |
 
 ## Open questions
 
