@@ -181,6 +181,11 @@ fn malformed_cursor_facts_fail_before_projection() {
     let error = project_invocation_bindings(&descriptor, &missing_token, &[], ROPE)
         .expect_err("scalar decode must have one token row");
     assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error.message.contains("token row"),
+        "missing scalar token must fail closed before projection, got {}",
+        error.message
+    );
 
     let mismatched_after = decode_invocation(Some(9), 3, 3, 9);
     let error = project_invocation_bindings(&descriptor, &mismatched_after, &[], ROPE)

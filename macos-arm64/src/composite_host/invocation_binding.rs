@@ -108,7 +108,10 @@ pub fn project_invocation_bindings(
     let token_values = match invocation.mode {
         DeviceExecuteInvocationMode::Prefill => encode_ids(prompt_tokens),
         DeviceExecuteInvocationMode::ScalarDecode => {
-            encode_ids(&[invocation.token.expect("validated scalar token")])
+            let token = invocation
+                .token
+                .ok_or_else(|| invalid_args("scalar decode projection requires one token row"))?;
+            encode_ids(&[token])
         }
     };
     insert_checked(
@@ -224,15 +227,16 @@ where
     let mut specs = BTreeMap::new();
     for kernel in &descriptor.kernels {
         for slot in &kernel.buffers {
-            if slot.role != DeviceBufferRole::Input || !required.contains(slot.buffer_name.as_str())
-            {
+            if slot.role != DeviceBufferRole::Input {
                 continue;
             }
-            let name = required
+            let Some(name) = required
                 .iter()
                 .copied()
                 .find(|name| *name == slot.buffer_name)
-                .expect("required name was checked above");
+            else {
+                continue;
+            };
             let next = InputSpec {
                 buffer_id: slot.buffer_id,
                 element_count: slot.element_count,

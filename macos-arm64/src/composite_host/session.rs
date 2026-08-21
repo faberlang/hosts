@@ -46,9 +46,9 @@ impl IntermediateBufferPool {
     }
 
     fn return_buffer(&mut self, key: BufferKey, handle: DeviceHandle) {
-        let previous = self.buffers.insert(key, handle);
-        debug_assert!(previous.is_none(), "pool keys are unique per session");
-        let _ = previous;
+        if self.buffers.insert(key, handle).is_some() {
+            debug_assert!(false, "pool keys are unique per session");
+        }
     }
 
     fn values(&self) -> impl Iterator<Item = &DeviceHandle> {

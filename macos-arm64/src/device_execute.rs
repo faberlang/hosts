@@ -1753,15 +1753,24 @@ fn parse_hex_bytes(spelling: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err(format!("hex payload `{spelling}` is not whole bytes"));
     }
-    if !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(format!("hex payload `{spelling}` is not hex"));
-    }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for chunk in hex.as_bytes().chunks_exact(2) {
-        let text = std::str::from_utf8(chunk).expect("ascii hex digits");
-        bytes.push(u8::from_str_radix(text, 16).expect("ascii hex digits"));
+        let high =
+            hex_digit(chunk[0]).ok_or_else(|| format!("hex payload `{spelling}` is not hex"))?;
+        let low =
+            hex_digit(chunk[1]).ok_or_else(|| format!("hex payload `{spelling}` is not hex"))?;
+        bytes.push((high << 4) | low);
     }
     Ok(bytes)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Encode a receipt for stdout.
