@@ -371,9 +371,10 @@ fn copy_resident_inputs(
                 meta.element_count
             )));
         }
-        let handle = buffers.get(key).copied().ok_or_else(|| {
-            HostError::internal("session input buffer disappeared")
-        })?;
+        let handle = buffers
+            .get(key)
+            .copied()
+            .ok_or_else(|| HostError::internal("session input buffer disappeared"))?;
         runtime.copy_in_f32(&handle, values)?;
         copies += 1;
     }
@@ -1137,12 +1138,8 @@ impl<'host> ProgramSession<'host> {
         // SingleRun still copies per kernel; OnceInit copies nothing.
         if mode == CopyMode::ResidentStep {
             let copy_started = Instant::now();
-            copy_ins = copy_resident_inputs(
-                self.runtime,
-                &self.buffers,
-                &self.buffer_meta,
-                inputs,
-            )?;
+            copy_ins =
+                copy_resident_inputs(self.runtime, &self.buffers, &self.buffer_meta, inputs)?;
             copy_in_us = elapsed_us(copy_started);
         }
 
@@ -1204,6 +1201,7 @@ impl<'host> ProgramSession<'host> {
         self.runtime.sync()?;
         let gpu_encode_submit_wait_us = encode_us.saturating_add(elapsed_us(submit_started));
         let launch_gpu_us = self.runtime.take_encoder_gpu_us();
+        let launch_gpu_start_us = self.runtime.take_encoder_gpu_start_us();
 
         // Observation-only readback (F6): read back exactly the DECLARED
         // observation points — the result rows projected from the
@@ -1339,6 +1337,7 @@ impl<'host> ProgramSession<'host> {
             gpu_encode_submit_wait_us,
             readback_us,
             launch_gpu_us,
+            launch_gpu_start_us,
         })
     }
 
