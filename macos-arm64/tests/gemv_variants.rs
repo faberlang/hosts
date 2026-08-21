@@ -180,6 +180,46 @@ fn transformer_projection_entries_select_the_same_decode_gemv() {
 }
 
 #[test]
+fn dispatch_gemv_format_table_matches_block_value_oracle() {
+    let cases = [
+        (QuantizedFormat::Q4K, 256, q4_k_ones_block(), 256.0f32),
+        (
+            QuantizedFormat::Q5_0,
+            32,
+            q5_0_negative_fifteen_block(),
+            -480.0,
+        ),
+        (
+            QuantizedFormat::Q6K,
+            256,
+            q6_k_negative_thirty_one_block(),
+            -7936.0,
+        ),
+        (QuantizedFormat::Q8_0, 32, q8_0_ramp_block(), 496.0),
+    ];
+    for (format, k, block, expected) in cases {
+        let bind = QuantizedGemvBind::decode(k * 2, 1, format, [1, 1, 1]);
+        let packed = [block.as_slice(), block.as_slice()].concat();
+        let activation = vec![1.0f32; (k * 2) as usize];
+        let mut output = vec![0.0f32; 1];
+        dispatch_gemv(
+            GemvKernel::Quantized,
+            &bind,
+            &activation,
+            &packed,
+            &mut output,
+        )
+        .unwrap_or_else(|error| panic!("{} two-block GEMV failed: {error}", format.spelling()));
+        assert_eq!(
+            output[0],
+            expected * 2.0,
+            "{} two-block output",
+            format.spelling()
+        );
+    }
+}
+
+#[test]
 fn gemv_format_resolves_from_packed_ggml_type_id() {
     assert_eq!(
         QuantizedFormat::from_ggml_type_id(12),

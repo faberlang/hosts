@@ -889,17 +889,49 @@ fn simdgroup_reduce(mut lanes: [f32; SIMDGROUP_WIDTH]) -> f32 {
 
 /// Fused quantized GEMV for an M=1 decode projection.
 ///
-/// The activation is f32 and the right operand remains packed.  Each
-/// simdgroup lane accumulates its strided K slice, then the lane partials are
-/// reduced in f32.  Dequantization happens at the exact packed block load,
-/// matching the R-PACK-02 tiled GEMM bodies while avoiding a separate
-/// dequantization launch or a whole-matrix f32 expansion.
+/// Routes through [`dispatch_gemv`]'s per-format table.  Each specialized
+/// body streams one packed block at a time (header in registers, coalesced
+/// qs), then reduces 32 simdgroup lanes.  Dequant matches the R-PACK-02
+/// formulas; the body never expands a whole f32 weight matrix.
 pub fn quantized_gemv(
     bind: &QuantizedGemvBind,
     activation: &[f32],
     packed_weight: &[u8],
     output: &mut [f32],
 ) -> Result<(), KernelBodyError> {
+    dispatch_gemv(
+        GemvKernel::Quantized,
+        bind,
+        activation,
+        packed_weight,
+        output,
+    )
+}
+
+/// Dispatch key for a plan-selected decode GEMV body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemvKernel {
+    /// Per-format packed dequant fused with the GEMV reduction.
+    Quantized,
+}
+
+struct GemvBuffers<'a> {
+    k: usize,
+    n: usize,
+    input_stride: usize,
+    output_stride: usize,
+    column_stride: usize,
+    activation: &'a [f32],
+    packed_weight: &'a [u8],
+    output: &'a mut [f32],
+}
+
+fn prepare_gemv_buffers<'a>(
+    bind: &QuantizedGemvBind,
+    activation: &'a [f32],
+    packed_weight: &'a [u8],
+    output: &'a mut [f32],
+) -> Result<GemvBuffers<'a>, KernelBodyError> {
     bind.validate()?;
     let input_span = checked_usize(bind.input_span())?;
     let output_span = checked_usize(bind.output_span())?;
@@ -925,66 +957,24 @@ pub fn quantized_gemv(
             actual: packed_weight.len(),
         });
     }
-
-    let k = checked_usize(bind.k)?;
-    let n = checked_usize(bind.n)?;
-    let input_stride = checked_usize(bind.input_stride)?;
-    let output_stride = checked_usize(bind.output_stride)?;
-    let column_stride = checked_usize(bind.packed_column_stride_bytes)?;
-    let block_elements = checked_usize(bind.format.block_elements())?;
-    let block_bytes = checked_usize(bind.format.block_bytes())?;
-
-    for column in 0..n {
-        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
-        for lane in 0..SIMDGROUP_WIDTH {
-            let mut index = lane;
-            while index < k {
-                let block_index = index / block_elements;
-                let element = index % block_elements;
-                let block_start = column
-                    .checked_mul(column_stride)
-                    .and_then(|column_start| {
-                        block_index
-                            .checked_mul(block_bytes)
-                            .and_then(|block_offset| column_start.checked_add(block_offset))
-                    })
-                    .ok_or(KernelBodyError::InvalidBind(
-                        "quantized GEMV packed byte index overflow",
-                    ))?;
-                let weight = block_value(
-                    bind.format,
-                    &packed_weight[block_start..block_start + block_bytes],
-                    element,
-                )?;
-                let input_index =
-                    index
-                        .checked_mul(input_stride)
-                        .ok_or(KernelBodyError::InvalidBind(
-                            "quantized GEMV input index overflow",
-                        ))?;
-                lane_sums[lane] += activation[input_index] * weight;
-                index += SIMDGROUP_WIDTH;
-            }
-        }
-        let output_index =
-            column
-                .checked_mul(output_stride)
-                .ok_or(KernelBodyError::InvalidBind(
-                    "quantized GEMV output index overflow",
-                ))?;
-        output[output_index] = simdgroup_reduce(lane_sums);
-    }
-    Ok(())
-}
-
-/// Dispatch key for a plan-selected decode GEMV body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemvKernel {
-    /// Per-format packed dequant fused with the GEMV reduction.
-    Quantized,
+    Ok(GemvBuffers {
+        k: checked_usize(bind.k)?,
+        n: checked_usize(bind.n)?,
+        input_stride: checked_usize(bind.input_stride)?,
+        output_stride: checked_usize(bind.output_stride)?,
+        column_stride: checked_usize(bind.packed_column_stride_bytes)?,
+        activation,
+        packed_weight,
+        output,
+    })
 }
 
 /// Dispatch a plan-selected decode GEMV body.
+///
+/// The format table is the specialization surface: Q4_K / Q5_0 / Q6_K /
+/// Q8_0 (and Q5_K, retained from R-PACK-02) each own a block-streaming
+/// body.  Lane mapping stays 32-wide so the f32 reduction order matches
+/// the previous generic simdgroup loop.
 pub fn dispatch_gemv(
     kernel: GemvKernel,
     bind: &QuantizedGemvBind,
@@ -993,8 +983,162 @@ pub fn dispatch_gemv(
     output: &mut [f32],
 ) -> Result<(), KernelBodyError> {
     match kernel {
-        GemvKernel::Quantized => quantized_gemv(bind, activation, packed_weight, output),
+        GemvKernel::Quantized => {
+            let mut buffers = prepare_gemv_buffers(bind, activation, packed_weight, output)?;
+            match bind.format {
+                QuantizedFormat::Q4K => gemv_q4_k(&mut buffers),
+                QuantizedFormat::Q5_0 => gemv_q5_0(&mut buffers),
+                QuantizedFormat::Q5K => gemv_q5_k(&mut buffers),
+                QuantizedFormat::Q6K => gemv_q6_k(&mut buffers),
+                QuantizedFormat::Q8_0 => gemv_q8_0(&mut buffers),
+            }
+        }
     }
+}
+
+fn gemv_q8_0(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
+    let blocks = buffers.k / 32;
+    for column in 0..buffers.n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        let col_start = column * buffers.column_stride;
+        for ib in 0..blocks {
+            let base = col_start + ib * 34;
+            let block = &buffers.packed_weight[base..base + 34];
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let k_base = ib * 32;
+            for lane in 0..SIMDGROUP_WIDTH {
+                let q = i8::from_ne_bytes([block[2 + lane]]) as f32;
+                lane_sums[lane] +=
+                    buffers.activation[(k_base + lane) * buffers.input_stride] * (d * q);
+            }
+        }
+        buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
+}
+
+fn gemv_q5_0(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
+    let blocks = buffers.k / 32;
+    for column in 0..buffers.n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        let col_start = column * buffers.column_stride;
+        for ib in 0..blocks {
+            let base = col_start + ib * 22;
+            let block = &buffers.packed_weight[base..base + 22];
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+            let k_base = ib * 32;
+            for lane in 0..SIMDGROUP_WIDTH {
+                let pair = lane % 16;
+                let q = block[6 + pair];
+                let high = if lane < 16 {
+                    ((qh >> pair) << 4) & 0x10
+                } else {
+                    (qh >> (pair + 12)) & 0x10
+                };
+                let nibble = if lane < 16 { q & 0x0f } else { q >> 4 };
+                let weight = (f32::from((nibble | high as u8) as i8) - 16.0) * d;
+                lane_sums[lane] +=
+                    buffers.activation[(k_base + lane) * buffers.input_stride] * weight;
+            }
+        }
+        buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
+}
+
+fn gemv_q4_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
+    let blocks = buffers.k / 256;
+    for column in 0..buffers.n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        let col_start = column * buffers.column_stride;
+        for ib in 0..blocks {
+            let base = col_start + ib * 144;
+            let block = &buffers.packed_weight[base..base + 144];
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = half_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..16];
+            let k_base = ib * 256;
+            for lane in 0..SIMDGROUP_WIDTH {
+                for group in 0..8 {
+                    let (scale, min) = get_scale_min_k4(group, scales);
+                    let qs = block[16 + (group / 2) * 32 + lane];
+                    let nibble = if group % 2 == 0 { qs & 0x0f } else { qs >> 4 };
+                    let weight =
+                        d * f32::from(scale) * f32::from(nibble) - dmin * f32::from(min);
+                    let index = k_base + group * 32 + lane;
+                    lane_sums[lane] += buffers.activation[index * buffers.input_stride] * weight;
+                }
+            }
+        }
+        buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
+}
+
+fn gemv_q5_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
+    let blocks = buffers.k / 256;
+    for column in 0..buffers.n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        let col_start = column * buffers.column_stride;
+        for ib in 0..blocks {
+            let base = col_start + ib * 176;
+            let block = &buffers.packed_weight[base..base + 176];
+            let k_base = ib * 256;
+            for lane in 0..SIMDGROUP_WIDTH {
+                for group in 0..8 {
+                    let element = group * 32 + lane;
+                    let weight = block_value(QuantizedFormat::Q5K, block, element)?;
+                    lane_sums[lane] +=
+                        buffers.activation[(k_base + element) * buffers.input_stride] * weight;
+                }
+            }
+        }
+        buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
+}
+
+fn gemv_q6_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
+    let blocks = buffers.k / 256;
+    for column in 0..buffers.n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        let col_start = column * buffers.column_stride;
+        for ib in 0..blocks {
+            let base = col_start + ib * 210;
+            let block = &buffers.packed_weight[base..base + 210];
+            let d = half_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let k_base = ib * 256;
+            for lane in 0..SIMDGROUP_WIDTH {
+                for group in 0..8 {
+                    let element = group * 32 + lane;
+                    let half = (element / 128) * 128;
+                    let remainder = element % 128;
+                    let q_lane = remainder / 32;
+                    let l = remainder % 32;
+                    let scale_index = half / 16 + l / 16;
+                    let ql_offset = half / 2;
+                    let qh_offset = half / 4;
+                    let ql0 = block[ql_offset + l];
+                    let ql1 = block[ql_offset + l + 32];
+                    let qh = block[128 + qh_offset + l];
+                    let (q, scale_slot) = match q_lane {
+                        0 => ((ql0 & 0x0f) | ((qh & 3) << 4), scale_index),
+                        1 => ((ql1 & 0x0f) | (((qh >> 2) & 3) << 4), scale_index + 2),
+                        2 => ((ql0 >> 4) | (((qh >> 4) & 3) << 4), scale_index + 4),
+                        3 => ((ql1 >> 4) | (((qh >> 6) & 3) << 4), scale_index + 6),
+                        _ => unreachable!("Q6_K lane is bounded by 256-element blocks"),
+                    };
+                    let scale = i8::from_ne_bytes([block[192 + scale_slot]]) as f32;
+                    let weight = d * scale * (i32::from(q) - 32) as f32;
+                    lane_sums[lane] +=
+                        buffers.activation[(k_base + element) * buffers.input_stride] * weight;
+                }
+            }
+        }
+        buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
 }
 
 /// Select the decode GEMV library body from executor-plan facts.
