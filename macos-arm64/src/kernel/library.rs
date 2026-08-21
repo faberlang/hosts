@@ -166,6 +166,197 @@ fn row_major_strides(dims: &[u64]) -> Vec<u64> {
     strides
 }
 
+/// Quantized packed-weight format supported by the decode GEMV library.
+///
+/// The byte layout and block arithmetic mirror the R-PACK-02 Metal bodies.
+/// A GEMV dequantizes one block at the load that consumes it; it never builds
+/// a whole f32 weight matrix.  `Q5_K` is retained here because it is an
+/// admitted R-PACK-02 format even though the two dense reference rungs use
+/// `Q4_K`, `Q5_0`, `Q6_K`, and `Q8_0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizedFormat {
+    /// GGML Q4_K: 256 elements in a 144-byte superblock.
+    Q4K,
+    /// GGML Q5_0: 32 elements in a 22-byte block.
+    Q5_0,
+    /// GGML Q5_K: 256 elements in a 176-byte superblock.
+    Q5K,
+    /// GGML Q6_K: 256 elements in a 210-byte superblock.
+    Q6K,
+    /// GGML Q8_0: 32 elements in a 34-byte block.
+    Q8_0,
+}
+
+impl QuantizedFormat {
+    /// Logical elements covered by one packed block.
+    #[must_use]
+    pub const fn block_elements(self) -> u64 {
+        match self {
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Q5_0 | Self::Q8_0 => 32,
+        }
+    }
+
+    /// Packed bytes occupied by one block.
+    #[must_use]
+    pub const fn block_bytes(self) -> u64 {
+        match self {
+            Self::Q4K => 144,
+            Self::Q5_0 => 22,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            Self::Q8_0 => 34,
+        }
+    }
+
+    /// Canonical GGML spelling used in receipts and diagnostics.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Q4K => "Q4_K",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8_0 => "Q8_0",
+        }
+    }
+}
+
+/// Bind facts for one sequence-length-one quantized projection.
+///
+/// Packed columns use the R-PACK-02 layout: column `n` owns
+/// `ceil(k / block_elements) * block_bytes` bytes, and each block is decoded
+/// at use.  Strides are explicit so a plan can bind views without baking in
+/// model-specific dimensions or contiguous storage assumptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantizedGemvBind {
+    /// Contracted activation width.
+    pub k: u64,
+    /// Projection output width.
+    pub n: u64,
+    /// Physical stride between activation elements.
+    pub input_stride: u64,
+    /// Physical stride between output elements.
+    pub output_stride: u64,
+    /// Physical byte stride between packed weight columns.
+    pub packed_column_stride_bytes: u64,
+    /// Packed weight format.
+    pub format: QuantizedFormat,
+    /// Backend-neutral dispatch grid carried into the plan record.
+    pub grid: [u32; 3],
+}
+
+impl QuantizedGemvBind {
+    /// Construct a contiguous M=1 decode bind.
+    #[must_use]
+    pub fn decode(k: u64, n: u64, format: QuantizedFormat, grid: [u32; 3]) -> Self {
+        let blocks = k.div_ceil(format.block_elements());
+        Self {
+            k,
+            n,
+            input_stride: 1,
+            output_stride: 1,
+            packed_column_stride_bytes: blocks.saturating_mul(format.block_bytes()),
+            format,
+            grid,
+        }
+    }
+
+    /// Construct a decode bind over strided activation/output views.
+    #[must_use]
+    pub fn strided(
+        k: u64,
+        n: u64,
+        input_stride: u64,
+        output_stride: u64,
+        packed_column_stride_bytes: u64,
+        format: QuantizedFormat,
+        grid: [u32; 3],
+    ) -> Self {
+        Self {
+            k,
+            n,
+            input_stride,
+            output_stride,
+            packed_column_stride_bytes,
+            format,
+            grid,
+        }
+    }
+
+    /// Validate all bind facts before a body reads or writes a buffer.
+    pub fn validate(&self) -> Result<(), KernelBodyError> {
+        if self.k == 0 || self.n == 0 {
+            return Err(KernelBodyError::InvalidBind(
+                "quantized GEMV has a zero dimension",
+            ));
+        }
+        if self.input_stride == 0 || self.output_stride == 0 || self.packed_column_stride_bytes == 0
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "quantized GEMV has a zero stride",
+            ));
+        }
+        if self.grid.iter().any(|axis| *axis == 0) {
+            return Err(KernelBodyError::InvalidBind(
+                "quantized GEMV has a zero dispatch axis",
+            ));
+        }
+        let block_elements = self.format.block_elements();
+        if !self.k.is_multiple_of(block_elements) {
+            return Err(KernelBodyError::InvalidBind(
+                "quantized GEMV K is not block aligned",
+            ));
+        }
+        let blocks_per_column = self.k / block_elements;
+        let minimum_column_bytes = blocks_per_column
+            .checked_mul(self.format.block_bytes())
+            .ok_or(KernelBodyError::InvalidBind(
+                "quantized GEMV packed column span overflow",
+            ))?;
+        if self.packed_column_stride_bytes < minimum_column_bytes {
+            return Err(KernelBodyError::InvalidBind(
+                "quantized GEMV packed column stride is too small",
+            ));
+        }
+        self.k
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(self.input_stride))
+            .and_then(|last| last.checked_add(1))
+            .ok_or(KernelBodyError::InvalidBind(
+                "quantized GEMV input span overflow",
+            ))?;
+        self.n
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(self.output_stride))
+            .and_then(|last| last.checked_add(1))
+            .ok_or(KernelBodyError::InvalidBind(
+                "quantized GEMV output span overflow",
+            ))?;
+        self.n
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(self.packed_column_stride_bytes))
+            .and_then(|last| last.checked_add(minimum_column_bytes))
+            .ok_or(KernelBodyError::InvalidBind(
+                "quantized GEMV weight span overflow",
+            ))?;
+        Ok(())
+    }
+
+    fn input_span(self) -> u64 {
+        1 + (self.k - 1) * self.input_stride
+    }
+
+    fn output_span(self) -> u64 {
+        1 + (self.n - 1) * self.output_stride
+    }
+
+    fn weight_span(self) -> u64 {
+        (self.n - 1) * self.packed_column_stride_bytes
+            + (self.k / self.format.block_elements()) * self.format.block_bytes()
+    }
+}
+
 /// Layout family for the fused attention library body.
 ///
 /// `Grouped` is the canonical `[kv_group, q_head, query, head_dim]` query and
@@ -400,6 +591,15 @@ pub enum KernelBodyError {
     InvalidEpsilon,
     /// RoPE tables do not match the bound row and pair dimensions.
     InvalidRopeTable,
+    /// A packed weight block is shorter than its format requires.
+    PackedBlockTooShort {
+        /// Canonical packed format spelling.
+        format: &'static str,
+        /// Required bytes for one block.
+        required: usize,
+        /// Supplied bytes available to the block decoder.
+        actual: usize,
+    },
 }
 
 impl std::fmt::Display for KernelBodyError {
@@ -419,6 +619,14 @@ impl std::fmt::Display for KernelBodyError {
                 write!(f, "library RMSNorm epsilon must be finite and positive")
             }
             Self::InvalidRopeTable => write!(f, "library RoPE table does not match the bind"),
+            Self::PackedBlockTooShort {
+                format,
+                required,
+                actual,
+            } => write!(
+                f,
+                "library packed {format} block has {actual} bytes, needs {required}"
+            ),
         }
     }
 }
@@ -521,6 +729,256 @@ fn for_each_row(
 
 fn ensure_output(bind: &BindDescriptor, output: &[f32]) -> Result<(), KernelBodyError> {
     checked_span(bind, "output", output.len())
+}
+
+const SIMDGROUP_WIDTH: usize = 32;
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) & 1;
+    let exponent = u32::from(bits >> 10) & 0x1f;
+    let fraction = u32::from(bits & 0x03ff);
+    let bits32 = if exponent == 0 {
+        if fraction == 0 {
+            sign << 31
+        } else {
+            let position = 32 - fraction.leading_zeros();
+            (sign << 31) | ((position + 102) << 23) | ((fraction << (24 - position)) - (1 << 23))
+        }
+    } else if exponent == 0x1f {
+        (sign << 31) | (0xff << 23) | (fraction << 13)
+    } else {
+        (sign << 31) | ((exponent + 112) << 23) | (fraction << 13)
+    };
+    f32::from_bits(bits32)
+}
+
+fn get_scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
+    if index < 4 {
+        (scales[index] & 63, scales[index + 4] & 63)
+    } else {
+        (
+            (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4),
+            (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4),
+        )
+    }
+}
+
+fn block_value(
+    format: QuantizedFormat,
+    block: &[u8],
+    element: usize,
+) -> Result<f32, KernelBodyError> {
+    let expected = checked_usize(format.block_bytes())?;
+    if block.len() < expected {
+        return Err(KernelBodyError::PackedBlockTooShort {
+            format: format.spelling(),
+            required: expected,
+            actual: block.len(),
+        });
+    }
+    match format {
+        QuantizedFormat::Q4K => {
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = half_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..16];
+            let group = element / 64;
+            let within = element % 64;
+            let scale_index = group * 2 + usize::from(within >= 32);
+            let (scale, min) = get_scale_min_k4(scale_index, scales);
+            let q = block[16 + group * 32 + (within % 32)];
+            let nibble = if within < 32 { q & 0x0f } else { q >> 4 };
+            Ok(d * f32::from(scale) * f32::from(nibble) - dmin * f32::from(min))
+        }
+        QuantizedFormat::Q5_0 => {
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+            let pair = element % 16;
+            let q = block[6 + pair];
+            let high = if element < 16 {
+                ((qh >> pair) << 4) & 0x10
+            } else {
+                (qh >> (pair + 12)) & 0x10
+            };
+            let nibble = if element < 16 { q & 0x0f } else { q >> 4 };
+            Ok((f32::from((nibble | high as u8) as i8) - 16.0) * d)
+        }
+        QuantizedFormat::Q5K => {
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = half_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scale_index = element / 32;
+            let lane = element % 32;
+            let pair = element / 64;
+            let (scale, min) = if scale_index < 4 {
+                (block[4 + scale_index] & 63, block[8 + scale_index] & 63)
+            } else {
+                (
+                    (block[4 + scale_index + 4] & 0x0f) | ((block[4 + scale_index - 4] >> 6) << 4),
+                    (block[4 + scale_index + 4] >> 4) | ((block[4 + scale_index] >> 6) << 4),
+                )
+            };
+            let q = block[48 + pair * 32 + lane];
+            let nibble = if scale_index.is_multiple_of(2) {
+                q & 0x0f
+            } else {
+                q >> 4
+            };
+            let mask = if scale_index.is_multiple_of(2) {
+                1u8 << (2 * pair)
+            } else {
+                2u8 << (2 * pair)
+            };
+            let high = if block[16 + lane] & mask != 0 { 16 } else { 0 };
+            Ok(d * f32::from(scale) * f32::from(nibble + high) - dmin * f32::from(min))
+        }
+        QuantizedFormat::Q6K => {
+            let d = half_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let half = (element / 128) * 128;
+            let remainder = element % 128;
+            let lane = remainder / 32;
+            let l = remainder % 32;
+            let scale_index = half / 16 + l / 16;
+            let ql_offset = half / 2;
+            let qh_offset = half / 4;
+            let ql0 = block[ql_offset + l];
+            let ql1 = block[ql_offset + l + 32];
+            let qh = block[128 + qh_offset + l];
+            let (q, scale_slot) = match lane {
+                0 => ((ql0 & 0x0f) | ((qh & 3) << 4), scale_index),
+                1 => ((ql1 & 0x0f) | (((qh >> 2) & 3) << 4), scale_index + 2),
+                2 => ((ql0 >> 4) | (((qh >> 4) & 3) << 4), scale_index + 4),
+                3 => ((ql1 >> 4) | (((qh >> 6) & 3) << 4), scale_index + 6),
+                _ => unreachable!("Q6_K lane is bounded by 256-element blocks"),
+            };
+            let scale = i8::from_ne_bytes([block[192 + scale_slot]]) as f32;
+            Ok(d * scale * (i32::from(q) - 32) as f32)
+        }
+        QuantizedFormat::Q8_0 => {
+            let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let q = i8::from_ne_bytes([block[2 + element]]) as f32;
+            Ok(d * q)
+        }
+    }
+}
+
+fn simdgroup_reduce(mut lanes: [f32; SIMDGROUP_WIDTH]) -> f32 {
+    let mut width = SIMDGROUP_WIDTH / 2;
+    while width != 0 {
+        for lane in 0..width {
+            lanes[lane] += lanes[lane + width];
+        }
+        width /= 2;
+    }
+    lanes[0]
+}
+
+/// Fused quantized GEMV for an M=1 decode projection.
+///
+/// The activation is f32 and the right operand remains packed.  Each
+/// simdgroup lane accumulates its strided K slice, then the lane partials are
+/// reduced in f32.  Dequantization happens at the exact packed block load,
+/// matching the R-PACK-02 tiled GEMM bodies while avoiding a separate
+/// dequantization launch or a whole-matrix f32 expansion.
+pub fn quantized_gemv(
+    bind: &QuantizedGemvBind,
+    activation: &[f32],
+    packed_weight: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    bind.validate()?;
+    let input_span = checked_usize(bind.input_span())?;
+    let output_span = checked_usize(bind.output_span())?;
+    let weight_span = checked_usize(bind.weight_span())?;
+    if activation.len() < input_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "activation",
+            required: input_span as u64,
+            actual: activation.len(),
+        });
+    }
+    if output.len() < output_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "output",
+            required: output_span as u64,
+            actual: output.len(),
+        });
+    }
+    if packed_weight.len() < weight_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "packed_weight",
+            required: weight_span as u64,
+            actual: packed_weight.len(),
+        });
+    }
+
+    let k = checked_usize(bind.k)?;
+    let n = checked_usize(bind.n)?;
+    let input_stride = checked_usize(bind.input_stride)?;
+    let output_stride = checked_usize(bind.output_stride)?;
+    let column_stride = checked_usize(bind.packed_column_stride_bytes)?;
+    let block_elements = checked_usize(bind.format.block_elements())?;
+    let block_bytes = checked_usize(bind.format.block_bytes())?;
+
+    for column in 0..n {
+        let mut lane_sums = [0.0f32; SIMDGROUP_WIDTH];
+        for lane in 0..SIMDGROUP_WIDTH {
+            let mut index = lane;
+            while index < k {
+                let block_index = index / block_elements;
+                let element = index % block_elements;
+                let block_start = column
+                    .checked_mul(column_stride)
+                    .and_then(|column_start| {
+                        block_index
+                            .checked_mul(block_bytes)
+                            .and_then(|block_offset| column_start.checked_add(block_offset))
+                    })
+                    .ok_or(KernelBodyError::InvalidBind(
+                        "quantized GEMV packed byte index overflow",
+                    ))?;
+                let weight = block_value(
+                    bind.format,
+                    &packed_weight[block_start..block_start + block_bytes],
+                    element,
+                )?;
+                let input_index =
+                    index
+                        .checked_mul(input_stride)
+                        .ok_or(KernelBodyError::InvalidBind(
+                            "quantized GEMV input index overflow",
+                        ))?;
+                lane_sums[lane] += activation[input_index] * weight;
+                index += SIMDGROUP_WIDTH;
+            }
+        }
+        let output_index =
+            column
+                .checked_mul(output_stride)
+                .ok_or(KernelBodyError::InvalidBind(
+                    "quantized GEMV output index overflow",
+                ))?;
+        output[output_index] = simdgroup_reduce(lane_sums);
+    }
+    Ok(())
+}
+
+/// Dispatch key for a plan-selected decode GEMV body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemvKernel {
+    /// Per-format packed dequant fused with the GEMV reduction.
+    Quantized,
+}
+
+/// Dispatch a plan-selected decode GEMV body.
+pub fn dispatch_gemv(
+    kernel: GemvKernel,
+    bind: &QuantizedGemvBind,
+    activation: &[f32],
+    packed_weight: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        GemvKernel::Quantized => quantized_gemv(bind, activation, packed_weight, output),
+    }
 }
 
 /// RMS normalization over the last logical axis, with affine `gamma`.
