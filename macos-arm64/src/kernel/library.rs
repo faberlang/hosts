@@ -1064,8 +1064,7 @@ fn gemv_q4_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
                     let (scale, min) = get_scale_min_k4(group, scales);
                     let qs = block[16 + (group / 2) * 32 + lane];
                     let nibble = if group % 2 == 0 { qs & 0x0f } else { qs >> 4 };
-                    let weight =
-                        d * f32::from(scale) * f32::from(nibble) - dmin * f32::from(min);
+                    let weight = d * f32::from(scale) * f32::from(nibble) - dmin * f32::from(min);
                     let index = k_base + group * 32 + lane;
                     lane_sums[lane] += buffers.activation[index * buffers.input_stride] * weight;
                 }
