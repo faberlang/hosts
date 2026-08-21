@@ -128,6 +128,22 @@ fn decode_projects_only_declared_per_invocation_buffers() {
 }
 
 #[test]
+fn decode_prefix_ids_follow_declared_gather_width_not_sequence_len() {
+    // Dense M=1 gather tables are the logical Q/K/V span (960), not valid_len.
+    let descriptor = descriptor(1, 4, Some(960));
+    let invocation = decode_invocation(Some(42), 9, 9, 10);
+    let projected = project_invocation_bindings(&descriptor, &invocation, &[1, 2], ROPE)
+        .expect("gather-width decode projection");
+    let q = bits(projected.get(&4).expect("q prefix ids"));
+    let kv = bits(projected.get(&5).expect("kv prefix ids"));
+    assert_eq!(q.len(), 960);
+    assert_eq!(kv.len(), 960);
+    assert_eq!(q[0], 0);
+    assert_eq!(q[959], 959);
+    assert_eq!(q, kv);
+}
+
+#[test]
 fn decode_rope_uses_absolute_position_not_step_count() {
     let descriptor = descriptor(1, 4, Some(18));
     let invocation = decode_invocation(Some(42), 17, 17, 18);

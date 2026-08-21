@@ -73,9 +73,11 @@ fn invalid_args(message: impl Into<String>) -> HostError {
 ///
 /// Prefill emits the supplied prompt and the complete prompt-length RoPE
 /// table. Scalar decode emits one token, one RoPE row at the explicit absolute
-/// `position`, and prefix ids for the `[0, valid_len_after)` extent. The
-/// supplied prompt is ignored for decode, so a caller cannot accidentally
-/// upload a full prompt on a scalar step.
+/// `position`, and the declared gather-index tables (`decode.q_prefix_ids` /
+/// `decode.kv_prefix_ids`) as `0..element_count`. Those ids address the
+/// GEMV-padded logical Q/K/V span, not the sequence cursor. The supplied
+/// prompt is ignored for decode, so a caller cannot accidentally upload a
+/// full prompt on a scalar step.
 ///
 /// # Errors
 /// Returns `E_INVALID_ARGS` for malformed cursor arithmetic, a mode/query-row
@@ -130,18 +132,17 @@ pub fn project_invocation_bindings(
     insert_checked(&mut projected, ROPE_SIN, inputs.get(ROPE_SIN), sin)?;
 
     if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode {
-        let prefix_ids = encode_ids(&(0..invocation.valid_len_after).collect::<Vec<_>>());
         insert_checked(
             &mut projected,
             Q_PREFIX_IDS,
             inputs.get(Q_PREFIX_IDS),
-            prefix_ids.clone(),
+            prefix_ids_for(inputs.get(Q_PREFIX_IDS), Q_PREFIX_IDS)?,
         )?;
         insert_checked(
             &mut projected,
             KV_PREFIX_IDS,
             inputs.get(KV_PREFIX_IDS),
-            prefix_ids,
+            prefix_ids_for(inputs.get(KV_PREFIX_IDS), KV_PREFIX_IDS)?,
         )?;
     }
     Ok(projected)
@@ -270,6 +271,16 @@ where
         }
     }
     Ok(specs)
+}
+
+fn prefix_ids_for(spec: Option<&InputSpec>, name: &str) -> HostResult<Vec<f32>> {
+    let spec = spec.ok_or_else(|| invalid_args(format!("missing projected input `{name}`")))?;
+    let count = u32::try_from(spec.element_count).map_err(|_| {
+        invalid_args(format!(
+            "declared input `{name}` element count does not fit the host"
+        ))
+    })?;
+    Ok(encode_ids(&(0..count).collect::<Vec<_>>()))
 }
 
 fn insert_checked(
