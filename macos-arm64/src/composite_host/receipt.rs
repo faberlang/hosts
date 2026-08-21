@@ -115,6 +115,10 @@ pub struct DeviceExecutionReceipt {
     /// step did not sample timestamps. Length matches `launch_entries`
     /// when present.
     pub launch_gpu_us: Vec<u64>,
+    /// Per-encoder GPU start times in launch order (µs, relative to the
+    /// first encoder start). Empty when unsampled. Length matches
+    /// `launch_gpu_us` when present.
+    pub launch_gpu_start_us: Vec<u64>,
 }
 
 /// The completion boundary of one execution (R9).
