@@ -534,18 +534,18 @@ pub fn inputs_from_json(bytes: &[u8]) -> HostResult<BTreeMap<u32, Vec<f32>>> {
     Ok(inputs)
 }
 
-/// One GGUF byte range copied into a host f32 buffer (`elems` logical f32s).
+/// One GGUF byte range admitted as a native packed device region.
 ///
-/// Packed Q4_K words occupy the prefix as raw bits; the tail is zero pad
-/// so `copy_in_f32` sees the MIR logical element count. This is a file
-/// map, not a weight codec.
+/// Packed words occupy the prefix as raw bits. `elems` is the admitted
+/// packed-region width in f32 words (`ceil(len / 4)`), never the logical
+/// F32 element count. Extra logical-F32 padding fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightFileRange {
     /// Byte offset into `--weights`.
     pub offset: u64,
     /// Packed-byte length to copy.
     pub len: u64,
-    /// Logical f32 element count of the host buffer.
+    /// Admitted packed-region width in f32 words.
     pub elems: u64,
 }
 
@@ -582,7 +582,8 @@ pub fn weight_map_to_json(map: &BTreeMap<u32, WeightFileRange>) -> HostResult<Ve
     })
 }
 
-/// Copy GGUF byte ranges into host f32 buffers (prefix copy, zero pad).
+/// Admit GGUF byte ranges as native packed host regions (prefix copy, 4-byte
+/// align only). Logical-F32 padding is not an admitted path.
 pub fn inputs_from_gguf(
     gguf: &[u8],
     map: &BTreeMap<u32, WeightFileRange>,
@@ -604,25 +605,31 @@ pub fn inputs_from_gguf(
                 gguf.len()
             ))
         })?;
-        inputs.insert(*id, packed_bytes_as_f32_padded(slice, range.elems));
+        let packed_elems = packed_f32_count(range.len);
+        if packed_elems != range.elems {
+            return Err(HostError::invalid_args(format!(
+                "device-execute weight-map[{id}] elems {} is not the native packed width {packed_elems} (len {})",
+                range.elems, range.len
+            )));
+        }
+        inputs.insert(*id, packed_bytes_as_native_region(slice));
     }
     Ok(inputs)
 }
 
-fn packed_bytes_as_f32_padded(bytes: &[u8], logical_elems: u64) -> Vec<f32> {
+fn packed_f32_count(len: u64) -> u64 {
+    len.div_ceil(4).max(1)
+}
+
+fn packed_bytes_as_native_region(bytes: &[u8]) -> Vec<f32> {
     let mut padded = bytes.to_vec();
     while !padded.len().is_multiple_of(4) {
         padded.push(0);
     }
-    let mut values: Vec<f32> = padded
+    padded
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let want = logical_elems as usize;
-    if values.len() < want {
-        values.resize(want, 0.0);
-    }
-    values
+        .collect()
 }
 
 /// Encode inputs as `{ "<buffer-id>": [f32, ...] }`.

@@ -221,16 +221,29 @@ impl MetalHostSession {
     }
 
     pub fn copy_in_f32(&mut self, buffer: MetalHandleId, values: &[f32]) -> HostResult<()> {
+        self.copy_in_packed_bytes(buffer, f32_slice_as_bytes(values))
+    }
+
+    /// Admit a native packed region into a Metal buffer.
+    ///
+    /// Packed bytes copy as-is. A 1–3 byte tail may be zero-padded so the
+    /// buffer's f32-word width matches; a shorter logical-F32 expansion is
+    /// not admitted.
+    pub fn copy_in_packed_bytes(&mut self, buffer: MetalHandleId, bytes: &[u8]) -> HostResult<()> {
         self.require_admitted()?;
         let (token, len_bytes) = self.buffer_token(buffer)?;
-        let bytes = f32_slice_as_bytes(values);
-        if bytes.len() != len_bytes {
+        if bytes.len() == len_bytes {
+            return self.driver.copy_in(token, bytes);
+        }
+        if bytes.len() > len_bytes || len_bytes - bytes.len() >= 4 {
             return Err(HostError::invalid_args(format!(
-                "copy_in size mismatch: buffer {len_bytes} bytes, got {}",
+                "packed-region size mismatch: buffer {len_bytes} bytes, got {}",
                 bytes.len()
             )));
         }
-        self.driver.copy_in(token, bytes)
+        let mut padded = vec![0u8; len_bytes];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        self.driver.copy_in(token, &padded)
     }
 
     pub fn launch_elementwise_add_f32(
