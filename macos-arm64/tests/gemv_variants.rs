@@ -6,7 +6,8 @@
 //! in the test or library body.
 
 use faber_host_macos_arm64::kernel::library::{
-    self, dispatch_gemv, GemvKernel, KernelBodyError, QuantizedFormat, QuantizedGemvBind,
+    self, dispatch_gemv, select_decode_gemv, GemvKernel, KernelBodyError, QuantizedFormat,
+    QuantizedGemvBind,
 };
 
 fn q4_k_ones_block() -> Vec<u8> {
@@ -137,4 +138,49 @@ fn gemv_rejects_unaligned_k_and_truncated_blocks_before_access() {
             actual: 21
         }
     ));
+}
+
+#[test]
+fn plan_path_selects_gemv_when_m_is_one() {
+    assert_eq!(
+        select_decode_gemv(Some("quantized_gemv"), 1).expect("agreeing gemv facts"),
+        Some(GemvKernel::Quantized)
+    );
+    assert_eq!(
+        select_decode_gemv(Some("quantized_gemm"), 0).expect("prefill keeps GEMM"),
+        None
+    );
+    assert_eq!(
+        select_decode_gemv(None, 1).expect("uniform-only decode fact"),
+        Some(GemvKernel::Quantized)
+    );
+    assert!(matches!(
+        select_decode_gemv(Some("quantized_gemv"), 0),
+        Err(KernelBodyError::InvalidBind(message)) if message.contains("disagrees")
+    ));
+    assert!(matches!(
+        select_decode_gemv(Some("quantized_gemm"), 1),
+        Err(KernelBodyError::InvalidBind(message)) if message.contains("disagrees")
+    ));
+}
+
+#[test]
+fn gemv_format_resolves_from_packed_ggml_type_id() {
+    assert_eq!(
+        QuantizedFormat::from_ggml_type_id(12),
+        Some(QuantizedFormat::Q4K)
+    );
+    assert_eq!(
+        QuantizedFormat::from_ggml_type_id(6),
+        Some(QuantizedFormat::Q5_0)
+    );
+    assert_eq!(
+        QuantizedFormat::from_ggml_type_id(8),
+        Some(QuantizedFormat::Q8_0)
+    );
+    assert_eq!(
+        QuantizedFormat::from_ggml_type_id(14),
+        Some(QuantizedFormat::Q6K)
+    );
+    assert_eq!(QuantizedFormat::from_ggml_type_id(0), None);
 }
