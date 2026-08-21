@@ -1170,6 +1170,63 @@ fn duplicate_binding_fails_as_abi_mismatch() {
 }
 
 #[test]
+fn per_step_input_written_mid_graph_fails_closed() {
+    let mut host = metal_composite("add_one").expect("metal composite");
+    let mut token = add_slot(1, "t", DeviceBufferRole::Input, 0, 2);
+    token.lifetime = DeviceBufferLifetime::PerStep;
+    token.initialization = DeviceBufferInitialization::ZeroFill;
+    let mut write = add_slot(1, "t", DeviceBufferRole::InOut, 0, 2);
+    write.lifetime = DeviceBufferLifetime::PerStep;
+    write.initialization = DeviceBufferInitialization::ZeroFill;
+    let descriptor = make_descriptor(
+        DeviceBackend::Metal,
+        vec![
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    token,
+                    add_slot(2, "w", DeviceBufferRole::Input, 1, 2),
+                    add_slot(3, "h", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+            DescriptorKernel {
+                entry: "add_one".to_owned(),
+                buffers: vec![
+                    write,
+                    add_slot(2, "w", DeviceBufferRole::Input, 1, 2),
+                    add_slot(4, "out", DeviceBufferRole::Output, 2, 2),
+                ],
+                grid: [1, 1, 1],
+                block: [2, 1, 1],
+            },
+        ],
+        vec![
+            DescriptorLaunch {
+                id: 1,
+                kernel_index: 0,
+            },
+            DescriptorLaunch {
+                id: 2,
+                kernel_index: 1,
+            },
+        ],
+        Vec::new(),
+        vec![result(4, 2)],
+    );
+    let err = host
+        .execute_descriptor(&descriptor, &BTreeMap::new())
+        .expect_err("a PerStep input written mid-graph must fail closed");
+    assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        err.message.contains("PerStep input written mid-graph"),
+        "{}",
+        err.message
+    );
+}
+
+#[test]
 fn conflicting_buffer_roles_fail_as_abi_mismatch() {
     let mut host = metal_composite("add_one").expect("metal composite");
     // The same buffer id is Input in one kernel and Output in another.
