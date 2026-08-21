@@ -81,8 +81,10 @@ fi
 RADIX_BIN="${CUDA_PROOF_RADIX_BIN:-}"
 if [[ -z "$RADIX_BIN" ]]; then
   printf '── build radix\n'
-  if ! (cd "$RADIX_ROOT" && cargo build -q -p radix --bin radix); then
-    fail "radix build failed (cargo build -p radix --bin radix in $RADIX_ROOT)"
+  # The `radix` bin lives in package `radix-cli`. `-p radix` is the binless
+  # lib façade and cargo-rejects `--bin radix`.
+  if ! (cd "$RADIX_ROOT" && cargo build -q -p radix-cli --bin radix); then
+    fail "radix build failed (cargo build -p radix-cli --bin radix in $RADIX_ROOT)"
   fi
   RADIX_BIN="$RADIX_ROOT/target/debug/radix"
   if [[ ! -x "$RADIX_BIN" ]]; then
