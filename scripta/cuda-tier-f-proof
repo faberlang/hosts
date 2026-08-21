@@ -209,12 +209,16 @@ if ! grep -qE '\.(visible\s+)?entry\s+addita\b' "$PTX"; then
   fail "PTX missing '.entry addita' (NVPTX did not mark the kernel entry)"
 fi
 for param in 0 1 2; do
-  if ! grep -q "\\.param \\.u64 addita_param_$param" "$PTX"; then
+  # clang NVPTX writes `.param .u64 .ptr .global .align N addita_param_K`;
+  # llc may omit the pointer qualifiers. Require `.param .u64` + the name.
+  if ! grep -qE "\\.param[[:space:]]+\\.u64\\b.*\\baddita_param_${param}\\b" "$PTX"; then
     fail "PTX missing u64 buffer param addita_param_$param"
   fi
 done
-if ! grep -q 'ld\.global\.f32' "$PTX" || ! grep -q 'st\.global\.f32' "$PTX"; then
-  fail "PTX missing global f32 load/store buffer operations"
+# LLVM NVPTX may spell f32 buffer ops as `ld.global.f32` or `ld.global.b32`
+# plus `add.rn.f32`; require a global load and a global store either way.
+if ! grep -qE 'ld\.global\.(f32|b32)' "$PTX" || ! grep -qE 'st\.global\.(f32|b32)' "$PTX"; then
+  fail "PTX missing global f32/b32 load/store buffer operations"
 fi
 printf '── PTX OK: .entry addita present, 3 u64 buffer params, backend=%s path=%s pin=+%s\n' \
   "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
