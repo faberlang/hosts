@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use host_coordinator::DeviceBackend;
+use serde::{Deserialize, Serialize};
 
 use crate::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceProgramLifetime,
@@ -201,4 +202,162 @@ pub struct DataFlowEdge {
     pub producer: u32,
     /// Consuming launch id (1-based).
     pub consumer: u32,
+}
+
+/// F1 wall-decomposition evidence for one timing or duration value.
+///
+/// `NotMeasured` is a real schema value, not a zero sentinel. A timestamp
+/// that the host cannot observe therefore stays visibly absent instead of
+/// being defaulted to a plausible number. `Derived` is reserved for values
+/// computed from carried timestamps or other receipt facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum KvCacheMeasurement {
+    /// Directly observed on the host or device timeline.
+    #[serde(rename = "measured")]
+    Measured { value_us: u64 },
+    /// Computed from other receipt facts, never presented as a measurement.
+    #[serde(rename = "derived")]
+    Derived { value_us: u64 },
+    /// No observation exists for this value.
+    #[serde(rename = "not_measured")]
+    NotMeasured,
+}
+
+impl KvCacheMeasurement {
+    /// Construct a directly measured microsecond value.
+    #[must_use]
+    pub const fn measured(value_us: u64) -> Self {
+        Self::Measured { value_us }
+    }
+
+    /// Construct a value derived from other receipt facts.
+    #[must_use]
+    pub const fn derived(value_us: u64) -> Self {
+        Self::Derived { value_us }
+    }
+
+    /// Mark a value as absent without manufacturing a numeric default.
+    #[must_use]
+    pub const fn not_measured() -> Self {
+        Self::NotMeasured
+    }
+}
+
+/// Start/end timeline facts and the associated F1 duration fact for one
+/// lifecycle segment. Each timestamp is independently explicit, so a missing
+/// start or end never becomes `0` and cannot be mistaken for an observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCacheTimingSpan {
+    /// Monotonic start timestamp in microseconds, or [`KvCacheMeasurement::NotMeasured`].
+    pub start_us: KvCacheMeasurement,
+    /// Monotonic end timestamp in microseconds, or [`KvCacheMeasurement::NotMeasured`].
+    pub end_us: KvCacheMeasurement,
+    /// Duration classified as measured, derived, or not measured.
+    pub duration_us: KvCacheMeasurement,
+}
+
+impl KvCacheTimingSpan {
+    /// An explicit all-missing span for a phase that was not observed.
+    #[must_use]
+    pub const fn not_measured() -> Self {
+        Self {
+            start_us: KvCacheMeasurement::NotMeasured,
+            end_us: KvCacheMeasurement::NotMeasured,
+            duration_us: KvCacheMeasurement::NotMeasured,
+        }
+    }
+}
+
+/// Setup or steady-state timing split. The four spans are deliberately kept
+/// separate because `gpu_body`, encode, submit, and wait are different F1 wall
+/// terms and must not be collapsed into the legacy `kernel_us` proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCachePhaseTiming {
+    /// GPU/device body timeline for this phase.
+    pub gpu_body: KvCacheTimingSpan,
+    /// Host encoding timeline for this phase.
+    pub encode: KvCacheTimingSpan,
+    /// Command-buffer or driver submit timeline for this phase.
+    pub submit: KvCacheTimingSpan,
+    /// Blocking device wait timeline for this phase.
+    pub wait: KvCacheTimingSpan,
+}
+
+impl KvCachePhaseTiming {
+    /// An explicit all-missing phase for setup or steady state.
+    #[must_use]
+    pub const fn not_measured() -> Self {
+        let missing = KvCacheTimingSpan::not_measured();
+        Self {
+            gpu_body: missing,
+            encode: missing,
+            submit: missing,
+            wait: missing,
+        }
+    }
+}
+
+/// Lifecycle facts that explain whether a claimed steady-state route stayed
+/// resident. Counts and byte volumes are carried separately from timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCacheLifecycleReceipt {
+    /// Modules loaded again after the resident route was prepared.
+    pub module_reloads: u64,
+    /// Persistent/per-program allocations made again after preparation.
+    pub persistent_reallocations: u64,
+    /// Weight uploads performed by the route.
+    pub weight_uploads: u64,
+    /// Bytes copied from an already-resident old KV prefix.
+    pub old_prefix_copy_bytes: u64,
+    /// Bytes written when the full KV cache was cleared.
+    pub full_cache_clear_bytes: u64,
+}
+
+impl KvCacheLifecycleReceipt {
+    /// Zero lifecycle events and byte volumes for a newly prepared route.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            module_reloads: 0,
+            persistent_reallocations: 0,
+            weight_uploads: 0,
+            old_prefix_copy_bytes: 0,
+            full_cache_clear_bytes: 0,
+        }
+    }
+}
+
+/// F4H1 host timing/lifecycle schema for a KV-cache run.
+///
+/// Setup and steady state each retain independent body, encode, submit, and
+/// wait timestamps. Slack is classified with the same measured/derived/
+/// not-measured vocabulary as F1. F4H1 only defines the receipt; F4H2 later
+/// populates it from `session.rs` without changing this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCacheTimingReceipt {
+    /// One-time setup-phase timing, including any admission or preparation
+    /// work that the later steady-state route must not hide.
+    pub setup_phase: KvCachePhaseTiming,
+    /// One steady-state step's timing split.
+    pub steady_state: KvCachePhaseTiming,
+    /// Explicitly unattributed wall between the named F1 terms.
+    pub slack_us: KvCacheMeasurement,
+    /// Reload, reallocation, upload, prefix-copy, and full-clear facts.
+    pub lifecycle: KvCacheLifecycleReceipt,
+}
+
+impl KvCacheTimingReceipt {
+    /// An explicit schema value with every timing fact absent and lifecycle
+    /// counters set to their measured zero-event value. This is not a
+    /// `Default` implementation: callers must opt into the missing receipt.
+    #[must_use]
+    pub const fn not_measured() -> Self {
+        Self {
+            setup_phase: KvCachePhaseTiming::not_measured(),
+            steady_state: KvCachePhaseTiming::not_measured(),
+            slack_us: KvCacheMeasurement::NotMeasured,
+            lifecycle: KvCacheLifecycleReceipt::zero(),
+        }
+    }
 }
