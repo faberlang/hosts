@@ -14,10 +14,10 @@ use faber_host_macos_arm64::device_descriptor::{
 };
 use faber_host_macos_arm64::CudaHostSession;
 
-/// The emitted `rung-0-matmul` v2 descriptor shape
+/// The emitted `rung-0-matmul` v3 descriptor shape
 /// (`examples/gpu-workload/rung-0-matmul.fab` → `[2,3] × [3,2] → [2,2]`):
-/// schema v2, `tiled_matmul` plan `M=2,K=3,N=2`, block 8×8, grid 1×1.
-const RUNG0_MATMUL_DESCRIPTOR: &str = r#"{ "schema_version": 2, "target": "llvm-nvvm",
+/// schema v3, `tiled_matmul` plan `M=2,K=3,N=2`, block 8×8, grid 1×1.
+const RUNG0_MATMUL_DESCRIPTOR: &str = r#"{ "schema_version": 3, "target": "llvm-nvvm",
   "kernels": [ { "entry": "rung0_matmul_kernel", "element_type": "f32",
                  "element_byte_width": 4, "element_count": 6,
                  "element_counts": [6, 6, 4],
@@ -90,12 +90,12 @@ fn parse_rejects_wrong_schema_version() {
         parse_descriptor(descriptor).expect_err("v1 sidecar must fail closed on schema version");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("schema_version 1"), "{}", err.message);
-    assert!(err.message.contains("2"), "{}", err.message);
+    assert!(err.message.contains("3"), "{}", err.message);
 }
 
 #[test]
 fn parse_rejects_unknown_target() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-cuda",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-cuda",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 1, "element_counts": [1, 1], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -111,14 +111,14 @@ fn parse_rejects_unknown_target() {
 
 #[test]
 fn parse_rejects_empty_kernel_list() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm", "kernels": []}"#;
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm", "kernels": []}"#;
     let err = parse_descriptor(descriptor).expect_err("empty kernel list must fail closed");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
 }
 
 #[test]
 fn parse_rejects_non_nvvm_dtype() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f64", "element_byte_width": 8,
                      "element_count": 1, "element_counts": [1, 1], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -134,7 +134,7 @@ fn parse_rejects_non_nvvm_dtype() {
 
 #[test]
 fn parse_rejects_byte_width_dtype_conflict() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 8,
                      "element_count": 1, "element_counts": [1, 1], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -149,7 +149,7 @@ fn parse_rejects_byte_width_dtype_conflict() {
 
 #[test]
 fn parse_rejects_count_shape_contradiction() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 4], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -164,7 +164,7 @@ fn parse_rejects_count_shape_contradiction() {
 
 #[test]
 fn parse_rejects_element_counts_mismatch() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 6, 4], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -180,7 +180,7 @@ fn parse_rejects_element_counts_mismatch() {
 
 #[test]
 fn parse_rejects_role_counts_conflict() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 4], "input_buffers": 3,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -196,7 +196,7 @@ fn parse_rejects_role_counts_conflict() {
 
 #[test]
 fn parse_rejects_duplicate_bindings() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 4], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -211,7 +211,7 @@ fn parse_rejects_duplicate_bindings() {
 
 #[test]
 fn parse_rejects_zero_launch_axis() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 1, "element_counts": [1, 1], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -229,7 +229,7 @@ fn parse_rejects_zero_launch_axis() {
 fn parse_rejects_out_of_range_axis_without_saturation() {
     // 2^32 does not fit u32: the adapter must reject, never saturate to
     // u32::MAX.
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 1, "element_counts": [1, 1], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -250,7 +250,7 @@ fn parse_rejects_matmul_plan_shape_contradiction() {
     // The buffer's own count is internally consistent (shape [5], count 5),
     // but the `tiled_matmul` plan expects M·K = 6 at position 0 — the plan
     // cross-check must fail closed.
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 5, "element_counts": [5, 6, 4], "input_buffers": 2,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -270,7 +270,7 @@ fn parse_rejects_matmul_plan_shape_contradiction() {
 
 #[test]
 fn parse_rejects_matmul_plan_launch_authority_conflict() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 6, 4], "input_buffers": 2,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -296,7 +296,7 @@ fn parse_rejects_matmul_plan_launch_authority_conflict() {
 /// 32 partials. `dispatch.x` is the caller-supplied grid axis.
 fn tree_reduction_f11_descriptor(dispatch_x: u64) -> String {
     format!(
-        r#"{{"schema_version": 2, "target": "llvm-nvvm",
+        r#"{{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ {{ "entry": "reduce_sum", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 8192, "element_counts": [8192, 32], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -344,7 +344,7 @@ fn parse_accepts_reduction_plan_with_partials_grid() {
 fn parse_rejects_matmul_plan_grid_authority_conflict() {
     // Rung-0 M=2,N=2,tile=8 → expected grid (ceil(2/8), ceil(2/8)) = (1,1).
     // A 2×2 dispatch contradicts the plan-derived tile grid.
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 6, 4], "input_buffers": 2,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -368,7 +368,7 @@ fn parse_rejects_matmul_plan_grid_authority_conflict() {
 
 #[test]
 fn parse_rejects_unknown_plan_kind() {
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "k", "element_type": "f32", "element_byte_width": 4,
                      "element_count": 6, "element_counts": [6, 6, 4], "input_buffers": 2,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -502,7 +502,7 @@ fn execute_rejects_non_f32_transfer_route() {
     // `i32` is inside the NVVM scalar family, so the descriptor parses; the
     // session's transfer surface is f32-only, so the launch fails closed
     // before any driver work.
-    let descriptor = br#"{"schema_version": 2, "target": "llvm-nvvm",
+    let descriptor = br#"{"schema_version": 3, "target": "llvm-nvvm",
       "kernels": [ { "entry": "int_kernel", "element_type": "i32", "element_byte_width": 4,
                      "element_count": 4, "element_counts": [4, 4], "input_buffers": 1,
                      "output_buffers": 1, "accumulation_buffers": 0,
@@ -528,6 +528,6 @@ fn execute_rejects_non_f32_transfer_route() {
 }
 
 #[test]
-fn schema_constant_is_v2() {
-    assert_eq!(NVVM_DESCRIPTOR_SCHEMA_VERSION, 2);
+fn schema_constant_is_v3() {
+    assert_eq!(NVVM_DESCRIPTOR_SCHEMA_VERSION, 3);
 }

@@ -1,8 +1,8 @@
-//! CUDA host launch adapter: emitted NVVM descriptor v2 + PTX → launch (U-03).
+//! CUDA host launch adapter: emitted NVVM descriptor v3 + PTX → launch (U-03).
 //!
 //! The adapter is the host half of the Stage 2 launch route
 //! (`docs/factory/codex-gap-campaign/delivery-stage2.md`, U-03). It consumes
-//! the compiler-emitted NVVM kernel descriptor sidecar (`schema_version` 2,
+//! the compiler-emitted NVVM kernel descriptor sidecar (`schema_version` 3,
 //! `radix-mir-llvm/src/nvvm_descriptor.rs`) plus the emitted PTX bytes and
 //! drives the existing generalized [`CudaHostSession::launch_kernel_3d`]
 //! surface in one ordered sequence:
@@ -65,7 +65,7 @@ use crate::kernel::{HostError, HostResult};
 /// The emitted NVVM descriptor schema version this adapter consumes. Tracks
 /// `NVVM_DESCRIPTOR_SCHEMA_VERSION` in `radix-mir-llvm/src/nvvm_descriptor.rs`
 /// (U-01); a schema bump must land here in the same change set.
-pub const NVVM_DESCRIPTOR_SCHEMA_VERSION: u32 = 2;
+pub const NVVM_DESCRIPTOR_SCHEMA_VERSION: u32 = 3;
 
 /// The emitted descriptor target tag this adapter consumes.
 pub const NVVM_DESCRIPTOR_TARGET: &str = "llvm-nvvm";
