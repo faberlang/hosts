@@ -1,6 +1,6 @@
 # GOAL: device-session-byte-surface — dtype-tagged bytes both directions; packed weights reach every backend
 
-**Status**: active — all 4 units landed (DSB-1 9f21984, DSB-2 199bb67, DSB-3 563ea2b, DSB-4b 4774bcc); closeout audit 111e7de7 verdict residual: P2 zero-copy mmap admission unreachable on CLI weight path (upload clones before copy_in; repair dispatched) + P2 stale ledger (this flip). Neutrality/capability-gating/F4H2 survival/tail rejection/mapping all verified clean
+**Status**: done — all 4 units + follow-ups landed (DSB-1 9f21984, DSB-2 199bb67, DSB-3 563ea2b, DSB-4b 4774bcc, inputs-hex d32d8ab); closeout audit 111e7de7 residual repaired (4d4868b: Metal zero-copy wrap restored on CLI weight path when capability admits; wrap sees the retained mmap pointer; neutrality preserved). Neutrality/capability-gating/F4H2 survival/tail rejection/mapping verified clean under audit
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.2, parent-verified)
