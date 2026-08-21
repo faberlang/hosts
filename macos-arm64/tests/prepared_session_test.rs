@@ -281,6 +281,21 @@ fn prompt_a() -> Vec<BTreeMap<u32, Vec<f32>>> {
     ]
 }
 
+/// EXEC-03 prompt stream: each prompt is long enough to exercise the
+/// steady-state residency window, while the values stay small enough for the
+/// fake backend's exact arithmetic. The two seeds make prompt B observably
+/// distinct without changing the descriptor or its compiled session.
+fn prompt_stream(seed: f32) -> Vec<BTreeMap<u32, Vec<f32>>> {
+    (0..256)
+        .map(|step| {
+            let lane = step % 4;
+            let mut values = [0.0_f32; 4];
+            values[lane] = seed + step as f32 * 0.001;
+            token(values)
+        })
+        .collect()
+}
+
 fn expected_first_pass_logits() -> Vec<Vec<f32>> {
     vec![
         vec![11.0, 20.0, 30.0, 40.0],
@@ -617,6 +632,96 @@ fn prepared_session_reset_clears_state_and_replay_matches_token_for_token() {
 // ---------------------------------------------------------------------------
 // E03-U1 done-when (d): teardown leaves zero live handles
 // ---------------------------------------------------------------------------
+
+/// EXEC-03 oracle: two prompts of at least 256 new-token steps share one
+/// admitted session, with a prompt-scoped reset between them. The fake driver
+/// makes the lifecycle proof deterministic; the dense-device receipt carries
+/// the 419/315 census and 30/304 prompt-end pins separately.
+#[test]
+fn exec03_two_256_token_prompts_reuse_one_session_and_reset_state() {
+    let mut host = prepared_metal_composite().expect("metal composite");
+    let descriptor = prepared_decode_descriptor(DeviceBackend::Metal);
+    let mut prepared = host
+        .prepare_resident_session(&descriptor, &prepared_weights())
+        .expect("prepare");
+    let prompt_a = prompt_stream(1.0);
+    let prompt_b = prompt_stream(2.0);
+
+    let run_prompt = |prepared: &mut PreparedResidentSession<'_>,
+                      prompt: &[BTreeMap<u32, Vec<f32>>],
+                      first_prompt: bool| {
+        assert_eq!(prompt.len(), 256);
+        let mut last_logits = None;
+        let mut allocated_buffers = None;
+        for (step, inputs) in prompt.iter().enumerate() {
+            let receipt = prepared.execute_step(inputs).expect("resident decode step");
+            assert_eq!(receipt.copy_ins, 1, "only the PerStep token is copied");
+            assert_eq!(receipt.launches, 1);
+            assert_eq!(receipt.syncs, 1);
+            assert_eq!(receipt.releases, 0);
+            if step == 0 {
+                if first_prompt {
+                    assert_eq!(receipt.pool_allocations, 3);
+                    assert_eq!(receipt.pool_reuses, 0);
+                } else {
+                    assert_eq!(receipt.pool_allocations, 0);
+                    assert_eq!(receipt.pool_reuses, 3);
+                }
+                allocated_buffers = Some(receipt.allocated_buffers.clone());
+            } else {
+                assert_eq!(receipt.pool_allocations, 0);
+                assert_eq!(receipt.pool_reuses, 3);
+                assert_eq!(
+                    receipt.allocated_buffers,
+                    allocated_buffers.clone().expect("warm-up allocations")
+                );
+            }
+            last_logits = Some(receipt.outputs.get(&5).cloned().expect("logits observed"));
+        }
+        last_logits.expect("prompt has a final observation")
+    };
+
+    let prompt_a_last = run_prompt(&mut prepared, &prompt_a, true);
+    let after_a = prepared.receipt();
+    assert_eq!(after_a.counters.prepares, 1);
+    assert_eq!(after_a.counters.reuses, 256);
+    assert_eq!(after_a.counters.resets, 0);
+    assert_eq!(after_a.module_reloads, 0);
+    assert_eq!(after_a.per_program_reallocs, 0);
+    assert_eq!(after_a.live_handles, 6);
+    assert!(prompt_a_last.iter().any(|value| *value != 0.0));
+
+    let allocations_before_reset = prepared.driver_counters().buffer_allocs;
+    let releases_before_reset = prepared.driver_counters().buffer_releases;
+    assert_eq!(prepared.reset_prompt().expect("prompt-scoped reset"), 1);
+    assert_eq!(prepared.session_handle_count(), 6);
+    let after_reset_counters = prepared.driver_counters();
+    assert_eq!(after_reset_counters.buffer_allocs, allocations_before_reset);
+    assert_eq!(after_reset_counters.buffer_releases, releases_before_reset);
+    assert_eq!(prepared.receipt().counters.resets, 1);
+
+    let prompt_b_last = run_prompt(&mut prepared, &prompt_b, false);
+    assert_ne!(
+        prompt_a_last, prompt_b_last,
+        "prompt B must start from its own input"
+    );
+    let before_teardown = prepared.receipt();
+    assert_eq!(before_teardown.counters.reuses, 512);
+    assert_eq!(before_teardown.counters.resets, 1);
+    assert_eq!(before_teardown.module_reloads, 0);
+    assert_eq!(before_teardown.per_program_reallocs, 0);
+    assert_eq!(before_teardown.live_handles, 6);
+
+    let final_receipt = prepared.teardown().expect("teardown");
+    assert_eq!(final_receipt.counters.prepares, 1);
+    assert_eq!(final_receipt.counters.reuses, 512);
+    assert_eq!(final_receipt.counters.resets, 1);
+    assert_eq!(final_receipt.counters.releases, 1);
+    assert_eq!(final_receipt.module_reloads, 0);
+    assert_eq!(final_receipt.per_program_reallocs, 0);
+    assert_eq!(final_receipt.live_handles, 0);
+    assert_eq!(host.device().expect("device").live_handle_count(), 0);
+}
 
 #[test]
 fn prepared_session_teardown_releases_every_handle() {
