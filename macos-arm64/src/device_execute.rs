@@ -47,17 +47,91 @@ use crate::device_host::DeviceRuntime;
 use crate::kernel::{HostError, HostResult};
 use crate::metal_host::{process_resident_bytes, MappedWeightFile, MappedWeightPaging};
 
+/// The versioned control protocol carried by `device-execute`.
+///
+/// Version 1 is the existing one-program stream. It deliberately has no KV
+/// invocation surface: a v1 request containing a mode or cursor fact is
+/// rejected instead of being guessed into the v2 runtime-binding shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum DeviceExecuteProtocol {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl DeviceExecuteProtocol {
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        self as u32
+    }
+
+    fn from_version(version: u32) -> Option<Self> {
+        match version {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
+/// Explicit v2 invocation regime. The spelling is part of the control wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecuteInvocationMode {
+    Prefill,
+    ScalarDecode,
+}
+
+impl DeviceExecuteInvocationMode {
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::ScalarDecode => "scalar_decode",
+        }
+    }
+}
+
+/// Runtime facts for one v2 invocation. Cursor facts are explicit and are
+/// never inferred from the token or from the current step count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceExecuteInvocation {
+    pub mode: DeviceExecuteInvocationMode,
+    /// Decode's one token. Prefill may omit this when its token rows are in
+    /// the declared input stream.
+    #[serde(default)]
+    pub token: Option<u32>,
+    /// Absolute cache position written by this invocation.
+    pub position: u32,
+    pub sequence_epoch: u32,
+    pub prefix_before: u32,
+    pub valid_len_after: u32,
+    pub query_start: u32,
+}
+
 /// CLI flags for `device-execute`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceExecuteArgs {
     /// Optional selection override (`auto` / `metal` / `cuda`).
     pub backend: Option<DeviceSelection>,
-    /// Descriptor JSON path (no module image).
+    /// Control protocol. Omitted means the legacy v1 surface.
+    pub protocol: DeviceExecuteProtocol,
+    /// Descriptor JSON path (no module image). For v2 this is the prefill
+    /// descriptor alias, retained so old callers can still inspect the base
+    /// paths.
     pub descriptor: PathBuf,
     /// Raw module-image path (MSL source or PTX).
     pub module: PathBuf,
     /// Inputs JSON path (`{ "<id>": [f32, ...] }`) — tiny per-step values.
     pub inputs: PathBuf,
+    /// Optional second v2 program descriptor/module pair.
+    pub prefill_descriptor: Option<PathBuf>,
+    pub prefill_module: Option<PathBuf>,
+    pub decode_descriptor: Option<PathBuf>,
+    pub decode_module: Option<PathBuf>,
+    /// Explicit v2 model/session identities.
+    pub model_identity: Option<String>,
+    pub session_identity: Option<String>,
     /// Optional GGUF file the child maps for packed-weight buffers.
     pub weights: Option<PathBuf>,
     /// Optional `{ "<id>": { offset, len, elems } }` map into `--weights`.
@@ -69,6 +143,7 @@ pub struct DeviceExecuteArgs {
 
 /// Lifecycle facts returned by the explicit resident-session control entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DeviceExecuteLifecycle {
     /// Sessions admitted by `load`.
     pub prepares: usize,
@@ -91,8 +166,19 @@ pub struct DeviceExecuteLifecycle {
 pub struct DeviceExecuteControlReceipt {
     /// The accepted operation (`load`, `step`, `reset`, or `release`).
     pub operation: String,
+    /// Protocol version that admitted this operation.
+    #[serde(default = "default_protocol_version")]
+    pub protocol: u32,
     /// Session lifecycle evidence after the operation.
     pub lifecycle: DeviceExecuteLifecycle,
+    /// Explicit model/session identities carried by v2 load.
+    #[serde(default)]
+    pub model_identity: Option<String>,
+    #[serde(default)]
+    pub session_identity: Option<String>,
+    /// Program-graph identities for both admitted v2 programs.
+    #[serde(default)]
+    pub program_identities: BTreeMap<String, String>,
     /// Number of declared physical kernel bodies in the loaded descriptor.
     #[serde(default)]
     pub kernel_count: usize,
@@ -123,17 +209,26 @@ pub enum DeviceExecuteControlVerb {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceExecuteControlRequest {
+    pub protocol: DeviceExecuteProtocol,
     pub verb: DeviceExecuteControlVerb,
     pub inputs: Option<BTreeMap<u32, Vec<f32>>>,
+    pub invocation: Option<DeviceExecuteInvocation>,
 }
 
 /// Parse `device-execute` CLI flags. Unknown or missing flags are usage
 /// errors (the caller maps them to exit 64).
 pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, String> {
     let mut backend = None;
+    let mut protocol = DeviceExecuteProtocol::V1;
     let mut descriptor = None;
     let mut module = None;
     let mut inputs = None;
+    let mut prefill_descriptor = None;
+    let mut prefill_module = None;
+    let mut decode_descriptor = None;
+    let mut decode_module = None;
+    let mut model_identity = None;
+    let mut session_identity = None;
     let mut weights = None;
     let mut weight_map = None;
     let mut control = false;
@@ -144,6 +239,10 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
                 let value = next_flag_value(args, &mut index, "--backend")?;
                 backend = Some(parse_selection(&value)?);
             }
+            "--protocol" => {
+                let value = next_flag_value(args, &mut index, "--protocol")?;
+                protocol = parse_protocol(&value)?;
+            }
             "--descriptor" => {
                 let value = next_flag_value(args, &mut index, "--descriptor")?;
                 descriptor = Some(PathBuf::from(value));
@@ -151,6 +250,28 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
             "--module" => {
                 let value = next_flag_value(args, &mut index, "--module")?;
                 module = Some(PathBuf::from(value));
+            }
+            "--prefill-descriptor" => {
+                let value = next_flag_value(args, &mut index, "--prefill-descriptor")?;
+                prefill_descriptor = Some(PathBuf::from(value));
+            }
+            "--prefill-module" => {
+                let value = next_flag_value(args, &mut index, "--prefill-module")?;
+                prefill_module = Some(PathBuf::from(value));
+            }
+            "--decode-descriptor" => {
+                let value = next_flag_value(args, &mut index, "--decode-descriptor")?;
+                decode_descriptor = Some(PathBuf::from(value));
+            }
+            "--decode-module" => {
+                let value = next_flag_value(args, &mut index, "--decode-module")?;
+                decode_module = Some(PathBuf::from(value));
+            }
+            "--model-identity" => {
+                model_identity = Some(next_flag_value(args, &mut index, "--model-identity")?);
+            }
+            "--session-identity" => {
+                session_identity = Some(next_flag_value(args, &mut index, "--session-identity")?);
             }
             "--inputs" => {
                 let value = next_flag_value(args, &mut index, "--inputs")?;
@@ -178,11 +299,46 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
             ));
         }
     }
+    let descriptor = descriptor.or_else(|| prefill_descriptor.clone());
+    let module = module.or_else(|| prefill_module.clone());
+    let descriptor = descriptor.ok_or_else(|| usage_text().to_owned())?;
+    let module = module.ok_or_else(|| usage_text().to_owned())?;
+    let inputs = inputs.ok_or_else(|| usage_text().to_owned())?;
+    let has_v2_program_flags = prefill_descriptor.is_some()
+        || prefill_module.is_some()
+        || decode_descriptor.is_some()
+        || decode_module.is_some()
+        || model_identity.is_some()
+        || session_identity.is_some();
+    if protocol == DeviceExecuteProtocol::V1 && has_v2_program_flags {
+        return Err(format!(
+            "protocol v1 cannot carry KV execution; request --protocol v2; {}",
+            usage_text()
+        ));
+    }
+    if protocol == DeviceExecuteProtocol::V2
+        && (prefill_descriptor.is_none()
+            || prefill_module.is_none()
+            || decode_descriptor.is_none()
+            || decode_module.is_none())
+    {
+        return Err(format!(
+            "protocol v2 requires --prefill-descriptor/--prefill-module and --decode-descriptor/--decode-module; {}",
+            usage_text()
+        ));
+    }
     Ok(DeviceExecuteArgs {
         backend,
-        descriptor: descriptor.ok_or_else(|| usage_text().to_owned())?,
-        module: module.ok_or_else(|| usage_text().to_owned())?,
-        inputs: inputs.ok_or_else(|| usage_text().to_owned())?,
+        protocol,
+        descriptor,
+        module,
+        inputs,
+        prefill_descriptor,
+        prefill_module,
+        decode_descriptor,
+        decode_module,
+        model_identity,
+        session_identity,
         weights,
         weight_map,
         control,
@@ -192,14 +348,34 @@ pub fn parse_device_execute_args(args: &[String]) -> Result<DeviceExecuteArgs, S
 /// Usage line for the command.
 #[must_use]
 pub fn usage_text() -> &'static str {
-    "usage: faber-host-macos-arm64 device-execute [--control] [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
+    "usage: faber-host-macos-arm64 device-execute [--control] [--protocol v1|v2] [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--prefill-descriptor <json> --prefill-module <bin> --decode-descriptor <json> --decode-module <bin>] [--weights <gguf> --weight-map <json>]"
 }
 
 #[derive(Debug, Deserialize)]
 struct WireControlRequest {
     op: String,
     #[serde(default)]
+    protocol: Option<u32>,
+    #[serde(default)]
     inputs: Option<serde_json::Value>,
+    #[serde(default)]
+    mode: Option<DeviceExecuteInvocationMode>,
+    #[serde(default)]
+    token: Option<u32>,
+    #[serde(default)]
+    position: Option<u32>,
+    #[serde(default)]
+    sequence_epoch: Option<u32>,
+    #[serde(default)]
+    prefix_before: Option<u32>,
+    #[serde(default)]
+    valid_len_after: Option<u32>,
+    #[serde(default)]
+    query_start: Option<u32>,
+}
+
+fn default_protocol_version() -> u32 {
+    DeviceExecuteProtocol::V1.version()
 }
 
 /// Decode one line of the resident-session control protocol.
@@ -210,9 +386,15 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
     let wire: WireControlRequest = serde_json::from_slice(bytes).map_err(|error| {
         HostError::invalid_args(format!("device-execute control JSON is invalid: {error}"))
     })?;
+    let protocol = wire.protocol.unwrap_or(DeviceExecuteProtocol::V1.version());
+    let protocol = DeviceExecuteProtocol::from_version(protocol).ok_or_else(|| {
+        HostError::invalid_args(format!(
+            "device-execute control protocol {protocol} is unsupported; expected 1 or 2"
+        ))
+    })?;
     let verb = match wire.op.as_str() {
         "load" => DeviceExecuteControlVerb::Load,
-        "step" => DeviceExecuteControlVerb::Step,
+        "step" | "invoke" => DeviceExecuteControlVerb::Step,
         "reset" => DeviceExecuteControlVerb::Reset,
         "release" => DeviceExecuteControlVerb::Release,
         other => {
@@ -221,6 +403,26 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
             )))
         }
     };
+    let has_v2_fields = wire.mode.is_some()
+        || wire.token.is_some()
+        || wire.position.is_some()
+        || wire.sequence_epoch.is_some()
+        || wire.prefix_before.is_some()
+        || wire.valid_len_after.is_some()
+        || wire.query_start.is_some();
+    if protocol == DeviceExecuteProtocol::V1 && (has_v2_fields || wire.op == "invoke") {
+        return Err(HostError::invalid_args(
+            "device-execute protocol v1 cannot carry KV execution; request protocol v2",
+        ));
+    }
+    if protocol == DeviceExecuteProtocol::V2
+        && verb == DeviceExecuteControlVerb::Load
+        && has_v2_fields
+    {
+        return Err(HostError::invalid_args(
+            "device-execute v2 load admits programs; invocation facts belong to invoke",
+        ));
+    }
     let inputs = wire
         .inputs
         .map(|value| {
@@ -232,12 +434,121 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
             inputs_from_json(&bytes)
         })
         .transpose()?;
-    Ok(DeviceExecuteControlRequest { verb, inputs })
+    let invocation = if protocol == DeviceExecuteProtocol::V2
+        && verb == DeviceExecuteControlVerb::Step
+    {
+        let mode = wire.mode.ok_or_else(|| {
+            HostError::invalid_args(
+                "device-execute protocol v2 invoke requires explicit mode and cursor facts",
+            )
+        })?;
+        let invocation = DeviceExecuteInvocation {
+            mode,
+            token: wire.token,
+            position: wire.position.ok_or_else(|| {
+                HostError::invalid_args("device-execute v2 invoke requires position")
+            })?,
+            sequence_epoch: wire.sequence_epoch.ok_or_else(|| {
+                HostError::invalid_args("device-execute v2 invoke requires sequence_epoch")
+            })?,
+            prefix_before: wire.prefix_before.ok_or_else(|| {
+                HostError::invalid_args("device-execute v2 invoke requires prefix_before")
+            })?,
+            valid_len_after: wire.valid_len_after.ok_or_else(|| {
+                HostError::invalid_args("device-execute v2 invoke requires valid_len_after")
+            })?,
+            query_start: wire.query_start.ok_or_else(|| {
+                HostError::invalid_args("device-execute v2 invoke requires query_start")
+            })?,
+        };
+        if mode == DeviceExecuteInvocationMode::ScalarDecode {
+            if invocation.token.is_none() {
+                return Err(HostError::invalid_args(
+                    "device-execute scalar_decode invoke requires token",
+                ));
+            }
+            if inputs.is_some() {
+                return Err(HostError::invalid_args(
+                    "device-execute scalar_decode invoke carries token/position only; inputs are not accepted",
+                ));
+            }
+        }
+        Some(invocation)
+    } else {
+        if has_v2_fields {
+            return Err(HostError::invalid_args(
+                "device-execute v2 mode/cursor facts are only valid on invoke",
+            ));
+        }
+        None
+    };
+    Ok(DeviceExecuteControlRequest {
+        protocol,
+        verb,
+        inputs,
+        invocation,
+    })
+}
+
+/// Admit the two static programs carried by a v2 load.
+///
+/// This seam is intentionally pure. It validates both descriptors before a
+/// host/device session is constructed and returns the identities that the
+/// later resident owner must preserve. Cursor values are not part of either
+/// identity.
+pub fn admit_v2_load(
+    prefill: &DeviceDescriptor,
+    decode: &DeviceDescriptor,
+    model_identity: impl Into<String>,
+    session_identity: impl Into<String>,
+) -> HostResult<DeviceExecuteControlReceipt> {
+    prefill.validate()?;
+    decode.validate()?;
+    if prefill.backend != decode.backend {
+        return Err(HostError::invalid_args(format!(
+            "device-execute protocol v2 programs target different backends: {} and {}",
+            prefill.backend.spelling(),
+            decode.backend.spelling()
+        )));
+    }
+    let model_identity = model_identity.into();
+    let session_identity = session_identity.into();
+    if model_identity.is_empty() || session_identity.is_empty() {
+        return Err(HostError::invalid_args(
+            "device-execute protocol v2 load requires non-empty model_identity and session_identity",
+        ));
+    }
+    let program_identities = BTreeMap::from([
+        ("prefill".to_owned(), prefill.program_graph_hash()),
+        ("scalar_decode".to_owned(), decode.program_graph_hash()),
+    ]);
+    Ok(DeviceExecuteControlReceipt {
+        operation: "load".to_owned(),
+        protocol: DeviceExecuteProtocol::V2.version(),
+        lifecycle: DeviceExecuteLifecycle {
+            prepares: 1,
+            ..DeviceExecuteLifecycle::default()
+        },
+        model_identity: Some(model_identity),
+        session_identity: Some(session_identity),
+        program_identities,
+        kernel_count: prefill.kernels.len() + decode.kernels.len(),
+        reset_cleared: 0,
+        receipt: None,
+        mmap: MappedWeightPaging::default(),
+        mmap_data_start: 0,
+        mmap_regions: 0,
+    })
 }
 
 /// Load files, validate the descriptor, construct the composite host, and
 /// execute one packed device run.
 pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteReceipt> {
+    if args.protocol == DeviceExecuteProtocol::V2 {
+        return Err(HostError::invalid_args(
+            "protocol v2 paired programs require the --control load/invoke stream",
+        ));
+    }
     let cli_started = Instant::now();
     let read_started = Instant::now();
     let descriptor_bytes = read_file(&args.descriptor)?;
@@ -315,6 +626,130 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     Ok(wire)
 }
 
+/// Run the v2 paired-program admission stream.
+///
+/// D5 owns the protocol boundary: both static programs are admitted by one
+/// load, while the later executor owns device dispatch. Keeping this helper
+/// pure with respect to device work prevents a v1 single-program session from
+/// being smuggled in as a fake KV session.
+fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
+    let prefill_descriptor = args
+        .prefill_descriptor
+        .as_ref()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires a prefill descriptor"))?;
+    let prefill_module = args
+        .prefill_module
+        .as_ref()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires a prefill module"))?;
+    let decode_descriptor = args
+        .decode_descriptor
+        .as_ref()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires a decode descriptor"))?;
+    let decode_module = args
+        .decode_module
+        .as_ref()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires a decode module"))?;
+    let prefill =
+        descriptor_from_json(&read_file(prefill_descriptor)?, read_file(prefill_module)?)?;
+    let decode = descriptor_from_json(&read_file(decode_descriptor)?, read_file(decode_module)?)?;
+    let model_identity = args
+        .model_identity
+        .clone()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires --model-identity"))?;
+    let session_identity = args
+        .session_identity
+        .clone()
+        .ok_or_else(|| HostError::invalid_args("protocol v2 requires --session-identity"))?;
+    let mut load = admit_v2_load(&prefill, &decode, model_identity, session_identity)?;
+    let stdin = std::io::stdin();
+    let mut lines = BufReader::new(stdin.lock()).lines();
+    let first = lines
+        .next()
+        .transpose()
+        .map_err(|error| {
+            HostError::internal(format!("device-execute control read failed: {error}"))
+        })?
+        .ok_or_else(|| {
+            HostError::invalid_args("device-execute control requires load before end of input")
+        })?;
+    let first = parse_control_request(first.as_bytes())?;
+    if first.protocol != DeviceExecuteProtocol::V2
+        || first.verb != DeviceExecuteControlVerb::Load
+        || first.inputs.is_some()
+    {
+        return Err(HostError::invalid_args(
+            "device-execute protocol v2 stream must begin with {\\\"protocol\\\":2,\\\"op\\\":\\\"load\\\"}",
+        ));
+    }
+    let stdout = std::io::stdout();
+    let mut stdout = std::io::BufWriter::new(stdout.lock());
+    write_control_receipt(&mut stdout, load.clone())?;
+    for line in lines {
+        let line = line.map_err(|error| {
+            HostError::internal(format!("device-execute control read failed: {error}"))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = parse_control_request(line.as_bytes())?;
+        if request.protocol != DeviceExecuteProtocol::V2 {
+            return Err(HostError::invalid_args(
+                "device-execute control protocol cannot change after v2 load",
+            ));
+        }
+        match request.verb {
+            DeviceExecuteControlVerb::Load => {
+                return Err(HostError::invalid_args(
+                    "device-execute protocol v2 load is only valid once per process",
+                ));
+            }
+            DeviceExecuteControlVerb::Step => {
+                let invocation = request.invocation.ok_or_else(|| {
+                    HostError::invalid_args(
+                        "device-execute protocol v2 invoke requires invocation facts",
+                    )
+                })?;
+                if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode
+                    && request.inputs.is_some()
+                {
+                    return Err(HostError::invalid_args(
+                        "device-execute scalar_decode invoke carries token/position only; inputs are not accepted",
+                    ));
+                }
+                load.operation = "invoke".to_owned();
+                load.lifecycle.reuses += 1;
+                load.receipt = None;
+                write_control_receipt(&mut stdout, load.clone())?;
+            }
+            DeviceExecuteControlVerb::Reset => {
+                if request.inputs.is_some() || request.invocation.is_some() {
+                    return Err(HostError::invalid_args(
+                        "device-execute protocol v2 reset does not accept invocation inputs",
+                    ));
+                }
+                load.operation = "reset".to_owned();
+                load.lifecycle.resets += 1;
+                write_control_receipt(&mut stdout, load.clone())?;
+            }
+            DeviceExecuteControlVerb::Release => {
+                if request.inputs.is_some() || request.invocation.is_some() {
+                    return Err(HostError::invalid_args(
+                        "device-execute protocol v2 release does not accept invocation inputs",
+                    ));
+                }
+                load.operation = "release".to_owned();
+                load.lifecycle.releases += 1;
+                load.lifecycle.live_handles = 0;
+                write_control_receipt(&mut stdout, load)?;
+                return Ok(());
+            }
+        }
+    }
+    Err(HostError::invalid_args(
+        "device-execute control stream ended before explicit release",
+    ))
+}
+
 /// Run the explicit resident-session control stream.
 ///
 /// The descriptor/module/weight map are read once, then the first command must
@@ -322,6 +757,9 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
 /// process until an explicit `release`; each `step` only receives invocation
 /// inputs and uses the already admitted resident adapter.
 pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
+    if args.protocol == DeviceExecuteProtocol::V2 {
+        return run_device_execute_control_v2(args);
+    }
     let descriptor_bytes = read_file(&args.descriptor)?;
     let module_image = read_file(&args.module)?;
     let base_inputs = inputs_from_json(&read_file(&args.inputs)?)?;
@@ -363,7 +801,11 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
             HostError::invalid_args("device-execute control requires load before end of input")
         })?;
     let first = parse_control_request(first.as_bytes())?;
-    if first.verb != DeviceExecuteControlVerb::Load || first.inputs.is_some() {
+    if first.protocol != args.protocol
+        || first.verb != DeviceExecuteControlVerb::Load
+        || first.inputs.is_some()
+        || first.invocation.is_some()
+    {
         return Err(HostError::invalid_args(
             "device-execute control stream must begin with {\\\"op\\\":\\\"load\\\"}",
         ));
@@ -433,6 +875,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                     &mut stdout,
                     DeviceExecuteControlReceipt {
                         operation: "release".to_owned(),
+                        protocol: args.protocol.version(),
                         lifecycle: DeviceExecuteLifecycle {
                             prepares: lifecycle.counters.prepares,
                             reuses: lifecycle.counters.reuses,
@@ -445,6 +888,9 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                         kernel_count: descriptor.kernels.len(),
                         reset_cleared: 0,
                         receipt: None,
+                        model_identity: None,
+                        session_identity: None,
+                        program_identities: BTreeMap::new(),
                         mmap: MappedWeightPaging::default(),
                         mmap_data_start: 0,
                         mmap_regions: 0,
@@ -469,6 +915,7 @@ fn control_receipt(
     let lifecycle = session.receipt();
     DeviceExecuteControlReceipt {
         operation: operation.to_owned(),
+        protocol: DeviceExecuteProtocol::V1.version(),
         lifecycle: DeviceExecuteLifecycle {
             prepares: lifecycle.counters.prepares,
             reuses: lifecycle.counters.reuses,
@@ -481,6 +928,9 @@ fn control_receipt(
         kernel_count,
         reset_cleared,
         receipt,
+        model_identity: None,
+        session_identity: None,
+        program_identities: BTreeMap::new(),
         mmap: MappedWeightPaging::default(),
         mmap_data_start: 0,
         mmap_regions: 0,
@@ -1020,6 +1470,22 @@ pub struct DeviceExecuteReceipt {
     pub backend: String,
     /// Selected-hardware name.
     pub device_name: String,
+    /// Protocol version that produced this receipt.
+    #[serde(default = "default_protocol_version")]
+    pub protocol: u32,
+    /// Explicit model/session identities for a v2 route.
+    #[serde(default)]
+    pub model_identity: Option<String>,
+    #[serde(default)]
+    pub session_identity: Option<String>,
+    #[serde(default)]
+    pub program_identities: BTreeMap<String, String>,
+    /// Lifecycle counters for resident control operations.
+    #[serde(default)]
+    pub lifecycle: DeviceExecuteLifecycle,
+    /// Explicit invocation mode when this is a v2 invocation receipt.
+    #[serde(default)]
+    pub invocation_mode: Option<DeviceExecuteInvocationMode>,
     /// Launches dispatched.
     pub launches: usize,
     /// Descriptor launch identities, in order.
@@ -1128,6 +1594,12 @@ impl DeviceExecuteReceipt {
         Self {
             backend: receipt.backend.spelling().to_owned(),
             device_name: receipt.device_name.clone(),
+            protocol: DeviceExecuteProtocol::V1.version(),
+            model_identity: None,
+            session_identity: None,
+            program_identities: BTreeMap::new(),
+            lifecycle: DeviceExecuteLifecycle::default(),
+            invocation_mode: None,
             launches: receipt.launches,
             launch_ids: receipt.launch_ids.clone(),
             launch_entries: receipt.launch_entries.clone(),
@@ -1453,6 +1925,16 @@ fn parse_selection(spelling: &str) -> Result<DeviceSelection, String> {
         "cuda" => Ok(DeviceSelection::Cuda),
         other => Err(format!(
             "device-execute --backend must be auto, metal, or cuda (got `{other}`)"
+        )),
+    }
+}
+
+fn parse_protocol(spelling: &str) -> Result<DeviceExecuteProtocol, String> {
+    match spelling {
+        "1" | "v1" => Ok(DeviceExecuteProtocol::V1),
+        "2" | "v2" => Ok(DeviceExecuteProtocol::V2),
+        other => Err(format!(
+            "device-execute --protocol must be v1 or v2 (got `{other}`)"
         )),
     }
 }

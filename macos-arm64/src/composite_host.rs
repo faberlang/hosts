@@ -45,12 +45,18 @@
 //! and reports an A9-style receipt (selected hardware, module hash, launches,
 //! transfers, readbacks, allocations).
 
-mod inference_state;
+pub mod inference_state;
 mod invocation_program;
 mod receipt;
 mod residency;
 mod session;
 
+pub use inference_state::{
+    CursorFacts, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
+    InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase, SessionError,
+    SessionInspection, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
+    E_KV_STALE,
+};
 pub use receipt::{
     CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
 };

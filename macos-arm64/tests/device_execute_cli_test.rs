@@ -4,17 +4,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
-use faber_host_macos_arm64::composite_host::CompositeHost;
+use faber_host_macos_arm64::composite_host::{CompositeHost, InferenceSessionState};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DescriptorLaunch,
     DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
     DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use faber_host_macos_arm64::device_execute::{
-    descriptor_from_json, descriptor_to_json, gguf_region_table, inputs_from_gguf,
+    admit_v2_load, descriptor_from_json, descriptor_to_json, gguf_region_table, inputs_from_gguf,
     inputs_from_json, inputs_from_mapped_gguf, inputs_to_json, parse_control_request,
     parse_device_execute_args, receipt_to_json, weight_map_from_json, weight_map_to_json,
-    DeviceExecuteControlVerb, DeviceExecuteReceipt, WeightFileRange,
+    DeviceExecuteControlVerb, DeviceExecuteInvocationMode, DeviceExecuteProtocol,
+    DeviceExecuteReceipt, WeightFileRange,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::metal_host::MappedWeightFile;
@@ -287,6 +288,120 @@ fn control_protocol_rejects_unknown_verb_with_structured_error() {
         error.message.contains("load, step, reset, release"),
         "{error}"
     );
+}
+
+#[test]
+fn protocol_v2_load_names_both_programs_and_requires_the_pair() {
+    let args = [
+        "--control".to_owned(),
+        "--protocol".to_owned(),
+        "v2".to_owned(),
+        "--prefill-descriptor".to_owned(),
+        "prefill.json".to_owned(),
+        "--prefill-module".to_owned(),
+        "prefill.msl".to_owned(),
+        "--decode-descriptor".to_owned(),
+        "decode.json".to_owned(),
+        "--decode-module".to_owned(),
+        "decode.msl".to_owned(),
+        "--model-identity".to_owned(),
+        "smollm2".to_owned(),
+        "--session-identity".to_owned(),
+        "prompt-7".to_owned(),
+        "--inputs".to_owned(),
+        "prefill-inputs.json".to_owned(),
+    ];
+    let parsed = parse_device_execute_args(&args).expect("v2 pair");
+    assert_eq!(parsed.protocol, DeviceExecuteProtocol::V2);
+    assert_eq!(
+        parsed.prefill_descriptor.as_deref(),
+        Some(std::path::Path::new("prefill.json"))
+    );
+    assert_eq!(
+        parsed.decode_module.as_deref(),
+        Some(std::path::Path::new("decode.msl"))
+    );
+    assert_eq!(parsed.model_identity.as_deref(), Some("smollm2"));
+    assert_eq!(parsed.session_identity.as_deref(), Some("prompt-7"));
+
+    let missing = [
+        "--protocol".to_owned(),
+        "v2".to_owned(),
+        "--prefill-descriptor".to_owned(),
+        "prefill.json".to_owned(),
+        "--prefill-module".to_owned(),
+        "prefill.msl".to_owned(),
+        "--inputs".to_owned(),
+        "inputs.json".to_owned(),
+    ];
+    let error = parse_device_execute_args(&missing).expect_err("decode pair is mandatory");
+    assert!(error.contains("decode-descriptor"), "{error}");
+
+    let legacy_with_pair = [
+        "--protocol".to_owned(),
+        "v1".to_owned(),
+        "--descriptor".to_owned(),
+        "legacy.json".to_owned(),
+        "--module".to_owned(),
+        "legacy.msl".to_owned(),
+        "--inputs".to_owned(),
+        "inputs.json".to_owned(),
+        "--decode-descriptor".to_owned(),
+        "decode.json".to_owned(),
+    ];
+    let error = parse_device_execute_args(&legacy_with_pair)
+        .expect_err("v1 cannot carry a second KV program");
+    assert!(error.contains("protocol v1"), "{error}");
+}
+
+#[test]
+fn protocol_v2_decode_carries_token_and_cursor_but_v1_rejects_it() {
+    let request = parse_control_request(
+        br#"{"protocol":2,"op":"invoke","mode":"scalar_decode","token":42,"position":17,"sequence_epoch":3,"prefix_before":17,"valid_len_after":18,"query_start":17}"#,
+    )
+    .expect("v2 invoke");
+    assert_eq!(request.protocol, DeviceExecuteProtocol::V2);
+    assert_eq!(request.verb, DeviceExecuteControlVerb::Step);
+    let invocation = request.invocation.expect("invocation");
+    assert_eq!(invocation.mode, DeviceExecuteInvocationMode::ScalarDecode);
+    assert_eq!(invocation.token, Some(42));
+    assert_eq!(invocation.position, 17);
+    assert!(request.inputs.is_none(), "decode has no legacy inputs map");
+
+    let error = parse_control_request(
+        br#"{"protocol":1,"op":"invoke","mode":"scalar_decode","token":42,"position":17,"sequence_epoch":3,"prefix_before":17,"valid_len_after":18,"query_start":17}"#,
+    )
+    .expect_err("v1 cannot carry KV execution");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(error.message.contains("protocol v1"), "{error}");
+
+    let error = parse_control_request(
+        br#"{"protocol":2,"op":"invoke","mode":"scalar_decode","token":42,"position":17,"sequence_epoch":3,"prefix_before":17,"valid_len_after":18,"query_start":17,"inputs":{"1":[42]}}"#,
+    )
+    .expect_err("decode must not carry a legacy input map");
+    assert!(error.message.contains("token/position only"), "{error}");
+}
+
+#[test]
+fn protocol_v2_admission_exposes_both_program_identities_and_one_prepare() {
+    let prefill = elementwise_add_descriptor();
+    let decode = elementwise_add_descriptor();
+    let receipt = admit_v2_load(&prefill, &decode, "smollm2", "prompt-7").expect("admit pair");
+    assert_eq!(receipt.protocol, 2);
+    assert_eq!(receipt.lifecycle.prepares, 1);
+    assert_eq!(receipt.lifecycle.reuses, 0);
+    assert_eq!(receipt.model_identity.as_deref(), Some("smollm2"));
+    assert_eq!(receipt.session_identity.as_deref(), Some("prompt-7"));
+    assert_eq!(receipt.program_identities.len(), 2);
+    assert!(receipt.program_identities.contains_key("prefill"));
+    assert!(receipt.program_identities.contains_key("scalar_decode"));
+}
+
+#[test]
+fn d1_state_machine_is_public_at_the_composite_host_boundary() {
+    let state = InferenceSessionState::new(8).expect("state");
+    assert_eq!(state.sequence_epoch(), 1);
+    assert_eq!(state.valid_len(), 0);
 }
 
 #[test]
