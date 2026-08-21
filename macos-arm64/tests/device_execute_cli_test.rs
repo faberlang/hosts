@@ -21,7 +21,7 @@ use faber_host_macos_arm64::device_execute::{
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::metal_host::MappedWeightFile;
-use faber_host_macos_arm64::{CudaHostSession, FakeCudaDriver};
+use faber_host_macos_arm64::{CudaHostSession, FakeCudaDriver, HostError};
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde_json::Value;
@@ -496,7 +496,8 @@ fn inputs_json_round_trips_buffer_ids() {
     let inputs = add_inputs();
     let json = inputs_to_json(&inputs).expect("encode");
     let decoded = inputs_from_json(&json).expect("decode");
-    assert_eq!(decoded, inputs);
+    assert_eq!(decoded.map(), &inputs);
+    assert!(decoded.byte_map().is_empty());
 }
 
 #[test]
@@ -510,7 +511,7 @@ fn inputs_json_round_trips_non_finite_values() {
     );
     assert!(!text.contains("null"), "{text}");
     let decoded = inputs_from_json(&json).expect("decode");
-    let values = decoded.get(&1).expect("buffer 1");
+    let values = decoded.map().get(&1).expect("buffer 1");
     assert_eq!(values[0].to_bits(), f32::NAN.to_bits());
     assert_eq!(values[1], f32::INFINITY);
     assert_eq!(values[2], f32::NEG_INFINITY);
@@ -529,7 +530,7 @@ fn inputs_json_preserves_smollm2_first_nan_payload() {
     assert!(text.contains("\"0xff810000\""), "{text}");
     assert!(!text.contains("\"NaN\""), "{text}");
     let decoded = inputs_from_json(&json).expect("decode");
-    assert_eq!(decoded[&1][0].to_bits(), FIRST);
+    assert_eq!(decoded.map()[&1][0].to_bits(), FIRST);
 }
 
 #[test]
@@ -541,7 +542,7 @@ fn inputs_json_round_trips_smollm2_token_bit_patterns() {
     let inputs = BTreeMap::from([(1, tokens.clone())]);
     let json = inputs_to_json(&inputs).expect("encode");
     let decoded = inputs_from_json(&json).expect("decode");
-    let got = decoded.get(&1).expect("buffer 1");
+    let got = decoded.map().get(&1).expect("buffer 1");
     assert_eq!(got.len(), tokens.len());
     for (index, (observed, expected)) in got.iter().zip(&tokens).enumerate() {
         assert_eq!(
@@ -555,7 +556,71 @@ fn inputs_json_round_trips_smollm2_token_bit_patterns() {
 #[test]
 fn inputs_json_accepts_legacy_nan_string() {
     let decoded = inputs_from_json(br#"{"1":["NaN"]}"#).expect("decode");
-    assert!(decoded[&1][0].is_nan());
+    assert!(decoded.map()[&1][0].is_nan());
+}
+
+fn tagged_input_json(id: u32, dtype: &str, bytes: &[u8]) -> Vec<u8> {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(r#"{{"{id}":{{"dtype":"{dtype}","bytes":"{hex}"}}}}"#).into_bytes()
+}
+
+fn assert_misaligned_tail(err: &HostError, dtype: &str, len: usize) {
+    assert_eq!(err.code, "E_INVALID_ARGS");
+    assert!(
+        err.message.contains("misaligned")
+            && err.message.contains(dtype)
+            && err.message.contains(&len.to_string()),
+        "misaligned-tail error must name dtype and length, got {}",
+        err.message
+    );
+}
+
+/// Tagged `--inputs` stay raw bytes. 34-byte f16/bf16 payloads are aligned
+/// (width 2); 32-byte f32 is aligned (width 4). Untagged hex still means
+/// one f32 word of bits — that legacy array form is back-compat, not a
+/// byte blob.
+#[test]
+fn inputs_json_accepts_dtype_tagged_aligned_bytes() {
+    let payload_34: Vec<u8> = (0..34).collect();
+    for dtype in [(DeviceDataType::F16, "f16"), (DeviceDataType::BF16, "bf16")] {
+        let decoded = inputs_from_json(&tagged_input_json(7, dtype.1, &payload_34))
+            .expect("aligned tagged payload");
+        let got = &decoded.byte_map()[&7];
+        assert_eq!(got.dtype, dtype.0);
+        assert_eq!(got.bytes, payload_34);
+        assert!(decoded.map().is_empty());
+    }
+
+    let payload_32: Vec<u8> = (0..32).collect();
+    let decoded =
+        inputs_from_json(&tagged_input_json(3, "f32", &payload_32)).expect("aligned f32 payload");
+    let got = &decoded.byte_map()[&3];
+    assert_eq!(got.dtype, DeviceDataType::F32);
+    assert_eq!(got.bytes, payload_32);
+
+    let mixed = br#"{"1":[1.0,2.0],"2":{"dtype":"f16","bytes":"0x0011"}}"#;
+    let decoded = inputs_from_json(mixed).expect("mixed array and tagged bytes");
+    assert_eq!(decoded.map()[&1], vec![1.0, 2.0]);
+    assert_eq!(decoded.byte_map()[&2].dtype, DeviceDataType::F16);
+    assert_eq!(decoded.byte_map()[&2].bytes, vec![0x00, 0x11]);
+}
+
+/// DSB-2 named rule: payload length must be a multiple of the tag width.
+/// 34-byte f32 is the CUDA first-failing oracle (`len % 4 == 2`); 33-byte
+/// tails are odd and miss every f32/f16/bf16 width.
+#[test]
+fn inputs_json_rejects_misaligned_tagged_bytes_by_name() {
+    let payload_34: Vec<u8> = (0..34).collect();
+    let err = inputs_from_json(&tagged_input_json(7, "f32", &payload_34))
+        .expect_err("34-byte f32 tail is misaligned");
+    assert_misaligned_tail(&err, "f32", 34);
+
+    let payload_33: Vec<u8> = (0..33).collect();
+    for dtype in ["f32", "f16", "bf16"] {
+        let err = inputs_from_json(&tagged_input_json(7, dtype, &payload_33))
+            .expect_err("33-byte tail is misaligned");
+        assert_misaligned_tail(&err, dtype, 33);
+    }
 }
 
 #[test]

@@ -17,9 +17,11 @@
 //! `--backend` is optional; when omitted the descriptor's `backend` field
 //! is the explicit selection. The module image is a raw file (not encoded
 //! in the descriptor JSON). `--inputs` is `{ "<buffer-id>": [f32, ...] }`
-//! for tiny per-step values (tokens, rope, synthesized tables). Packed
-//! weights are not JSON: `--weights` is the GGUF file and `--weight-map`
-//! names byte ranges inside it (`offset` / `len` / `elems` per buffer id).
+//! for tiny per-step values (tokens, rope, synthesized tables), or
+//! `{ "<buffer-id>": { "dtype": "f32"|"f16"|"bf16", "bytes": "<hex>" } }`
+//! for dtype-tagged raw payloads. Packed weights are not JSON: `--weights`
+//! is the GGUF file and `--weight-map` names byte ranges inside it
+//! (`offset` / `len` / `elems` per buffer id).
 //!
 //! Success prints a receipt JSON and exits 0. A host failure prints a
 //! [`HostError`] JSON and exits 2. Usage / parse failures exit 64.
@@ -122,7 +124,7 @@ pub struct DeviceExecuteArgs {
     pub descriptor: PathBuf,
     /// Raw module-image path (MSL source or PTX).
     pub module: PathBuf,
-    /// Inputs JSON path (`{ "<id>": [f32, ...] }`) — tiny per-step values.
+    /// Inputs JSON path: f32 arrays or dtype-tagged hex bytes.
     pub inputs: PathBuf,
     /// Optional second v2 program descriptor/module pair.
     pub prefill_descriptor: Option<PathBuf>,
@@ -431,7 +433,7 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
                     "device-execute control inputs are invalid: {error}"
                 ))
             })?;
-            inputs_from_json(&bytes)
+            inputs_from_json(&bytes)?.into_f32_map()
         })
         .transpose()?;
     let invocation = if protocol == DeviceExecuteProtocol::V2
@@ -580,14 +582,7 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
     let descriptor_decode_us = elapsed_us(descriptor_started);
     let inputs_started = Instant::now();
     let json_inputs = inputs_from_json(&inputs_bytes)?;
-    for (id, values) in json_inputs {
-        if weight_inputs.contains(id) {
-            return Err(HostError::invalid_args(format!(
-                "device-execute buffer {id} is in both --weight-map and --inputs"
-            )));
-        }
-        weight_inputs.insert_owned(id, values);
-    }
+    merge_json_inputs(&mut weight_inputs, json_inputs)?;
     let json_decode_us = elapsed_us(inputs_started);
     descriptor.validate()?;
     let selection = args
@@ -763,7 +758,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
     }
     let descriptor_bytes = read_file(&args.descriptor)?;
     let module_image = read_file(&args.module)?;
-    let base_inputs = inputs_from_json(&read_file(&args.inputs)?)?;
+    let json_inputs = inputs_from_json(&read_file(&args.inputs)?)?;
     let weight_map = match &args.weight_map {
         Some(path) => weight_map_from_json(&read_file(path)?)?,
         None => BTreeMap::new(),
@@ -775,7 +770,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
     let mut mmap_paging = MappedWeightPaging::default();
     let mut mmap_data_start = 0u64;
     let mut mmap_regions = 0usize;
-    let weight_inputs = if let Some(mapped) = &mapped_weights {
+    let mut weight_inputs = if let Some(mapped) = &mapped_weights {
         let table = gguf_region_table(mapped.bytes(), &weight_map)?;
         mmap_paging = mapped_paging(mapped);
         mmap_data_start = table.data_start;
@@ -784,6 +779,8 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
     } else {
         WeightInputs::default()
     };
+    merge_json_inputs(&mut weight_inputs, json_inputs)?;
+    let base_inputs = weight_inputs.take_f32_map();
     let descriptor = descriptor_from_json(&descriptor_bytes, module_image)?;
     descriptor.validate()?;
     let selection = args
@@ -1027,35 +1024,107 @@ pub fn descriptor_to_json(descriptor: &DeviceDescriptor) -> HostResult<Vec<u8>> 
     })
 }
 
-/// Decode `{ "<buffer-id>": [f32, ...] }`.
+/// Decode `{ "<buffer-id>": [f32, ...] }` or dtype-tagged hex bytes.
 ///
-/// Finite values are JSON numbers (`f32` → `f64` is injective). NaN
-/// payloads are `"0x"` + 8 hex bits so packed GGUF words survive the
-/// file; `"NaN"` still decodes as the canonical quiet NaN. Infinities
-/// stay `"Infinity"` / `"-Infinity"`.
-pub fn inputs_from_json(bytes: &[u8]) -> HostResult<BTreeMap<u32, Vec<f32>>> {
-    let wire: BTreeMap<String, Vec<serde_json::Value>> =
+/// Untagged arrays keep the legacy f32 wire: finite values are JSON
+/// numbers (`f32` → `f64` is injective); NaN payloads are `"0x"` + 8 hex
+/// bits so packed GGUF words survive the file; `"NaN"` still decodes as
+/// the canonical quiet NaN; infinities stay `"Infinity"` / `"-Infinity"`.
+/// Tagged objects `{ "dtype", "bytes" }` stay raw bytes with a
+/// [`DeviceDataType`] tag; a tail that is not a multiple of the tag's
+/// byte width fails closed by name.
+pub fn inputs_from_json(bytes: &[u8]) -> HostResult<WeightInputs> {
+    let wire: BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(bytes).map_err(|error| {
             HostError::invalid_args(format!("device-execute inputs JSON is invalid: {error}"))
         })?;
-    let mut inputs = BTreeMap::new();
-    for (key, values) in wire {
+    let mut inputs = WeightInputs::default();
+    for (key, value) in wire {
         let id = key.parse::<u32>().map_err(|_| {
             HostError::invalid_args(format!(
                 "device-execute inputs key `{key}` is not a buffer id"
             ))
         })?;
-        let mut parsed = Vec::with_capacity(values.len());
-        for (index, value) in values.into_iter().enumerate() {
-            parsed.push(f32_from_json(&value).map_err(|detail| {
-                HostError::invalid_args(format!(
-                    "device-execute inputs[{id}][{index}] is invalid: {detail}"
-                ))
-            })?);
+        match value {
+            serde_json::Value::Array(values) => {
+                let mut parsed = Vec::with_capacity(values.len());
+                for (index, item) in values.into_iter().enumerate() {
+                    parsed.push(f32_from_json(&item).map_err(|detail| {
+                        HostError::invalid_args(format!(
+                            "device-execute inputs[{id}][{index}] is invalid: {detail}"
+                        ))
+                    })?);
+                }
+                inputs.insert_owned(id, parsed);
+            }
+            serde_json::Value::Object(_) => {
+                let tagged: WireTaggedInput = serde_json::from_value(value).map_err(|error| {
+                    HostError::invalid_args(format!(
+                        "device-execute inputs[{id}] tagged bytes are invalid: {error}"
+                    ))
+                })?;
+                let dtype = parse_input_dtype(&tagged.dtype)?;
+                let payload = parse_hex_bytes(&tagged.bytes).map_err(|detail| {
+                    HostError::invalid_args(format!(
+                        "device-execute inputs[{id}] bytes are invalid: {detail}"
+                    ))
+                })?;
+                if payload.len() % dtype.byte_width() != 0 {
+                    return Err(misaligned_input_tail(id, dtype, payload.len()));
+                }
+                inputs.insert_bytes_owned(
+                    id,
+                    DeviceByteBuffer {
+                        bytes: payload,
+                        dtype,
+                    },
+                );
+            }
+            other => {
+                return Err(HostError::invalid_args(format!(
+                    "device-execute inputs[{id}] expected an f32 array or dtype-tagged bytes, got {other}"
+                )));
+            }
         }
-        inputs.insert(id, parsed);
     }
     Ok(inputs)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireTaggedInput {
+    dtype: String,
+    bytes: String,
+}
+
+fn parse_input_dtype(spelling: &str) -> HostResult<DeviceDataType> {
+    DeviceDataType::from_spelling(spelling).ok_or_else(|| {
+        HostError::invalid_args(format!(
+            "device-execute inputs dtype `{spelling}` is outside the host dtype surface"
+        ))
+    })
+}
+
+fn misaligned_input_tail(id: u32, dtype: DeviceDataType, len: usize) -> HostError {
+    HostError::invalid_args(format!(
+        "device-execute inputs[{id}] rejects a misaligned {} tail of {} bytes",
+        dtype.spelling(),
+        len
+    ))
+}
+
+fn merge_json_inputs(dst: &mut WeightInputs, mut src: WeightInputs) -> HostResult<()> {
+    let ids: Vec<u32> = src.values.keys().chain(src.bytes.keys()).copied().collect();
+    for id in ids {
+        if dst.contains(id) {
+            return Err(HostError::invalid_args(format!(
+                "device-execute buffer {id} is in both --weight-map and --inputs"
+            )));
+        }
+    }
+    dst.values.append(&mut src.values);
+    dst.bytes.append(&mut src.bytes);
+    Ok(())
 }
 
 /// One GGUF byte range admitted as a native packed device region.
@@ -1163,9 +1232,9 @@ pub struct GgufRegionTable {
     pub abs_ends: Vec<u64>,
 }
 
-/// Host-side inputs for one device-execute request. JSON invocation values
-/// remain f32 values; GGUF weight-map entries are raw dtype-tagged bytes and
-/// may alias a retained mmap.
+/// Host-side inputs for one device-execute request. Untagged JSON arrays
+/// remain f32 values; tagged JSON objects and GGUF weight-map entries are
+/// raw dtype-tagged bytes. Mapped GGUF ranges may alias a retained mmap.
 #[derive(Debug, Default)]
 pub struct WeightInputs {
     values: BTreeMap<u32, Vec<f32>>,
@@ -1218,6 +1287,19 @@ impl WeightInputs {
             },
         );
         self.aliased_bytes.insert(id);
+    }
+
+    fn take_f32_map(&mut self) -> BTreeMap<u32, Vec<f32>> {
+        std::mem::take(&mut self.values)
+    }
+
+    fn into_f32_map(mut self) -> HostResult<BTreeMap<u32, Vec<f32>>> {
+        if !self.bytes.is_empty() {
+            return Err(HostError::invalid_args(
+                "device-execute control inputs do not accept dtype-tagged bytes",
+            ));
+        }
+        Ok(self.take_f32_map())
     }
 }
 
@@ -1492,6 +1574,26 @@ fn parse_f32_string(spelling: &str) -> Result<f32, String> {
         }
         other => Err(format!("unknown f32 spelling `{other}`")),
     }
+}
+
+fn parse_hex_bytes(spelling: &str) -> Result<Vec<u8>, String> {
+    let hex = if spelling.len() >= 2 && spelling.as_bytes()[..2].eq_ignore_ascii_case(b"0x") {
+        &spelling[2..]
+    } else {
+        spelling
+    };
+    if hex.len() % 2 != 0 {
+        return Err(format!("hex payload `{spelling}` is not whole bytes"));
+    }
+    if !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(format!("hex payload `{spelling}` is not hex"));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(chunk).expect("ascii hex digits");
+        bytes.push(u8::from_str_radix(text, 16).expect("ascii hex digits"));
+    }
+    Ok(bytes)
 }
 
 /// Encode a receipt for stdout.
