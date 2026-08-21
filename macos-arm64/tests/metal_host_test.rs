@@ -3,14 +3,14 @@
 
 use faber::Valor;
 use faber_host_macos_arm64::device_descriptor::{
-    DescriptorRuntimeSource, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
+    DescriptorRuntimeSource, DeviceDataType, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
 };
-use faber_host_macos_arm64::device_host::DeviceLaunchBinding;
+use faber_host_macos_arm64::device_host::{DeviceLaunchBinding, DeviceRuntime, DeviceSession};
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::metal_host::{MappedWeightFile, MetalHandleId, MetalLaunchBinding};
 use faber_host_macos_arm64::{
-    probe_metal_environment, FakeMetalDriver, MetalHostSession, E_METAL_INVALID_HANDLE,
-    E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
+    probe_metal_environment, CudaHostSession, FakeCudaDriver, FakeMetalDriver, MetalHostSession,
+    E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };
 use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
@@ -62,7 +62,7 @@ fn fake_driver_sequences_elementwise_add_without_product_label() {
     session.copy_in_f32(b, &[3.0, 4.0]).expect("copy b");
     let packed = session.alloc_bytes(4).expect("alloc packed");
     session
-        .copy_in_packed_bytes(packed, &[0x11, 0x22, 0x33])
+        .copy_in_bytes(packed, &[0x11, 0x22, 0x33], DeviceDataType::U8)
         .expect("packed-region 3-byte admit pads to 4");
     session
         .launch_elementwise_add_f32(module, a, b, out)
@@ -75,6 +75,37 @@ fn fake_driver_sequences_elementwise_add_without_product_label() {
         .readback_f32(out)
         .expect_err("stale handle must fail closed");
     assert_eq!(err.code, E_METAL_INVALID_HANDLE);
+}
+
+#[test]
+fn device_session_byte_surface_round_trips_metal_and_declares_retention() {
+    let mut runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake admit"),
+    );
+    assert!(runtime.supports_mapped_weight_retention());
+
+    let cuda_runtime = DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(Box::new(FakeCudaDriver::default())).expect("fake admit"),
+    );
+    assert!(!cuda_runtime.supports_mapped_weight_retention());
+
+    for payload in [
+        vec![0x11],
+        vec![0x22, 0x33],
+        vec![0x44, 0x55, 0x66],
+        (0..34).collect(),
+    ] {
+        let handle = runtime.alloc_bytes(payload.len()).expect("alloc");
+        runtime
+            .copy_in_bytes(&handle, &payload, DeviceDataType::U8)
+            .expect("byte upload");
+        assert_eq!(
+            runtime
+                .readback_bytes(&handle, DeviceDataType::U8)
+                .expect("byte readback"),
+            payload
+        );
+    }
 }
 
 #[test]
@@ -509,7 +540,7 @@ fn system_driver_admits_mmap_region_without_copy_and_launches() {
     let b = session.alloc_bytes(16 * 4).expect("alloc b");
     let out = session.alloc_bytes(16 * 4).expect("alloc out");
     session
-        .copy_in_packed_bytes(a, &mapped.bytes()[..64])
+        .copy_in_bytes(a, &mapped.bytes()[..64], DeviceDataType::F32)
         .expect("mmap admit");
     session
         .launch_elementwise_add_f32(module, a, b, out)
@@ -550,7 +581,7 @@ fn system_driver_mmap_unaligned_region_uses_page_remainder() {
         .expect("retain mapping");
     let buffer = session.alloc_bytes(8).expect("alloc region");
     session
-        .copy_in_packed_bytes(buffer, &mapped.bytes()[16..24])
+        .copy_in_bytes(buffer, &mapped.bytes()[16..24], DeviceDataType::F32)
         .expect("mmap unaligned admit");
     let values = session.readback_f32(buffer).expect("readback");
     assert_eq!(
@@ -815,7 +846,7 @@ fn b6_mapped_region_composes_page_remainder_with_binding_offset() {
         .expect("load");
     let region = session.alloc_bytes(16).expect("mapped region");
     session
-        .copy_in_packed_bytes(region, &mapped.bytes()[16..32])
+        .copy_in_bytes(region, &mapped.bytes()[16..32], DeviceDataType::F32)
         .expect("mmap unaligned admit");
     let echoed = session.readback_f32(region).expect("logical start");
     assert_eq!(
@@ -914,7 +945,7 @@ fn system_driver_mapped_region_composes_page_remainder_with_binding_offset() {
         .expect("runtime MSL compile");
     let region = session.alloc_bytes(16).expect("mapped region");
     session
-        .copy_in_packed_bytes(region, &mapped.bytes()[16..32])
+        .copy_in_bytes(region, &mapped.bytes()[16..32], DeviceDataType::F32)
         .expect("mmap unaligned admit");
     let out = session.alloc_bytes(4).expect("out");
     session

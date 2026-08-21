@@ -23,7 +23,7 @@ use crate::cuda_host::{CudaHandleId, CudaHostSession, E_CUDA_UNSUPPORTED};
 use crate::device_descriptor::errors;
 use crate::device_descriptor::{
     DescriptorInvocationState, DescriptorLaunchBinding, DescriptorRuntimeSource, DescriptorView,
-    KvCacheDescriptor,
+    DeviceDataType, KvCacheDescriptor,
 };
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
@@ -213,10 +213,10 @@ impl DeviceRuntime {
                 )));
             }
         }
-        copy_in_bytes(
-            self,
+        self.copy_in_bytes(
             &buffer.handle,
             &InvocationStateBuffer::encoded_bytes(state),
+            DeviceDataType::U8,
         )
     }
 
@@ -376,8 +376,25 @@ pub trait DeviceSession {
     fn load_module(&mut self, image: &[u8]) -> HostResult<DeviceHandle>;
     /// Allocate a device buffer of the given byte length.
     fn alloc_bytes(&mut self, len_bytes: usize) -> HostResult<DeviceHandle>;
+    /// Copy dtype-tagged bytes into a device buffer without changing their
+    /// representation.
+    fn copy_in_bytes(
+        &mut self,
+        buffer: &DeviceHandle,
+        bytes: &[u8],
+        dtype: DeviceDataType,
+    ) -> HostResult<()>;
     /// Copy f32 values into a device buffer (exact size match required).
-    fn copy_in_f32(&mut self, buffer: &DeviceHandle, values: &[f32]) -> HostResult<()>;
+    /// This is a compatibility wrapper over [`Self::copy_in_bytes`].
+    fn copy_in_f32(&mut self, buffer: &DeviceHandle, values: &[f32]) -> HostResult<()> {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        self.copy_in_bytes(buffer, &bytes, DeviceDataType::F32)
+    }
+    /// Whether this backend keeps mapped weight storage alive for the session.
+    fn supports_mapped_weight_retention(&self) -> bool;
     /// Launch a named kernel entry over device buffers with a 3D grid/block
     /// shape. Metal encodes into the step command buffer (commit+wait at
     /// `sync`); CUDA still synchronizes internally.
@@ -391,8 +408,27 @@ pub trait DeviceSession {
     ) -> HostResult<()>;
     /// Explicit device synchronization barrier.
     fn sync(&mut self) -> HostResult<()>;
+    /// Read a device buffer back as dtype-tagged bytes without changing their
+    /// representation.
+    fn readback_bytes(
+        &mut self,
+        buffer: &DeviceHandle,
+        dtype: DeviceDataType,
+    ) -> HostResult<Vec<u8>>;
     /// Read a device buffer back as f32 values.
-    fn readback_f32(&mut self, buffer: &DeviceHandle) -> HostResult<Vec<f32>>;
+    /// This is a compatibility wrapper over [`Self::readback_bytes`].
+    fn readback_f32(&mut self, buffer: &DeviceHandle) -> HostResult<Vec<f32>> {
+        let bytes = self.readback_bytes(buffer, DeviceDataType::F32)?;
+        if bytes.len() % 4 != 0 {
+            return Err(HostError::internal(
+                "f32 readback returned an unexpected byte length",
+            ));
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
     /// Release a handle and its underlying device object.
     fn release(&mut self, handle: &DeviceHandle) -> HostResult<()>;
 }
@@ -406,6 +442,13 @@ impl DeviceSession for DeviceRuntime {
         match self {
             Self::Metal(session) => session.is_admitted(),
             Self::Cuda(session) => session.is_admitted(),
+        }
+    }
+
+    fn supports_mapped_weight_retention(&self) -> bool {
+        match self {
+            Self::Metal(_) => true,
+            Self::Cuda(_) => false,
         }
     }
 
@@ -455,10 +498,31 @@ impl DeviceSession for DeviceRuntime {
         }
     }
 
-    fn copy_in_f32(&mut self, buffer: &DeviceHandle, values: &[f32]) -> HostResult<()> {
+    fn copy_in_bytes(
+        &mut self,
+        buffer: &DeviceHandle,
+        bytes: &[u8],
+        dtype: DeviceDataType,
+    ) -> HostResult<()> {
         match self {
-            Self::Metal(session) => session.copy_in_f32(metal_handle(buffer)?, values),
-            Self::Cuda(session) => session.copy_in_f32(cuda_handle(buffer)?, values),
+            Self::Metal(session) => session.copy_in_bytes(metal_handle(buffer)?, bytes, dtype),
+            // Transitional DSB-1 behavior: CUDA still routes bytes through
+            // its f32 surface. DSB-2 replaces this reinterpretation with the
+            // raw-byte driver path.
+            Self::Cuda(session) => {
+                let _ = dtype;
+                if bytes.len() % 4 != 0 {
+                    return Err(HostError::invalid_args(format!(
+                        "CUDA invocation-state copy requires a 4-byte multiple, got {} bytes",
+                        bytes.len()
+                    )));
+                }
+                let values: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                session.copy_in_f32(cuda_handle(buffer)?, &values)
+            }
         }
     }
 
@@ -481,10 +545,23 @@ impl DeviceSession for DeviceRuntime {
         }
     }
 
-    fn readback_f32(&mut self, buffer: &DeviceHandle) -> HostResult<Vec<f32>> {
+    fn readback_bytes(
+        &mut self,
+        buffer: &DeviceHandle,
+        dtype: DeviceDataType,
+    ) -> HostResult<Vec<u8>> {
         match self {
-            Self::Metal(session) => session.readback_f32(metal_handle(buffer)?),
-            Self::Cuda(session) => session.readback_f32(cuda_handle(buffer)?),
+            Self::Metal(session) => session.readback_bytes(metal_handle(buffer)?, dtype),
+            // Transitional DSB-1 behavior: preserve the existing CUDA f32
+            // readback until DSB-2 can use the driver's raw-byte result.
+            Self::Cuda(session) => {
+                let _ = dtype;
+                let values = session.readback_f32(cuda_handle(buffer)?)?;
+                Ok(values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect())
+            }
         }
     }
 
@@ -693,29 +770,6 @@ fn allocation_id_for_handle(
             handle.id
         ))
     })
-}
-
-fn copy_in_bytes(
-    runtime: &mut DeviceRuntime,
-    buffer: &DeviceHandle,
-    bytes: &[u8],
-) -> HostResult<()> {
-    match runtime {
-        DeviceRuntime::Metal(session) => session.copy_in_packed_bytes(metal_handle(buffer)?, bytes),
-        DeviceRuntime::Cuda(session) => {
-            if bytes.len() % 4 != 0 {
-                return Err(HostError::invalid_args(format!(
-                    "CUDA invocation-state copy requires a 4-byte multiple, got {} bytes",
-                    bytes.len()
-                )));
-            }
-            let values: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            session.copy_in_f32(cuda_handle(buffer)?, &values)
-        }
-    }
 }
 
 fn cuda_dynamic_unsupported(binding: &DeviceLaunchBinding) -> HostError {

@@ -23,7 +23,7 @@ use metal::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::device_descriptor::errors;
+use crate::device_descriptor::{errors, DeviceDataType};
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
@@ -523,25 +523,30 @@ impl MetalHostSession {
     }
 
     pub fn copy_in_f32(&mut self, buffer: MetalHandleId, values: &[f32]) -> HostResult<()> {
-        self.copy_in_packed_bytes(buffer, f32_slice_as_bytes(values))
+        self.copy_in_bytes(buffer, f32_slice_as_bytes(values), DeviceDataType::F32)
     }
 
-    /// Keep a GGUF mmap alive for the session so packed-region `copy_in`
-    /// can wrap the mapped pages instead of uploading them.
+    /// Keep a GGUF mmap alive for the session so byte-region `copy_in` can
+    /// wrap the mapped pages instead of uploading them.
     pub fn retain_mapped_file(&mut self, file: MappedWeightFile) -> HostResult<()> {
         self.require_admitted()?;
         self.driver.retain_mapped_file(file);
         Ok(())
     }
 
-    /// Admit a native packed region into a Metal buffer.
+    /// Admit a native byte region into a Metal buffer.
     ///
     /// Bytes that sit inside a retained mmap become a no-copy MTLBuffer
     /// (page-rounded wrap; bind offset is the intra-page remainder). Other
     /// bytes copy as-is. A 1–3 byte tail may be zero-padded so the buffer's
     /// f32-word width matches; a shorter logical-F32 expansion is not
     /// admitted.
-    pub fn copy_in_packed_bytes(&mut self, buffer: MetalHandleId, bytes: &[u8]) -> HostResult<()> {
+    pub fn copy_in_bytes(
+        &mut self,
+        buffer: MetalHandleId,
+        bytes: &[u8],
+        _dtype: DeviceDataType,
+    ) -> HostResult<()> {
         self.require_admitted()?;
         let (token, len_bytes) = self.buffer_token(buffer)?;
         if bytes.len() == len_bytes {
@@ -717,13 +722,27 @@ impl MetalHostSession {
         self.driver.sync()
     }
 
-    pub fn readback_f32(&mut self, buffer: MetalHandleId) -> HostResult<Vec<f32>> {
+    pub fn readback_bytes(
+        &mut self,
+        buffer: MetalHandleId,
+        _dtype: DeviceDataType,
+    ) -> HostResult<Vec<u8>> {
         self.require_admitted()?;
         let (token, len_bytes) = self.buffer_token(buffer)?;
         let bytes = self.driver.copy_out(token, len_bytes)?;
-        if bytes.len() != len_bytes || len_bytes % 4 != 0 {
+        if bytes.len() != len_bytes {
             return Err(HostError::internal(
                 "Metal readback returned unexpected byte length",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn readback_f32(&mut self, buffer: MetalHandleId) -> HostResult<Vec<f32>> {
+        let bytes = self.readback_bytes(buffer, DeviceDataType::F32)?;
+        if bytes.len() % 4 != 0 {
+            return Err(HostError::internal(
+                "Metal readback returned unexpected f32 byte length",
             ));
         }
         Ok((0..bytes.len() / 4)
