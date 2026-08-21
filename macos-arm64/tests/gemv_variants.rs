@@ -165,6 +165,21 @@ fn plan_path_selects_gemv_when_m_is_one() {
 }
 
 #[test]
+fn transformer_projection_entries_select_the_same_decode_gemv() {
+    for entry in ["QkvProjection", "OutputProjection", "SwiGlu"] {
+        assert_eq!(
+            select_decode_gemv(Some(entry), 1).expect("decode projection selection"),
+            Some(GemvKernel::Quantized),
+            "{entry} must use the packed GEMV body"
+        );
+    }
+    assert_eq!(
+        select_decode_gemv(Some("QkvProjection"), 0).expect("prefill projection selection"),
+        None
+    );
+}
+
+#[test]
 fn gemv_format_resolves_from_packed_ggml_type_id() {
     assert_eq!(
         QuantizedFormat::from_ggml_type_id(12),
