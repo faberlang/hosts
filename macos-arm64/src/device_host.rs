@@ -27,7 +27,7 @@ use crate::device_descriptor::{
 };
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
-use crate::metal_host::{MetalHandleId, MetalHostSession};
+use crate::metal_host::{MetalHandleId, MetalHostSession, MetalLaunchBinding};
 
 /// Stable host error code for a device handle that does not belong to the
 /// runtime's backend session (cross-backend misuse or an unparsable handle).
@@ -223,7 +223,8 @@ impl DeviceRuntime {
     /// Launch with explicit bindings. Offsets and spans are checked against
     /// each handle's allocation size before the backend is touched. CUDA
     /// dynamic bindings fail with [`E_CUDA_UNSUPPORTED`]. Binding indices
-    /// select dispatch slots; they are not dropped.
+    /// select dispatch slots; they are not dropped. Metal carries each
+    /// binding's offset and span through to [`MetalHostSession::launch_kernel_bound`].
     pub fn launch_kernel_bound(
         &mut self,
         module: &DeviceHandle,
@@ -233,8 +234,20 @@ impl DeviceRuntime {
         block: [u32; 3],
     ) -> HostResult<()> {
         validate_dispatch_bindings(self.backend(), bindings)?;
-        let handles = handles_in_binding_order(bindings)?;
-        dispatch_kernel(self, module, entry, &handles, grid, block)
+        match self {
+            Self::Metal(session) => {
+                let module_id = metal_handle(module)?;
+                let metal_bindings: Vec<MetalLaunchBinding> = bindings
+                    .iter()
+                    .map(metal_from_device_binding)
+                    .collect::<HostResult<_>>()?;
+                session.launch_kernel_bound(module_id, entry, &metal_bindings, grid, block)
+            }
+            Self::Cuda(_) => {
+                let handles = handles_in_binding_order(bindings)?;
+                dispatch_kernel(self, module, entry, &handles, grid, block)
+            }
+        }
     }
 
     /// Resolve B3 launch records, validate offsets/spans against views, then
@@ -726,6 +739,15 @@ fn runtime_source_spelling(source: DescriptorRuntimeSource) -> &'static str {
         DescriptorRuntimeSource::QueryRows => "query_rows",
         DescriptorRuntimeSource::SequenceEpoch => "sequence_epoch",
     }
+}
+
+fn metal_from_device_binding(binding: &DeviceLaunchBinding) -> HostResult<MetalLaunchBinding> {
+    Ok(MetalLaunchBinding {
+        handle: metal_handle(&binding.handle)?,
+        binding_index: binding.binding_index,
+        byte_offset: binding.byte_offset,
+        view_span: binding.view_span,
+    })
 }
 
 fn metal_handle(handle: &DeviceHandle) -> HostResult<MetalHandleId> {

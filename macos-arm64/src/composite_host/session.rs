@@ -10,10 +10,14 @@ use std::time::Instant;
 use host_coordinator::{DeviceBackend, DeviceHandle};
 
 use crate::device_descriptor::{
-    errors as descriptor_errors, fnv1a64, DeviceBufferInitialization, DeviceBufferLifetime,
-    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
+    errors as descriptor_errors, fnv1a64, DescriptorAllocation, DescriptorInvocationState,
+    DescriptorLaunchBinding, DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization,
+    DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
+    DeviceProgramLifetime, KvCacheDescriptor, E_DEVICE_DESCRIPTOR,
 };
-use crate::device_host::{DeviceRuntime, DeviceSession};
+use crate::device_host::{
+    DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
+};
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 
@@ -1931,4 +1935,381 @@ impl<'host> PreparedResidentSession<'host> {
         self.counters.releases += 1;
         Ok(self.receipt())
     }
+}
+
+// ---------------------------------------------------------------------------
+// KV-B B7: generic session binding materializer
+// ---------------------------------------------------------------------------
+
+/// Session-owned KV storage and launch-binding materializer.
+///
+/// One device allocation per persistent arena exposes the declared append and
+/// prefix views. The invocation-state buffer is allocated once and copied
+/// once per step; append and attention launches share that upload. Changing
+/// live offsets reuses the same handles: no cache copy, no persistent
+/// reallocation, no weight re-upload. Metal receives the live offsets on
+/// the B6 bound-launch path.
+pub struct KvCacheBindingSession<'host> {
+    runtime: &'host mut DeviceRuntime,
+    kv: KvCacheDescriptor,
+    allocations: Vec<(u32, DeviceHandle)>,
+    weights: Vec<(u32, DeviceHandle)>,
+    cursor: InvocationStateBuffer,
+    module: DeviceHandle,
+    cursor_uploads: usize,
+    weight_uploads: usize,
+    cache_copies: usize,
+    allocs_at_prepare: usize,
+}
+
+impl<'host> KvCacheBindingSession<'host> {
+    /// Allocate each KV arena once, the cursor once, and any HostProvided
+    /// weights once. Views share those arena handles; they do not allocate.
+    ///
+    /// # Errors
+    /// Descriptor validation, allocation, module load, or a weight shape
+    /// mismatch fail closed. Partial allocations are released first.
+    pub fn prepare(
+        runtime: &'host mut DeviceRuntime,
+        kv: &KvCacheDescriptor,
+        module_image: &[u8],
+        weights: &[(DescriptorAllocation, &[f32])],
+    ) -> HostResult<Self> {
+        kv.validate()?;
+        let module = runtime.load_module(module_image)?;
+        let mut allocations: Vec<(u32, DeviceHandle)> = Vec::with_capacity(kv.allocations.len());
+        let mut weight_handles: Vec<(u32, DeviceHandle)> = Vec::with_capacity(weights.len());
+        let prepared = (|| {
+            for allocation in &kv.allocations {
+                let handle = runtime.alloc_bytes(allocation.capacity_bytes as usize)?;
+                allocations.push((allocation.buffer_id, handle));
+            }
+            let cursor = runtime.alloc_invocation_state()?;
+            let mut weight_uploads = 0usize;
+            for (allocation, values) in weights {
+                expect_weight_shape(allocation, values)?;
+                let handle = runtime.alloc_bytes(allocation.capacity_bytes as usize)?;
+                runtime.copy_in_f32(&handle, values)?;
+                weight_handles.push((allocation.buffer_id, handle));
+                weight_uploads += 1;
+            }
+            Ok((cursor, weight_uploads))
+        })();
+        let (cursor, weight_uploads) = match prepared {
+            Ok(ok) => ok,
+            Err(error) => {
+                release_handles(runtime, allocations.iter().map(|(_, handle)| handle));
+                release_handles(runtime, weight_handles.iter().map(|(_, handle)| handle));
+                drop(runtime.release(&module));
+                return Err(error);
+            }
+        };
+        let allocs_at_prepare = runtime.driver_counters().buffer_allocs;
+        Ok(Self {
+            runtime,
+            kv: kv.clone(),
+            allocations,
+            weights: weight_handles,
+            cursor,
+            module,
+            cursor_uploads: 0,
+            weight_uploads,
+            cache_copies: 0,
+            allocs_at_prepare,
+        })
+    }
+
+    /// Live launch bindings for `state`. Handles are the session allocations;
+    /// offsets and spans are the static envelope plus the tagged cursor field.
+    pub fn materialize_bindings(
+        &self,
+        state: DescriptorInvocationState,
+    ) -> HostResult<Vec<DeviceLaunchBinding>> {
+        materialize_session_bindings(&self.kv, &self.allocations, state)
+    }
+
+    /// Copy the cursor once and return the live bindings for this step.
+    /// Append and attention launches share this upload.
+    pub fn begin_step(
+        &mut self,
+        state: DescriptorInvocationState,
+    ) -> HostResult<Vec<DeviceLaunchBinding>> {
+        self.runtime.upload_invocation_state(&self.cursor, state)?;
+        self.cursor_uploads += 1;
+        self.materialize_bindings(state)
+    }
+
+    /// Bound launch on the session module. Offsets reach Metal on the B6 path.
+    pub fn launch_kernel_bound(
+        &mut self,
+        entry: &str,
+        bindings: &[DeviceLaunchBinding],
+        grid: [u32; 3],
+        block: [u32; 3],
+    ) -> HostResult<()> {
+        self.runtime
+            .launch_kernel_bound(&self.module, entry, bindings, grid, block)
+    }
+
+    /// Persistent allocation handle for a KV arena (not a view).
+    #[must_use]
+    pub fn allocation_handle(&self, buffer_id: u32) -> Option<DeviceHandle> {
+        self.allocations
+            .iter()
+            .find_map(|(id, handle)| (*id == buffer_id).then_some(*handle))
+    }
+
+    /// HostProvided weight handle uploaded at prepare.
+    #[must_use]
+    pub fn weight_handle(&self, buffer_id: u32) -> Option<DeviceHandle> {
+        self.weights
+            .iter()
+            .find_map(|(id, handle)| (*id == buffer_id).then_some(*handle))
+    }
+
+    /// The reusable invocation-state buffer. Identity is stable across steps.
+    #[must_use]
+    pub fn cursor_handle(&self) -> DeviceHandle {
+        self.cursor.handle()
+    }
+
+    /// Cursor copies performed by [`Self::begin_step`]. One per step.
+    #[must_use]
+    pub fn cursor_uploads(&self) -> usize {
+        self.cursor_uploads
+    }
+
+    /// Cache-data copies after prepare. The materializer never copies cache.
+    #[must_use]
+    pub fn cache_copies(&self) -> usize {
+        self.cache_copies
+    }
+
+    /// Weight uploads. Exactly the prepare-time count; steps do not re-upload.
+    #[must_use]
+    pub fn weight_uploads(&self) -> usize {
+        self.weight_uploads
+    }
+
+    /// Persistent buffer allocations beyond prepare. Steps must keep this at 0.
+    #[must_use]
+    pub fn persistent_reallocs(&self) -> usize {
+        self.runtime
+            .driver_counters()
+            .buffer_allocs
+            .saturating_sub(self.allocs_at_prepare)
+    }
+
+    /// Driver-level lifecycle counters (prepare baseline vs later steps).
+    #[must_use]
+    pub fn driver_counters(&self) -> DriverCounters {
+        self.runtime.driver_counters()
+    }
+
+    /// Allocate a transient observation buffer. Not a persistent KV arena.
+    pub fn alloc_bytes(&mut self, len_bytes: usize) -> HostResult<DeviceHandle> {
+        let handle = self.runtime.alloc_bytes(len_bytes)?;
+        self.allocs_at_prepare = self.runtime.driver_counters().buffer_allocs;
+        Ok(handle)
+    }
+
+    /// Host→device copy into a session-owned handle (test seeding).
+    pub fn copy_in_f32(&mut self, handle: &DeviceHandle, values: &[f32]) -> HostResult<()> {
+        self.runtime.copy_in_f32(handle, values)
+    }
+
+    /// Device→host readback.
+    pub fn readback_f32(&mut self, handle: &DeviceHandle) -> HostResult<Vec<f32>> {
+        self.runtime.readback_f32(handle)
+    }
+
+    /// Step-boundary sync after the shared cursor upload's launches.
+    pub fn sync(&mut self) -> HostResult<()> {
+        self.runtime.sync()
+    }
+}
+
+fn expect_weight_shape(allocation: &DescriptorAllocation, values: &[f32]) -> HostResult<()> {
+    let expected = allocation.capacity_bytes / allocation.dtype.byte_width() as u64;
+    if u64::try_from(values.len()).ok() != Some(expected) {
+        return Err(descriptor_errors::shape_mismatch(format!(
+            "weight allocation {} has {} f32 elements but its capacity holds {expected}",
+            allocation.buffer_id,
+            values.len()
+        )));
+    }
+    Ok(())
+}
+
+fn release_handles<'a>(
+    runtime: &mut DeviceRuntime,
+    handles: impl IntoIterator<Item = &'a DeviceHandle>,
+) {
+    for handle in handles {
+        drop(runtime.release(handle));
+    }
+}
+
+/// Apply the tagged cursor to each declared launch record. Handles stay the
+/// session allocations; only offset and span change.
+fn materialize_session_bindings(
+    kv: &KvCacheDescriptor,
+    allocations: &[(u32, DeviceHandle)],
+    state: DescriptorInvocationState,
+) -> HostResult<Vec<DeviceLaunchBinding>> {
+    kv.validate()?;
+    let mut bindings = Vec::with_capacity(kv.launch_records().len());
+    for record in kv.launch_records() {
+        bindings.push(materialize_one_binding(kv, allocations, record, state)?);
+    }
+    Ok(bindings)
+}
+
+fn materialize_one_binding(
+    kv: &KvCacheDescriptor,
+    allocations: &[(u32, DeviceHandle)],
+    record: &DescriptorLaunchBinding,
+    state: DescriptorInvocationState,
+) -> HostResult<DeviceLaunchBinding> {
+    let handle = allocation_handle(allocations, record.handle)?;
+    let allocation = kv
+        .allocations
+        .iter()
+        .find(|allocation| allocation.buffer_id == record.handle)
+        .ok_or_else(|| {
+            descriptor_errors::descriptor(format!(
+                "launch binding index {} names unknown allocation {}",
+                record.binding_index, record.handle
+            ))
+        })?;
+    let view = matching_static_view(kv, record).ok_or_else(|| {
+        descriptor_errors::shape_mismatch(format!(
+            "launch binding index {} offset {} span {} does not match a view on allocation {}",
+            record.binding_index, record.byte_offset, record.view_span, record.handle
+        ))
+    })?;
+    let row_step = row_step_bytes(kv, record.handle).ok_or_else(|| {
+        descriptor_errors::descriptor(format!(
+            "allocation {} has no view from which to derive a row step",
+            record.handle
+        ))
+    })?;
+    let (byte_offset, view_span) = live_envelope(record, view, allocation, state, row_step)?;
+    Ok(DeviceLaunchBinding {
+        handle,
+        binding_index: record.binding_index,
+        byte_offset,
+        view_span,
+        runtime_source: record.runtime_source,
+    })
+}
+
+fn live_envelope(
+    record: &DescriptorLaunchBinding,
+    view: &DescriptorView,
+    allocation: &DescriptorAllocation,
+    state: DescriptorInvocationState,
+    row_step: u64,
+) -> HostResult<(u64, u64)> {
+    let (byte_offset, view_span) = match record.runtime_source {
+        DescriptorRuntimeSource::Constant | DescriptorRuntimeSource::SequenceEpoch => {
+            (record.byte_offset, record.view_span)
+        }
+        DescriptorRuntimeSource::Position => (
+            shift_offset(record.byte_offset, state.position, row_step)?,
+            record.view_span,
+        ),
+        DescriptorRuntimeSource::ValidLenAfter => (
+            record.byte_offset,
+            scale_span(state.valid_len_after, row_step, view, record.binding_index)?,
+        ),
+        DescriptorRuntimeSource::QueryRows => (
+            record.byte_offset,
+            scale_span(state.query_rows, row_step, view, record.binding_index)?,
+        ),
+    };
+    if view_span == 0 {
+        return Err(descriptor_errors::descriptor(format!(
+            "launch binding index {} has a zero view span",
+            record.binding_index
+        )));
+    }
+    let Some(end) = byte_offset.checked_add(view_span) else {
+        return Err(descriptor_errors::shape_mismatch(format!(
+            "launch binding index {} overflows its static envelope",
+            record.binding_index
+        )));
+    };
+    if end > allocation.capacity_bytes || view_span > view.maximum_span {
+        return Err(descriptor_errors::shape_mismatch(format!(
+            "launch binding index {} spans {view_span} bytes from offset {byte_offset} but allocation {} capacity is {} bytes (view maximum {})",
+            record.binding_index,
+            allocation.buffer_id,
+            allocation.capacity_bytes,
+            view.maximum_span
+        )));
+    }
+    Ok((byte_offset, view_span))
+}
+
+fn shift_offset(base: u64, index: u32, step: u64) -> HostResult<u64> {
+    let delta = u64::from(index).checked_mul(step).ok_or_else(|| {
+        descriptor_errors::shape_mismatch("launch binding offset overflows its static envelope")
+    })?;
+    base.checked_add(delta).ok_or_else(|| {
+        descriptor_errors::shape_mismatch("launch binding offset overflows its static envelope")
+    })
+}
+
+fn scale_span(
+    rows: u32,
+    row_step: u64,
+    view: &DescriptorView,
+    binding_index: u32,
+) -> HostResult<u64> {
+    let span = u64::from(rows).checked_mul(row_step).ok_or_else(|| {
+        descriptor_errors::shape_mismatch(format!(
+            "launch binding index {binding_index} overflows its static envelope"
+        ))
+    })?;
+    if span > view.maximum_span {
+        return Err(descriptor_errors::shape_mismatch(format!(
+            "launch binding index {binding_index} span {span} exceeds view maximum {}",
+            view.maximum_span
+        )));
+    }
+    Ok(span)
+}
+
+fn matching_static_view<'a>(
+    kv: &'a KvCacheDescriptor,
+    record: &DescriptorLaunchBinding,
+) -> Option<&'a DescriptorView> {
+    kv.views.iter().find(|view| {
+        view.allocation_id == record.handle
+            && view.static_base == record.byte_offset
+            && view.maximum_span >= record.view_span
+    })
+}
+
+fn row_step_bytes(kv: &KvCacheDescriptor, allocation_id: u32) -> Option<u64> {
+    kv.views
+        .iter()
+        .filter(|view| view.allocation_id == allocation_id)
+        .map(|view| view.maximum_span)
+        .min()
+}
+
+fn allocation_handle(
+    allocations: &[(u32, DeviceHandle)],
+    allocation_id: u32,
+) -> HostResult<DeviceHandle> {
+    allocations
+        .iter()
+        .find_map(|(id, handle)| (*id == allocation_id).then_some(*handle))
+        .ok_or_else(|| {
+            descriptor_errors::descriptor(format!(
+                "launch binding names allocation {allocation_id} with no live handle"
+            ))
+        })
 }

@@ -55,7 +55,8 @@ pub use receipt::{
     CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
 };
 pub use session::{
-    PreparedResidentSession, PreparedSessionCounters, PreparedSessionReceipt, ProgramSession,
+    KvCacheBindingSession, PreparedResidentSession, PreparedSessionCounters,
+    PreparedSessionReceipt, ProgramSession,
 };
 
 use std::collections::BTreeMap;
