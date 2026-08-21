@@ -5,13 +5,19 @@
 //! Runtime cursor values never join the graph hash. Declared binding
 //! indices and order are the launch records.
 
+use faber_host_macos_arm64::cuda_host::{FakeCudaDriver, E_CUDA_UNSUPPORTED};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorAllocation, DescriptorBuffer, DescriptorBufferVersion, DescriptorInvocationState,
     DescriptorKernel, DescriptorLaunch, DescriptorLaunchBinding, DescriptorResult,
     DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
     DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, KvCacheDescriptor,
-    E_DEVICE_SHAPE_MISMATCH,
+    E_DEVICE_ABI_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
 };
+use faber_host_macos_arm64::device_host::{
+    handles_in_binding_order, resolve_launch_bindings, validate_launch_bindings,
+    DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
+};
+use faber_host_macos_arm64::{CudaHostSession, FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 
 /// Layers × KV-heads × positions × dim for the persistent arenas.
@@ -356,5 +362,296 @@ fn view_extent_beyond_allocation_capacity_fails_before_launch() {
     let err = kv
         .validate()
         .expect_err("a view larger than its allocation must fail closed");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+}
+
+fn fake_metal() -> DeviceRuntime {
+    DeviceRuntime::Metal(
+        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default())).expect("fake metal"),
+    )
+}
+
+fn fake_cuda() -> DeviceRuntime {
+    DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(Box::new(FakeCudaDriver::default())).expect("fake cuda"),
+    )
+}
+
+fn live_arenas(runtime: &mut DeviceRuntime) -> [(u32, host_coordinator::DeviceHandle); 2] {
+    let capacity = arena_capacity_bytes() as usize;
+    let k = runtime.alloc_bytes(capacity).expect("K arena");
+    let v = runtime.alloc_bytes(capacity).expect("V arena");
+    [(K_ALLOCATION, k), (V_ALLOCATION, v)]
+}
+
+#[test]
+fn launch_bindings_carry_handle_index_offset_span_and_source() {
+    let mut runtime = fake_metal();
+    let map = live_arenas(&mut runtime);
+    let kv = base_kv();
+    let bindings = resolve_launch_bindings(&kv, &map).expect("B3 records resolve");
+    assert_eq!(bindings.len(), 4);
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.handle,
+                    binding.binding_index,
+                    binding.byte_offset,
+                    binding.view_span,
+                    binding.runtime_source,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                map[0].1,
+                2,
+                0,
+                append_span_bytes(),
+                DescriptorRuntimeSource::Position
+            ),
+            (
+                map[0].1,
+                0,
+                0,
+                arena_capacity_bytes(),
+                DescriptorRuntimeSource::ValidLenAfter
+            ),
+            (
+                map[1].1,
+                3,
+                0,
+                append_span_bytes(),
+                DescriptorRuntimeSource::Position
+            ),
+            (
+                map[1].1,
+                1,
+                0,
+                arena_capacity_bytes(),
+                DescriptorRuntimeSource::ValidLenAfter
+            ),
+        ]
+    );
+}
+
+#[test]
+fn handles_in_binding_order_keep_declared_indices() {
+    let mut runtime = fake_metal();
+    let map = live_arenas(&mut runtime);
+    let bindings = resolve_launch_bindings(&base_kv(), &map).expect("resolve");
+    let ordered = handles_in_binding_order(&bindings).expect("dense indices");
+    assert_eq!(
+        ordered,
+        vec![map[0].1, map[1].1, map[0].1, map[1].1],
+        "slot i is the binding whose declared index is i"
+    );
+
+    let mut dropped = bindings;
+    dropped.pop();
+    let err = handles_in_binding_order(&dropped)
+        .expect_err("a missing index must not be dropped into a packed slice");
+    assert_eq!(err.code, E_DEVICE_ABI_MISMATCH);
+}
+
+#[test]
+fn offset_that_matches_no_view_fails_before_dispatch() {
+    let mut runtime = fake_metal();
+    let map = live_arenas(&mut runtime);
+    let module = runtime.load_module(b"// unused").expect("module");
+    let mut kv = base_kv();
+    kv.launch_bindings[0].byte_offset = 4;
+    kv.validate()
+        .expect("offset 4 still fits allocation capacity");
+    let err = resolve_launch_bindings(&kv, &map).expect_err("offset 4 is not a view static_base");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+
+    let err = runtime
+        .launch_kv_kernel(&module, "kv_step", &kv, &map, [1, 1, 1], [1, 1, 1])
+        .expect_err("dispatch must not run after a view mismatch");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+}
+
+#[test]
+fn span_beyond_every_view_on_the_allocation_fails_before_dispatch() {
+    let mut runtime = fake_metal();
+    let mut kv = base_kv();
+    kv.views
+        .retain(|view| view.maximum_span == append_span_bytes());
+    kv.launch_bindings
+        .retain(|binding| binding.view_span == append_span_bytes());
+    kv.validate().expect("append-only plan admits");
+
+    let map = live_arenas(&mut runtime);
+    let mut bindings = resolve_launch_bindings(&kv, &map).expect("append views resolve");
+    bindings[0].view_span = append_span_bytes() * 2;
+    let err = validate_launch_bindings(&kv, &bindings, &map)
+        .expect_err("wider span than every remaining view");
+    assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+}
+
+#[test]
+fn cursor_buffer_is_allocated_once_and_reused_across_steps() {
+    let mut runtime = fake_metal();
+    let buffer = runtime
+        .alloc_invocation_state()
+        .expect("one invocation-state allocation");
+    let live_after_alloc = runtime.live_handle_count();
+    let handle = buffer.handle();
+
+    let first = DescriptorInvocationState {
+        position: 3,
+        valid_len_after: 4,
+        query_rows: 1,
+        sequence_epoch: 7,
+    };
+    runtime
+        .upload_invocation_state(&buffer, first)
+        .expect("first step upload");
+    assert_eq!(runtime.live_handle_count(), live_after_alloc);
+    assert_eq!(buffer.handle(), handle);
+
+    let second = DescriptorInvocationState {
+        position: 4,
+        valid_len_after: 5,
+        query_rows: 1,
+        sequence_epoch: 7,
+    };
+    runtime
+        .upload_invocation_state(&buffer, second)
+        .expect("second step overwrites the same buffer");
+    assert_eq!(runtime.live_handle_count(), live_after_alloc);
+    assert_eq!(buffer.handle(), handle);
+    assert_eq!(
+        handle.len_bytes(),
+        Some(InvocationStateBuffer::BYTE_LENGTH as u64)
+    );
+
+    let words = runtime.readback_f32(&handle).expect("typed upload");
+    assert_eq!(words[0].to_bits(), second.position);
+    assert_eq!(words[1].to_bits(), second.valid_len_after);
+    assert_eq!(words[2].to_bits(), second.query_rows);
+    assert_eq!(words[3].to_bits(), second.sequence_epoch);
+}
+
+#[test]
+fn dynamic_cuda_descriptor_rejects_explicitly_instead_of_offset_zero() {
+    let mut runtime = fake_cuda();
+    let map = live_arenas(&mut runtime);
+    let bindings = resolve_launch_bindings(&base_kv(), &map).expect("resolve");
+    assert!(
+        bindings.iter().any(DeviceLaunchBinding::is_cuda_dynamic),
+        "the KV fixture carries runtime sources"
+    );
+    let module = runtime
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let err = runtime
+        .launch_kernel_bound(&module, "addita", &bindings, [1, 1, 1], [1, 1, 1])
+        .expect_err("CUDA must reject KV-dynamic bindings");
+    assert_eq!(err.code, E_CUDA_UNSUPPORTED);
+    assert!(
+        err.message.contains("does not bind it at offset zero"),
+        "rejection must not be a silent offset-zero bind: {}",
+        err.message
+    );
+
+    let mut constant_offset = DeviceLaunchBinding::whole_handle(map[0].1, 0).expect("whole");
+    constant_offset.byte_offset = append_span_bytes();
+    constant_offset.view_span = append_span_bytes();
+    let err = runtime
+        .launch_kernel_bound(&module, "addita", &[constant_offset], [1, 1, 1], [1, 1, 1])
+        .expect_err("CUDA must reject a nonzero constant offset");
+    assert_eq!(err.code, E_CUDA_UNSUPPORTED);
+}
+
+#[test]
+fn legacy_whole_handle_offset_zero_wrapper_stays_green_on_metal() {
+    let mut runtime = fake_metal();
+    let module = runtime
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = runtime.alloc_bytes(8).expect("a");
+    let b = runtime.alloc_bytes(8).expect("b");
+    let out = runtime.alloc_bytes(8).expect("out");
+    runtime.copy_in_f32(&a, &[1.0, 2.0]).expect("copy a");
+    runtime.copy_in_f32(&b, &[3.0, 4.0]).expect("copy b");
+    runtime
+        .launch_kernel(&module, "add_one", &[a, b, out], [1, 1, 1], [8, 1, 1])
+        .expect("legacy whole-handle wrapper");
+    let values = runtime.readback_f32(&out).expect("readback");
+    assert_eq!(values, vec![4.0, 6.0]);
+
+    let bindings = [
+        DeviceLaunchBinding::whole_handle(a, 0).expect("a"),
+        DeviceLaunchBinding::whole_handle(b, 1).expect("b"),
+        DeviceLaunchBinding::whole_handle(out, 2).expect("out"),
+    ];
+    assert!(bindings.iter().all(|binding| {
+        binding.byte_offset == 0
+            && binding.runtime_source == DescriptorRuntimeSource::Constant
+            && !DeviceLaunchBinding::is_cuda_dynamic(binding)
+    }));
+}
+
+#[test]
+fn cuda_constant_offset_zero_wrapper_still_launches() {
+    let mut runtime = fake_cuda();
+    let module = runtime
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = runtime.alloc_bytes(8).expect("a");
+    let b = runtime.alloc_bytes(8).expect("b");
+    let out = runtime.alloc_bytes(8).expect("out");
+    runtime.copy_in_f32(&a, &[1.0, 2.0]).expect("copy a");
+    runtime.copy_in_f32(&b, &[3.0, 4.0]).expect("copy b");
+    runtime
+        .launch_kernel(&module, "addita", &[a, b, out], [2, 2, 1], [8, 8, 1])
+        .expect("CUDA static offset-zero wrapper");
+    let values = runtime.readback_f32(&out).expect("readback");
+    assert_eq!(values, vec![4.0, 6.0]);
+
+    runtime
+        .launch_kernel_bound(
+            &module,
+            "addita",
+            &[
+                DeviceLaunchBinding::whole_handle(a, 0).expect("a"),
+                DeviceLaunchBinding::whole_handle(b, 1).expect("b"),
+                DeviceLaunchBinding::whole_handle(out, 2).expect("out"),
+            ],
+            [2, 2, 1],
+            [8, 8, 1],
+        )
+        .expect("CUDA constant offset-zero bound launch");
+}
+
+#[test]
+fn dispatch_rejects_offset_past_handle_capacity_before_backend() {
+    let mut runtime = fake_metal();
+    let module = runtime
+        .load_module(b"// fake compiler-owned image bytes")
+        .expect("load");
+    let a = runtime.alloc_bytes(8).expect("a");
+    let b = runtime.alloc_bytes(8).expect("b");
+    let out = runtime.alloc_bytes(8).expect("out");
+    let mut over = DeviceLaunchBinding::whole_handle(a, 0).expect("a");
+    over.byte_offset = 8;
+    over.view_span = 8;
+    let err = runtime
+        .launch_kernel_bound(
+            &module,
+            "add_one",
+            &[
+                over,
+                DeviceLaunchBinding::whole_handle(b, 1).expect("b"),
+                DeviceLaunchBinding::whole_handle(out, 2).expect("out"),
+            ],
+            [1, 1, 1],
+            [8, 1, 1],
+        )
+        .expect_err("offset past the allocation must fail closed");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
 }
