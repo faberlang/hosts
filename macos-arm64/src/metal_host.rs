@@ -17,8 +17,8 @@ use faber::Valor;
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePassDescriptor,
     ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor, Device,
-    MTLCommandBufferStatus, MTLCounterSamplingPoint, MTLResourceOptions, MTLSize,
-    MTLStorageMode, NSRange,
+    MTLCommandBufferStatus, MTLCounterSamplingPoint, MTLResourceOptions, MTLSize, MTLStorageMode,
+    NSRange,
 };
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +133,11 @@ pub trait MetalDriver: Send {
     fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
         Vec::new()
     }
+    /// Per-encoder GPU start times from the last committed step, in µs
+    /// relative to the first encoder start. Empty when unsampled.
+    fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
@@ -218,6 +223,11 @@ impl MetalHostSession {
     /// Per-encoder GPU timestamps from the last committed step (µs).
     pub fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
         self.driver.take_encoder_gpu_us()
+    }
+
+    /// Per-encoder GPU start times from the last committed step (µs).
+    pub fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
+        self.driver.take_encoder_gpu_start_us()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<MetalHandleId> {
@@ -906,6 +916,9 @@ struct SystemMetalDriver {
     encoder_sample_count: usize,
     /// Last committed step's per-encoder GPU times (µs).
     last_encoder_gpu_us: Vec<u64>,
+    /// Last committed step's per-encoder GPU start times (µs, relative to
+    /// the first encoder start). Empty when unsampled.
+    last_encoder_gpu_start_us: Vec<u64>,
     /// Timestamp counters were probed and are unavailable on this device.
     timestamp_unavailable: bool,
 }
@@ -1225,6 +1238,10 @@ impl MetalDriver for SystemMetalDriver {
     fn take_encoder_gpu_us(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.last_encoder_gpu_us)
     }
+
+    fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.last_encoder_gpu_start_us)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1277,6 +1294,7 @@ impl SystemMetalDriver {
         let encoder_count = self.encoder_sample_count;
         self.encoder_sample_count = 0;
         self.last_encoder_gpu_us.clear();
+        self.last_encoder_gpu_start_us.clear();
         let dest = if encoder_count > 0 {
             match (self.device.as_ref(), self.timestamp_buffer.as_ref()) {
                 (Some(device), Some(sample_buffer)) => {
@@ -1286,12 +1304,7 @@ impl SystemMetalDriver {
                         MTLResourceOptions::StorageModeShared,
                     );
                     let blit = command_buffer.new_blit_command_encoder();
-                    blit.resolve_counters(
-                        sample_buffer,
-                        NSRange::new(0, sample_count),
-                        &dest,
-                        0,
-                    );
+                    blit.resolve_counters(sample_buffer, NSRange::new(0, sample_count), &dest, 0);
                     blit.end_encoding();
                     Some(dest)
                 }
@@ -1325,7 +1338,7 @@ impl SystemMetalDriver {
             }
         }
         if let Some(dest) = dest {
-            self.last_encoder_gpu_us = convert_encoder_gpu_us(
+            let timeline = convert_encoder_gpu_timeline(
                 &dest,
                 encoder_count,
                 cpu_start,
@@ -1333,41 +1346,90 @@ impl SystemMetalDriver {
                 gpu_start,
                 gpu_end,
             );
+            self.last_encoder_gpu_us = timeline.duration_us;
+            self.last_encoder_gpu_start_us = timeline.start_us;
         }
         Ok(())
     }
 }
 
+/// GPU timeline for one sampled command buffer: per-encoder duration and
+/// start time relative to the first encoder start.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct EncoderGpuTimeline {
+    duration_us: Vec<u64>,
+    start_us: Vec<u64>,
+}
+
+fn ticks_to_us(ticks: f64, gpu_span: u64, cpu_span: u64) -> u64 {
+    if gpu_span == 0 || cpu_span == 0 {
+        return 0;
+    }
+    let nanoseconds = ticks / (gpu_span as f64) * (cpu_span as f64);
+    let micros = nanoseconds / 1000.0;
+    if micros.is_finite() && micros > 0.0 {
+        micros.round() as u64
+    } else {
+        0
+    }
+}
+
+/// Convert interleaved start/end GPU ticks into durations and start times.
+///
+/// `samples` is `[start0, end0, start1, end1, …]`. Start times are relative
+/// to `samples[0]` so inter-encoder gaps are `start[i+1] - (start[i] + duration[i])`.
+fn encoder_gpu_timeline_from_samples(
+    samples: &[u64],
+    encoder_count: usize,
+    cpu_start: u64,
+    cpu_end: u64,
+    gpu_start: u64,
+    gpu_end: u64,
+) -> EncoderGpuTimeline {
+    let cpu_span = cpu_end.saturating_sub(cpu_start);
+    let gpu_span = gpu_end.saturating_sub(gpu_start);
+    let sample_count = encoder_count.saturating_mul(2);
+    if encoder_count == 0 || cpu_span == 0 || gpu_span == 0 || samples.len() < sample_count {
+        return EncoderGpuTimeline::default();
+    }
+    let origin = samples[0] as f64;
+    let mut duration_us = Vec::with_capacity(encoder_count);
+    let mut start_us = Vec::with_capacity(encoder_count);
+    for index in 0..encoder_count {
+        let begin = samples[index * 2] as f64;
+        let end = samples[index * 2 + 1] as f64;
+        start_us.push(ticks_to_us(begin - origin, gpu_span, cpu_span));
+        duration_us.push(ticks_to_us(end - begin, gpu_span, cpu_span));
+    }
+    EncoderGpuTimeline {
+        duration_us,
+        start_us,
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn convert_encoder_gpu_us(
+fn convert_encoder_gpu_timeline(
     dest: &Buffer,
     encoder_count: usize,
     cpu_start: u64,
     cpu_end: u64,
     gpu_start: u64,
     gpu_end: u64,
-) -> Vec<u64> {
-    let cpu_span = cpu_end.saturating_sub(cpu_start);
-    let gpu_span = gpu_end.saturating_sub(gpu_start);
-    if encoder_count == 0 || cpu_span == 0 || gpu_span == 0 {
-        return Vec::new();
-    }
+) -> EncoderGpuTimeline {
     let sample_count = encoder_count.saturating_mul(2);
+    if sample_count == 0 {
+        return EncoderGpuTimeline::default();
+    }
     let samples =
         unsafe { std::slice::from_raw_parts(dest.contents().cast::<u64>(), sample_count) };
-    let mut out = Vec::with_capacity(encoder_count);
-    for index in 0..encoder_count {
-        let begin = samples[index * 2] as f64;
-        let end = samples[index * 2 + 1] as f64;
-        let nanoseconds = (end - begin) / (gpu_span as f64) * (cpu_span as f64);
-        let micros = nanoseconds / 1000.0;
-        out.push(if micros.is_finite() && micros > 0.0 {
-            micros.round() as u64
-        } else {
-            0
-        });
-    }
-    out
+    encoder_gpu_timeline_from_samples(
+        samples,
+        encoder_count,
+        cpu_start,
+        cpu_end,
+        gpu_start,
+        gpu_end,
+    )
 }
 
 /// Every `kernel void <name>` entry point in an MSL module, in source order.
@@ -1412,5 +1474,44 @@ impl fmt::Debug for MetalHostSession {
             .field("admitted", &self.admitted)
             .field("handles", &self.handles.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod encoder_gpu_timeline_tests {
+    use super::{encoder_gpu_timeline_from_samples, EncoderGpuTimeline};
+
+    #[test]
+    fn timeline_converts_ticks_relative_to_first_start() {
+        // cpu 1 ms ↔ gpu 1_000_000 ticks, so 1000 ticks = 1 µs.
+        let samples = [1000, 6000, 8000, 13_000];
+        let timeline = encoder_gpu_timeline_from_samples(&samples, 2, 0, 1_000_000, 0, 1_000_000);
+        assert_eq!(
+            timeline,
+            EncoderGpuTimeline {
+                duration_us: vec![5, 5],
+                start_us: vec![0, 7],
+            }
+        );
+        let end0 = timeline.start_us[0].saturating_add(timeline.duration_us[0]);
+        let gap = timeline.start_us[1].saturating_sub(end0);
+        assert_eq!(gap, 2);
+    }
+
+    #[test]
+    fn timeline_rejects_empty_or_zero_span() {
+        let samples = [0, 10];
+        assert_eq!(
+            encoder_gpu_timeline_from_samples(&samples, 0, 0, 1, 0, 1),
+            EncoderGpuTimeline::default()
+        );
+        assert_eq!(
+            encoder_gpu_timeline_from_samples(&samples, 1, 5, 5, 0, 1),
+            EncoderGpuTimeline::default()
+        );
+        assert_eq!(
+            encoder_gpu_timeline_from_samples(&samples, 1, 0, 1, 9, 9),
+            EncoderGpuTimeline::default()
+        );
     }
 }

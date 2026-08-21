@@ -96,6 +96,14 @@ impl DeviceRuntime {
             Self::Cuda(_) => Vec::new(),
         }
     }
+
+    /// Per-encoder GPU start times from the last committed Metal step (µs).
+    pub fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
+        match self {
+            Self::Metal(session) => session.take_encoder_gpu_start_us(),
+            Self::Cuda(_) => Vec::new(),
+        }
+    }
 }
 
 /// Backend-neutral lifecycle surface shared by every native device session.
