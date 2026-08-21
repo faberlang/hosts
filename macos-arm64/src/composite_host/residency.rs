@@ -1,9 +1,10 @@
-//! KV-D D2: shared model/sequence residency.
+//! KV-D D2/D4: shared model/sequence residency.
 //!
 //! Pure composition over B3 allocation/view types and the D1 sequence
 //! machine. No device allocation, upload, launch, or cache clear. Handle
 //! identity is the resident object (KV-L7): equal byte counts are not
-//! proof of sharing.
+//! proof of sharing. D4 adds O(1) logical reset, pre-dispatch abort, poison
+//! on possible partial mutation, and release that drops every live handle.
 //!
 //! Parent registration is a private `mod residency` in `composite_host.rs`;
 //! this unit cannot re-export it.
@@ -13,8 +14,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::inference_state::{
-    CursorFacts, InferenceSessionState, InvocationMode, PlannedInvocation, SequencePhase,
-    SessionError, SessionInspection, E_INVALID_ARGS,
+    CursorFacts, FailureOutcome, InferenceSessionState, InvocationMode, InvocationTransaction,
+    PlannedInvocation, ResetReceipt, SequencePhase, SessionError, SessionInspection,
+    E_INVALID_ARGS,
 };
 use crate::device_descriptor::{
     DescriptorAllocation, DescriptorInvocationState, DescriptorView, DeviceBufferLifetime,
@@ -420,6 +422,57 @@ impl SequenceResidency {
             sequence_epoch: self.state.sequence_epoch(),
         };
     }
+
+    fn sync_invocation_state_reset(&mut self) {
+        self.invocation_state = DescriptorInvocationState {
+            position: 0,
+            valid_len_after: 0,
+            query_rows: 0,
+            sequence_epoch: self.state.sequence_epoch(),
+        };
+    }
+
+    pub fn begin_transaction(
+        &self,
+        mode: InvocationMode,
+        query_rows: u32,
+    ) -> Result<InvocationTransaction, SessionError> {
+        self.state.begin_transaction(mode, query_rows)
+    }
+
+    pub fn commit(&mut self, plan: &PlannedInvocation) -> Result<CursorFacts, SessionError> {
+        let facts = self.state.commit(plan)?;
+        self.sync_invocation_state(&facts);
+        Ok(facts)
+    }
+
+    pub fn commit_transaction(
+        &mut self,
+        tx: &InvocationTransaction,
+    ) -> Result<CursorFacts, SessionError> {
+        self.commit(tx.plan())
+    }
+
+    /// Logical reset (KV-L8): epoch advances, cursor/valid length return to
+    /// zero, arenas and views stay put. No cache clear or zero-fill.
+    pub fn logical_reset(&mut self) -> Result<ResetReceipt, SessionError> {
+        let receipt = self.state.logical_reset()?;
+        self.sync_invocation_state_reset();
+        Ok(receipt)
+    }
+
+    pub fn abort_pre_dispatch(&self, tx: &InvocationTransaction) -> Result<(), SessionError> {
+        self.state.abort_pre_dispatch(tx)
+    }
+
+    pub fn fail(&mut self, tx: &InvocationTransaction) -> Result<FailureOutcome, SessionError> {
+        // Poison leaves the last committed cursor; pre-dispatch is a no-op.
+        self.state.fail(tx)
+    }
+
+    pub fn release(&mut self) -> Result<(), SessionError> {
+        self.state.release()
+    }
 }
 
 /// Handles both invocation programs resolve. References are into the
@@ -442,6 +495,11 @@ pub struct SessionResidency {
     model: ModelResidency,
     sequence: SequenceResidency,
     released_allocations: usize,
+    live_handles: bool,
+    cache_clear_bytes: u64,
+    buffer_zero_fill_bytes: u64,
+    old_prefix_copy_bytes: u64,
+    reset_count: u32,
 }
 
 impl SessionResidency {
@@ -464,6 +522,11 @@ impl SessionResidency {
             model,
             sequence,
             released_allocations: 0,
+            live_handles: true,
+            cache_clear_bytes: 0,
+            buffer_zero_fill_bytes: 0,
+            old_prefix_copy_bytes: 0,
+            reset_count: 0,
         })
     }
 
@@ -496,7 +559,36 @@ impl SessionResidency {
 
     #[must_use]
     pub fn live_allocation_count(&self) -> usize {
-        self.model.weights.len() + 3
+        if self.live_handles {
+            self.model.weights.len() + 3
+        } else {
+            0
+        }
+    }
+
+    #[must_use]
+    pub fn cache_clear_bytes(&self) -> u64 {
+        self.cache_clear_bytes
+    }
+
+    #[must_use]
+    pub fn buffer_zero_fill_bytes(&self) -> u64 {
+        self.buffer_zero_fill_bytes
+    }
+
+    #[must_use]
+    pub fn old_prefix_copy_bytes(&self) -> u64 {
+        self.old_prefix_copy_bytes
+    }
+
+    #[must_use]
+    pub fn reset_count(&self) -> u32 {
+        self.reset_count
+    }
+
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.sequence.state.released()
     }
 
     #[must_use]
@@ -547,11 +639,55 @@ impl SessionResidency {
         self.sequence.state.begin_invocation(mode, query_rows)
     }
 
+    pub fn begin_transaction(
+        &self,
+        mode: InvocationMode,
+        query_rows: u32,
+    ) -> Result<InvocationTransaction, SessionError> {
+        self.sequence.begin_transaction(mode, query_rows)
+    }
+
     /// Commit through D1. The prefill→decode transition allocates nothing,
     /// uploads no weights, and releases nothing.
     pub fn commit(&mut self, plan: &PlannedInvocation) -> Result<CursorFacts, SessionError> {
-        let facts = self.sequence.state.commit(plan)?;
-        self.sequence.sync_invocation_state(&facts);
-        Ok(facts)
+        self.sequence.commit(plan)
+    }
+
+    pub fn commit_transaction(
+        &mut self,
+        tx: &InvocationTransaction,
+    ) -> Result<CursorFacts, SessionError> {
+        self.sequence.commit_transaction(tx)
+    }
+
+    /// Logical reset (KV-L8): O(1) cursor/epoch update. Allocations,
+    /// capacities, weight uploads, and program artifacts stay put. No
+    /// cache clear, buffer zero-fill, or upload.
+    pub fn logical_reset(&mut self) -> Result<ResetReceipt, SessionError> {
+        let receipt = self.sequence.logical_reset()?;
+        self.reset_count = self.reset_count.saturating_add(1);
+        Ok(receipt)
+    }
+
+    pub fn abort_pre_dispatch(&self, tx: &InvocationTransaction) -> Result<(), SessionError> {
+        self.sequence.abort_pre_dispatch(tx)
+    }
+
+    /// Pre-dispatch: unchanged. Possible partial mutation: poison; reset
+    /// and retry stay illegal because rollback is not proven.
+    pub fn fail(&mut self, tx: &InvocationTransaction) -> Result<FailureOutcome, SessionError> {
+        self.sequence.fail(tx)
+    }
+
+    /// Terminal release: every live handle is dropped. Inspect remains
+    /// legal. No device work — the live-handle count is the drop.
+    pub fn release(&mut self) -> Result<(), SessionError> {
+        self.sequence.release()?;
+        if self.live_handles {
+            let live = self.model.weights.len() + 3;
+            self.released_allocations = self.released_allocations.saturating_add(live);
+            self.live_handles = false;
+        }
+        Ok(())
     }
 }

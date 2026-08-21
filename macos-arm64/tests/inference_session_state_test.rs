@@ -8,8 +8,9 @@
 mod inference_state;
 
 use inference_state::{
-    CursorFacts, FailureStage, InferenceSessionState, InvocationMode, SequencePhase,
-    E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED, E_KV_STALE,
+    CursorFacts, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
+    SequencePhase, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
+    E_KV_STALE,
 };
 
 fn fresh(capacity: u32) -> InferenceSessionState {
@@ -394,4 +395,139 @@ fn u32_capacity_max_decode_overflows_fail_closed() {
         .expect_err("MAX+1");
     assert_eq!(err.code, E_KV_OVERFLOW);
     assert_eq!(full, before);
+}
+
+#[test]
+fn logical_reset_is_o1_no_cache_clear_zero_fill_or_upload() {
+    let mut state = fresh(8);
+    commit_prefill(&mut state, 5);
+    commit_decode(&mut state);
+    let previous_epoch = state.sequence_epoch();
+    let previous_valid_len = state.valid_len();
+    let capacity = state.capacity();
+
+    let receipt = state.logical_reset().expect("logical reset");
+    assert_eq!(receipt.previous_epoch, previous_epoch);
+    assert_eq!(receipt.sequence_epoch, previous_epoch + 1);
+    assert_eq!(receipt.previous_valid_len, previous_valid_len);
+    assert_eq!(receipt.valid_len, 0);
+    assert_eq!(receipt.capacity, capacity);
+    assert!(!receipt.cache_cleared);
+    assert!(!receipt.buffers_zero_filled);
+    assert_eq!(receipt.uploads, 0);
+    assert_eq!(state.valid_len(), 0);
+    assert_eq!(state.capacity(), capacity);
+    assert_eq!(state.phase(), SequencePhase::Fresh);
+    assert_eq!(state.sequence_epoch(), previous_epoch + 1);
+}
+
+#[test]
+fn replay_after_reset_drives_a_new_valid_prefix() {
+    let mut state = fresh(8);
+    commit_prefill(&mut state, 4);
+    commit_decode(&mut state);
+    assert_eq!(state.valid_len(), 5);
+    let epoch = state.logical_reset().expect("reset").sequence_epoch;
+
+    let replay = commit_prefill(&mut state, 2);
+    assert_eq!(replay.prefix_before, 0);
+    assert_eq!(replay.query_rows, 2);
+    assert_eq!(replay.valid_len_after, 2);
+    assert_eq!(state.valid_len(), 2);
+    assert_eq!(state.sequence_epoch(), epoch);
+    assert_eq!(state.phase(), SequencePhase::Prefill);
+
+    let decode = commit_decode(&mut state);
+    assert_eq!(decode.prefix_before, 2);
+    assert_eq!(state.valid_len(), 3);
+}
+
+#[test]
+fn pre_dispatch_transaction_abort_leaves_state_unchanged() {
+    let mut state = fresh(8);
+    commit_prefill(&mut state, 3);
+    let before = state.clone();
+    let tx = state
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect("admitted");
+    assert!(tx.is_pre_dispatch());
+    assert_eq!(
+        state.fail(&tx).expect("pre-dispatch abort"),
+        FailureOutcome::Unchanged
+    );
+    assert_eq!(state, before);
+
+    let overflow = state
+        .begin_transaction(InvocationMode::Prefill, 1)
+        .expect_err("prefill after commit is pre-dispatch");
+    assert_eq!(overflow.code, E_KV_PHASE);
+    assert_eq!(state, before);
+}
+
+#[test]
+fn possible_partial_mutation_poisons_and_rejects_reset_retry() {
+    let mut state = fresh(8);
+    commit_prefill(&mut state, 3);
+    let mut tx = state
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect("admitted");
+    tx.record_possible_mutation(FailureStage::Dispatch);
+    let epoch = state.sequence_epoch();
+    let valid_len = state.valid_len();
+    let before_cursor = state.inspect();
+
+    let outcome = state.fail(&tx).expect("unproven mutation poisons");
+    assert_eq!(
+        outcome,
+        FailureOutcome::Poisoned {
+            epoch,
+            failure_stage: FailureStage::Dispatch,
+        }
+    );
+    assert_eq!(
+        state.phase(),
+        SequencePhase::Poisoned {
+            epoch,
+            failure_stage: FailureStage::Dispatch,
+        }
+    );
+    assert_eq!(state.valid_len(), valid_len);
+    assert_eq!(state.inspect().valid_len, before_cursor.valid_len);
+    assert_eq!(state.inspect().last_commit, before_cursor.last_commit);
+
+    let poisoned = state.clone();
+    let reset_err = state.logical_reset().expect_err("reset after poison");
+    assert_eq!(reset_err.code, E_KV_POISONED);
+    let retry_err = state
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect_err("retry after poison");
+    assert_eq!(retry_err.code, E_KV_POISONED);
+    assert_eq!(state, poisoned);
+
+    state.release().expect("release after poison");
+    assert!(state.released());
+    let inspect = state.inspect();
+    assert!(inspect.released);
+    assert_eq!(inspect.phase, state.phase());
+}
+
+#[test]
+fn abort_pre_dispatch_rejected_after_possible_mutation() {
+    let mut state = fresh(8);
+    let mut tx = state
+        .begin_transaction(InvocationMode::Prefill, 2)
+        .expect("admitted");
+    tx.record_possible_mutation(FailureStage::CursorUpload);
+    let before = state.clone();
+    let err = state.abort_pre_dispatch(&tx).expect_err("not pre-dispatch");
+    assert_eq!(err.code, E_INVALID_ARGS);
+    assert_eq!(state, before);
+    state.fail(&tx).expect("poison path");
+    match state.phase() {
+        SequencePhase::Poisoned {
+            failure_stage: FailureStage::CursorUpload,
+            ..
+        } => {}
+        other => panic!("expected CursorUpload poison, got {other:?}"),
+    }
 }

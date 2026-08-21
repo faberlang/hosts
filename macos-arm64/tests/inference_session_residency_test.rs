@@ -19,7 +19,10 @@ use device_descriptor::{
     DescriptorAllocation, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
     DeviceDataType,
 };
-use inference_state::{InvocationMode, SequencePhase, E_INVALID_ARGS};
+use inference_state::{
+    FailureOutcome, FailureStage, InvocationMode, SequencePhase, E_INVALID_ARGS, E_KV_OVERFLOW,
+    E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
+};
 use residency::{ModelIdentity, ModelSpec, ResidentAllocation, SequenceSpec, SessionResidency};
 
 const LAYERS: u64 = 2;
@@ -431,4 +434,272 @@ fn one_weight_upload_covers_several_weight_buffers() {
     let decode = session.resolve(InvocationMode::ScalarDecode);
     assert!(std::ptr::eq(prefill.weights, decode.weights));
     assert_ne!(prefill.weights[0].identity(), prefill.weights[1].identity());
+}
+
+#[test]
+fn logical_reset_is_o1_preserves_allocations_and_does_not_clear() {
+    let mut session = prepare_session(8);
+    let live = session.live_allocation_count();
+    let uploads = session.weight_uploads();
+    let prepares = session.artifact_prepares();
+    let k_ptr = session.sequence().k_arena() as *const ResidentAllocation;
+    let v_ptr = session.sequence().v_arena() as *const ResidentAllocation;
+    let weight_ptr = &session.model().weights()[0] as *const ResidentAllocation;
+    let inv_ptr = session.sequence().invocation_state_allocation() as *const ResidentAllocation;
+    let k_id = session.sequence().k_arena().identity();
+    let v_id = session.sequence().v_arena().identity();
+    let k_capacity = session.sequence().k_arena().capacity_bytes();
+    let v_capacity = session.sequence().v_arena().capacity_bytes();
+
+    let prefill = session
+        .begin_transaction(InvocationMode::Prefill, 4)
+        .expect("prefill");
+    session.commit_transaction(&prefill).expect("commit");
+    session
+        .commit(
+            &session
+                .begin_invocation(InvocationMode::ScalarDecode, 1)
+                .expect("decode"),
+        )
+        .expect("decode commit");
+    assert_eq!(session.valid_len(), 5);
+
+    let previous_epoch = session.sequence_epoch();
+    let receipt = session.logical_reset().expect("logical reset");
+    assert_eq!(receipt.previous_epoch, previous_epoch);
+    assert_eq!(receipt.sequence_epoch, previous_epoch + 1);
+    assert_eq!(receipt.previous_valid_len, 5);
+    assert_eq!(receipt.valid_len, 0);
+    assert!(!receipt.cache_cleared);
+    assert!(!receipt.buffers_zero_filled);
+    assert_eq!(receipt.uploads, 0);
+
+    assert_eq!(session.valid_len(), 0);
+    assert_eq!(session.phase(), SequencePhase::Fresh);
+    assert_eq!(session.sequence_epoch(), previous_epoch + 1);
+    assert_eq!(session.reset_count(), 1);
+    assert_eq!(session.cache_clear_bytes(), 0);
+    assert_eq!(session.buffer_zero_fill_bytes(), 0);
+    assert_eq!(session.old_prefix_copy_bytes(), 0);
+    assert_eq!(session.weight_uploads(), uploads);
+    assert_eq!(session.artifact_prepares(), prepares);
+    assert_eq!(session.live_allocation_count(), live);
+    assert_eq!(session.released_allocation_count(), 0);
+
+    let cursor = session.sequence().invocation_state();
+    assert_eq!(cursor.position, 0);
+    assert_eq!(cursor.valid_len_after, 0);
+    assert_eq!(cursor.query_rows, 0);
+    assert_eq!(cursor.sequence_epoch, session.sequence_epoch());
+
+    assert_eq!(session.sequence().k_arena().identity(), k_id);
+    assert_eq!(session.sequence().v_arena().identity(), v_id);
+    assert_eq!(session.sequence().k_arena().capacity_bytes(), k_capacity);
+    assert_eq!(session.sequence().v_arena().capacity_bytes(), v_capacity);
+    assert_eq!(
+        session.sequence().k_arena() as *const ResidentAllocation,
+        k_ptr
+    );
+    assert_eq!(
+        session.sequence().v_arena() as *const ResidentAllocation,
+        v_ptr
+    );
+    assert_eq!(
+        &session.model().weights()[0] as *const ResidentAllocation,
+        weight_ptr
+    );
+    assert_eq!(
+        session.sequence().invocation_state_allocation() as *const ResidentAllocation,
+        inv_ptr
+    );
+}
+
+#[test]
+fn replay_after_reset_drives_a_new_valid_prefix() {
+    let mut session = prepare_session(8);
+    session
+        .commit(
+            &session
+                .begin_invocation(InvocationMode::Prefill, 5)
+                .expect("first prefill"),
+        )
+        .expect("first commit");
+    let k_ptr = session.sequence().k_arena() as *const ResidentAllocation;
+    session.logical_reset().expect("reset");
+
+    let replay = session
+        .begin_transaction(InvocationMode::Prefill, 2)
+        .expect("replay prefill");
+    let facts = session.commit_transaction(&replay).expect("replay commit");
+    assert_eq!(facts.prefix_before, 0);
+    assert_eq!(facts.query_rows, 2);
+    assert_eq!(facts.valid_len_after, 2);
+    assert_eq!(session.valid_len(), 2);
+    assert_eq!(session.phase(), SequencePhase::Prefill);
+    assert_eq!(session.sequence().invocation_state().valid_len_after, 2);
+    assert_eq!(session.sequence().invocation_state().position, 0);
+    assert_eq!(
+        session.sequence().k_arena() as *const ResidentAllocation,
+        k_ptr,
+        "replay must not reallocate the K arena"
+    );
+    assert_eq!(session.weight_uploads(), 1);
+    assert_eq!(session.cache_clear_bytes(), 0);
+}
+
+#[test]
+fn pre_dispatch_failure_leaves_residency_unchanged() {
+    let mut session = prepare_session(4);
+    session
+        .commit(
+            &session
+                .begin_invocation(InvocationMode::Prefill, 4)
+                .expect("fill"),
+        )
+        .expect("commit");
+    let inspect = session.inspect();
+    let cursor = session.sequence().invocation_state();
+    let live = session.live_allocation_count();
+    let uploads = session.weight_uploads();
+    let k_ptr = session.sequence().k_arena() as *const ResidentAllocation;
+    let k_id = session.sequence().k_arena().identity();
+
+    let err = session
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect_err("overflow is pre-dispatch");
+    assert_eq!(err.code, E_KV_OVERFLOW);
+    assert_eq!(session.inspect(), inspect);
+    assert_eq!(session.sequence().invocation_state(), cursor);
+    assert_eq!(session.live_allocation_count(), live);
+    assert_eq!(session.weight_uploads(), uploads);
+    assert_eq!(session.released_allocation_count(), 0);
+    assert_eq!(session.sequence().k_arena().identity(), k_id);
+    assert_eq!(
+        session.sequence().k_arena() as *const ResidentAllocation,
+        k_ptr
+    );
+
+    let phase_err = session
+        .begin_transaction(InvocationMode::Prefill, 1)
+        .expect_err("second prefill is pre-dispatch");
+    assert_eq!(phase_err.code, E_KV_PHASE);
+    assert_eq!(session.inspect(), inspect);
+    assert_eq!(session.sequence().invocation_state(), cursor);
+}
+
+#[test]
+fn admitted_pre_dispatch_abort_leaves_cursor_and_handles() {
+    let mut session = prepare_session(8);
+    session
+        .commit(
+            &session
+                .begin_invocation(InvocationMode::Prefill, 3)
+                .expect("prefill"),
+        )
+        .expect("commit");
+    let inspect = session.inspect();
+    let cursor = session.sequence().invocation_state();
+    let live = session.live_allocation_count();
+    let k_ptr = session.sequence().k_arena() as *const ResidentAllocation;
+
+    let tx = session
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect("admitted");
+    assert!(tx.is_pre_dispatch());
+    assert_eq!(
+        session.fail(&tx).expect("pre-dispatch abort"),
+        FailureOutcome::Unchanged
+    );
+    assert_eq!(session.inspect(), inspect);
+    assert_eq!(session.sequence().invocation_state(), cursor);
+    assert_eq!(session.live_allocation_count(), live);
+    assert_eq!(session.released_allocation_count(), 0);
+    assert_eq!(
+        session.sequence().k_arena() as *const ResidentAllocation,
+        k_ptr
+    );
+}
+
+#[test]
+fn possible_partial_mutation_poisons_and_release_drops_handles() {
+    let mut session = prepare_session(8);
+    session
+        .commit(
+            &session
+                .begin_invocation(InvocationMode::Prefill, 3)
+                .expect("prefill"),
+        )
+        .expect("commit");
+    let live = session.live_allocation_count();
+    let cursor = session.sequence().invocation_state();
+    let epoch = session.sequence_epoch();
+    let valid_len = session.valid_len();
+    let k_id = session.sequence().k_arena().identity();
+
+    let mut tx = session
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect("admitted");
+    tx.record_possible_mutation(FailureStage::Sync);
+    let outcome = session.fail(&tx).expect("poison");
+    assert_eq!(
+        outcome,
+        FailureOutcome::Poisoned {
+            epoch,
+            failure_stage: FailureStage::Sync,
+        }
+    );
+    assert_eq!(
+        session.phase(),
+        SequencePhase::Poisoned {
+            epoch,
+            failure_stage: FailureStage::Sync,
+        }
+    );
+    assert_eq!(session.valid_len(), valid_len);
+    assert_eq!(
+        session.sequence().invocation_state(),
+        cursor,
+        "poison leaves the last committed cursor"
+    );
+    assert_eq!(session.live_allocation_count(), live);
+    assert_eq!(session.released_allocation_count(), 0);
+    assert_eq!(session.sequence().k_arena().identity(), k_id);
+
+    let reset_err = session.logical_reset().expect_err("reset after poison");
+    assert_eq!(reset_err.code, E_KV_POISONED);
+    let retry_err = session
+        .begin_transaction(InvocationMode::ScalarDecode, 1)
+        .expect_err("retry after poison");
+    assert_eq!(retry_err.code, E_KV_POISONED);
+    let commit_err = session.commit(tx.plan()).expect_err("commit after poison");
+    assert_eq!(commit_err.code, E_KV_POISONED);
+    assert_eq!(session.live_allocation_count(), live);
+
+    let inspection = session.inspect();
+    assert!(!inspection.released);
+    assert_eq!(inspection.sequence_epoch, epoch);
+
+    session.release().expect("release after poison");
+    assert!(session.released());
+    assert_eq!(session.live_allocation_count(), 0);
+    assert_eq!(session.released_allocation_count(), live);
+    let released = session.inspect();
+    assert!(released.released);
+    assert_eq!(
+        released.phase,
+        SequencePhase::Poisoned {
+            epoch,
+            failure_stage: FailureStage::Sync,
+        }
+    );
+
+    let begin_err = session
+        .begin_invocation(InvocationMode::Prefill, 1)
+        .expect_err("begin after release");
+    assert_eq!(begin_err.code, E_KV_RELEASED);
+    let reset_err = session.logical_reset().expect_err("reset after release");
+    assert_eq!(reset_err.code, E_KV_RELEASED);
+    let rerelease = session.release().expect_err("double release");
+    assert_eq!(rerelease.code, E_KV_RELEASED);
+    assert_eq!(session.live_allocation_count(), 0);
 }

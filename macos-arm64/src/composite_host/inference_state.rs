@@ -1,8 +1,10 @@
-//! KV-D D1: model-session sequence state machine.
+//! KV-D D1/D4: model-session sequence state machine.
 //!
 //! Pure logical cursor/phase ownership. No device allocation, upload, launch,
 //! or cache clear. Coordinate facts stay distinct (KV-L1/KV-L2). Reset is
-//! logical (KV-L8). Failure is fail-closed (KV-L9).
+//! logical (KV-L8). Failure is fail-closed (KV-L9). D4 adds the invocation
+//! transaction and the O(1) reset receipt; rollback is not proven, so a
+//! possible partial device mutation poisons.
 //!
 //! Parent registration is a private `mod inference_state` in
 //! `composite_host.rs`; this unit cannot re-export it.
@@ -110,8 +112,8 @@ pub enum FailureStage {
 }
 
 /// Sequence lifecycle. Fresh → prefill → decode; poison is terminal except
-/// inspect + release. Rollback is not proven in D1, so poison rejects reset
-/// and retry.
+/// inspect + release. Rollback is not proven in D1/D4, so poison rejects
+/// reset and retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequencePhase {
     Fresh,
@@ -168,6 +170,82 @@ pub struct PlannedInvocation {
     mode: InvocationMode,
     coordinates: CursorFacts,
     sequence_epoch: u32,
+}
+
+/// Open invocation transaction (D4).
+///
+/// Admission is pure. The machine mutates only on commit or on a
+/// post-dispatch poison. `possible_mutation == None` is pre-dispatch
+/// (KV-L9 unchanged). `Some(stage)` means a device write may have started;
+/// D4 does not prove rollback, so [`InferenceSessionState::fail`] poisons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationTransaction {
+    plan: PlannedInvocation,
+    possible_mutation: Option<FailureStage>,
+}
+
+impl InvocationTransaction {
+    #[must_use]
+    pub fn plan(&self) -> &PlannedInvocation {
+        &self.plan
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> InvocationMode {
+        self.plan.mode
+    }
+
+    #[must_use]
+    pub fn coordinates(&self) -> CursorFacts {
+        self.plan.coordinates
+    }
+
+    #[must_use]
+    pub fn sequence_epoch(&self) -> u32 {
+        self.plan.sequence_epoch
+    }
+
+    #[must_use]
+    pub fn possible_mutation(&self) -> Option<FailureStage> {
+        self.possible_mutation
+    }
+
+    #[must_use]
+    pub fn is_pre_dispatch(&self) -> bool {
+        self.possible_mutation.is_none()
+    }
+
+    /// Record that device work at `stage` may have mutated the cache.
+    /// Does not mutate the sequence machine.
+    pub fn record_possible_mutation(&mut self, stage: FailureStage) {
+        self.possible_mutation = Some(stage);
+    }
+}
+
+/// O(1) logical-reset receipt (KV-L8). Capacity is preserved. Cache clear,
+/// buffer zero-fill, and upload are not on this path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetReceipt {
+    pub previous_epoch: u32,
+    pub sequence_epoch: u32,
+    pub previous_valid_len: u32,
+    pub valid_len: u32,
+    pub capacity: u32,
+    pub cache_cleared: bool,
+    pub buffers_zero_filled: bool,
+    pub uploads: u32,
+}
+
+/// Outcome of [`InferenceSessionState::fail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureOutcome {
+    /// Pre-dispatch abort: the machine was not mutated (KV-L9).
+    Unchanged,
+    /// Possible partial device write without proven rollback.
+    Poisoned {
+        epoch: u32,
+        failure_stage: FailureStage,
+    },
 }
 
 impl PlannedInvocation {
@@ -342,6 +420,18 @@ impl InferenceSessionState {
         })
     }
 
+    /// Open a D4 transaction around pre-dispatch admission.
+    pub fn begin_transaction(
+        &self,
+        mode: InvocationMode,
+        query_rows: u32,
+    ) -> Result<InvocationTransaction, SessionError> {
+        Ok(InvocationTransaction {
+            plan: self.begin_invocation(mode, query_rows)?,
+            possible_mutation: None,
+        })
+    }
+
     /// Contiguous commit: valid length advances by exactly `query_rows`.
     pub fn commit(&mut self, plan: &PlannedInvocation) -> Result<CursorFacts, SessionError> {
         self.ensure_mutable()?;
@@ -356,9 +446,17 @@ impl InferenceSessionState {
         Ok(coordinates)
     }
 
+    /// Commit the admitted transaction plan.
+    pub fn commit_transaction(
+        &mut self,
+        tx: &InvocationTransaction,
+    ) -> Result<CursorFacts, SessionError> {
+        self.commit(&tx.plan)
+    }
+
     /// Possible partial device mutation: poison the sequence (KV-L9).
     ///
-    /// D1 does not prove rollback, so the only legal follow-ups are inspect
+    /// D1/D4 do not prove rollback, so the only legal follow-ups are inspect
     /// and release. The committed cursor is left unchanged.
     pub fn poison(
         &mut self,
@@ -376,10 +474,63 @@ impl InferenceSessionState {
         Ok(phase)
     }
 
-    /// Logical prompt reset (KV-L8): valid length → 0, epoch advances,
-    /// capacity preserved. No cache clear.
-    pub fn reset(&mut self) -> Result<u32, SessionError> {
+    /// Pre-dispatch abort (KV-L9): the machine is not mutated.
+    ///
+    /// Illegal after [`InvocationTransaction::record_possible_mutation`];
+    /// that path must [`Self::fail`].
+    pub fn abort_pre_dispatch(&self, tx: &InvocationTransaction) -> Result<(), SessionError> {
         self.ensure_mutable()?;
+        self.ensure_plan_matches(&tx.plan)?;
+        if let Some(stage) = tx.possible_mutation {
+            return Err(SessionError::invalid_args(format!(
+                "abort_pre_dispatch after possible mutation at {stage:?}; poison because rollback is not proven"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Possible partial mutation without proven rollback: poison (KV-L9).
+    pub fn fail_unproven(
+        &mut self,
+        tx: &InvocationTransaction,
+    ) -> Result<SequencePhase, SessionError> {
+        let stage = tx.possible_mutation.ok_or_else(|| {
+            SessionError::invalid_args(
+                "fail_unproven requires a possible mutation stage; abort_pre_dispatch if still pre-dispatch",
+            )
+        })?;
+        self.poison(&tx.plan, stage)
+    }
+
+    /// Close a failed transaction: pre-dispatch stays unchanged; a possible
+    /// device write poisons because rollback is not proven.
+    pub fn fail(&mut self, tx: &InvocationTransaction) -> Result<FailureOutcome, SessionError> {
+        if tx.is_pre_dispatch() {
+            self.abort_pre_dispatch(tx)?;
+            Ok(FailureOutcome::Unchanged)
+        } else {
+            match self.fail_unproven(tx)? {
+                SequencePhase::Poisoned {
+                    epoch,
+                    failure_stage,
+                } => Ok(FailureOutcome::Poisoned {
+                    epoch,
+                    failure_stage,
+                }),
+                other => Err(SessionError::invalid_args(format!(
+                    "expected poison after unproven mutation, got {other:?}"
+                ))),
+            }
+        }
+    }
+
+    /// Logical prompt reset (KV-L8): valid length → 0, epoch advances,
+    /// capacity preserved. No cache clear, zero-fill, or upload.
+    pub fn logical_reset(&mut self) -> Result<ResetReceipt, SessionError> {
+        self.ensure_mutable()?;
+        let previous_epoch = self.sequence_epoch;
+        let previous_valid_len = self.valid_len;
+        let capacity = self.capacity;
         let next_epoch = self
             .sequence_epoch
             .checked_add(1)
@@ -389,7 +540,22 @@ impl InferenceSessionState {
         self.phase = SequencePhase::Fresh;
         self.last_commit = None;
         self.poisoned_invocation = None;
-        Ok(next_epoch)
+        Ok(ResetReceipt {
+            previous_epoch,
+            sequence_epoch: next_epoch,
+            previous_valid_len,
+            valid_len: 0,
+            capacity,
+            cache_cleared: false,
+            buffers_zero_filled: false,
+            uploads: 0,
+        })
+    }
+
+    /// Logical prompt reset (KV-L8): valid length → 0, epoch advances,
+    /// capacity preserved. No cache clear.
+    pub fn reset(&mut self) -> Result<u32, SessionError> {
+        Ok(self.logical_reset()?.sequence_epoch)
     }
 
     /// Terminal release. Legal after poison. Inspect remains legal.
