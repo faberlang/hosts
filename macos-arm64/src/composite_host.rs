@@ -45,7 +45,10 @@
 //! and reports an A9-style receipt (selected hardware, module hash, launches,
 //! transfers, readbacks, allocations).
 
+mod inference_state;
+mod invocation_program;
 mod receipt;
+mod residency;
 mod session;
 
 pub use receipt::{
