@@ -40,7 +40,9 @@ impl IntermediateBufferPool {
     }
 
     fn return_buffer(&mut self, key: BufferKey, handle: DeviceHandle) {
-        debug_assert!(self.buffers.insert(key, handle).is_none());
+        let previous = self.buffers.insert(key, handle);
+        debug_assert!(previous.is_none(), "pool keys are unique per session");
+        let _ = previous;
     }
 
     fn values(&self) -> impl Iterator<Item = &DeviceHandle> {
@@ -331,6 +333,51 @@ pub struct ProgramSession<'host> {
 
 fn elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Copy every unique `PerStep` Input buffer once for a resident step.
+///
+/// The launch loop must not re-marshal the same invocation slot per kernel:
+/// the baked session already owns the launch plan, and weights stay
+/// device-resident from prepare. Missing or mis-sized invocation inputs
+/// fail closed before any encode.
+fn copy_resident_inputs(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    buffer_meta: &BTreeMap<BufferKey, SessionBufferMeta>,
+    inputs: &BTreeMap<u32, Vec<f32>>,
+) -> HostResult<usize> {
+    let mut copies = 0usize;
+    let mut copied: BTreeSet<BufferKey> = BTreeSet::new();
+    for (key, meta) in buffer_meta {
+        if meta.role != DeviceBufferRole::Input
+            || meta.lifetime != DeviceBufferLifetime::PerStep
+            || !copied.insert(*key)
+        {
+            continue;
+        }
+        let values = inputs.get(&key.0).ok_or_else(|| {
+            descriptor_errors::shape_mismatch(format!(
+                "resident step declares PerStep input `{}` (id {}) but no host input was provided",
+                meta.name, key.0
+            ))
+        })?;
+        if u64::try_from(values.len()).ok() != Some(meta.element_count) {
+            return Err(descriptor_errors::shape_mismatch(format!(
+                "input for buffer `{}` (id {}) has {} f32 elements but the resident session declares {}",
+                meta.name,
+                key.0,
+                values.len(),
+                meta.element_count
+            )));
+        }
+        let handle = buffers.get(key).copied().ok_or_else(|| {
+            HostError::internal("session input buffer disappeared")
+        })?;
+        runtime.copy_in_f32(&handle, values)?;
+        copies += 1;
+    }
+    Ok(copies)
 }
 
 /// Copy this kernel's declared host inputs into their slots for this
@@ -1085,6 +1132,20 @@ impl<'host> ProgramSession<'host> {
         // teardown (S2-3).
         let (pool_allocations, pool_reuses) = self.allocate_step_buffers(use_intermediate_pool)?;
 
+        // Resident steps marshal invocation inputs once against the baked
+        // session plan (unique PerStep slots). Weights are never re-copied.
+        // SingleRun still copies per kernel; OnceInit copies nothing.
+        if mode == CopyMode::ResidentStep {
+            let copy_started = Instant::now();
+            copy_ins = copy_resident_inputs(
+                self.runtime,
+                &self.buffers,
+                &self.buffer_meta,
+                inputs,
+            )?;
+            copy_in_us = elapsed_us(copy_started);
+        }
+
         for launch in &self.launches {
             let kernel = self
                 .kernels
@@ -1103,21 +1164,22 @@ impl<'host> ProgramSession<'host> {
 
             // Copy-in declared inputs for this kernel — `SingleRun` copies
             // every declared input (PerStep mode); a prepared resident step
-            // (ResidentStep mode) copies only the declared `PerStep` input
-            // slots (the per-token values) — the once-init weights stay
-            // device-resident (E03-U1); a `RepeatingStep` step (OnceInit
-            // mode) copies nothing: the HostProvided params were once-init'd
-            // at session creation and stay device-resident (S5-U6).
-            let copy_started = Instant::now();
-            copy_ins += copy_declared_inputs(
-                self.runtime,
-                &self.buffers,
-                &self.buffer_meta,
-                kernel,
-                inputs,
-                mode,
-            )?;
-            copy_in_us = copy_in_us.saturating_add(elapsed_us(copy_started));
+            // already copied unique PerStep slots above; a `RepeatingStep`
+            // step (OnceInit mode) copies nothing: the HostProvided params
+            // were once-init'd at session creation and stay device-resident
+            // (S5-U6).
+            if mode != CopyMode::ResidentStep {
+                let copy_started = Instant::now();
+                copy_ins += copy_declared_inputs(
+                    self.runtime,
+                    &self.buffers,
+                    &self.buffer_meta,
+                    kernel,
+                    inputs,
+                    mode,
+                )?;
+                copy_in_us = copy_in_us.saturating_add(elapsed_us(copy_started));
+            }
 
             let encode_started = Instant::now();
             self.runtime.launch_kernel(

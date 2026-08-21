@@ -724,6 +724,11 @@ impl DeviceDescriptor {
         let mut semantic_values: Vec<(u32, u32)> = Vec::new();
         let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
         let mut initializations: Vec<(u32, DeviceBufferInitialization)> = Vec::new();
+        // Resident steps copy each PerStep input once. A later kernel write
+        // to that same buffer would clobber the host value (the old
+        // per-kernel copy hid this). Admit fails closed.
+        let mut per_step_inputs: Vec<u32> = Vec::new();
+        let mut per_step_writes: Vec<u32> = Vec::new();
 
         for kernel in &self.kernels {
             if kernel.entry.trim().is_empty() {
@@ -823,6 +828,21 @@ impl DeviceDescriptor {
                     identities.push((slot.buffer_id, slot.buffer_name.clone(), slot.role));
                 }
 
+                if slot.lifetime == DeviceBufferLifetime::PerStep {
+                    match slot.role {
+                        DeviceBufferRole::Input => {
+                            if !per_step_inputs.contains(&slot.buffer_id) {
+                                per_step_inputs.push(slot.buffer_id);
+                            }
+                        }
+                        DeviceBufferRole::Output | DeviceBufferRole::InOut => {
+                            if !per_step_writes.contains(&slot.buffer_id) {
+                                per_step_writes.push(slot.buffer_id);
+                            }
+                        }
+                    }
+                }
+
                 let Some(version) = versions.iter().find(|version| {
                     version.buffer_id == slot.buffer_id && version.version == slot.version
                 }) else {
@@ -891,6 +911,19 @@ impl DeviceDescriptor {
                 } else {
                     initializations.push((slot.buffer_id, slot.initialization));
                 }
+            }
+        }
+
+        for id in &per_step_inputs {
+            if per_step_writes.contains(id) {
+                let name = identities
+                    .iter()
+                    .find(|(buffer_id, _, _)| buffer_id == id)
+                    .map(|(_, name, _)| name.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(errors::descriptor(format!(
+                    "device buffer `{name}` (id {id}) is a PerStep input written mid-graph; resident steps copy PerStep inputs once, so a later kernel write would clobber the host value"
+                )));
             }
         }
 
