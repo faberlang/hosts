@@ -1,6 +1,6 @@
 # GOAL: md3h-virtual-partition-host — every device run admits through a virtual partition
 
-**Status**: planned — lowered 2026-08-21 from radix MD3H; no unit started
+**Status**: active — W0 dispatched 2026-08-22 (R1 radix-mir `7f7ed3c6`, F1 fmir fixtures `2af2dc3a`, H1 discovery `d22be982`); spine H1→H2→H3→C1→P1→C2; MD3H-WIN hot-file window gate (Mind) before H3
 **Created**: 2026-08-21
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3H + the 2026-08-21 operator amendment (uniform N=1; eight-rank bind); lowered spec [`md3h-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3h-delivery.md)
