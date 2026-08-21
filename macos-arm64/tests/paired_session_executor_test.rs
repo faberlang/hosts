@@ -7,7 +7,9 @@
 use faber_host_macos_arm64::composite_host::invocation_binding::{
     RopeConfig, KV_PREFIX_IDS, PROMPT_TOKENS, Q_PREFIX_IDS, ROPE_COS, ROPE_SIN,
 };
-use faber_host_macos_arm64::composite_host::{CompositeHost, DeviceByteBuffer};
+use faber_host_macos_arm64::composite_host::{
+    CompositeHost, DeviceByteBuffer, SequencePhase, E_KV_PHASE, E_KV_POISONED,
+};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DescriptorLaunch,
     DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
@@ -276,15 +278,70 @@ fn invocation(
     prefix_before: u32,
     valid_len_after: u32,
 ) -> DeviceExecuteInvocation {
+    invocation_on(mode, token, position, prefix_before, valid_len_after, 1)
+}
+
+fn invocation_on(
+    mode: DeviceExecuteInvocationMode,
+    token: Option<u32>,
+    position: u32,
+    prefix_before: u32,
+    valid_len_after: u32,
+    sequence_epoch: u32,
+) -> DeviceExecuteInvocation {
     DeviceExecuteInvocation {
         mode,
         token,
         position,
-        sequence_epoch: 1,
+        sequence_epoch,
         prefix_before,
         valid_len_after,
         query_start: position,
     }
+}
+
+fn cache_slots(k_id: u32, v_id: u32) -> DescriptorKernel {
+    DescriptorKernel {
+        entry: "cache".to_owned(),
+        buffers: vec![
+            slot(
+                k_id,
+                "cache.k",
+                30,
+                DeviceBufferRole::Input,
+                DeviceBufferLifetime::PerProgram,
+                DeviceBufferInitialization::ZeroFill,
+                8,
+                0,
+            ),
+            slot(
+                v_id,
+                "cache.v",
+                31,
+                DeviceBufferRole::Input,
+                DeviceBufferLifetime::PerProgram,
+                DeviceBufferInitialization::ZeroFill,
+                8,
+                1,
+            ),
+        ],
+        grid: [1, 1, 1],
+        block: [1, 1, 1],
+    }
+}
+
+fn prefill_descriptor_with_cache() -> DeviceDescriptor {
+    let mut prefill = prefill_descriptor();
+    prefill.kernels.push(cache_slots(30, 31));
+    prefill.buffer_versions = buffer_versions(&prefill.kernels);
+    prefill
+}
+
+fn decode_descriptor_with_cache() -> DeviceDescriptor {
+    let mut decode = decode_descriptor();
+    decode.kernels.push(cache_slots(130, 131));
+    decode.buffer_versions = buffer_versions(&decode.kernels);
+    decode
 }
 
 fn paired_host() -> CompositeHost {
@@ -389,6 +446,19 @@ fn paired_projection_failure_is_pre_dispatch_and_does_not_poison_the_pair() {
         )
         .expect("prepare pair");
 
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+    ))
+    .expect("prefill so decode is the legal next mode");
+    assert_eq!(pair.valid_len(), 2);
+    assert_eq!(pair.sequence_epoch(), 1);
+    assert_eq!(pair.reuses(), 1);
+    let handles = pair.live_handles();
+
     let error = pair
         .execute_invocation(&invocation(
             DeviceExecuteInvocationMode::ScalarDecode,
@@ -399,19 +469,23 @@ fn paired_projection_failure_is_pre_dispatch_and_does_not_poison_the_pair() {
         ))
         .expect_err("a position gap is rejected before dispatch");
     assert_eq!(error.code, "E_INVALID_ARGS");
-    assert_eq!(pair.reuses(), 0);
-    assert_eq!(pair.live_handles(), 2);
+    assert_eq!(pair.reuses(), 1);
+    assert_eq!(pair.valid_len(), 2);
+    assert_eq!(pair.sequence_epoch(), 1);
+    assert_eq!(pair.phase(), SequencePhase::Prefill);
+    assert_eq!(pair.live_handles(), handles);
 
     let receipt = pair
         .execute_invocation(&invocation(
-            DeviceExecuteInvocationMode::Prefill,
-            None,
-            0,
-            0,
+            DeviceExecuteInvocationMode::ScalarDecode,
+            Some(42),
             2,
+            2,
+            3,
         ))
         .expect("the pair remains usable after pre-dispatch rejection");
-    assert_eq!(receipt.launch_entries, vec!["addita"]);
+    assert_eq!(receipt.launch_entries, vec!["observa"]);
+    assert_eq!(pair.valid_len(), 3);
     pair.teardown().expect("teardown");
 }
 
@@ -466,6 +540,187 @@ fn paired_device_failure_releases_the_shared_owner() {
             1,
         ))
         .is_err());
+    let reset_err = pair
+        .reset()
+        .expect_err("poisoned sequence rejects reset; rollback is not proven");
+    assert_eq!(reset_err.code, E_KV_POISONED);
     pair.teardown().expect("poisoned pair teardown");
     assert_eq!(host.device().expect("runtime").live_handle_count(), 0);
+}
+
+#[test]
+fn paired_reset_replays_prefill_without_cache_upload() {
+    let mut host = paired_host();
+    let mut pair = host
+        .prepare_paired_session(
+            &prefill_descriptor_with_cache(),
+            &decode_descriptor_with_cache(),
+            vec![11, 22],
+            RopeConfig {
+                head_dim: 8,
+                theta: 10_000.0,
+            },
+            &std::collections::BTreeMap::from([(10, vec![10.0, 20.0])]),
+            &std::collections::BTreeMap::new(),
+            "model",
+            "session",
+        )
+        .expect("prepare pair with shared K/V arenas");
+
+    // Module + weight + K + V. The arenas exist before any step so reset
+    // can prove it does not reallocate or zero-fill them.
+    assert_eq!(pair.live_handles(), 4);
+    assert_eq!(pair.driver_counters().buffer_allocs, 3);
+    let identity = pair
+        .shared_owner_identity()
+        .expect("shared owner at prepare");
+    assert_eq!(identity.1, std::collections::BTreeSet::from([10, 30, 31]));
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+    ))
+    .expect("prefill");
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::ScalarDecode,
+        Some(42),
+        2,
+        2,
+        3,
+    ))
+    .expect("decode");
+    assert_eq!(pair.valid_len(), 3);
+    assert_eq!(pair.sequence_epoch(), 1);
+    assert_eq!(pair.reuses(), 2);
+    assert_eq!(pair.resets(), 0);
+    assert_eq!(pair.reset_cleared(), 0);
+
+    let allocs_before_reset = pair.driver_counters().buffer_allocs;
+    let handles_before_reset = pair.live_handles();
+    let identity_before_reset = pair
+        .shared_owner_identity()
+        .expect("shared owner before reset");
+    let epoch_before = pair.sequence_epoch();
+
+    let receipt = pair.reset().expect("logical reset");
+    assert_eq!(receipt.previous_epoch, epoch_before);
+    assert_eq!(receipt.sequence_epoch, epoch_before + 1);
+    assert_eq!(receipt.previous_valid_len, 3);
+    assert_eq!(receipt.valid_len, 0);
+    assert!(!receipt.cache_cleared);
+    assert!(!receipt.buffers_zero_filled);
+    assert_eq!(receipt.uploads, 0);
+    assert_eq!(pair.valid_len(), 0);
+    assert_eq!(pair.sequence_epoch(), epoch_before + 1);
+    assert_eq!(pair.phase(), SequencePhase::Fresh);
+    assert_eq!(pair.resets(), 1);
+    assert_eq!(pair.reset_cleared(), 3);
+    assert_eq!(pair.driver_counters().buffer_allocs, allocs_before_reset);
+    assert_eq!(pair.live_handles(), handles_before_reset);
+    assert_eq!(
+        pair.shared_owner_identity()
+            .expect("shared owner after reset"),
+        identity_before_reset
+    );
+
+    let stale = pair
+        .execute_invocation(&invocation(
+            DeviceExecuteInvocationMode::Prefill,
+            None,
+            0,
+            0,
+            2,
+        ))
+        .expect_err("stale epoch is pre-dispatch");
+    assert_eq!(stale.code, "E_KV_STALE");
+    assert_eq!(pair.valid_len(), 0);
+    assert_eq!(pair.sequence_epoch(), epoch_before + 1);
+    assert_eq!(pair.resets(), 1);
+
+    let replay = pair
+        .execute_invocation(&invocation_on(
+            DeviceExecuteInvocationMode::Prefill,
+            None,
+            0,
+            0,
+            2,
+            epoch_before + 1,
+        ))
+        .expect("fresh-sequence prefill after reset");
+    assert_eq!(replay.launch_entries, vec!["addita"]);
+    assert_eq!(pair.valid_len(), 2);
+    assert_eq!(pair.sequence_epoch(), epoch_before + 1);
+    assert_eq!(pair.phase(), SequencePhase::Prefill);
+    assert_eq!(pair.driver_counters().buffer_allocs, allocs_before_reset);
+    pair.teardown().expect("teardown");
+}
+
+#[test]
+fn paired_pre_dispatch_failure_leaves_sequence_unchanged() {
+    let mut host = paired_host();
+    let mut pair = host
+        .prepare_paired_session(
+            &prefill_descriptor(),
+            &decode_descriptor(),
+            vec![11, 22],
+            RopeConfig {
+                head_dim: 8,
+                theta: 10_000.0,
+            },
+            &std::collections::BTreeMap::from([(10, vec![10.0, 20.0])]),
+            &std::collections::BTreeMap::new(),
+            "model",
+            "session",
+        )
+        .expect("prepare pair");
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+    ))
+    .expect("prefill");
+    let epoch = pair.sequence_epoch();
+    let valid_len = pair.valid_len();
+    let reuses = pair.reuses();
+    let handles = pair.live_handles();
+    let identity = pair.shared_owner_identity().expect("identity");
+
+    let phase_err = pair
+        .execute_invocation(&invocation(
+            DeviceExecuteInvocationMode::Prefill,
+            None,
+            0,
+            0,
+            2,
+        ))
+        .expect_err("second prefill is illegal until reset");
+    assert_eq!(phase_err.code, E_KV_PHASE);
+    assert_eq!(pair.sequence_epoch(), epoch);
+    assert_eq!(pair.valid_len(), valid_len);
+    assert_eq!(pair.reuses(), reuses);
+    assert_eq!(pair.resets(), 0);
+    assert_eq!(pair.live_handles(), handles);
+    assert_eq!(
+        pair.shared_owner_identity().expect("identity after reject"),
+        identity
+    );
+
+    let decode = pair
+        .execute_invocation(&invocation(
+            DeviceExecuteInvocationMode::ScalarDecode,
+            Some(42),
+            2,
+            2,
+            3,
+        ))
+        .expect("decode remains legal after a pre-dispatch reject");
+    assert_eq!(decode.launch_entries, vec!["observa"]);
+    assert_eq!(pair.valid_len(), 3);
+    pair.teardown().expect("teardown");
 }

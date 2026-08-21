@@ -1,20 +1,26 @@
-//! PPE-P1: one-runtime paired prefill/scalar-decode executor.
+//! PPE-P1/P3: one-runtime paired prefill/scalar-decode executor.
 //!
 //! A pair is prepared before its first invocation. The pair owns one mutable
 //! device runtime and detaches the two program-owned states from the legacy
 //! `ProgramSession` borrow while they are idle. A short-lived `ProgramSession`
 //! reattaches each state only for the selected dispatch, so both programs use
-//! the same runtime and the same semantic PerProgram owner.
+//! the same runtime and the same semantic PerProgram owner. Reset is a D4
+//! logical cursor/epoch update: K/V arenas and weights stay put, and the
+//! normal path uploads zero cache bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::composite_host::invocation_binding::{project_invocation_bindings, RopeConfig};
 use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
-use crate::device_execute::DeviceExecuteInvocation;
+use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
 use crate::device_host::DeviceRuntime;
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 
+use super::inference_state::{
+    FailureStage, InferenceSessionState, InvocationMode, InvocationTransaction, ResetReceipt,
+    SequencePhase, SessionError, E_KV_STALE,
+};
 use super::session::{ProgramInner, ProgramSession};
 use super::DeviceExecutionReceipt;
 
@@ -29,7 +35,10 @@ pub struct PairedProgramSession<'host> {
     rope: RopeConfig,
     model_identity: String,
     session_identity: String,
+    state: InferenceSessionState,
     reuses: usize,
+    resets: usize,
+    reset_cleared: usize,
 }
 
 impl<'host> PairedProgramSession<'host> {
@@ -85,6 +94,8 @@ impl<'host> PairedProgramSession<'host> {
             return Err(error);
         }
         let decode = decode_session.into_inner();
+        let state = InferenceSessionState::new(pair_sequence_capacity(prompt_tokens.len())?)
+            .map_err(session_error)?;
 
         Ok(Self {
             runtime,
@@ -96,54 +107,137 @@ impl<'host> PairedProgramSession<'host> {
             rope,
             model_identity,
             session_identity,
+            state,
             reuses: 0,
+            resets: 0,
+            reset_cleared: 0,
         })
     }
 
     /// Dispatch one explicitly selected invocation through the corresponding
-    /// prepared program. P2 projects only the selected descriptor's dynamic
-    /// inputs before the device sees the request.
+    /// prepared program. D4 admits the mode against the live cursor first.
+    /// P2 then projects only the selected descriptor's dynamic inputs. Both
+    /// of those steps are pre-dispatch (KV-L9): a rejection leaves the
+    /// sequence unchanged. A device-side failure poisons because rollback
+    /// is not proven.
     pub fn execute_invocation(
         &mut self,
         invocation: &DeviceExecuteInvocation,
     ) -> HostResult<DeviceExecutionReceipt> {
+        let mode = invocation_mode(invocation.mode);
+        let query_rows = invocation_query_rows(invocation, self.prompt_tokens.len())?;
+        let mut tx = self
+            .state
+            .begin_transaction(mode, query_rows)
+            .map_err(session_error)?;
+        if let Err(error) = match_invocation_cursor(invocation, &tx) {
+            drop(self.state.fail(&tx));
+            return Err(error);
+        }
         let descriptor = match invocation.mode {
-            crate::device_execute::DeviceExecuteInvocationMode::Prefill => &self.prefill_descriptor,
-            crate::device_execute::DeviceExecuteInvocationMode::ScalarDecode => {
-                &self.decode_descriptor
+            DeviceExecuteInvocationMode::Prefill => &self.prefill_descriptor,
+            DeviceExecuteInvocationMode::ScalarDecode => &self.decode_descriptor,
+        };
+        let inputs = match project_invocation_bindings(
+            descriptor,
+            invocation,
+            &self.prompt_tokens,
+            self.rope,
+        ) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                drop(self.state.fail(&tx));
+                return Err(error);
             }
         };
-        let inputs =
-            project_invocation_bindings(descriptor, invocation, &self.prompt_tokens, self.rope)?;
+        tx.record_possible_mutation(FailureStage::Dispatch);
         let result = match invocation.mode {
-            crate::device_execute::DeviceExecuteInvocationMode::Prefill => {
-                self.execute_prefill(&inputs)
-            }
-            crate::device_execute::DeviceExecuteInvocationMode::ScalarDecode => {
-                self.execute_decode(&inputs)
-            }
+            DeviceExecuteInvocationMode::Prefill => self.execute_prefill(&inputs),
+            DeviceExecuteInvocationMode::ScalarDecode => self.execute_decode(&inputs),
         };
         match result {
-            Ok(receipt) => {
-                self.reuses += 1;
-                Ok(receipt)
-            }
+            Ok(receipt) => match self.state.commit_transaction(&tx) {
+                Ok(_) => {
+                    self.reuses += 1;
+                    Ok(receipt)
+                }
+                Err(error) => {
+                    drop(self.state.fail(&tx));
+                    drop(self.release_all());
+                    Err(session_error(error))
+                }
+            },
             Err(error) => {
-                // A device-side failure may have partially mutated one
-                // program. The pair has no proven rollback boundary, so
-                // poison the whole shared owner by releasing both programs;
-                // projection failures above remain pre-dispatch and leave
-                // the pair untouched.
+                drop(self.state.fail(&tx));
                 drop(self.release_all());
                 Err(error)
             }
         }
     }
 
+    /// Logical reset (KV-L8): epoch advances, committed valid length returns
+    /// to zero, K/V arenas and weights stay put. No zero-fill upload.
+    /// Poisoned sequences reject reset with the D4 error shape because
+    /// rollback is not proven.
+    pub fn reset(&mut self) -> HostResult<ResetReceipt> {
+        let receipt = self.state.logical_reset().map_err(session_error)?;
+        self.resets = self.resets.saturating_add(1);
+        self.reset_cleared = receipt.previous_valid_len as usize;
+        Ok(receipt)
+    }
+
     /// Number of successful prefill/decode dispatches.
     #[must_use]
     pub fn reuses(&self) -> usize {
         self.reuses
+    }
+
+    /// Successful logical resets through this pair.
+    #[must_use]
+    pub fn resets(&self) -> usize {
+        self.resets
+    }
+
+    /// Rows logically retired by the last successful reset. Zero until a
+    /// reset commits; never a zero-fill upload count.
+    #[must_use]
+    pub fn reset_cleared(&self) -> usize {
+        self.reset_cleared
+    }
+
+    /// Live D4 sequence epoch.
+    #[must_use]
+    pub fn sequence_epoch(&self) -> u32 {
+        self.state.sequence_epoch()
+    }
+
+    /// Live committed valid length.
+    #[must_use]
+    pub fn valid_len(&self) -> u32 {
+        self.state.valid_len()
+    }
+
+    /// Live D4 sequence phase.
+    #[must_use]
+    pub fn phase(&self) -> SequencePhase {
+        self.state.phase()
+    }
+
+    /// Shared module handle id plus PerProgram semantic identities. Stable
+    /// across logical reset; used to prove the owner was not reallocated.
+    pub fn shared_owner_identity(&mut self) -> HostResult<(u64, BTreeSet<u32>)> {
+        let inner = self
+            .prefill
+            .take()
+            .ok_or_else(|| HostError::internal("paired program session is closed"))?;
+        let session = ProgramSession::from_inner(self.runtime, inner);
+        let offer = session.shared_offer();
+        let identity = (
+            offer.module_handle.id,
+            offer.buffers.keys().copied().collect(),
+        );
+        self.prefill = Some(session.into_inner());
+        Ok(identity)
     }
 
     /// The explicitly carried model identity.
@@ -267,6 +361,106 @@ fn execute_inner(
 
 fn release_inner(runtime: &mut DeviceRuntime, inner: ProgramInner) {
     drop(ProgramSession::from_inner(runtime, inner).teardown());
+}
+
+fn session_error(error: SessionError) -> HostError {
+    HostError {
+        code: error.code.to_string(),
+        message: error.message,
+        retryable: false,
+    }
+}
+
+fn pair_sequence_capacity(prompt_len: usize) -> HostResult<u32> {
+    let prompt = u32::try_from(prompt_len).map_err(|_| {
+        HostError::invalid_args("prefill prompt is longer than the sequence coordinate space")
+    })?;
+    // The prepare API has no model context length (composite_host.rs is
+    // outside this unit). Admit a long decode window; D4 still rejects
+    // u32 overflow pre-dispatch.
+    Ok(prompt.saturating_add(65_536).max(1))
+}
+
+fn invocation_mode(mode: DeviceExecuteInvocationMode) -> InvocationMode {
+    match mode {
+        DeviceExecuteInvocationMode::Prefill => InvocationMode::Prefill,
+        DeviceExecuteInvocationMode::ScalarDecode => InvocationMode::ScalarDecode,
+    }
+}
+
+fn invocation_query_rows(
+    invocation: &DeviceExecuteInvocation,
+    prompt_len: usize,
+) -> HostResult<u32> {
+    let query_rows = invocation
+        .valid_len_after
+        .checked_sub(invocation.prefix_before)
+        .ok_or_else(|| {
+            HostError::invalid_args("invocation valid_len_after is before prefix_before")
+        })?;
+    match invocation.mode {
+        DeviceExecuteInvocationMode::Prefill => {
+            let prompt_rows = u32::try_from(prompt_len).map_err(|_| {
+                HostError::invalid_args(
+                    "prefill prompt is longer than the sequence coordinate space",
+                )
+            })?;
+            if query_rows != prompt_rows {
+                return Err(HostError::invalid_args(
+                    "prefill query_rows must equal the prepared prompt length",
+                ));
+            }
+        }
+        DeviceExecuteInvocationMode::ScalarDecode => {
+            if query_rows != 1 {
+                return Err(HostError::invalid_args(
+                    "scalar decode is M=1; valid_len_after must be prefix_before + 1",
+                ));
+            }
+        }
+    }
+    Ok(query_rows)
+}
+
+fn match_invocation_cursor(
+    invocation: &DeviceExecuteInvocation,
+    tx: &InvocationTransaction,
+) -> HostResult<()> {
+    let coords = tx.coordinates();
+    if invocation.sequence_epoch != tx.sequence_epoch() {
+        return Err(HostError {
+            code: E_KV_STALE.to_owned(),
+            message: format!(
+                "invocation epoch {} does not match live epoch {}",
+                invocation.sequence_epoch,
+                tx.sequence_epoch()
+            ),
+            retryable: false,
+        });
+    }
+    if invocation.prefix_before != coords.prefix_before
+        || invocation.valid_len_after != coords.valid_len_after
+    {
+        return Err(HostError {
+            code: E_KV_STALE.to_owned(),
+            message: format!(
+                "invocation prefix_before={} valid_len_after={} does not match live prefix_before={} valid_len_after={}",
+                invocation.prefix_before,
+                invocation.valid_len_after,
+                coords.prefix_before,
+                coords.valid_len_after
+            ),
+            retryable: false,
+        });
+    }
+    if invocation.position != coords.write_position || invocation.query_start != coords.query_start
+    {
+        return Err(HostError::invalid_args(format!(
+            "invocation position={} query_start={} does not match write_position={} query_start={}",
+            invocation.position, invocation.query_start, coords.write_position, coords.query_start
+        )));
+    }
+    Ok(())
 }
 
 fn validate_pair_descriptors(

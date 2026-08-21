@@ -779,9 +779,11 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                         "device-execute protocol v2 reset does not accept invocation inputs",
                     ));
                 }
+                let reset = paired.reset()?;
                 load.operation = "reset".to_owned();
-                load.lifecycle.resets += 1;
+                load.lifecycle.resets = paired.resets();
                 load.lifecycle.live_handles = paired.live_handles();
+                load.reset_cleared = reset.previous_valid_len as usize;
                 load.receipt = None;
                 write_control_receipt(&mut stdout, load.clone())?;
             }
