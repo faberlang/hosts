@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::composite_host::invocation_binding::RopeConfig;
 use crate::composite_host::{
     CompositeHost, CompositeHostConfig, DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection,
-    PreparedResidentSession, PreparedSessionReceipt,
+    PairedProgramSession, PreparedResidentSession, PreparedSessionReceipt,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -721,9 +721,7 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
         model_identity,
         session_identity,
     )?;
-    load.lifecycle.live_handles = paired.live_handles();
-    load.lifecycle.module_reloads = paired.module_reloads();
-    load.lifecycle.per_program_reallocs = paired.per_program_reallocs();
+    apply_paired_lifecycle(&mut load, &paired);
 
     let stdout = std::io::stdout();
     let mut stdout = std::io::BufWriter::new(stdout.lock());
@@ -768,8 +766,7 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                 };
                 wire.stage_timing = stage_timing(wall_us, &receipt);
                 load.operation = "invoke".to_owned();
-                load.lifecycle.reuses = paired.reuses();
-                load.lifecycle.live_handles = paired.live_handles();
+                apply_paired_lifecycle(&mut load, &paired);
                 load.receipt = Some(wire);
                 write_control_receipt(&mut stdout, load.clone())?;
             }
@@ -781,8 +778,7 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                 }
                 let reset = paired.reset()?;
                 load.operation = "reset".to_owned();
-                load.lifecycle.resets = paired.resets();
-                load.lifecycle.live_handles = paired.live_handles();
+                apply_paired_lifecycle(&mut load, &paired);
                 load.reset_cleared = reset.previous_valid_len as usize;
                 load.receipt = None;
                 write_control_receipt(&mut stdout, load.clone())?;
@@ -793,12 +789,14 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                         "device-execute protocol v2 release does not accept invocation inputs",
                     ));
                 }
-                let reuses = paired.reuses();
+                apply_paired_lifecycle(&mut load, &paired);
                 paired.teardown()?;
                 load.operation = "release".to_owned();
-                load.lifecycle.reuses = reuses;
                 load.lifecycle.releases += 1;
-                load.lifecycle.live_handles = 0;
+                load.lifecycle.live_handles = host
+                    .device()
+                    .map(|device| device.live_handle_count())
+                    .unwrap_or(0);
                 load.receipt = None;
                 write_control_receipt(&mut stdout, load)?;
                 return Ok(());
@@ -1068,6 +1066,18 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
     Err(HostError::invalid_args(
         "device-execute control stream ended before explicit release",
     ))
+}
+
+fn apply_paired_lifecycle(
+    load: &mut DeviceExecuteControlReceipt,
+    paired: &PairedProgramSession<'_>,
+) {
+    load.lifecycle.reuses = paired.reuses();
+    load.lifecycle.resets = paired.resets();
+    load.lifecycle.module_reloads = paired.module_reloads();
+    load.lifecycle.per_program_reallocs = paired.per_program_reallocs();
+    load.lifecycle.live_handles = paired.live_handles();
+    load.reset_cleared = paired.reset_cleared();
 }
 
 fn control_receipt(

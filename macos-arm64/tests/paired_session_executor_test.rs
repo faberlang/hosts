@@ -384,6 +384,9 @@ fn paired_session_prepares_once_and_dispatches_each_mode() {
     assert_eq!(pair.live_handles(), 2);
     assert_eq!(pair.driver_counters().module_loads, 1);
     assert_eq!(pair.driver_counters().buffer_allocs, 1);
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.weight_uploads(), 1);
 
     let prefill_receipt = pair
         .execute_invocation(&invocation(
@@ -418,6 +421,9 @@ fn paired_session_prepares_once_and_dispatches_each_mode() {
     let counters = pair.driver_counters();
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.buffer_allocs, 1 + 4 + 6);
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.weight_uploads(), 1);
     pair.teardown().expect("paired teardown");
     assert_eq!(host.device().expect("runtime").live_handle_count(), 0);
     let counters = host.device().expect("runtime").driver_counters();
@@ -723,4 +729,128 @@ fn paired_pre_dispatch_failure_leaves_sequence_unchanged() {
     assert_eq!(decode.launch_entries, vec!["observa"]);
     assert_eq!(pair.valid_len(), 3);
     pair.teardown().expect("teardown");
+}
+
+#[test]
+fn paired_lifecycle_receipt_is_counter_derived() {
+    let mut host = paired_host();
+    let mut pair = host
+        .prepare_paired_session(
+            &prefill_descriptor_with_cache(),
+            &decode_descriptor_with_cache(),
+            vec![11, 22],
+            RopeConfig {
+                head_dim: 8,
+                theta: 10_000.0,
+            },
+            &std::collections::BTreeMap::from([(10, vec![10.0, 20.0])]),
+            &std::collections::BTreeMap::new(),
+            "model",
+            "session",
+        )
+        .expect("prepare pair");
+
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.weight_uploads(), 1);
+    assert!(pair.live_handles() > 0);
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+    ))
+    .expect("prefill");
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.weight_uploads(), 1);
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::ScalarDecode,
+        Some(42),
+        2,
+        2,
+        3,
+    ))
+    .expect("decode");
+    pair.reset().expect("logical reset");
+    pair.execute_invocation(&invocation_on(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+        2,
+    ))
+    .expect("replay prefill");
+
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.weight_uploads(), 1);
+    assert_eq!(pair.reset_cleared(), 3);
+    pair.teardown().expect("release");
+    assert_eq!(host.device().expect("runtime").live_handle_count(), 0);
+}
+
+#[test]
+fn paired_lifecycle_fields_move_when_driver_counters_move() {
+    let mut host = paired_host();
+    let mut pair = host
+        .prepare_paired_session(
+            &prefill_descriptor(),
+            &decode_descriptor(),
+            vec![11, 22],
+            RopeConfig {
+                head_dim: 8,
+                theta: 10_000.0,
+            },
+            &std::collections::BTreeMap::from([(10, vec![10.0, 20.0])]),
+            &std::collections::BTreeMap::new(),
+            "model",
+            "session",
+        )
+        .expect("prepare pair");
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::Prefill,
+        None,
+        0,
+        0,
+        2,
+    ))
+    .expect("prefill warms only the prefill pool");
+    assert_eq!(pair.module_reloads(), 0);
+    assert_eq!(pair.per_program_reallocs(), 0);
+
+    // Per-program warm-up: an extra alloc after only prefill must still
+    // surface. Combined-pool subtraction would hide it until decode runs.
+    let allocs_after_prefill = pair.driver_counters().buffer_allocs;
+    pair.force_buffer_alloc()
+        .expect("forced PerProgram realloc");
+    assert_eq!(
+        pair.driver_counters().buffer_allocs,
+        allocs_after_prefill + 1
+    );
+    assert_eq!(pair.per_program_reallocs(), 1);
+
+    pair.execute_invocation(&invocation(
+        DeviceExecuteInvocationMode::ScalarDecode,
+        Some(42),
+        2,
+        2,
+        3,
+    ))
+    .expect("decode warms its own pool");
+    assert_eq!(pair.per_program_reallocs(), 1);
+
+    let loads_before = pair.driver_counters().module_loads;
+    pair.force_module_load().expect("forced module reload");
+    assert_eq!(pair.driver_counters().module_loads, loads_before + 1);
+    assert_eq!(pair.module_reloads(), 1);
+    assert_eq!(pair.weight_uploads(), 1);
+
+    pair.teardown().expect("teardown");
+    assert_eq!(host.device().expect("runtime").live_handle_count(), 0);
 }

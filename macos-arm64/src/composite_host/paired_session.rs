@@ -1,4 +1,4 @@
-//! PPE-P1/P3: one-runtime paired prefill/scalar-decode executor.
+//! PPE-P1/P3/P4: one-runtime paired prefill/scalar-decode executor.
 //!
 //! A pair is prepared before its first invocation. The pair owns one mutable
 //! device runtime and detaches the two program-owned states from the legacy
@@ -6,14 +6,18 @@
 //! reattaches each state only for the selected dispatch, so both programs use
 //! the same runtime and the same semantic PerProgram owner. Reset is a D4
 //! logical cursor/epoch update: K/V arenas and weights stay put, and the
-//! normal path uploads zero cache bytes.
+//! normal path uploads zero cache bytes. Lifecycle receipt fields are derived
+//! from driver-counter baselines taken at prepare, with per-program pool
+//! warm-up subtracted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::composite_host::invocation_binding::{project_invocation_bindings, RopeConfig};
-use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
+use crate::device_descriptor::{
+    DeviceBufferInitialization, DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime,
+};
 use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
-use crate::device_host::DeviceRuntime;
+use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 
@@ -39,6 +43,16 @@ pub struct PairedProgramSession<'host> {
     reuses: usize,
     resets: usize,
     reset_cleared: usize,
+    /// Driver-counter baselines at prepare for reload/realloc derivation.
+    module_loads_at_prepare: usize,
+    buffer_allocs_at_prepare: usize,
+    prefill_per_execution_alloc_count: usize,
+    decode_per_execution_alloc_count: usize,
+    prefill_pool_warmed: bool,
+    decode_pool_warmed: bool,
+    /// Distinct HostProvided PerProgram semantic identities uploaded once
+    /// at prepare. Shared across both programs, never re-copied on reuse.
+    weight_uploads_at_prepare: usize,
 }
 
 impl<'host> PairedProgramSession<'host> {
@@ -96,6 +110,11 @@ impl<'host> PairedProgramSession<'host> {
         let decode = decode_session.into_inner();
         let state = InferenceSessionState::new(pair_sequence_capacity(prompt_tokens.len())?)
             .map_err(session_error)?;
+        let counters = runtime.driver_counters();
+        let mut weight_semantics = host_provided_weight_semantics(&prefill_descriptor);
+        weight_semantics.extend(host_provided_weight_semantics(&decode_descriptor));
+        let prefill_per_execution_alloc_count = per_execution_alloc_count(&prefill_descriptor);
+        let decode_per_execution_alloc_count = per_execution_alloc_count(&decode_descriptor);
 
         Ok(Self {
             runtime,
@@ -111,6 +130,13 @@ impl<'host> PairedProgramSession<'host> {
             reuses: 0,
             resets: 0,
             reset_cleared: 0,
+            module_loads_at_prepare: counters.module_loads,
+            buffer_allocs_at_prepare: counters.buffer_allocs,
+            prefill_per_execution_alloc_count,
+            decode_per_execution_alloc_count,
+            prefill_pool_warmed: false,
+            decode_pool_warmed: false,
+            weight_uploads_at_prepare: weight_semantics.len(),
         })
     }
 
@@ -287,19 +313,47 @@ impl<'host> PairedProgramSession<'host> {
         self.runtime.driver_counters()
     }
 
-    /// Driver module loads and buffer allocations observed since preparation.
-    /// P4 owns richer counter derivation; P1 exposes the measured no-reload
-    /// baseline used by the control receipt.
+    /// Module loads observed beyond the prepare-time baseline. 0 across
+    /// reuses means the shared module was never reloaded.
     #[must_use]
     pub fn module_reloads(&self) -> usize {
-        0
+        self.runtime
+            .driver_counters()
+            .module_loads
+            .saturating_sub(self.module_loads_at_prepare)
     }
 
-    /// P1 does not classify the resident step pool as a PerProgram realloc.
-    /// P4 extends this with the full counter-baseline derivation.
+    /// Buffer allocations beyond prepare and the one-time per-program step
+    /// pool warm-up. 0 across reuses means no PerProgram owner was reallocated.
     #[must_use]
     pub fn per_program_reallocs(&self) -> usize {
-        0
+        self.runtime
+            .driver_counters()
+            .buffer_allocs
+            .saturating_sub(self.buffer_allocs_at_prepare)
+            .saturating_sub(self.pool_warmup_allocs())
+    }
+
+    /// Distinct HostProvided PerProgram weights copied at prepare. Shared
+    /// identities count once; reuses never re-copy.
+    #[must_use]
+    pub fn weight_uploads(&self) -> usize {
+        self.weight_uploads_at_prepare
+    }
+
+    /// Extra module load through the pair's runtime. Derived `module_reloads`
+    /// must move with the driver counter; a structural zero cannot.
+    pub fn force_module_load(&mut self) -> HostResult<()> {
+        let handle = self.runtime.load_module(b"p4-forced-module-reload")?;
+        self.runtime.release(&handle)
+    }
+
+    /// Extra buffer allocation through the pair's runtime. Derived
+    /// `per_program_reallocs` must move with the driver after pool warm-up
+    /// subtraction.
+    pub fn force_buffer_alloc(&mut self) -> HostResult<()> {
+        let handle = self.runtime.alloc_bytes(16)?;
+        self.runtime.release(&handle)
     }
 
     /// Release decode-owned handles first, then the shared prefill owner.
@@ -312,14 +366,27 @@ impl<'host> PairedProgramSession<'host> {
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        execute_inner(&mut self.runtime, &mut self.prefill, inputs)
+        let result = execute_inner(&mut self.runtime, &mut self.prefill, inputs);
+        if result.is_ok() {
+            self.prefill_pool_warmed = true;
+        }
+        result
     }
 
     fn execute_decode(
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        execute_inner(&mut self.runtime, &mut self.decode, inputs)
+        let result = execute_inner(&mut self.runtime, &mut self.decode, inputs);
+        if result.is_ok() {
+            self.decode_pool_warmed = true;
+        }
+        result
+    }
+
+    fn pool_warmup_allocs(&self) -> usize {
+        usize::from(self.prefill_pool_warmed) * self.prefill_per_execution_alloc_count
+            + usize::from(self.decode_pool_warmed) * self.decode_per_execution_alloc_count
     }
 
     fn release_all(&mut self) -> HostResult<()> {
@@ -506,6 +573,34 @@ fn persistent_semantics(descriptor: &DeviceDescriptor) -> BTreeSet<u32> {
         .filter(|slot| slot.lifetime == DeviceBufferLifetime::PerProgram)
         .map(|slot| slot.semantic_value)
         .collect()
+}
+
+fn host_provided_weight_semantics(descriptor: &DeviceDescriptor) -> BTreeSet<u32> {
+    descriptor
+        .kernels
+        .iter()
+        .flat_map(|kernel| &kernel.buffers)
+        .filter(|slot| {
+            slot.lifetime == DeviceBufferLifetime::PerProgram
+                && slot.initialization == DeviceBufferInitialization::HostProvided
+        })
+        .map(|slot| slot.semantic_value)
+        .collect()
+}
+
+fn per_execution_alloc_count(descriptor: &DeviceDescriptor) -> usize {
+    let mut per_execution = BTreeSet::new();
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            match slot.lifetime {
+                DeviceBufferLifetime::PerStep | DeviceBufferLifetime::ObservationPoint => {
+                    per_execution.insert((slot.buffer_id, slot.version));
+                }
+                DeviceBufferLifetime::PerProgram => {}
+            }
+        }
+    }
+    per_execution.len()
 }
 
 impl RopeConfig {
