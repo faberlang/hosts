@@ -46,6 +46,7 @@
 //! transfers, readbacks, allocations).
 
 pub mod inference_state;
+pub mod invocation_binding;
 mod invocation_program;
 mod receipt;
 mod residency;
