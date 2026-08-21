@@ -15,6 +15,10 @@
 //!   role consistency (`E_DEVICE_ABI_MISMATCH`), cross-reference shape
 //!   conflicts (`E_DEVICE_SHAPE_MISMATCH`), and cross-reference dtype
 //!   conflicts (`E_DEVICE_DTYPE_MISMATCH`).
+//! - [`KvCacheDescriptor`] is the KV storage/binding plan: allocation
+//!   capacity and view extent are separate typed facts, multiple views may
+//!   share one allocation, launch bindings preserve declared indices and
+//!   order, and runtime cursor values never join the graph hash.
 //!
 //! The stable codes below are the host-side half of the N1.4 error table.
 //! Backend-availability failures (`E_BACKEND_UNAVAILABLE`) and the no-device-
@@ -403,6 +407,105 @@ pub struct DescriptorBufferVersion {
     pub element_ty: DeviceDataType,
     /// Element count of this version's shape.
     pub element_count: u64,
+}
+
+/// One persistent allocation: buffer identity, dtype, capacity bytes,
+/// lifetime, and initialization. Capacity is a storage fact and is never a
+/// view extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorAllocation {
+    /// Buffer identity of this allocation (the launch-binding handle).
+    pub buffer_id: u32,
+    /// Element type of the backing store.
+    pub dtype: DeviceDataType,
+    /// Fixed capacity in bytes. Distinct from any view's [`DescriptorView::maximum_span`].
+    pub capacity_bytes: u64,
+    /// How long this allocation lives.
+    pub lifetime: DeviceBufferLifetime,
+    /// How the allocation is brought to its first defined state.
+    pub initialization: DeviceBufferInitialization,
+}
+
+/// A bounded view over an allocation. Multiple views may share one
+/// allocation (append and prefix over a persistent K or V arena).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DescriptorView {
+    /// Allocation this view addresses ([`DescriptorAllocation::buffer_id`]).
+    pub allocation_id: u32,
+    /// Logical dimensions in axis order (layer, KV-head, position, dim).
+    pub logical_dims: Vec<u64>,
+    /// Element strides matching [`Self::logical_dims`] rank.
+    pub strides: Vec<u64>,
+    /// Static base offset in bytes from the allocation start.
+    pub static_base: u64,
+    /// Maximum span in bytes this view may address. Distinct from allocation
+    /// capacity.
+    pub maximum_span: u64,
+}
+
+/// One typed invocation-state upload. Current cursor values never join
+/// static program identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct DescriptorInvocationState {
+    /// Write position (absolute cache row).
+    pub position: u32,
+    /// Valid length after this step.
+    pub valid_len_after: u32,
+    /// Query rows in this step.
+    pub query_rows: u32,
+    /// Sequence epoch; advances on logical reset.
+    pub sequence_epoch: u32,
+}
+
+/// Tagged source of a launch binding's dynamic offset or span. Typed tags
+/// only — never a magic uniform bit pattern or string sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DescriptorRuntimeSource {
+    /// Offset and span are the constant descriptor facts.
+    Constant,
+    /// Offset or span is produced from [`DescriptorInvocationState::position`].
+    Position,
+    /// Offset or span is produced from [`DescriptorInvocationState::valid_len_after`].
+    ValidLenAfter,
+    /// Offset or span is produced from [`DescriptorInvocationState::query_rows`].
+    QueryRows,
+    /// Offset or span is produced from [`DescriptorInvocationState::sequence_epoch`].
+    SequenceEpoch,
+}
+
+/// One launch binding: declared binding index is preserved through to the
+/// launch record. `handle` names the allocation; `byte_offset` / `view_span`
+/// are the static envelope (runtime sources supply the live cursor at launch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorLaunchBinding {
+    /// Allocation handle ([`DescriptorAllocation::buffer_id`]).
+    pub handle: u32,
+    /// Declared binding index. Never dropped before launch.
+    pub binding_index: u32,
+    /// Byte offset into the allocation (static base, or the static envelope
+    /// when [`Self::runtime_source`] is a cursor tag).
+    pub byte_offset: u64,
+    /// View span in bytes for this binding.
+    pub view_span: u64,
+    /// Whether offset/span are constant or sourced from invocation state.
+    pub runtime_source: DescriptorRuntimeSource,
+}
+
+/// KV storage and binding plan: two persistent arenas expose bounded views
+/// without copying, and one typed invocation-state upload carries the live
+/// cursor. Lives beside [`DeviceDescriptor`] so legacy whole-buffer
+/// descriptors keep their struct shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KvCacheDescriptor {
+    /// Persistent allocations (K and V arenas). Capacity is a storage fact.
+    pub allocations: Vec<DescriptorAllocation>,
+    /// Bounded views over those allocations. Multiple views may share one
+    /// allocation.
+    pub views: Vec<DescriptorView>,
+    /// Current cursor. Deliberately excluded from [`Self::program_graph_hash`].
+    pub invocation_state: DescriptorInvocationState,
+    /// Ordered launch bindings. Declaration order is the launch-record order.
+    pub launch_bindings: Vec<DescriptorLaunchBinding>,
 }
 
 /// Typed runtime device descriptor: the host's contract for one device
@@ -1139,6 +1242,20 @@ impl DeviceDescriptor {
     /// Never panics.
     #[must_use]
     pub fn program_graph_hash(&self) -> String {
+        format!("sha256:{}", sha256_hex(&self.program_graph_bytes()))
+    }
+
+    /// Program-graph identity of this descriptor plus the KV storage/binding
+    /// plan. Runtime invocation-state cursor values are excluded: static
+    /// hashes include binding expressions, not current cursor values.
+    #[must_use]
+    pub fn program_graph_hash_with_kv(&self, kv: &KvCacheDescriptor) -> String {
+        let mut bytes = self.program_graph_bytes();
+        bytes.extend_from_slice(&kv.static_graph_bytes());
+        format!("sha256:{}", sha256_hex(&bytes))
+    }
+
+    fn program_graph_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         // The distinct host-graph domain tag (OQ1) is part of the receipt
         // substrate: length-prefixed like every UTF-8 field in the canonical
@@ -1246,7 +1363,201 @@ impl DeviceDescriptor {
             push_u32(&mut bytes, end_of_run.buffer_id);
             push_u32(&mut bytes, end_of_run.version);
         }
-        format!("sha256:{}", sha256_hex(&bytes))
+        bytes
+    }
+}
+
+/// Distinct domain tag for the KV storage/binding plan. Cursor values are
+/// never part of this stream.
+const HOST_KV_STORAGE_DOMAIN_TAG: &str = "faber.host-kv-storage.v1";
+
+impl KvCacheDescriptor {
+    /// Validate allocation/view/binding consistency **before any launch**.
+    ///
+    /// Allocation capacity and view extent are checked as separate facts: a
+    /// view must fit in its allocation, and two views may share one
+    /// allocation. Binding records keep declared indices and order.
+    ///
+    /// # Errors
+    /// Returns the first typed [`HostError`] the plan violates.
+    pub fn validate(&self) -> HostResult<()> {
+        let mut allocations: Vec<DescriptorAllocation> = Vec::with_capacity(self.allocations.len());
+        for allocation in &self.allocations {
+            if allocation.buffer_id == 0 {
+                return Err(errors::descriptor(
+                    "device descriptor allocation uses the reserved zero buffer identity",
+                ));
+            }
+            if allocation.capacity_bytes == 0 {
+                return Err(errors::descriptor(format!(
+                    "device descriptor allocation {} has a zero byte capacity",
+                    allocation.buffer_id
+                )));
+            }
+            if allocations
+                .iter()
+                .any(|first| first.buffer_id == allocation.buffer_id)
+            {
+                return Err(errors::descriptor(format!(
+                    "device descriptor repeats allocation identity {}",
+                    allocation.buffer_id
+                )));
+            }
+            allocations.push(*allocation);
+        }
+        if allocations.is_empty() {
+            return Err(errors::descriptor(
+                "device descriptor declares no allocations",
+            ));
+        }
+
+        for view in &self.views {
+            if view.logical_dims.is_empty() || view.logical_dims.len() != view.strides.len() {
+                return Err(errors::descriptor(format!(
+                    "device descriptor view on allocation {} has rank-mismatched dims and strides",
+                    view.allocation_id
+                )));
+            }
+            if view.logical_dims.iter().any(|dim| *dim == 0)
+                || view.strides.iter().any(|stride| *stride == 0)
+            {
+                return Err(errors::descriptor(format!(
+                    "device descriptor view on allocation {} has a zero dim or stride",
+                    view.allocation_id
+                )));
+            }
+            if view.maximum_span == 0 {
+                return Err(errors::descriptor(format!(
+                    "device descriptor view on allocation {} has a zero maximum span",
+                    view.allocation_id
+                )));
+            }
+            let Some(allocation) = allocations
+                .iter()
+                .find(|allocation| allocation.buffer_id == view.allocation_id)
+            else {
+                return Err(errors::descriptor(format!(
+                    "device descriptor view names unknown allocation {}",
+                    view.allocation_id
+                )));
+            };
+            let Some(end) = view.static_base.checked_add(view.maximum_span) else {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor view on allocation {} overflows its static envelope",
+                    view.allocation_id
+                )));
+            };
+            if end > allocation.capacity_bytes {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor view on allocation {} spans {} bytes from base {} but allocation capacity is {} bytes",
+                    view.allocation_id, view.maximum_span, view.static_base, allocation.capacity_bytes
+                )));
+            }
+        }
+
+        for binding in &self.launch_bindings {
+            if binding.view_span == 0 {
+                return Err(errors::descriptor(format!(
+                    "device descriptor launch binding index {} has a zero view span",
+                    binding.binding_index
+                )));
+            }
+            let Some(allocation) = allocations
+                .iter()
+                .find(|allocation| allocation.buffer_id == binding.handle)
+            else {
+                return Err(errors::descriptor(format!(
+                    "device descriptor launch binding index {} names unknown allocation handle {}",
+                    binding.binding_index, binding.handle
+                )));
+            };
+            let Some(end) = binding.byte_offset.checked_add(binding.view_span) else {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor launch binding index {} overflows its static envelope",
+                    binding.binding_index
+                )));
+            };
+            if end > allocation.capacity_bytes {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor launch binding index {} spans {} bytes from offset {} but allocation {} capacity is {} bytes",
+                    binding.binding_index,
+                    binding.view_span,
+                    binding.byte_offset,
+                    binding.handle,
+                    allocation.capacity_bytes
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Launch records in declared binding order, with indices preserved.
+    #[must_use]
+    pub fn launch_records(&self) -> &[DescriptorLaunchBinding] {
+        &self.launch_bindings
+    }
+
+    /// SHA-256 receipt of the static storage/binding plan. Runtime cursor
+    /// values on [`Self::invocation_state`] are not hashed.
+    #[must_use]
+    pub fn program_graph_hash(&self) -> String {
+        format!("sha256:{}", sha256_hex(&self.static_graph_bytes()))
+    }
+
+    fn static_graph_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_bytes(&mut bytes, HOST_KV_STORAGE_DOMAIN_TAG.as_bytes());
+        let mut allocations: Vec<&DescriptorAllocation> = self.allocations.iter().collect();
+        allocations.sort_by_key(|allocation| allocation.buffer_id);
+        push_u32(&mut bytes, allocations.len() as u32);
+        for allocation in allocations {
+            push_u32(&mut bytes, allocation.buffer_id);
+            push_u32(&mut bytes, allocation.dtype as u32);
+            bytes.extend_from_slice(&allocation.capacity_bytes.to_le_bytes());
+            push_u32(&mut bytes, allocation.lifetime as u32);
+            push_u32(&mut bytes, allocation.initialization as u32);
+        }
+        let mut views: Vec<&DescriptorView> = self.views.iter().collect();
+        views.sort_by(|left, right| {
+            (
+                left.allocation_id,
+                left.static_base,
+                left.maximum_span,
+                left.logical_dims.as_slice(),
+            )
+                .cmp(&(
+                    right.allocation_id,
+                    right.static_base,
+                    right.maximum_span,
+                    right.logical_dims.as_slice(),
+                ))
+        });
+        push_u32(&mut bytes, views.len() as u32);
+        for view in views {
+            push_u32(&mut bytes, view.allocation_id);
+            push_u32(&mut bytes, view.logical_dims.len() as u32);
+            for dim in &view.logical_dims {
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            push_u32(&mut bytes, view.strides.len() as u32);
+            for stride in &view.strides {
+                bytes.extend_from_slice(&stride.to_le_bytes());
+            }
+            bytes.extend_from_slice(&view.static_base.to_le_bytes());
+            bytes.extend_from_slice(&view.maximum_span.to_le_bytes());
+        }
+        // Launch bindings hash in declared order: the launch record is the
+        // declaration. Binding expressions (index, offset, span, source tag)
+        // join the identity; current cursor values do not.
+        push_u32(&mut bytes, self.launch_bindings.len() as u32);
+        for binding in &self.launch_bindings {
+            push_u32(&mut bytes, binding.handle);
+            push_u32(&mut bytes, binding.binding_index);
+            bytes.extend_from_slice(&binding.byte_offset.to_le_bytes());
+            bytes.extend_from_slice(&binding.view_span.to_le_bytes());
+            push_u32(&mut bytes, binding.runtime_source as u32);
+        }
+        bytes
     }
 }
 
