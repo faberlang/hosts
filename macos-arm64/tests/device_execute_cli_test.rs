@@ -700,6 +700,75 @@ fn packed_weight_bytes_reach_session_buffers_on_both_fake_backends() {
 }
 
 #[test]
+fn mmap_aliased_weight_bytes_take_metal_wrap_on_cli_session_path() {
+    let mut file = vec![0u8; 64];
+    for (index, byte) in file.iter_mut().take(34).enumerate() {
+        *byte = index as u8;
+    }
+    let path = unique_temp("mmap-cli-wrap.bin");
+    fs::write(&path, &file).expect("write fixture");
+    let mapped = MappedWeightFile::open(&path).expect("mmap");
+    let map = BTreeMap::from([(
+        1,
+        WeightFileRange {
+            offset: 0,
+            len: 34,
+            elems: 9,
+        },
+    )]);
+    let table = gguf_region_table(mapped.bytes(), &map).expect("region table");
+    let aliased = inputs_from_mapped_gguf(&mapped, &map, &table).expect("alias");
+    assert_eq!(
+        aliased.byte_map()[&1].bytes.as_ptr(),
+        mapped.bytes().as_ptr(),
+        "aliased weight bytes must keep the mmap pointer"
+    );
+    let inputs = BTreeMap::from([(2, vec![0.0; 9])]);
+    let expected: Vec<f32> = file[..36]
+        .chunks(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("word")))
+        .collect();
+
+    let mut metal = fake_runtime(DeviceBackend::Metal);
+    metal
+        .retain_mapped_weight_file(mapped.clone())
+        .expect("retain mapping");
+    let mut host = CompositeHost::with_device(metal, "fake-metal-wrap").expect("host");
+    let mut session = host
+        .create_program_session(&packed_weight_descriptor(DeviceBackend::Metal))
+        .expect("session create");
+    let receipt = session
+        .execute_with_weight_bytes(&inputs, aliased.byte_map())
+        .expect("mmap weight execute");
+    assert_eq!(receipt.outputs.get(&3), Some(&expected));
+    session.teardown().expect("teardown");
+    match host.device().expect("device") {
+        DeviceRuntime::Metal(runtime) => assert!(
+            runtime.mmap_wrap_count() >= 1,
+            "CLI weight upload must reach the Metal mmap wrap branch"
+        ),
+        DeviceRuntime::Cuda(_) => panic!("expected Metal"),
+    }
+
+    let mut cuda = fake_runtime(DeviceBackend::Cuda);
+    cuda.retain_mapped_weight_file(mapped.clone())
+        .expect("cuda retain is a no-op");
+    let mut cuda_host = CompositeHost::with_device(cuda, "fake-cuda-wrap").expect("cuda host");
+    let mut cuda_session = cuda_host
+        .create_program_session(&packed_weight_descriptor(DeviceBackend::Cuda))
+        .expect("cuda session");
+    let cuda_receipt = cuda_session
+        .execute_with_weight_bytes(&inputs, aliased.byte_map())
+        .expect("cuda copies the same raw bytes");
+    assert_eq!(cuda_receipt.outputs.get(&3), Some(&expected));
+    cuda_session.teardown().expect("cuda teardown");
+
+    drop(aliased);
+    drop(mapped);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn mmap_region_table_aliases_raw_packed_bytes() {
     let mut file = Vec::new();
     file.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);

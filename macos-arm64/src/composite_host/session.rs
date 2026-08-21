@@ -749,8 +749,11 @@ impl<'host> ProgramSession<'host> {
 
     /// Upload packed weight bytes directly into the session's private
     /// PerProgram allocations. The neutral device surface receives the raw
-    /// bytes and dtype tag; only the descriptor's one-to-three-byte word tail
-    /// may be zero-filled to reach a word-rounded allocation.
+    /// bytes and dtype tag. Metal wrap needs the caller's slice pointer to
+    /// stay inside a retained mapping, so a backend that admits mapped
+    /// retention gets the original borrow. Clone+pad is only the fallback
+    /// when the backend cannot wrap and the packed region is a 1–3 byte
+    /// word-tail short of the allocation.
     fn upload_weight_bytes_inner(
         &mut self,
         weights: &BTreeMap<u32, DeviceByteBuffer>,
@@ -785,9 +788,14 @@ impl<'host> ProgramSession<'host> {
                 .get(&key)
                 .copied()
                 .ok_or_else(|| HostError::internal("session weight buffer disappeared"))?;
-            let mut bytes = input.bytes.clone();
-            bytes.resize(expected, 0);
-            self.runtime.copy_in_bytes(&handle, &bytes, input.dtype)?;
+            if self.runtime.supports_mapped_weight_retention() || input.bytes.len() == expected {
+                self.runtime
+                    .copy_in_bytes(&handle, &input.bytes, input.dtype)?;
+            } else {
+                let mut bytes = input.bytes.clone();
+                bytes.resize(expected, 0);
+                self.runtime.copy_in_bytes(&handle, &bytes, input.dtype)?;
+            }
             uploaded.insert(*id);
         }
         Ok(uploaded)

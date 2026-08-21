@@ -408,8 +408,13 @@ pub trait MetalDriver: Send {
         Vec::new()
     }
     /// Keep a read-only weight mapping alive for no-copy MTLBuffer admission.
-    /// Fake drivers ignore it (they still memcpy into simulated storage).
+    /// Fake drivers retain the mapping so `copy_in` can take the wrap branch
+    /// (they still memcpy the page into simulated storage).
     fn retain_mapped_file(&mut self, _file: MappedWeightFile) {}
+    /// Times `copy_in` admitted a slice by wrapping a retained mmap.
+    fn mmap_wrap_count(&self) -> usize {
+        0
+    }
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
@@ -500,6 +505,12 @@ impl MetalHostSession {
     /// Per-encoder GPU start times from the last committed step (µs).
     pub fn take_encoder_gpu_start_us(&mut self) -> Vec<u64> {
         self.driver.take_encoder_gpu_start_us()
+    }
+
+    /// Times this session admitted a `copy_in` by wrapping a retained mmap.
+    #[must_use]
+    pub fn mmap_wrap_count(&self) -> usize {
+        self.driver.mmap_wrap_count()
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<MetalHandleId> {
@@ -970,6 +981,10 @@ fn detect_metal_framework_paths() -> Vec<String> {
 struct FakeBufferSlot {
     bytes: Vec<u8>,
     region_offset: u64,
+    /// Original allocation length. mmap wrap replaces `bytes` with the
+    /// page-rounded mapping; kernels still see this many bytes from the
+    /// remainder, matching the session handle's `len_bytes`.
+    logical_len: usize,
 }
 
 /// Sequencing-only fake driver for unit tests. Not product Metal evidence.
@@ -1006,6 +1021,8 @@ pub struct FakeMetalDriver {
     command_submits: usize,
     /// Blocking waits performed (one per flush of a non-empty encode batch).
     blocking_waits: usize,
+    /// Times `copy_in` took the retained-mmap wrap branch.
+    mmap_wraps: usize,
 }
 
 impl FakeMetalDriver {
@@ -1059,7 +1076,11 @@ impl FakeMetalDriver {
             0,
             slot.bytes.len() as u64,
         )? as usize;
-        Ok(&slot.bytes[start..])
+        let end = (slot.region_offset as usize)
+            .saturating_add(slot.logical_len)
+            .min(slot.bytes.len())
+            .max(start);
+        Ok(&slot.bytes[start..end])
     }
 
     /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
@@ -1209,6 +1230,7 @@ impl MetalDriver for FakeMetalDriver {
             FakeBufferSlot {
                 bytes: vec![0; len_bytes],
                 region_offset: 0,
+                logical_len: len_bytes,
             },
         );
         Ok(token)
@@ -1227,6 +1249,7 @@ impl MetalDriver for FakeMetalDriver {
                 .ok_or_else(|| HostError::internal("fake copy_in missing buffer"))?;
             slot.bytes = page.to_vec();
             slot.region_offset = wrap.offset;
+            self.mmap_wraps += 1;
             return Ok(());
         }
         let slot = self
@@ -1400,6 +1423,10 @@ impl MetalDriver for FakeMetalDriver {
     fn blocking_wait_count(&self) -> usize {
         self.blocking_waits
     }
+
+    fn mmap_wrap_count(&self) -> usize {
+        self.mmap_wraps
+    }
 }
 
 impl FakeMetalDriver {
@@ -1453,6 +1480,8 @@ struct SystemMetalDriver {
     last_encoder_gpu_start_us: Vec<u64>,
     /// Timestamp counters were probed and are unavailable on this device.
     timestamp_unavailable: bool,
+    /// Times `copy_in` took the retained-mmap wrap branch.
+    mmap_wraps: usize,
 }
 
 /// A compiled Metal compute module: a compute pipeline per declared `kernel
@@ -1581,6 +1610,7 @@ impl MetalDriver for SystemMetalDriver {
                     region_offset: wrap.offset,
                 },
             );
+            self.mmap_wraps += 1;
             return Ok(());
         }
         let slot = self
@@ -1842,6 +1872,10 @@ impl MetalDriver for SystemMetalDriver {
 
     fn blocking_wait_count(&self) -> usize {
         self.blocking_waits
+    }
+
+    fn mmap_wrap_count(&self) -> usize {
+        self.mmap_wraps
     }
 
     fn take_encoder_gpu_us(&mut self) -> Vec<u64> {

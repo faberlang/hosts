@@ -848,6 +848,10 @@ fn b6_mapped_region_composes_page_remainder_with_binding_offset() {
     session
         .copy_in_bytes(region, &mapped.bytes()[16..32], DeviceDataType::F32)
         .expect("mmap unaligned admit");
+    assert!(
+        session.mmap_wrap_count() >= 1,
+        "mapped copy_in must take the wrap branch"
+    );
     let echoed = session.readback_f32(region).expect("logical start");
     assert_eq!(
         echoed[..1],
