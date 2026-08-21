@@ -75,11 +75,16 @@
 //! `try_open` failure (dlopen/`cuInit` → `E_CUDA_UNAVAILABLE`; later driver
 //! failures → `E_CUDA_DRIVER`).
 //!
-//! The descriptor is the C4 sidecar (schema_version 1, target `llvm-nvvm`):
+//! The descriptor is the NVVM sidecar (`schema_version` tracks
+//! `NVVM_DESCRIPTOR_SCHEMA_VERSION`, currently 3, target `llvm-nvvm`):
 //! a single `addita` kernel, f32, 4-byte, N elements, 2 input buffers /
-//! 1 output buffer. Grid is `ceil(N / 256)`, block is 256.
+//! 1 output buffer, zero accumulation buffers, per-buffer roles/bindings/
+//! shapes, and explicit `launch` geometry. The G3 launch recipe stays
+//! grid `ceil(N / 256)`, block 256 (independent of the sidecar's workgroup).
 
-use faber_host_macos_arm64::CudaHostSession;
+use faber_host_macos_arm64::{
+    CudaHostSession, NVVM_DESCRIPTOR_SCHEMA_VERSION, NVVM_DESCRIPTOR_TARGET,
+};
 use serde::Deserialize;
 
 /// Sentinel bit pattern: every output byte is 0xFE. Prefilled into the output
@@ -105,8 +110,33 @@ struct ProofKernel {
     element_type: String,
     element_byte_width: u32,
     element_count: u64,
+    element_counts: Vec<u64>,
     input_buffers: usize,
     output_buffers: usize,
+    accumulation_buffers: usize,
+    buffers: Vec<ProofBuffer>,
+    launch: ProofLaunch,
+}
+
+#[derive(Deserialize)]
+struct ProofBuffer {
+    role: String,
+    binding: u32,
+    element_count: u64,
+    shape: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct ProofLaunch {
+    workgroup: ProofAxis,
+    dispatch: ProofAxis,
+}
+
+#[derive(Deserialize)]
+struct ProofAxis {
+    x: u64,
+    y: u64,
+    z: u64,
 }
 
 #[test]
@@ -135,12 +165,12 @@ fn cuda_driver_api_proof() {
         .unwrap_or_else(|error| panic!("FAIL: proof descriptor JSON invalid: {error}"));
 
     assert_eq!(
-        descriptor.schema_version, 1,
-        "FAIL: descriptor schema_version {}",
+        descriptor.schema_version, NVVM_DESCRIPTOR_SCHEMA_VERSION,
+        "FAIL: descriptor schema_version {} (expected {NVVM_DESCRIPTOR_SCHEMA_VERSION})",
         descriptor.schema_version
     );
     assert_eq!(
-        descriptor.target, "llvm-nvvm",
+        descriptor.target, NVVM_DESCRIPTOR_TARGET,
         "FAIL: descriptor target {}",
         descriptor.target
     );
@@ -171,6 +201,88 @@ fn cuda_driver_api_proof() {
         "FAIL: proof fixture output_buffers {}",
         kernel.output_buffers
     );
+    assert_eq!(
+        kernel.accumulation_buffers, 0,
+        "FAIL: proof fixture accumulation_buffers {}",
+        kernel.accumulation_buffers
+    );
+    let expected_buffer_count =
+        kernel.input_buffers + kernel.output_buffers + kernel.accumulation_buffers;
+    assert_eq!(
+        kernel.buffers.len(),
+        expected_buffer_count,
+        "FAIL: proof fixture buffers.len() {} != input+output+accumulation {}",
+        kernel.buffers.len(),
+        expected_buffer_count
+    );
+    assert_eq!(
+        kernel.element_counts.len(),
+        kernel.buffers.len(),
+        "FAIL: proof fixture element_counts.len() {} != buffers.len() {}",
+        kernel.element_counts.len(),
+        kernel.buffers.len()
+    );
+    let roles: Vec<&str> = kernel
+        .buffers
+        .iter()
+        .map(|buffer| buffer.role.as_str())
+        .collect();
+    assert_eq!(
+        roles,
+        ["input", "extra-input", "output"],
+        "FAIL: proof fixture buffer roles {roles:?}"
+    );
+    let bindings: Vec<u32> = kernel.buffers.iter().map(|buffer| buffer.binding).collect();
+    assert_eq!(
+        bindings,
+        [0, 1, 2],
+        "FAIL: proof fixture buffer bindings {bindings:?}"
+    );
+    for (index, buffer) in kernel.buffers.iter().enumerate() {
+        assert_eq!(
+            kernel.element_counts[index], buffer.element_count,
+            "FAIL: proof fixture element_counts[{index}] {} != buffer binding {} count {}",
+            kernel.element_counts[index], buffer.binding, buffer.element_count
+        );
+        assert_eq!(
+            buffer.shape.len(),
+            1,
+            "FAIL: proof fixture buffer binding {} shape rank {}",
+            buffer.binding,
+            buffer.shape.len()
+        );
+        assert_eq!(
+            buffer.shape[0], buffer.element_count,
+            "FAIL: proof fixture buffer binding {} shape {:?} != element_count {}",
+            buffer.binding, buffer.shape, buffer.element_count
+        );
+        assert_eq!(
+            buffer.element_count, kernel.element_count,
+            "FAIL: proof fixture buffer binding {} element_count {} != kernel element_count {}",
+            buffer.binding, buffer.element_count, kernel.element_count
+        );
+    }
+    for (label, axis) in [
+        ("workgroup", &kernel.launch.workgroup),
+        ("dispatch", &kernel.launch.dispatch),
+    ] {
+        assert!(
+            axis.x > 0 && axis.y > 0 && axis.z > 0,
+            "FAIL: proof fixture launch.{label} has a zero axis ({}, {}, {})",
+            axis.x,
+            axis.y,
+            axis.z
+        );
+        assert!(
+            u32::try_from(axis.x).is_ok()
+                && u32::try_from(axis.y).is_ok()
+                && u32::try_from(axis.z).is_ok(),
+            "FAIL: proof fixture launch.{label} axis does not fit u32 ({}, {}, {})",
+            axis.x,
+            axis.y,
+            axis.z
+        );
+    }
 
     let n = kernel.element_count as usize;
     assert!(n > 0, "FAIL: proof element_count must be positive");
