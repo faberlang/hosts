@@ -220,6 +220,22 @@ impl QuantizedFormat {
             Self::Q8_0 => "Q8_0",
         }
     }
+
+    /// Resolve a GEMV format from a packed-layout GGML type id.
+    ///
+    /// Unknown ids fail closed — never a guessed block geometry. F32/F16/BF16
+    /// are not GEMV packed formats on this path.
+    #[must_use]
+    pub const fn from_ggml_type_id(id: u32) -> Option<Self> {
+        match id {
+            6 => Some(Self::Q5_0),
+            8 => Some(Self::Q8_0),
+            12 => Some(Self::Q4K),
+            13 => Some(Self::Q5K),
+            14 => Some(Self::Q6K),
+            _ => None,
+        }
+    }
 }
 
 /// Bind facts for one sequence-length-one quantized projection.
@@ -978,6 +994,28 @@ pub fn dispatch_gemv(
 ) -> Result<(), KernelBodyError> {
     match kernel {
         GemvKernel::Quantized => quantized_gemv(bind, activation, packed_weight, output),
+    }
+}
+
+/// Select the decode GEMV library body from executor-plan facts.
+///
+/// `library_entry` is the M5-U2 `quantized_gemv` / `quantized_gemm` selection.
+/// `decode_gemv` is the matching uniform (`1` when M/seq is 1). Prefill keeps
+/// GEMM. The two facts must agree; a mismatch fails closed.
+pub fn select_decode_gemv(
+    library_entry: Option<&str>,
+    decode_gemv: u32,
+) -> Result<Option<GemvKernel>, KernelBodyError> {
+    let gemv_entry = library_entry == Some("quantized_gemv");
+    let gemm_entry = library_entry == Some("quantized_gemm");
+    match (gemv_entry, gemm_entry, decode_gemv) {
+        (true, false, 1) => Ok(Some(GemvKernel::Quantized)),
+        (false, true, 0) => Ok(None),
+        (false, false, 0) => Ok(None),
+        (false, false, 1) if library_entry.is_none() => Ok(Some(GemvKernel::Quantized)),
+        _ => Err(KernelBodyError::InvalidBind(
+            "decode GEMV selection disagrees with library_entry",
+        )),
     }
 }
 
