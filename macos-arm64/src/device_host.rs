@@ -506,23 +506,7 @@ impl DeviceSession for DeviceRuntime {
     ) -> HostResult<()> {
         match self {
             Self::Metal(session) => session.copy_in_bytes(metal_handle(buffer)?, bytes, dtype),
-            // Transitional DSB-1 behavior: CUDA still routes bytes through
-            // its f32 surface. DSB-2 replaces this reinterpretation with the
-            // raw-byte driver path.
-            Self::Cuda(session) => {
-                let _ = dtype;
-                if bytes.len() % 4 != 0 {
-                    return Err(HostError::invalid_args(format!(
-                        "CUDA invocation-state copy requires a 4-byte multiple, got {} bytes",
-                        bytes.len()
-                    )));
-                }
-                let values: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-                session.copy_in_f32(cuda_handle(buffer)?, &values)
-            }
+            Self::Cuda(session) => session.copy_in_bytes(cuda_handle(buffer)?, bytes, dtype),
         }
     }
 
@@ -552,16 +536,7 @@ impl DeviceSession for DeviceRuntime {
     ) -> HostResult<Vec<u8>> {
         match self {
             Self::Metal(session) => session.readback_bytes(metal_handle(buffer)?, dtype),
-            // Transitional DSB-1 behavior: preserve the existing CUDA f32
-            // readback until DSB-2 can use the driver's raw-byte result.
-            Self::Cuda(session) => {
-                let _ = dtype;
-                let values = session.readback_f32(cuda_handle(buffer)?)?;
-                Ok(values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect())
-            }
+            Self::Cuda(session) => session.readback_bytes(cuda_handle(buffer)?, dtype),
         }
     }
 

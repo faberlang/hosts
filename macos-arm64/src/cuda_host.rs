@@ -15,6 +15,7 @@ use std::process::Command;
 use faber::Valor;
 use serde::{Deserialize, Serialize};
 
+use crate::device_descriptor::DeviceDataType;
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
@@ -214,9 +215,23 @@ impl CudaHostSession {
     }
 
     pub fn copy_in_f32(&mut self, buffer: CudaHandleId, values: &[f32]) -> HostResult<()> {
+        self.copy_in_bytes(buffer, f32_slice_as_bytes(values), DeviceDataType::F32)
+    }
+
+    /// Copy dtype-tagged bytes into a device buffer without changing their
+    /// representation. Length must match the allocation and be a multiple of
+    /// `dtype`'s byte width; a shorter tail is rejected, never padded.
+    pub fn copy_in_bytes(
+        &mut self,
+        buffer: CudaHandleId,
+        bytes: &[u8],
+        dtype: DeviceDataType,
+    ) -> HostResult<()> {
         self.require_admitted()?;
+        if bytes.len() % dtype.byte_width() != 0 {
+            return Err(cuda_misaligned_tail(dtype, bytes.len()));
+        }
         let (token, len_bytes) = self.buffer_token(buffer)?;
-        let bytes = f32_slice_as_bytes(values);
         if bytes.len() != len_bytes {
             return Err(HostError::invalid_args(format!(
                 "copy_in size mismatch: buffer {len_bytes} bytes, got {}",
@@ -317,13 +332,30 @@ impl CudaHostSession {
         self.driver.sync()
     }
 
-    pub fn readback_f32(&mut self, buffer: CudaHandleId) -> HostResult<Vec<f32>> {
+    pub fn readback_bytes(
+        &mut self,
+        buffer: CudaHandleId,
+        dtype: DeviceDataType,
+    ) -> HostResult<Vec<u8>> {
         self.require_admitted()?;
         let (token, len_bytes) = self.buffer_token(buffer)?;
+        if len_bytes % dtype.byte_width() != 0 {
+            return Err(cuda_misaligned_tail(dtype, len_bytes));
+        }
         let bytes = self.driver.copy_out(token, len_bytes)?;
-        if bytes.len() != len_bytes || len_bytes % 4 != 0 {
+        if bytes.len() != len_bytes {
             return Err(HostError::internal(
                 "CUDA readback returned unexpected byte length",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn readback_f32(&mut self, buffer: CudaHandleId) -> HostResult<Vec<f32>> {
+        let bytes = self.readback_bytes(buffer, DeviceDataType::F32)?;
+        if bytes.len() % 4 != 0 {
+            return Err(HostError::internal(
+                "CUDA readback returned unexpected f32 byte length",
             ));
         }
         Ok(f32_bytes_to_values(&bytes))
@@ -390,6 +422,14 @@ fn f32_bytes_to_values(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+fn cuda_misaligned_tail(dtype: DeviceDataType, len: usize) -> HostError {
+    HostError::invalid_args(format!(
+        "CUDA copy rejects a misaligned {} tail of {} bytes",
+        dtype.spelling(),
+        len
+    ))
 }
 
 fn cuda_unavailable(message: impl Into<String>) -> HostError {

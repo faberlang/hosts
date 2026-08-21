@@ -2,6 +2,8 @@
 
 use faber::Valor;
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
+use faber_host_macos_arm64::device_descriptor::DeviceDataType;
+use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession};
 use faber_host_macos_arm64::{
     probe_cuda_environment, CudaHostSession, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
     E_CUDA_UNAVAILABLE,
@@ -106,4 +108,44 @@ fn fake_unavailable_driver_rejects_session_open() {
     let err = CudaHostSession::with_driver(Box::new(FakeCudaDriver::unavailable()))
         .expect_err("unavailable fake");
     assert_eq!(err.code, E_CUDA_UNAVAILABLE);
+}
+
+fn fake_cuda_runtime() -> DeviceRuntime {
+    DeviceRuntime::Cuda(
+        CudaHostSession::with_driver(Box::new(FakeCudaDriver::default())).expect("fake admit"),
+    )
+}
+
+#[test]
+fn fake_cuda_byte_surface_round_trips_q8_0_row() {
+    let mut runtime = fake_cuda_runtime();
+    let payload: Vec<u8> = (0..34).collect();
+    let handle = runtime.alloc_bytes(payload.len()).expect("alloc");
+    runtime
+        .copy_in_bytes(&handle, &payload, DeviceDataType::U8)
+        .expect("byte upload");
+    assert_eq!(
+        runtime
+            .readback_bytes(&handle, DeviceDataType::U8)
+            .expect("byte readback"),
+        payload
+    );
+}
+
+#[test]
+fn fake_cuda_rejects_misaligned_f32_tail_by_name() {
+    let mut runtime = fake_cuda_runtime();
+    let payload: Vec<u8> = (0..34).collect();
+    let handle = runtime.alloc_bytes(payload.len()).expect("alloc");
+    let err = runtime
+        .copy_in_bytes(&handle, &payload, DeviceDataType::F32)
+        .expect_err("misaligned f32 tail must fail closed");
+    assert_eq!(err.code, "E_INVALID_ARGS");
+    assert!(
+        err.message.contains("misaligned")
+            && err.message.contains("f32")
+            && err.message.contains("34"),
+        "misaligned-tail error must name dtype and length, got {}",
+        err.message
+    );
 }
