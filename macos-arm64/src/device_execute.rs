@@ -160,6 +160,9 @@ pub struct DeviceExecuteLifecycle {
     pub module_reloads: usize,
     /// PerProgram allocations after load.
     pub per_program_reallocs: usize,
+    /// HostProvided weight copies measured from the driver upload counter.
+    /// Prepare-time once-init copies are included; later copies increment.
+    pub weight_uploads: usize,
     /// Device handles still owned by the session.
     pub live_handles: usize,
 }
@@ -1046,6 +1049,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                             releases: lifecycle.counters.releases,
                             module_reloads: lifecycle.module_reloads,
                             per_program_reallocs: lifecycle.per_program_reallocs,
+                            weight_uploads: lifecycle.timing.lifecycle.weight_uploads as usize,
                             live_handles: lifecycle.live_handles,
                         },
                         kernel_count: descriptor.kernels.len(),
@@ -1076,6 +1080,7 @@ fn apply_paired_lifecycle(
     load.lifecycle.resets = paired.resets();
     load.lifecycle.module_reloads = paired.module_reloads();
     load.lifecycle.per_program_reallocs = paired.per_program_reallocs();
+    load.lifecycle.weight_uploads = paired.weight_uploads();
     load.lifecycle.live_handles = paired.live_handles();
     load.reset_cleared = paired.reset_cleared();
 }
@@ -1098,6 +1103,7 @@ fn control_receipt(
             releases: lifecycle.counters.releases,
             module_reloads: lifecycle.module_reloads,
             per_program_reallocs: lifecycle.per_program_reallocs,
+            weight_uploads: lifecycle.timing.lifecycle.weight_uploads as usize,
             live_handles: lifecycle.live_handles,
         },
         kernel_count,

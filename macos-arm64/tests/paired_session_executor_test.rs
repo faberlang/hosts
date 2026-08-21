@@ -16,7 +16,7 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
 };
 use faber_host_macos_arm64::device_execute::{
-    DeviceExecuteInvocation, DeviceExecuteInvocationMode,
+    DeviceExecuteInvocation, DeviceExecuteInvocationMode, DeviceExecuteLifecycle,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
@@ -384,6 +384,7 @@ fn paired_session_prepares_once_and_dispatches_each_mode() {
     assert_eq!(pair.live_handles(), 2);
     assert_eq!(pair.driver_counters().module_loads, 1);
     assert_eq!(pair.driver_counters().buffer_allocs, 1);
+    assert_eq!(pair.driver_counters().uploads, 1);
     assert_eq!(pair.module_reloads(), 0);
     assert_eq!(pair.per_program_reallocs(), 0);
     assert_eq!(pair.weight_uploads(), 1);
@@ -421,6 +422,7 @@ fn paired_session_prepares_once_and_dispatches_each_mode() {
     let counters = pair.driver_counters();
     assert_eq!(counters.module_loads, 1);
     assert_eq!(counters.buffer_allocs, 1 + 4 + 6);
+    assert_eq!(counters.uploads, 1);
     assert_eq!(pair.module_reloads(), 0);
     assert_eq!(pair.per_program_reallocs(), 0);
     assert_eq!(pair.weight_uploads(), 1);
@@ -752,6 +754,7 @@ fn paired_lifecycle_receipt_is_counter_derived() {
 
     assert_eq!(pair.module_reloads(), 0);
     assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.driver_counters().uploads, 1);
     assert_eq!(pair.weight_uploads(), 1);
     assert!(pair.live_handles() > 0);
 
@@ -765,6 +768,7 @@ fn paired_lifecycle_receipt_is_counter_derived() {
     .expect("prefill");
     assert_eq!(pair.module_reloads(), 0);
     assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.driver_counters().uploads, 1);
     assert_eq!(pair.weight_uploads(), 1);
 
     pair.execute_invocation(&invocation(
@@ -788,8 +792,23 @@ fn paired_lifecycle_receipt_is_counter_derived() {
 
     assert_eq!(pair.module_reloads(), 0);
     assert_eq!(pair.per_program_reallocs(), 0);
+    assert_eq!(pair.driver_counters().uploads, 1);
     assert_eq!(pair.weight_uploads(), 1);
     assert_eq!(pair.reset_cleared(), 3);
+
+    let wire = serde_json::to_value(DeviceExecuteLifecycle {
+        prepares: 1,
+        reuses: pair.reuses(),
+        resets: pair.resets(),
+        weight_uploads: pair.weight_uploads(),
+        live_handles: pair.live_handles(),
+        ..DeviceExecuteLifecycle::default()
+    })
+    .expect("encode v2 lifecycle");
+    assert_eq!(wire["weight_uploads"], 1);
+    assert_eq!(wire["module_reloads"], 0);
+    assert_eq!(wire["per_program_reallocs"], 0);
+
     pair.teardown().expect("release");
     assert_eq!(host.device().expect("runtime").live_handle_count(), 0);
 }
@@ -850,6 +869,12 @@ fn paired_lifecycle_fields_move_when_driver_counters_move() {
     assert_eq!(pair.driver_counters().module_loads, loads_before + 1);
     assert_eq!(pair.module_reloads(), 1);
     assert_eq!(pair.weight_uploads(), 1);
+
+    let uploads_before = pair.driver_counters().uploads;
+    pair.force_weight_upload()
+        .expect("forced HostProvided upload");
+    assert_eq!(pair.driver_counters().uploads, uploads_before + 1);
+    assert_eq!(pair.weight_uploads(), 2);
 
     pair.teardown().expect("teardown");
     assert_eq!(host.device().expect("runtime").live_handle_count(), 0);

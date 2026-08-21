@@ -88,14 +88,16 @@ impl<K> HandleRegistry<K> {
     }
 }
 
-/// Driver-level lifecycle counters for the module-cache leak-free bar (S2-2).
+/// Driver-level lifecycle counters for the module-cache leak-free bar (S2-2)
+/// and HostProvided weight-upload measurement (PPE-P4b).
 ///
-/// The fake drivers increment these counters so a test can prove the cache
-/// policy at the driver boundary: one module load per program session, one
-/// release at teardown, buffers allocated once and released once, and
-/// nothing persists past teardown. The real drivers do not track counters —
-/// their leak evidence is the S2-8 real-device gate — so the default is
-/// all-zero; this observability is for the fakes only.
+/// The fake drivers increment module/buffer counters so a test can prove the
+/// cache policy at the driver boundary: one module load per program session,
+/// one release at teardown, buffers allocated once and released once, and
+/// nothing persists past teardown. Real drivers report those four as zero —
+/// their leak evidence is the S2-8 real-device gate. `uploads` is different:
+/// the host session counts each HostProvided once-init copy, fake or real,
+/// because that copy is a host-issued transfer, not a GPU-internal event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriverCounters {
     /// Cumulative module loads (each program session loads its module once).
@@ -106,6 +108,8 @@ pub struct DriverCounters {
     pub buffer_allocs: usize,
     /// Cumulative buffer releases.
     pub buffer_releases: usize,
+    /// Cumulative HostProvided PerProgram weight copies (once-init site).
+    pub uploads: usize,
 }
 
 /// A driver stage the fake drivers can be told to fail (S2-3 error-path

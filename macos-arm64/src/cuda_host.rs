@@ -138,6 +138,8 @@ pub struct CudaHostSession {
     driver: Box<dyn CudaDriver>,
     handles: HandleRegistry<CudaHandleKind>,
     admitted: bool,
+    /// HostProvided once-init copies issued through this session.
+    uploads: usize,
 }
 
 impl CudaHostSession {
@@ -171,6 +173,7 @@ impl CudaHostSession {
             driver,
             handles: HandleRegistry::new(),
             admitted,
+            uploads: 0,
         })
     }
 
@@ -188,10 +191,18 @@ impl CudaHostSession {
     /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
     /// fake drivers track cumulative module loads/releases and buffer
     /// allocs/releases so session tests prove the policy at the driver
-    /// boundary; the real drivers report all-zero (S2-8 real-device gate).
+    /// boundary; the real drivers report those as zero (S2-8 real-device
+    /// gate). HostProvided uploads are counted on the session for both.
     #[must_use]
     pub fn driver_counters(&self) -> DriverCounters {
-        self.driver.counters()
+        let mut counters = self.driver.counters();
+        counters.uploads = self.uploads;
+        counters
+    }
+
+    /// Record one HostProvided PerProgram weight copy through this session.
+    pub fn record_weight_upload(&mut self) {
+        self.uploads = self.uploads.saturating_add(1);
     }
 
     pub fn load_module(&mut self, image: &[u8]) -> HostResult<CudaHandleId> {
@@ -1336,6 +1347,7 @@ impl CudaDriver for FakeCudaDriver {
             module_releases: self.module_releases,
             buffer_allocs: self.buffer_allocs,
             buffer_releases: self.buffer_releases,
+            uploads: 0,
         }
     }
 }

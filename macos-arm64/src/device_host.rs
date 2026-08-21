@@ -156,12 +156,22 @@ impl DeviceRuntime {
     /// Driver-level lifecycle counters (S2-2 module-cache leak bar). The
     /// fake drivers track cumulative module loads/releases and buffer
     /// allocs/releases so session tests prove the policy at the driver
-    /// boundary; the real drivers report all-zero (S2-8 real-device gate).
+    /// boundary; the real drivers report those as zero (S2-8 real-device
+    /// gate). HostProvided uploads are counted on the session for both.
     #[must_use]
     pub fn driver_counters(&self) -> DriverCounters {
         match self {
             Self::Metal(session) => session.driver_counters(),
             Self::Cuda(session) => session.driver_counters(),
+        }
+    }
+
+    /// Record one HostProvided PerProgram weight copy at the shared once-init
+    /// site. Paired and single-program sessions both count through here.
+    pub fn record_weight_upload(&mut self) {
+        match self {
+            Self::Metal(session) => session.record_weight_upload(),
+            Self::Cuda(session) => session.record_weight_upload(),
         }
     }
 

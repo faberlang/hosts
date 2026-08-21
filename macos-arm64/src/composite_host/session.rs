@@ -911,6 +911,7 @@ impl<'host> ProgramSession<'host> {
                 bytes.resize(expected, 0);
                 self.runtime.copy_in_bytes(&handle, &bytes, input.dtype)?;
             }
+            self.runtime.record_weight_upload();
             uploaded.insert(*id);
         }
         Ok(uploaded)
@@ -1153,6 +1154,7 @@ impl<'host> ProgramSession<'host> {
                 .copied()
                 .ok_or_else(|| HostError::internal("RepeatingStep param buffer disappeared"))?;
             self.runtime.copy_in_f32(&handle, values)?;
+            self.runtime.record_weight_upload();
         }
         Ok(())
     }

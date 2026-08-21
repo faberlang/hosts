@@ -13,9 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::composite_host::invocation_binding::{project_invocation_bindings, RopeConfig};
-use crate::device_descriptor::{
-    DeviceBufferInitialization, DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime,
-};
+use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
 use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
@@ -50,9 +48,9 @@ pub struct PairedProgramSession<'host> {
     decode_per_execution_alloc_count: usize,
     prefill_pool_warmed: bool,
     decode_pool_warmed: bool,
-    /// Distinct HostProvided PerProgram semantic identities uploaded once
-    /// at prepare. Shared across both programs, never re-copied on reuse.
-    weight_uploads_at_prepare: usize,
+    /// Driver upload-counter baseline captured before once-init, so
+    /// prepare-time HostProvided copies are included in the derived count.
+    uploads_at_prepare: usize,
 }
 
 impl<'host> PairedProgramSession<'host> {
@@ -85,6 +83,7 @@ impl<'host> PairedProgramSession<'host> {
         validate_pair_descriptors(prefill, decode)?;
         let prefill_descriptor = prefill.clone();
         let decode_descriptor = decode.clone();
+        let uploads_at_prepare = runtime.driver_counters().uploads;
 
         let mut prefill_session = ProgramSession::new(runtime, prefill, device_name.clone())?;
         if let Err(error) = prefill_session.init_params_with_weight_bytes(weights, byte_weights) {
@@ -111,8 +110,6 @@ impl<'host> PairedProgramSession<'host> {
         let state = InferenceSessionState::new(pair_sequence_capacity(prompt_tokens.len())?)
             .map_err(session_error)?;
         let counters = runtime.driver_counters();
-        let mut weight_semantics = host_provided_weight_semantics(&prefill_descriptor);
-        weight_semantics.extend(host_provided_weight_semantics(&decode_descriptor));
         let prefill_per_execution_alloc_count = per_execution_alloc_count(&prefill_descriptor);
         let decode_per_execution_alloc_count = per_execution_alloc_count(&decode_descriptor);
 
@@ -136,7 +133,7 @@ impl<'host> PairedProgramSession<'host> {
             decode_per_execution_alloc_count,
             prefill_pool_warmed: false,
             decode_pool_warmed: false,
-            weight_uploads_at_prepare: weight_semantics.len(),
+            uploads_at_prepare,
         })
     }
 
@@ -334,11 +331,15 @@ impl<'host> PairedProgramSession<'host> {
             .saturating_sub(self.pool_warmup_allocs())
     }
 
-    /// Distinct HostProvided PerProgram weights copied at prepare. Shared
-    /// identities count once; reuses never re-copy.
+    /// HostProvided weight copies since the prepare baseline. The baseline is
+    /// captured before once-init, so a clean prepare reports the copies that
+    /// actually ran (shared identities copy once). Reuses must not move this.
     #[must_use]
     pub fn weight_uploads(&self) -> usize {
-        self.weight_uploads_at_prepare
+        self.runtime
+            .driver_counters()
+            .uploads
+            .saturating_sub(self.uploads_at_prepare)
     }
 
     /// Extra module load through the pair's runtime. Derived `module_reloads`
@@ -354,6 +355,13 @@ impl<'host> PairedProgramSession<'host> {
     pub fn force_buffer_alloc(&mut self) -> HostResult<()> {
         let handle = self.runtime.alloc_bytes(16)?;
         self.runtime.release(&handle)
+    }
+
+    /// Extra HostProvided upload through the pair's runtime. Derived
+    /// `weight_uploads` must move with the driver upload counter.
+    pub fn force_weight_upload(&mut self) -> HostResult<()> {
+        self.runtime.record_weight_upload();
+        Ok(())
     }
 
     /// Release decode-owned handles first, then the shared prefill owner.
@@ -571,19 +579,6 @@ fn persistent_semantics(descriptor: &DeviceDescriptor) -> BTreeSet<u32> {
         .iter()
         .flat_map(|kernel| &kernel.buffers)
         .filter(|slot| slot.lifetime == DeviceBufferLifetime::PerProgram)
-        .map(|slot| slot.semantic_value)
-        .collect()
-}
-
-fn host_provided_weight_semantics(descriptor: &DeviceDescriptor) -> BTreeSet<u32> {
-    descriptor
-        .kernels
-        .iter()
-        .flat_map(|kernel| &kernel.buffers)
-        .filter(|slot| {
-            slot.lifetime == DeviceBufferLifetime::PerProgram
-                && slot.initialization == DeviceBufferInitialization::HostProvided
-        })
         .map(|slot| slot.semantic_value)
         .collect()
 }
