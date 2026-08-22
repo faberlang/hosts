@@ -70,6 +70,32 @@ fn cuda_product_session_admits_exactly_one_implicit_local_partition() {
 }
 
 #[test]
+fn n1_parity_keeps_numeric_session_and_leak_bars_on_both_backends() {
+    let inputs = BTreeMap::from([(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])]);
+    for (backend, mut host) in [
+        (DeviceBackend::Metal, metal_host()),
+        (DeviceBackend::Cuda, cuda_host()),
+    ] {
+        let descriptor = elementwise_add(backend);
+        let mut session = host
+            .create_program_session(&descriptor)
+            .expect("N=1 session admission");
+        let first = session.execute(&inputs).expect("first numeric execution");
+        let second = session.execute(&inputs).expect("second numeric execution");
+
+        for receipt in [first, second] {
+            assert_eq!(receipt.outputs.get(&3), Some(&vec![4.0, 6.0]));
+            assert_eq!(receipt.launches, 1);
+            assert_eq!(receipt.copy_ins, 2);
+            assert_eq!(receipt.readbacks, 1);
+            assert_eq!(receipt.transfers, 3);
+        }
+        session.teardown().expect("N=1 session teardown");
+        assert_eq!(host.device().expect("device").live_handle_count(), 0);
+    }
+}
+
+#[test]
 fn n1_bound_plan_has_zero_communication_ops() {
     let host = metal_host();
     let plan = host.bound_plan().expect("bound plan");
