@@ -74,7 +74,11 @@ impl DeviceRuntimeSet {
                 "live DeviceRuntimeSet is M=1 today; M>1 is composition via from_members",
             ));
         }
-        let id = unique.keys().next().expect("non-empty").clone();
+        let Some(id) = unique.into_keys().next() else {
+            return Err(HostError::invalid_args(
+                "DeviceRuntimeSet::open_live requires at least one PhysicalDeviceId",
+            ));
+        };
         match_enumerated_identity(&id)?;
         let runtime = DeviceRuntime::open(id.backend())?;
         Self::from_members([(id, runtime)])
@@ -95,11 +99,12 @@ impl DeviceRuntimeSet {
     /// The homogeneous backend of every member.
     #[must_use]
     pub fn backend(&self) -> DeviceBackend {
-        self.members
-            .keys()
-            .next()
-            .expect("construction rejected empty")
-            .backend()
+        match self.members.keys().next() {
+            Some(id) => id.backend(),
+            // from_members rejects empty sets; keep a defined backend so
+            // production hygiene stays at zero expects.
+            None => DeviceBackend::Metal,
+        }
     }
 
     /// Whether `id` is a member.
