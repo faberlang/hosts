@@ -2439,6 +2439,96 @@ pub enum LibraryKernel {
     ResidualRmsNorm,
 }
 
+/// One fully bound request for the production library dispatch seam.
+///
+/// The selection facts stay at this boundary instead of being reconstructed
+/// from buffer lengths or entry-name guesses.  Each variant carries the
+/// arguments required by its selected body, so a caller cannot accidentally
+/// route a QKV or residual request through the legacy attention signature.
+pub enum LibraryDispatch<'a> {
+    /// The fused causal-attention body.
+    CausalAttention {
+        bind: &'a CausalAttentionBind,
+        q: &'a [f32],
+        k: &'a [f32],
+        v: &'a [f32],
+        output: &'a mut [f32],
+    },
+    /// The selected single-body Q/K/V projection.
+    QkvProjection {
+        library_entry: Option<&'a str>,
+        decode_gemv: u32,
+        layout: QkvProjectionLayout,
+        bind: &'a QkvProjectionBind,
+        activation: &'a [f32],
+        weights: [QkvProjectionWeight<'a>; 3],
+        biases: [Option<&'a [f32]>; 3],
+        rope: Option<(&'a [f32], &'a [f32])>,
+        outputs: [&'a mut [f32]; 3],
+    },
+    /// The selected single-body residual-plus-RMS normalization.
+    ResidualRmsNorm {
+        library_entry: Option<&'a str>,
+        layout: BindLayout,
+        bind: &'a BindDescriptor,
+        residual: &'a [f32],
+        skip: &'a [f32],
+        gamma: &'a [f32],
+        output: &'a mut [f32],
+        epsilon: f32,
+    },
+}
+
+/// Dispatch a plan-selected library request through its production selector
+/// and body.  Unsupported vocabulary, uniform drift, or an absent selection
+/// fails closed before any body accesses a buffer.
+pub fn dispatch_selected(request: LibraryDispatch<'_>) -> Result<(), KernelBodyError> {
+    match request {
+        LibraryDispatch::CausalAttention {
+            bind,
+            q,
+            k,
+            v,
+            output,
+        } => dispatch(LibraryKernel::CausalAttention, bind, q, k, v, output),
+        LibraryDispatch::QkvProjection {
+            library_entry,
+            decode_gemv,
+            layout,
+            bind,
+            activation,
+            weights,
+            biases,
+            rope,
+            outputs,
+        } => {
+            let kernel = select_qkv_projection(library_entry, decode_gemv, layout)?.ok_or(
+                KernelBodyError::InvalidBind(
+                    "QKV projection selection did not admit a library body",
+                ),
+            )?;
+            dispatch_qkv_projection(kernel, bind, activation, weights, biases, rope, outputs)
+        }
+        LibraryDispatch::ResidualRmsNorm {
+            library_entry,
+            layout,
+            bind,
+            residual,
+            skip,
+            gamma,
+            output,
+            epsilon,
+        } => {
+            let kernel = select_residual_rms_norm(library_entry, layout)?.ok_or(
+                KernelBodyError::InvalidBind(
+                    "ResidualRmsNorm selection did not admit a library body",
+                ),
+            )?;
+            dispatch_residual_rms_norm(kernel, bind, residual, skip, gamma, output, epsilon)
+        }
+    }
+}
+
 /// Dispatch one plan-selected library kernel.
 ///
 /// Keeping this narrow dispatcher separate from the legacy descriptor

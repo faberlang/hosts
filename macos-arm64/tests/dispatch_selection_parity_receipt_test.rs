@@ -7,8 +7,9 @@
 //! change dispatch policy.
 
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_gemv, dispatch_residual_rms_norm, residual, rms, select_decode_gemv,
-    select_residual_rms_norm, BindDescriptor, BindLayout, GemvKernel, KernelBodyError,
+    dispatch_gemv, dispatch_residual_rms_norm, dispatch_selected, residual, rms,
+    select_decode_gemv, select_residual_rms_norm, BindDescriptor, BindLayout, GemvKernel,
+    KernelBodyError, LibraryDispatch, QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight,
     QuantizedFormat, QuantizedGemvBind,
 };
 
@@ -84,6 +85,166 @@ impl ProjectionFixture {
             packed_weight,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct QkvProjectionFixture {
+    rows: usize,
+    hidden: usize,
+    q_columns: usize,
+    kv_columns: usize,
+    activation: Vec<f32>,
+    weights: [Vec<u8>; 3],
+}
+
+impl QkvProjectionFixture {
+    fn for_rung(rung: Rung) -> Self {
+        let head_dim = 32;
+        let q_columns = rung.q_per_kv * rung.kv_heads * head_dim;
+        let kv_columns = rung.kv_heads * head_dim;
+        let hidden = q_columns;
+        let weights = [
+            q8_0_columns(q_columns, hidden, 1),
+            q8_0_columns(kv_columns, hidden, 7),
+            q8_0_columns(kv_columns, hidden, 13),
+        ];
+        let activation = (0..KV_A_CAPACITY_ROWS * hidden)
+            .map(|index| {
+                let row = index / hidden;
+                let element = index % hidden;
+                0.0625 + row as f32 * 0.015625 + element as f32 * 0.00025
+            })
+            .collect();
+        Self {
+            rows: KV_A_CAPACITY_ROWS,
+            hidden,
+            q_columns,
+            kv_columns,
+            activation,
+            weights,
+        }
+    }
+
+    fn bind(&self, rung: Rung) -> QkvProjectionBind {
+        QkvProjectionBind::grouped(
+            self.rows as u64,
+            self.hidden as u64,
+            rung.kv_heads as u64,
+            rung.q_per_kv as u64,
+            32,
+            [self.q_columns as u32, 1, 1],
+        )
+    }
+}
+
+fn q8_0_columns(columns: usize, hidden: usize, salt: i32) -> Vec<u8> {
+    let blocks = hidden / K;
+    (0..columns)
+        .flat_map(|column| {
+            (0..blocks).flat_map(move |block| {
+                let mut bytes = vec![0u8; 34];
+                bytes[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                for element in 0..K {
+                    let value =
+                        ((column as i32 * 5 + block as i32 * 11 + element as i32 * 3 + salt) % 31)
+                            - 15;
+                    bytes[2 + element] = (value as i8) as u8;
+                }
+                bytes
+            })
+        })
+        .collect()
+}
+
+fn q8_0_column_value(packed: &[u8], column: usize, hidden: usize, element: usize) -> f32 {
+    let blocks = hidden / K;
+    let offset = (column * blocks + element / K) * 34;
+    assert_eq!(
+        u16::from_le_bytes([packed[offset], packed[offset + 1]]),
+        0x3c00
+    );
+    i8::from_ne_bytes([packed[offset + 2 + element % K]]) as f32
+}
+
+fn qkv_batched_baseline(fixture: &QkvProjectionFixture, weights: &[Vec<u8>; 3]) -> [Vec<f32>; 3] {
+    [
+        (0..fixture.rows * fixture.q_columns)
+            .map(|index| {
+                let row = index / fixture.q_columns;
+                let column = index % fixture.q_columns;
+                (0..fixture.hidden)
+                    .map(|element| {
+                        fixture.activation[row * fixture.hidden + element]
+                            * q8_0_column_value(&weights[0], column, fixture.hidden, element)
+                    })
+                    .sum()
+            })
+            .collect(),
+        (0..fixture.rows * fixture.kv_columns)
+            .map(|index| {
+                let row = index / fixture.kv_columns;
+                let column = index % fixture.kv_columns;
+                (0..fixture.hidden)
+                    .map(|element| {
+                        fixture.activation[row * fixture.hidden + element]
+                            * q8_0_column_value(&weights[1], column, fixture.hidden, element)
+                    })
+                    .sum()
+            })
+            .collect(),
+        (0..fixture.rows * fixture.kv_columns)
+            .map(|index| {
+                let row = index / fixture.kv_columns;
+                let column = index % fixture.kv_columns;
+                (0..fixture.hidden)
+                    .map(|element| {
+                        fixture.activation[row * fixture.hidden + element]
+                            * q8_0_column_value(&weights[2], column, fixture.hidden, element)
+                    })
+                    .sum()
+            })
+            .collect(),
+    ]
+}
+
+fn qkv_batched_last_rows(fixture: &QkvProjectionFixture, outputs: &[Vec<f32>; 3]) -> [Vec<f32>; 3] {
+    let row = fixture.rows - 1;
+    [
+        outputs[0][row * fixture.q_columns..(row + 1) * fixture.q_columns].to_vec(),
+        outputs[1][row * fixture.kv_columns..(row + 1) * fixture.kv_columns].to_vec(),
+        outputs[2][row * fixture.kv_columns..(row + 1) * fixture.kv_columns].to_vec(),
+    ]
+}
+
+fn qkv_logical_last_rows(
+    rung: Rung,
+    fixture: &QkvProjectionFixture,
+    outputs: &[Vec<f32>; 3],
+) -> [Vec<f32>; 3] {
+    let row = fixture.rows - 1;
+    let head_dim = 32;
+    let mut q = Vec::with_capacity(fixture.q_columns);
+    for group in 0..rung.kv_heads {
+        for query_head in 0..rung.q_per_kv {
+            for dimension in 0..head_dim {
+                let offset = (group * rung.q_per_kv + query_head) * fixture.rows * head_dim
+                    + row * head_dim
+                    + dimension;
+                q.push(outputs[0][offset]);
+            }
+        }
+    }
+    let kv = |values: &Vec<f32>| {
+        let mut row_values = Vec::with_capacity(fixture.kv_columns);
+        for group in 0..rung.kv_heads {
+            for dimension in 0..head_dim {
+                row_values
+                    .push(values[group * fixture.rows * head_dim + row * head_dim + dimension]);
+            }
+        }
+        row_values
+    };
+    [q, kv(&outputs[1]), kv(&outputs[2])]
 }
 
 /// One reusable, printed parity record for one selected body.
@@ -411,6 +572,131 @@ fn flipping_decode_uniform_swaps_bodies_without_leaving_kva_bounds() {
             assert_eq!(decode.last_row.len(), fixture.columns);
         }
     }
+}
+
+#[test]
+fn qkv_single_body_selection_parity_receipt_covers_both_rungs_and_uniforms() {
+    for rung in RUNGS {
+        let fixture = QkvProjectionFixture::for_rung(rung);
+        let bind = fixture.bind(rung);
+        let baseline = qkv_batched_baseline(&fixture, &fixture.weights);
+        let baseline_last = qkv_batched_last_rows(&fixture, &baseline);
+        for decode_gemv in [0, 1] {
+            let mut outputs = [
+                vec![f32::NAN; fixture.q_columns * fixture.rows],
+                vec![f32::NAN; fixture.kv_columns * fixture.rows],
+                vec![f32::NAN; fixture.kv_columns * fixture.rows],
+            ];
+            let weights = [
+                QkvProjectionWeight::Quantized {
+                    bind: QuantizedGemvBind::decode(
+                        fixture.hidden as u64,
+                        fixture.q_columns as u64,
+                        QuantizedFormat::Q8_0,
+                        [fixture.q_columns as u32, 1, 1],
+                    ),
+                    packed: &fixture.weights[0],
+                },
+                QkvProjectionWeight::Quantized {
+                    bind: QuantizedGemvBind::decode(
+                        fixture.hidden as u64,
+                        fixture.kv_columns as u64,
+                        QuantizedFormat::Q8_0,
+                        [fixture.kv_columns as u32, 1, 1],
+                    ),
+                    packed: &fixture.weights[1],
+                },
+                QkvProjectionWeight::Quantized {
+                    bind: QuantizedGemvBind::decode(
+                        fixture.hidden as u64,
+                        fixture.kv_columns as u64,
+                        QuantizedFormat::Q8_0,
+                        [fixture.kv_columns as u32, 1, 1],
+                    ),
+                    packed: &fixture.weights[2],
+                },
+            ];
+            let (q_output, rest) = outputs.split_at_mut(1);
+            let (k_output, v_output) = rest.split_at_mut(1);
+            dispatch_selected(LibraryDispatch::QkvProjection {
+                library_entry: Some("QkvProjection"),
+                decode_gemv,
+                layout: QkvProjectionLayout::Grouped,
+                bind: &bind,
+                activation: &fixture.activation,
+                weights,
+                biases: [None, None, None],
+                rope: None,
+                outputs: [&mut q_output[0], &mut k_output[0], &mut v_output[0]],
+            })
+            .expect("selected QKV body");
+            let actual_last = qkv_logical_last_rows(rung, &fixture, &outputs);
+            for (actual, expected) in actual_last.iter().zip(&baseline_last) {
+                assert_eq!(actual.len(), expected.len());
+                let max_ulp = actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| ulp_distance(*actual, *expected))
+                    .max()
+                    .unwrap_or(0);
+                let max_relative_error = actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| {
+                        (actual - expected).abs() / expected.abs().max(f32::MIN_POSITIVE)
+                    })
+                    .fold(0.0f32, f32::max);
+                assert!(actual.iter().all(|value| value.is_finite()));
+                assert!(expected.iter().all(|value| value.is_finite()));
+                assert_eq!(argmax(actual), argmax(expected));
+                assert!(
+                    max_ulp <= KV_A_MAX_ULP,
+                    "rung={} decode_gemv={} max_ulp={} actual={:?} expected={:?}",
+                    rung.name,
+                    decode_gemv,
+                    max_ulp,
+                    actual,
+                    expected
+                );
+                assert!(
+                    max_relative_error <= KV_A_MAX_RELATIVE_ERROR,
+                    "rung={} decode_gemv={} max_relative_error={} actual={:?} expected={:?}",
+                    rung.name,
+                    decode_gemv,
+                    max_relative_error,
+                    actual,
+                    expected
+                );
+                eprintln!(
+                    "M4-U2b parity receipt: rung={} entry=Some(QkvProjection) decode_gemv={} max_ulp={} max_relative_error={:.3e} rows={} qkv=single-body",
+                    rung.name,
+                    decode_gemv,
+                    max_ulp,
+                    max_relative_error,
+                    fixture.rows,
+                );
+            }
+        }
+    }
+    assert!(select_qkv_projection_for_test_drift().is_err());
+}
+
+fn select_qkv_projection_for_test_drift() -> Result<(), KernelBodyError> {
+    dispatch_selected(LibraryDispatch::QkvProjection {
+        library_entry: Some("QkvProjection"),
+        decode_gemv: 2,
+        layout: QkvProjectionLayout::Grouped,
+        bind: &QkvProjectionBind::grouped(1, 32, 1, 1, 32, [1, 1, 1]),
+        activation: &[],
+        weights: [
+            QkvProjectionWeight::Dense(&[]),
+            QkvProjectionWeight::Dense(&[]),
+            QkvProjectionWeight::Dense(&[]),
+        ],
+        biases: [None, None, None],
+        rope: None,
+        outputs: [&mut [], &mut [], &mut []],
+    })
 }
 
 #[test]
