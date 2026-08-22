@@ -24,7 +24,7 @@ use host_coordinator::bound_plan::{
     bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, LogicalPartitionId,
     PartitionBinding,
 };
-use host_coordinator::device_identity::PhysicalDeviceId;
+use host_coordinator::device_identity::{DeviceHealthGeneration, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
 use host_coordinator::discovery::DeviceDiscoverySnapshot;
 use host_coordinator::execution_transaction::{
@@ -343,19 +343,33 @@ pub fn bind_translated(
     snapshot: &DeviceDiscoverySnapshot,
     policy: BindPolicy,
 ) -> Result<BoundDistributedPlan, BindError> {
-    // RED: bind wiring for OnePhysicalPerPartition is not landed. Every
-    // policy colocates so the 8:1-promoted-as-8-physical rejection stays
-    // red until the follow-up commit.
-    let _ = policy;
-    bind_colocate(plan, snapshot)
+    match policy {
+        BindPolicy::ColocateOnSnapshot => bind_colocate(plan, snapshot),
+        BindPolicy::OnePhysicalPerPartition => bind_one_physical_per_partition(plan, snapshot),
+    }
+}
+
+fn snapshot_physical_ids(snapshot: &DeviceDiscoverySnapshot) -> Vec<PhysicalDeviceId> {
+    snapshot
+        .devices()
+        .values()
+        .map(|entry| entry.identity.clone())
+        .collect()
+}
+
+fn partition_budget(plan: &TranslatedDistributedPlan, partition: &LogicalPartitionId) -> u64 {
+    plan.partition_budget_bytes
+        .get(partition)
+        .copied()
+        .unwrap_or(DEFAULT_PARTITION_BUDGET_BYTES)
 }
 
 fn bind_colocate(
     plan: &TranslatedDistributedPlan,
     snapshot: &DeviceDiscoverySnapshot,
 ) -> Result<BoundDistributedPlan, BindError> {
-    let device = match snapshot.devices().values().next() {
-        Some(entry) => entry.identity.clone(),
+    let device = match snapshot_physical_ids(snapshot).into_iter().next() {
+        Some(device) => device,
         None => {
             return Err(BindError::TopologyMismatch {
                 detail: "discovery snapshot has no physical devices".to_owned(),
@@ -364,18 +378,56 @@ fn bind_colocate(
     };
     let mut bindings = BTreeMap::new();
     for (index, partition) in plan.partitions.iter().enumerate() {
-        let budget = plan
-            .partition_budget_bytes
-            .get(partition)
-            .copied()
-            .unwrap_or(DEFAULT_PARTITION_BUDGET_BYTES);
-        let vp = admit_virtual(index as u64 + 1, device.clone(), budget)?;
+        let vp = admit_virtual(
+            index as u64 + 1,
+            device.clone(),
+            partition_budget(plan, partition),
+        )?;
         bindings.insert(
             partition.clone(),
             PartitionBinding::with_virtual_partition(device.clone(), vp),
         );
     }
     finish_bind(plan, bindings, DeviceSet::from_members([device]), snapshot)
+}
+
+fn bind_one_physical_per_partition(
+    plan: &TranslatedDistributedPlan,
+    snapshot: &DeviceDiscoverySnapshot,
+) -> Result<BoundDistributedPlan, BindError> {
+    // Device set is the snapshot's real membership. Bindings claim one
+    // distinct physical id per logical partition — fabricated ids fill
+    // ranks the snapshot does not have. bind() then TopologyMismatch
+    // when the claimed set is not exactly the snapshot membership
+    // (8:1 promoted as 8 physical).
+    let snapshot_devices = snapshot_physical_ids(snapshot);
+    if snapshot_devices.is_empty() {
+        return Err(BindError::TopologyMismatch {
+            detail: "discovery snapshot has no physical devices".to_owned(),
+        });
+    }
+    let mut bindings = BTreeMap::new();
+    for (index, partition) in plan.partitions.iter().enumerate() {
+        let device = match snapshot_devices.get(index) {
+            Some(device) => device.clone(),
+            None => PhysicalDeviceId::cuda(format!("GPU-promoted-{index}"), None),
+        };
+        let vp = admit_virtual(
+            index as u64 + 1,
+            device.clone(),
+            partition_budget(plan, partition),
+        )?;
+        bindings.insert(
+            partition.clone(),
+            PartitionBinding::with_virtual_partition(device, vp),
+        );
+    }
+    finish_bind(
+        plan,
+        bindings,
+        DeviceSet::from_members(snapshot_devices),
+        snapshot,
+    )
 }
 
 fn admit_virtual(
@@ -426,7 +478,7 @@ fn finish_bind(
         bindings,
         device_set,
         snapshot,
-        host_coordinator::device_identity::DeviceHealthGeneration::initial(),
+        DeviceHealthGeneration::initial(),
         FixtureIdentityClass::Virtual,
         TransportClass::HostStaged,
     )

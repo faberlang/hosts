@@ -141,9 +141,9 @@ fn eight_rank_colocated_bind_prepares_on_one_physical_snapshot() {
     assert_eq!(transaction.state(), &TransactionState::Prepared);
 }
 
-/// RED-FIRST: claiming 8 physical devices for the F1 8-rank image against a
-/// 1-physical snapshot must reject TopologyMismatch. Lands failing until
-/// bind wiring honors [`BindPolicy::OnePhysicalPerPartition`].
+/// Claiming 8 physical devices for the F1 8-rank image against a 1-physical
+/// snapshot rejects TopologyMismatch (the red row from the first H4 commit,
+/// now green).
 #[test]
 fn eight_rank_promoted_as_eight_physical_rejects_topology_mismatch() {
     let translated =
