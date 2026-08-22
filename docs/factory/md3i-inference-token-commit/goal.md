@@ -5,7 +5,7 @@
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3I + the 2026-08-21 amendment (MD3I follows MD3H); lowered spec [`md3i-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3i-delivery.md); frozen session facts [`gi4-contract.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-contract.md) §1–§6; ownership amendment [`gi4-ownership-amendment.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-ownership-amendment.md)
 **Repos:** `hosts` (primary: `macos-arm64` product host — the commit binding is a consumers-side layer; `host-coordinator` is **read-only**), `radix` (fixture surface only)
-**Related:** archived [`md3h-virtual-partition-host`](../archived/md3h-virtual-partition-host/goal.md) (uniform virtual-partition path + real backend + distributed seam) · archived [`kv-cache-model-session`](../../../../radix/docs/archived/kv-cache-model-session/goal.md) (D1/D4 logical sequence machine MD3I binds) · device-executor M8 / gpu-production-readiness (seam adjacency — see MD3I-WIN)
+**Related:** archived [`md3h-virtual-partition-host`](../../archived/md3h-virtual-partition-host/goal.md) (uniform virtual-partition path + real backend + distributed seam) · archived [`kv-cache-model-session`](../../../../radix/docs/archived/kv-cache-model-session/goal.md) (D1/D4 logical sequence machine MD3I binds) · device-executor M8 / gpu-production-readiness (seam adjacency — see MD3I-WIN)
 
 ---
 
