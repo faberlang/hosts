@@ -14,10 +14,12 @@ pub mod device_descriptor;
 pub mod device_execute;
 pub mod device_host;
 pub mod device_registry;
+pub mod device_runtime_set;
 pub mod kernel;
 pub mod manifest;
 pub mod metal_host;
 pub mod syscall_import;
+pub mod transaction_backend;
 pub mod wasm;
 
 pub use cuda_host::{
@@ -30,6 +32,7 @@ pub use cuda_launch_adapter::{
     NvvmElementType, NvvmLaunchBuffer, NvvmLaunchPlan, OracleCheck, NVVM_DESCRIPTOR_SCHEMA_VERSION,
     NVVM_DESCRIPTOR_TARGET,
 };
+pub use device_runtime_set::DeviceRuntimeSet;
 pub use kernel::{Conversation, Direction, Frame, HostError, HostKernel, Status};
 pub use manifest::{CapabilityManifest, RegisteredProvider, SyscallManifest};
 pub use metal_host::{
@@ -37,3 +40,4 @@ pub use metal_host::{
     FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession, MetalPhysicalDevice,
     E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
 };
+pub use transaction_backend::{DeviceRuntimeBackend, LaunchProgram};
