@@ -1,6 +1,6 @@
 # GOAL: md3h-virtual-partition-host — every device run admits through a virtual partition
 
-**Status**: active — W0 LANDED+Mind-verified 2026-08-22 (R1 `6b503ef5c` 580/0, F1 `be69f5ace` 179/0+fixtures, H1 `34aa2cc` with burgus-Metal + pharos-CUDA identity receipts); W1 H2 LANDED (`cb79d8f` DeviceRuntimeSet + real backend, absorbs MD1-H1/MD3-S1) + X1 LANDED (`8ec2abd` real-backend fault suite); spine H1→H2→H3→C1→P1→C2; MD3H-WIN gate before H3
+**Status**: active — W0 LANDED+Mind-verified 2026-08-22 (R1 `6b503ef5c` 580/0, F1 `be69f5ace` 179/0+fixtures, H1 `34aa2cc` with burgus-Metal + pharos-CUDA identity receipts); W1 H2 LANDED (`cb79d8f` DeviceRuntimeSet + real backend, absorbs MD1-H1/MD3-S1) + X1 LANDED (`8ec2abd` real-backend fault suite); H3 LANDED (`295eb2a` implicit_local N=1 admission; hygiene `26e191ea`/`68c24046`/`f5370d5d`) + H4 LANDED (H4p1 `5e0cec9`/`7f2276f` translation, H4p2 `57cb94ce` distributed-image CLI); spine H1→H2→H3→C1→P1→C2 (C1 running; P1/P2 remain)
 **Created**: 2026-08-21
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3H + the 2026-08-21 operator amendment (uniform N=1; eight-rank bind); lowered spec [`md3h-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3h-delivery.md)
@@ -68,8 +68,8 @@ ledger authority):
 | --- | --- | --- | --- |
 | MD3H-H1 | Multi-ordinal discovery into physical-identity facts; ordinal-0 hardcode removed | — | none |
 | MD3H-H2 | `DeviceRuntimeSet` + real `DeviceExecutionBackend` (absorbs MD1-H1/MD3-S1) | MD3H-H1 | `cb79d8f` |
-| MD3H-H3 | CompositeHost + device-execute uniform admission; partition-free path deleted | MD3H-H2 + **MD3H-WIN** window | none |
-| MD3H-H4 | Distributed-section ingestion + mirror translation + CLI arg surface | MD3H-F1 (radix), MD3H-H2 | none |
+| MD3H-H3 | CompositeHost + device-execute uniform admission; partition-free path deleted | MD3H-H2 + **MD3H-WIN** window | `295eb2a` |
+| MD3H-H4 | Distributed-section ingestion + mirror translation + CLI arg surface | MD3H-F1 (radix), MD3H-H2 | `57cb94ce` |
 | MD3H-X1 | Real-backend fault injection suite (no partial commit) | MD3H-H2 | `8ec2abd` |
 | MD3H-P2 | 8:1 mechanics proof + honest receipts + NOT ATTEMPTED 8:8 row | MD3H-H3, MD3H-H4, MD3H-F1 | none |
 | MD3H-P1 | N=1 parity on existing single-device fixtures (co-tracked with radix) | MD3H-C1 (radix) | none |
@@ -94,16 +94,15 @@ to H3 on disjoint files once H2 lands.
 | --- | --- | --- | --- | --- |
 | MD3H-H1 | pending | — | — | discovery |
 | MD3H-H2 | done | hand | `cb79d8f` | structural: DeviceRuntimeSet + DeviceRuntimeBackend (no host-coordinator trait extension). measured: absent in this commit — live Metal/CUDA tests env-gated PENDING when not admitted; no burgus/pharos machine receipt |
-| MD3H-H3 | pending | — | — | uniform admission (MD3H-WIN gated) |
-| MD3H-H4 | pending | — | — | ingestion + translation |
+| MD3H-H3 | done | hand | `295eb2a` | structural: VirtualDevicePartition::implicit_local N=1 → BoundPlanKind::ImplicitLocal; partition-free product construction deleted; DeviceSelection backend-kind-only; N=1 coordinator-free (copy_ins=2, TransportClass::None). Hygiene `26e191ea`/`68c24046`/`f5370d5d`. measured: detached `cargo test -p host-coordinator` 134 passed; `cargo test -p faber-host-macos-arm64` wasm 3 passed. No live pharos CUDA admission receipt |
+| MD3H-H4 | done | hand | `57cb94ce` | structural: H4p1 `5e0cec9`/`7f2276f` F1 postcard → transaction mirror; OnePhysicalPerPartition TopologyMismatch on 1-physical snapshot; OQ-2 macos-arm64 radix-mir-fmir dep (host-coordinator serde-free). H4p2 `57cb94ce` `--distributed-image` + `--bind-count`. measured: detached distributed_translate_test 10 passed; device_execute_cli_test 38 passed; package green. Residual: live pharos CUDA CLI spawn not exercised on burgus |
 | MD3H-X1 | done | hand | `8ec2abd` | structural: 5 Metal + 1 CUDA fault tests (cancel/timeout/kernel/transfer/device-loss; no partial publication). measured: absent in this commit — live tests skip when Metal/CUDA not admitted; CUDA helper is pending-when-unreachable |
 | MD3H-P2 | pending | — | — | 8:1 proof |
 | MD3H-P1 | pending | — | — | parity (with radix) |
 
 ## Open questions
 
-Owned by the delivery spec (`md3h-delivery.md` OQ-1..OQ-5); the two that
-touch this goal directly: translation dependency route (OQ-2 — default
-hosts-side in `macos-arm64`, `host-coordinator` stays dependency-free) and
-the spawn-seam extension shape (OQ-5 — default minimal `device-execute`
-args). Decided at the named unit audits; never silently.
+Owned by the delivery spec (`md3h-delivery.md` OQ-1..OQ-5). Decided at H4:
+OQ-2 translation route is macos-arm64 `radix-mir-fmir` (F1 postcard decode);
+`host-coordinator` stays serde-free/radix-mir-free (`5e0cec9`). OQ-5
+spawn-seam is `--distributed-image` plus `--bind-count` (`57cb94ce`).
