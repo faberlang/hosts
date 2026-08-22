@@ -203,6 +203,10 @@ impl PreparedArtifacts {
         match mode {
             InvocationMode::Prefill => &self.prefill,
             InvocationMode::ScalarDecode => &self.scalar_decode,
+            // SV-E2 session shape; no verification artifact exists until SV-E3.
+            InvocationMode::Verification => {
+                panic!("verification artifact is not materialized until SV-E3")
+            }
         }
     }
 }

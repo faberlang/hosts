@@ -95,6 +95,10 @@ pub enum InvocationMode {
     Prefill,
     /// Scalar decode M=1, `prefix_before = L`.
     ScalarDecode,
+    /// Suffix verification M=k>1 at committed nonzero `prefix_before = L`
+    /// (SV-E2). Candidate rows `[L, L+k)` are an uncommitted view; commit
+    /// advances by exactly the accepted `r ≤ k` (never `k`).
+    Verification,
 }
 
 /// Post-dispatch stage at which a possible partial device mutation occurred.
@@ -172,6 +176,44 @@ pub struct PlannedInvocation {
     sequence_epoch: u32,
 }
 
+/// Uncommitted candidate-row view over the fixed-capacity storage (SV-E2).
+///
+/// Rows `[start, start + rows)` of the one committed allocation; there is no
+/// old-prefix copy on any path. The view is scratch until
+/// [`InferenceSessionState::commit_verification`] admits exactly `r` rows or
+/// the transaction aborts/poisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateRows {
+    pub start: u32,
+    pub rows: u32,
+    pub capacity: u32,
+}
+
+impl CandidateRows {
+    /// Absolute position of candidate row `i` (`i < rows`).
+    pub fn position(&self, row: u32) -> Result<u32, SessionError> {
+        if row >= self.rows {
+            return Err(SessionError::invalid_args(format!(
+                "candidate row {row} is outside rows={}",
+                self.rows
+            )));
+        }
+        Ok(self.start + row)
+    }
+}
+
+/// Outcome of [`InferenceSessionState::commit_verification`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationCommit {
+    /// `r = 0` abort: committed length/phase/epoch/cursor are byte-identical.
+    AbortedZero,
+    /// Committed exactly `accepted_rows ≤ k`; `valid_len` advanced by `r`.
+    Committed {
+        accepted_rows: u32,
+        committed: CursorFacts,
+    },
+}
+
 /// Open invocation transaction (D4).
 ///
 /// Admission is pure. The machine mutates only on commit or on a
@@ -213,6 +255,19 @@ impl InvocationTransaction {
     #[must_use]
     pub fn is_pre_dispatch(&self) -> bool {
         self.possible_mutation.is_none()
+    }
+
+    /// Candidate scratch rows `[L, L+k)` over the fixed-capacity storage
+    /// (SV-E2). No old-prefix copy: the view aliases committed storage past
+    /// the committed prefix and is uncommitted until exact-`r` commit.
+    #[must_use]
+    pub fn candidate_rows(&self) -> CandidateRows {
+        let coordinates = self.plan.coordinates;
+        CandidateRows {
+            start: coordinates.query_start,
+            rows: coordinates.query_rows,
+            capacity: coordinates.capacity,
+        }
     }
 
     /// Record that device work at `stage` may have mutated the cache.
@@ -391,6 +446,32 @@ impl InferenceSessionState {
                     }
                 }
             }
+            InvocationMode::Verification => {
+                if query_rows < 2 {
+                    return Err(SessionError::invalid_args(
+                        "verification is M=k>1; use scalar decode for a single row",
+                    ));
+                }
+                match self.phase {
+                    SequencePhase::Prefill | SequencePhase::Decode => {}
+                    SequencePhase::Fresh => {
+                        return Err(SessionError::phase(
+                            "verification requires a committed prefill at nonzero L; a fresh-prefill masquerade is rejected",
+                        ));
+                    }
+                    SequencePhase::Poisoned {
+                        epoch,
+                        failure_stage,
+                    } => {
+                        return Err(SessionError::poisoned(epoch, failure_stage));
+                    }
+                }
+                if self.valid_len == 0 {
+                    return Err(SessionError::phase(
+                        "verification requires a committed nonzero prefix_before=L",
+                    ));
+                }
+            }
         }
 
         let prefix_before = self.valid_len;
@@ -433,14 +514,24 @@ impl InferenceSessionState {
     }
 
     /// Contiguous commit: valid length advances by exactly `query_rows`.
+    ///
+    /// Verification transactions must not commit `k` rows wholesale; they
+    /// commit exactly `r ≤ k` via [`Self::commit_verification`].
     pub fn commit(&mut self, plan: &PlannedInvocation) -> Result<CursorFacts, SessionError> {
         self.ensure_mutable()?;
         self.ensure_plan_matches(plan)?;
+        if plan.mode == InvocationMode::Verification {
+            return Err(SessionError::invalid_args(
+                "verification commits exactly r accepted rows, not k; use commit_verification",
+            ));
+        }
         let coordinates = plan.coordinates;
         self.valid_len = coordinates.valid_len_after;
         self.phase = match plan.mode {
             InvocationMode::Prefill => SequencePhase::Prefill,
-            InvocationMode::ScalarDecode => SequencePhase::Decode,
+            // Verification never reaches here: `commit` rejects it in favor
+            // of `commit_verification`.
+            InvocationMode::ScalarDecode | InvocationMode::Verification => SequencePhase::Decode,
         };
         self.last_commit = Some(coordinates);
         Ok(coordinates)
@@ -452,6 +543,51 @@ impl InferenceSessionState {
         tx: &InvocationTransaction,
     ) -> Result<CursorFacts, SessionError> {
         self.commit(&tx.plan)
+    }
+
+    /// Verification commit of exactly `accepted_rows = r ≤ k` (SV-E2).
+    ///
+    /// `r = 0` is an abort: committed length/phase/epoch/cursor stay
+    /// byte-identical and the sequence stays reusable. `0 < r ≤ k` advances
+    /// `valid_len` by exactly `r` and lands in `Decode`. Stale epoch or
+    /// cursor coordinates reject before any mutation.
+    pub fn commit_verification(
+        &mut self,
+        tx: &InvocationTransaction,
+        accepted_rows: u32,
+    ) -> Result<VerificationCommit, SessionError> {
+        self.ensure_mutable()?;
+        if tx.mode() != InvocationMode::Verification {
+            return Err(SessionError::invalid_args(
+                "commit_verification requires a Verification transaction",
+            ));
+        }
+        self.ensure_plan_matches(&tx.plan)?;
+        let coordinates = tx.plan.coordinates;
+        if accepted_rows > coordinates.query_rows {
+            return Err(SessionError::invalid_args(format!(
+                "accepted_rows={accepted_rows} exceeds candidate query_rows={}",
+                coordinates.query_rows
+            )));
+        }
+        if accepted_rows == 0 {
+            return Ok(VerificationCommit::AbortedZero);
+        }
+        let committed = CursorFacts {
+            prefix_before: coordinates.prefix_before,
+            query_rows: accepted_rows,
+            write_position: coordinates.prefix_before,
+            valid_len_after: coordinates.prefix_before + accepted_rows,
+            capacity: coordinates.capacity,
+            query_start: coordinates.prefix_before,
+        };
+        self.valid_len = committed.valid_len_after;
+        self.phase = SequencePhase::Decode;
+        self.last_commit = Some(committed);
+        Ok(VerificationCommit::Committed {
+            accepted_rows,
+            committed,
+        })
     }
 
     /// Possible partial device mutation: poison the sequence (KV-L9).

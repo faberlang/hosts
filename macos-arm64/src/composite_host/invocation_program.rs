@@ -203,6 +203,11 @@ impl InvocationPrograms {
         let graph = match mode {
             InvocationMode::Prefill => &self.prefill,
             InvocationMode::ScalarDecode => &self.scalar_decode,
+            // SV-E2 session shape; no verification program exists until SV-E3
+            // materializes it. Fail closed rather than alias the scalar loop.
+            InvocationMode::Verification => {
+                panic!("verification program is not materialized until SV-E3")
+            }
         };
         SelectedProgram {
             graph,

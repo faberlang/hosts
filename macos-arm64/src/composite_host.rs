@@ -66,10 +66,10 @@ mod residency;
 mod session;
 
 pub use inference_state::{
-    CursorFacts, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
-    InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase, SessionError,
-    SessionInspection, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
-    E_KV_STALE,
+    CandidateRows, CursorFacts, FailureOutcome, FailureStage, InferenceSessionState,
+    InvocationMode, InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase,
+    SessionError, SessionInspection, VerificationCommit, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE,
+    E_KV_POISONED, E_KV_RELEASED, E_KV_STALE,
 };
 pub use paired_session::PairedProgramSession;
 pub use receipt::{
