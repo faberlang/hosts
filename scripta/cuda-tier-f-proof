@@ -12,10 +12,10 @@
 #      PTX with the PTX ISA version pinned (-mattr=+ptxXX for llc /
 #      --cuda-feature=+ptxXX for clang; default CUDA_PROOF_PTX_ISA=ptx87,
 #      the minimum PTX ISA that carries sm_120)
-#   4. build the host proof binary (hosts/macos-arm64)
-#   5. run the environment-gated host proof:
+#   4. build the Linux host-cuda proof crate
+#   5. run the environment-gated host-cuda proof:
 #        CUDA_PROOF_PTX=<ptx> CUDA_PROOF_DESCRIPTOR=<desc> \
-#          cargo test --test cuda_host_proof
+#          cargo test -p host-cuda --test cuda_host_proof
 #   6. require PASS
 #
 # On pharos the Driver API JIT-compiles the PTX for sm_120 at module load; the
@@ -75,6 +75,22 @@ not_attempted() {
 if [[ ! -f "$FIXTURE" ]]; then
   printf 'cuda-tier-f-proof: config error — fixture not found: %s\n' "$FIXTURE" >&2
   exit 3
+fi
+
+# --- 0. Linux host-cuda leg (CLH-5) ----------------------------------------
+# This proof is the Linux product leg and must not silently fall back to the
+# macOS product crate. Run it on pharos (or another Linux host) before the
+# artifact pipeline; no target-specific macOS feature is involved.
+if [[ "$(uname -s)" != "Linux" ]]; then
+  fail "CLH-5 Linux host-cuda leg requires a Linux host (pharos)"
+fi
+printf '── Linux host-cuda check\n'
+if ! (cd "$ROOT" && cargo check -p host-cuda); then
+  fail "Linux host-cuda cargo check failed"
+fi
+printf '── Linux host-cuda tests\n'
+if ! (cd "$ROOT" && cargo test -p host-cuda); then
+  fail "Linux host-cuda cargo test failed"
 fi
 
 # --- 1. build radix ---------------------------------------------------------
@@ -223,19 +239,19 @@ fi
 printf '── PTX OK: .entry addita present, 3 u64 buffer params, backend=%s path=%s pin=+%s\n' \
   "$BACKEND" "$BACKEND_PATH" "$PTX_ISA"
 
-# --- 4. build the host proof binary ------------------------------------------
-printf '── build host proof binary\n'
-if ! cargo build --release --manifest-path "$ROOT/macos-arm64/Cargo.toml"; then
-  fail "host proof binary build failed (cargo build --release --manifest-path hosts/macos-arm64/Cargo.toml)"
+# --- 4. build the Linux host-cuda proof crate -------------------------------
+printf '── build host-cuda proof crate\n'
+if ! cargo build --release --manifest-path "$ROOT/crates/host-cuda/Cargo.toml"; then
+  fail "host-cuda proof crate build failed (cargo build --release --manifest-path hosts/crates/host-cuda/Cargo.toml)"
 fi
 
 # --- 5. run the host proof with artifact paths -------------------------------
-printf '── run host proof (CUDA_PROOF_PTX=%s CUDA_PROOF_DESCRIPTOR=%s)\n' "$PTX" "$DESCRIPTOR"
+printf '── run host-cuda proof (CUDA_PROOF_PTX=%s CUDA_PROOF_DESCRIPTOR=%s)\n' "$PTX" "$DESCRIPTOR"
 set +e
 (
-  cd "$ROOT/macos-arm64"
+  cd "$ROOT"
   CUDA_PROOF_PTX="$PTX" CUDA_PROOF_DESCRIPTOR="$DESCRIPTOR" \
-    cargo test --test cuda_host_proof -- --nocapture
+    cargo test -p host-cuda --test cuda_host_proof -- --nocapture
 ) > "$SCRATCH/proof-test.log" 2>&1
 test_status=$?
 set -e
