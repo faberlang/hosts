@@ -21,6 +21,8 @@ pub const ROPE_SIN: &str = "prefill.rope.sin";
 pub const Q_PREFIX_IDS: &str = "decode.q_prefix_ids";
 /// Dense descriptor input name for K/V projection prefix ids.
 pub const KV_PREFIX_IDS: &str = "decode.kv_prefix_ids";
+/// Dense descriptor input name for the four-field B1 invocation cursor.
+pub const INVOCATION_STATE: &str = "kv.invocation_state";
 
 /// Parameters needed to materialize one or more RoPE rows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,13 +97,9 @@ pub fn project_invocation_bindings(
 
     let required = match invocation.mode {
         DeviceExecuteInvocationMode::Prefill => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", ""],
-        DeviceExecuteInvocationMode::ScalarDecode => [
-            PROMPT_TOKENS,
-            ROPE_COS,
-            ROPE_SIN,
-            Q_PREFIX_IDS,
-            KV_PREFIX_IDS,
-        ],
+        DeviceExecuteInvocationMode::ScalarDecode => {
+            [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, Q_PREFIX_IDS, ""]
+        }
     };
     let required = required.into_iter().filter(|name| !name.is_empty());
     let inputs = declared_input_specs(descriptor, required)?;
@@ -123,13 +121,35 @@ pub fn project_invocation_bindings(
         token_values,
     )?;
 
-    let positions: Vec<u32> = match invocation.mode {
-        DeviceExecuteInvocationMode::Prefill => (0..query_rows).collect(),
-        DeviceExecuteInvocationMode::ScalarDecode => vec![invocation.position],
+    let cos_spec = inputs.get(ROPE_COS);
+    let pairs = rope.row_width();
+    let declared_rope = cos_spec.map(|spec| spec.element_count).unwrap_or(0);
+    let rope_rows_count = if pairs == 0 {
+        0
+    } else {
+        declared_rope / pairs as u64
     };
+    let positions: Vec<u32> =
+        if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode && rope_rows_count <= 1 {
+            vec![invocation.position]
+        } else if invocation.mode == DeviceExecuteInvocationMode::Prefill {
+            (0..query_rows).collect()
+        } else {
+            (0..u32::try_from(rope_rows_count).unwrap_or(u32::MAX)).collect()
+        };
     let (cos, sin) = rope_rows(&positions, rope);
     insert_checked(&mut projected, ROPE_COS, inputs.get(ROPE_COS), cos)?;
     insert_checked(&mut projected, ROPE_SIN, inputs.get(ROPE_SIN), sin)?;
+
+    if let Some(cursor) = optional_input_spec(descriptor, INVOCATION_STATE)? {
+        let values = vec![
+            invocation.position as f32,
+            invocation.valid_len_after as f32,
+            query_rows as f32,
+            invocation.sequence_epoch as f32,
+        ];
+        insert_checked(&mut projected, INVOCATION_STATE, Some(&cursor), values)?;
+    }
 
     if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode {
         insert_checked(
@@ -138,12 +158,14 @@ pub fn project_invocation_bindings(
             inputs.get(Q_PREFIX_IDS),
             prefix_ids_for(inputs.get(Q_PREFIX_IDS), Q_PREFIX_IDS)?,
         )?;
-        insert_checked(
-            &mut projected,
-            KV_PREFIX_IDS,
-            inputs.get(KV_PREFIX_IDS),
-            prefix_ids_for(inputs.get(KV_PREFIX_IDS), KV_PREFIX_IDS)?,
-        )?;
+        if let Some(spec) = optional_input_spec(descriptor, KV_PREFIX_IDS)? {
+            insert_checked(
+                &mut projected,
+                KV_PREFIX_IDS,
+                Some(&spec),
+                prefix_ids_for(Some(&spec), KV_PREFIX_IDS)?,
+            )?;
+        }
     }
     Ok(projected)
 }
@@ -271,6 +293,35 @@ where
         }
     }
     Ok(specs)
+}
+
+fn optional_input_spec(
+    descriptor: &DeviceDescriptor,
+    name: &'static str,
+) -> HostResult<Option<InputSpec>> {
+    let mut found = None;
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            if slot.role != DeviceBufferRole::Input || slot.buffer_name != name {
+                continue;
+            }
+            let next = InputSpec {
+                buffer_id: slot.buffer_id,
+                element_count: slot.element_count,
+                element_ty: slot.element_ty,
+            };
+            if let Some(previous) = found {
+                if previous != next {
+                    return Err(invalid_args(format!(
+                        "declared input `{name}` has conflicting buffer identity or shape"
+                    )));
+                }
+            } else {
+                found = Some(next);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn prefix_ids_for(spec: Option<&InputSpec>, name: &str) -> HostResult<Vec<f32>> {
