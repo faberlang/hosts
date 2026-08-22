@@ -10,10 +10,10 @@ use std::collections::BTreeSet;
 
 use faber_host_macos_arm64::device_execute::prepare_distributed_image;
 use faber_host_macos_arm64::distributed_translate::{
-    bind_policy_for_declared_count, bind_translated, translate_device_section_bytes, BindPolicy,
-    TranslateError,
+    bind_policy_for_declared_count, bind_translated, bind_translated_with_constraints,
+    translate_device_section_bytes, BindPolicy, TranslateError,
 };
-use host_coordinator::bound_plan::BindError;
+use host_coordinator::bound_plan::{BindError, DeclaredPlacementConstraint, LogicalPartitionId};
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use host_coordinator::discovery::{
     ComputeCapability, DeviceCapabilities, DeviceDiscoveryEntry, DeviceDiscoverySnapshot,
@@ -224,15 +224,23 @@ fn declared_bind_count_matching_partitions_is_one_physical_each() {
     );
 }
 
-/// MD3J-B1 red-first row: 8:2 is a legal split shape. `--bind-count 2` for
-/// 8 partitions must derive a split policy, not the current `Unsupported`
-/// rejection.
+/// MD3J-B1 (was the red-first row): `--bind-count 2` for 8 partitions
+/// derives the split policy.
 #[test]
-fn declared_bind_count_two_is_split_not_unsupported() {
-    let policy = bind_policy_for_declared_count(8, 2)
-        .expect("8:2 must derive a split bind policy, not reject as unsupported");
-    assert_ne!(policy, BindPolicy::ColocateOnSnapshot);
-    assert_ne!(policy, BindPolicy::OnePhysicalPerPartition);
+fn declared_bind_count_two_is_split_policy() {
+    assert_eq!(
+        bind_policy_for_declared_count(8, 2).expect("8:2"),
+        BindPolicy::SplitAcrossMembership { bind_count: 2 }
+    );
+}
+
+/// Any divisor of the partition count is a legal split shape (8:4).
+#[test]
+fn declared_bind_count_four_is_split_policy() {
+    assert_eq!(
+        bind_policy_for_declared_count(8, 4).expect("8:4"),
+        BindPolicy::SplitAcrossMembership { bind_count: 4 }
+    );
 }
 
 /// Non-divisor bind counts stay fail-closed unsupported (8:3 — no legal
@@ -258,7 +266,7 @@ fn eight_rank_bind_count_two_prepares_four_and_four_on_two_physical_snapshot() {
     assert_eq!(receipt.virtual_partition_count, 8);
     assert_eq!(receipt.bind_shape, "8:2");
     assert_eq!(receipt.fixture_identity_class, "virtual");
-    assert_eq!(receipt.hardware_isolation_claimed, false);
+    assert!(!receipt.hardware_isolation_claimed);
     assert_eq!(receipt.transaction_state, "prepared");
     assert!(receipt.logical_distributed_plan_hash.starts_with("sha256:"));
     assert!(receipt.bound_distributed_plan_hash.starts_with("sha256:"));
@@ -290,6 +298,175 @@ fn eight_rank_bind_count_two_on_three_physical_rejects_topology_mismatch() {
         "3-physical bind-count 2 must be TopologyMismatch-class, got {}",
         error.message
     );
+}
+
+/// 8:2 split bind across the synthetic 2-physical membership: contiguous
+/// halves in plan order (partitions 0–3 → first physical, 4–7 → second),
+/// deterministically — repeat binds produce identical plans and hashes.
+#[test]
+fn eight_rank_split_two_binds_contiguous_halves_deterministically() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let plan_order: Vec<String> = translated
+        .partitions()
+        .iter()
+        .map(|partition| partition.as_str().to_owned())
+        .collect();
+    let expected_order: Vec<String> = (0..8).map(|id| format!("partition-{id}")).collect();
+    assert_eq!(plan_order, expected_order, "plan order is the split's rank order");
+
+    let snapshot = two_physical_snapshot();
+    let policy = BindPolicy::SplitAcrossMembership { bind_count: 2 };
+    let first = bind_translated(&translated, &snapshot, policy).expect("8:2 split binds");
+    let second = bind_translated(&translated, &snapshot, policy).expect("repeat split binds");
+    assert_eq!(first, second, "repeat binds are identical");
+    assert_eq!(
+        first.bound_distributed_plan_hash(),
+        second.bound_distributed_plan_hash()
+    );
+    assert_eq!(first.canonical_bytes(), second.canonical_bytes());
+
+    assert_eq!(first.device_set().len(), 2);
+    let bindings = first.bindings().expect("8:2 is a distributed bind");
+    assert_eq!(bindings.len(), 8);
+    let first_half_device = snapshot_device();
+    let second_half_device = PhysicalDeviceId::cuda(SECOND_SNAPSHOT_UUID, None);
+    for (index, partition) in translated.partitions().iter().enumerate() {
+        let binding = bindings
+            .get(partition)
+            .expect("every declared partition is bound");
+        let expected = if index < 4 {
+            &first_half_device
+        } else {
+            &second_half_device
+        };
+        assert_eq!(
+            binding.device(),
+            expected,
+            "partition {partition} binds its contiguous plan-order half"
+        );
+    }
+}
+
+/// Split bind on a 1-physical snapshot rejects `TopologyMismatch`.
+#[test]
+fn eight_rank_split_two_on_one_physical_rejects_topology_mismatch() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let error = bind_translated(
+        &translated,
+        &one_physical_snapshot(),
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+    )
+    .expect_err("8:2 on 1 physical must reject");
+    assert!(
+        matches!(error, BindError::TopologyMismatch { .. }),
+        "8:2 on 1 physical must be TopologyMismatch-class, got {error:?}"
+    );
+}
+
+/// Split bind on a 3-physical snapshot rejects `TopologyMismatch`.
+#[test]
+fn eight_rank_split_two_on_three_physical_rejects_topology_mismatch() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let error = bind_translated(
+        &translated,
+        &three_physical_snapshot(),
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+    )
+    .expect_err("8:2 on 3 physicals must reject");
+    assert!(
+        matches!(error, BindError::TopologyMismatch { .. }),
+        "8:2 on 3 physicals must be TopologyMismatch-class, got {error:?}"
+    );
+}
+
+/// A declared `Colocated` placement constraint spanning the split boundary
+/// (partitions on both physicals) rejects `ConstraintViolation` — declared
+/// placement constraints enforce per binding under the split policy.
+#[test]
+fn split_two_colocated_constraint_crossing_split_rejects() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let snapshot = two_physical_snapshot();
+    let constraint = DeclaredPlacementConstraint::Colocated {
+        partitions: BTreeSet::from([
+            LogicalPartitionId::new("partition-0"),
+            LogicalPartitionId::new("partition-4"),
+        ]),
+    };
+    let error = bind_translated_with_constraints(
+        &translated,
+        &snapshot,
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+        &[constraint],
+    )
+    .expect_err("colocating partitions across the split must reject");
+    assert!(
+        matches!(error, BindError::ConstraintViolation { .. }),
+        "split-crossing colocation must be ConstraintViolation-class, got {error:?}"
+    );
+}
+
+/// A `Colocated` constraint contained within one split half admits.
+#[test]
+fn split_two_colocated_constraint_within_one_half_admits() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let snapshot = two_physical_snapshot();
+    let constraint = DeclaredPlacementConstraint::Colocated {
+        partitions: BTreeSet::from([
+            LogicalPartitionId::new("partition-0"),
+            LogicalPartitionId::new("partition-3"),
+        ]),
+    };
+    bind_translated_with_constraints(
+        &translated,
+        &snapshot,
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+        &[constraint],
+    )
+    .expect("colocation within one half is consistent with the split");
+}
+
+/// Virtual and physical identity classes never merge in the 8:2 binding
+/// table: bindings name exactly the snapshot's two physical ids, the
+/// attached virtual partitions carry `vp:` ids from the machine-local
+/// partition namespace, and no id string is shared across the classes.
+#[test]
+fn split_two_binding_table_keeps_identity_classes_distinct() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("8-rank translates");
+    let snapshot = two_physical_snapshot();
+    let bound = bind_translated(
+        &translated,
+        &snapshot,
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+    )
+    .expect("8:2 split binds");
+    let bindings = bound.bindings().expect("distributed bind");
+    assert_eq!(bound.device_set().len(), 2);
+
+    let physical_ids: BTreeSet<String> = bindings
+        .values()
+        .map(|binding| binding.device().to_string())
+        .collect();
+    assert_eq!(physical_ids.len(), 2);
+    assert!(
+        physical_ids.iter().all(|id| id.starts_with("cuda:GPU-")),
+        "bindings name physical ids, got {physical_ids:?}"
+    );
+
+    let virtual_ids: BTreeSet<String> = bindings
+        .values()
+        .filter_map(|binding| binding.virtual_partition().map(|vp| vp.id().to_string()))
+        .collect();
+    assert_eq!(virtual_ids.len(), 8);
+    assert!(
+        virtual_ids.iter().all(|id| id.starts_with("vp:")),
+        "virtual partitions carry vp: ids, got {virtual_ids:?}"
+    );
+
+    assert!(
+        physical_ids.is_disjoint(&virtual_ids),
+        "virtual and physical identity namespaces must never merge"
+    );
+    assert_eq!(bound.fixture_identity_class(), FixtureIdentityClass::Virtual);
 }
 
 #[test]

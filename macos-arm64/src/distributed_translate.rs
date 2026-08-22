@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use host_coordinator::bound_plan::{
-    bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, LogicalPartitionId,
-    PartitionBinding,
+    bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
+    LogicalPartitionId, PartitionBinding,
 };
 use host_coordinator::device_identity::{DeviceHealthGeneration, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
@@ -94,19 +94,31 @@ pub enum BindPolicy {
     /// promotion). A 1-physical snapshot must reject this as topology
     /// mismatch.
     OnePhysicalPerPartition,
+    /// Split the partitions in contiguous plan-order halves across exactly
+    /// `bind_count` physical devices (8:2 → 4+4; OQ-3). Legal when
+    /// `1 < bind_count < partition_count` and
+    /// `partition_count % bind_count == 0`. The snapshot's physical
+    /// membership must be exactly `bind_count` devices or the bind rejects
+    /// [`BindError::TopologyMismatch`].
+    SplitAcrossMembership {
+        /// The number of physical devices the split claims.
+        bind_count: u32,
+    },
 }
 
 /// Map the CLI declared bind count onto [`BindPolicy`].
 ///
 /// `--bind-count 1` colocates every virtual partition on the snapshot
 /// (8:1). `--bind-count` equal to the partition count claims one physical
-/// per partition (8:8). Any other count is unsupported at this seam
+/// per partition (8:8). Any other divisor of the partition count splits
+/// contiguous plan-order halves across that many physicals (8:2 → 4+4,
+/// 8:4 → 2+2+2+2; OQ-3). Any other count is unsupported at this seam
 /// (OQ-5 — richer bind negotiation waits for MD5).
 ///
 /// # Errors
 ///
 /// Returns [`TranslateError::Unsupported`] when `bind_count` is 0 or is
-/// neither 1 nor the partition count.
+/// neither 1, the partition count, nor a divisor of the partition count.
 pub fn bind_policy_for_declared_count(
     partition_count: usize,
     bind_count: u32,
@@ -119,11 +131,15 @@ pub fn bind_policy_for_declared_count(
     if bind_count == 1 {
         return Ok(BindPolicy::ColocateOnSnapshot);
     }
-    if bind_count as usize == partition_count {
+    let bind = bind_count as usize;
+    if bind == partition_count {
         return Ok(BindPolicy::OnePhysicalPerPartition);
     }
+    if bind < partition_count && partition_count.is_multiple_of(bind) {
+        return Ok(BindPolicy::SplitAcrossMembership { bind_count });
+    }
     Err(TranslateError::Unsupported(format!(
-        "declared bind count {bind_count} for {partition_count} partitions is not 1 (colocate) or {partition_count} (one physical per partition); richer bind negotiation waits for MD5"
+        "declared bind count {bind_count} for {partition_count} partitions is not 1 (colocate), {partition_count} (one physical per partition), or a divisor (split); richer bind negotiation waits for MD5"
     )))
 }
 
@@ -378,15 +394,38 @@ fn barrier_ref(id: u32) -> BarrierRef {
 /// Returns [`BindError`] when admission, membership, or topology fails.
 /// [`BindPolicy::OnePhysicalPerPartition`] on a snapshot whose physical
 /// membership is not exactly the partition count rejects
-/// [`BindError::TopologyMismatch`].
+/// [`BindError::TopologyMismatch`]. [`BindPolicy::SplitAcrossMembership`]
+/// on a snapshot whose physical membership is not exactly `bind_count`
+/// devices rejects [`BindError::TopologyMismatch`].
 pub fn bind_translated(
     plan: &TranslatedDistributedPlan,
     snapshot: &DeviceDiscoverySnapshot,
     policy: BindPolicy,
 ) -> Result<BoundDistributedPlan, BindError> {
+    bind_translated_with_constraints(plan, snapshot, policy, &[])
+}
+
+/// Bind a translated plan under [`BindPolicy`] with declared placement
+/// constraints enforced per binding.
+///
+/// The mirror constraint vocabulary is [`DeclaredPlacementConstraint`]
+/// (host-coordinator, read-only). A constraint violated by the bindings —
+/// e.g. a [`DeclaredPlacementConstraint::Colocated`] set spanning the split
+/// boundary — rejects [`BindError::ConstraintViolation`].
+pub fn bind_translated_with_constraints(
+    plan: &TranslatedDistributedPlan,
+    snapshot: &DeviceDiscoverySnapshot,
+    policy: BindPolicy,
+    declared_constraints: &[DeclaredPlacementConstraint],
+) -> Result<BoundDistributedPlan, BindError> {
     match policy {
-        BindPolicy::ColocateOnSnapshot => bind_colocate(plan, snapshot),
-        BindPolicy::OnePhysicalPerPartition => bind_one_physical_per_partition(plan, snapshot),
+        BindPolicy::ColocateOnSnapshot => bind_colocate(plan, snapshot, declared_constraints),
+        BindPolicy::OnePhysicalPerPartition => {
+            bind_one_physical_per_partition(plan, snapshot, declared_constraints)
+        }
+        BindPolicy::SplitAcrossMembership { bind_count } => {
+            bind_split_across_membership(plan, snapshot, bind_count, declared_constraints)
+        }
     }
 }
 
@@ -408,6 +447,7 @@ fn partition_budget(plan: &TranslatedDistributedPlan, partition: &LogicalPartiti
 fn bind_colocate(
     plan: &TranslatedDistributedPlan,
     snapshot: &DeviceDiscoverySnapshot,
+    constraints: &[DeclaredPlacementConstraint],
 ) -> Result<BoundDistributedPlan, BindError> {
     let device = match snapshot_physical_ids(snapshot).into_iter().next() {
         Some(device) => device,
@@ -429,12 +469,19 @@ fn bind_colocate(
             PartitionBinding::with_virtual_partition(device.clone(), vp),
         );
     }
-    finish_bind(plan, bindings, DeviceSet::from_members([device]), snapshot)
+    finish_bind(
+        plan,
+        bindings,
+        DeviceSet::from_members([device]),
+        snapshot,
+        constraints,
+    )
 }
 
 fn bind_one_physical_per_partition(
     plan: &TranslatedDistributedPlan,
     snapshot: &DeviceDiscoverySnapshot,
+    constraints: &[DeclaredPlacementConstraint],
 ) -> Result<BoundDistributedPlan, BindError> {
     // Device set is the snapshot's real membership. Bindings claim one
     // distinct physical id per logical partition — fabricated ids fill
@@ -468,6 +515,64 @@ fn bind_one_physical_per_partition(
         bindings,
         DeviceSet::from_members(snapshot_devices),
         snapshot,
+        constraints,
+    )
+}
+
+/// Bind under [`BindPolicy::SplitAcrossMembership`]: `bind_count` physical
+/// devices claim `partition_count / bind_count` contiguous partitions each,
+/// in plan order (OQ-3 — partitions 1–4 → first physical, 5–8 → second).
+///
+/// The snapshot's physical membership must be exactly `bind_count` devices
+/// or the bind rejects [`BindError::TopologyMismatch`] — fail-closed in
+/// both directions (fewer and more). Declared placement constraints are
+/// enforced per binding by [`bind`].
+fn bind_split_across_membership(
+    plan: &TranslatedDistributedPlan,
+    snapshot: &DeviceDiscoverySnapshot,
+    bind_count: u32,
+    constraints: &[DeclaredPlacementConstraint],
+) -> Result<BoundDistributedPlan, BindError> {
+    let members = bind_count as usize;
+    let partition_count = plan.partitions.len();
+    if members == 0 || members >= partition_count || !partition_count.is_multiple_of(members) {
+        // Fail-closed even when the policy was constructed directly,
+        // bypassing [`bind_policy_for_declared_count`]'s divisor check.
+        return Err(BindError::TopologyMismatch {
+            detail: format!(
+                "split bind count {bind_count} is not a legal split of {partition_count} partitions (1 < m < {partition_count}, {partition_count} % m == 0)"
+            ),
+        });
+    }
+    let snapshot_devices = snapshot_physical_ids(snapshot);
+    if snapshot_devices.len() != members {
+        return Err(BindError::TopologyMismatch {
+            detail: format!(
+                "split bind count {bind_count} requires exactly {bind_count} physical device(s); snapshot has {}",
+                snapshot_devices.len()
+            ),
+        });
+    }
+    let chunk = partition_count / members;
+    let mut bindings = BTreeMap::new();
+    for (index, partition) in plan.partitions.iter().enumerate() {
+        let device = snapshot_devices[index / chunk].clone();
+        let vp = admit_virtual(
+            index as u64 + 1,
+            device.clone(),
+            partition_budget(plan, partition),
+        )?;
+        bindings.insert(
+            partition.clone(),
+            PartitionBinding::with_virtual_partition(device, vp),
+        );
+    }
+    finish_bind(
+        plan,
+        bindings,
+        DeviceSet::from_members(snapshot_devices),
+        snapshot,
+        constraints,
     )
 }
 
@@ -505,11 +610,12 @@ fn finish_bind(
     bindings: BTreeMap<LogicalPartitionId, PartitionBinding>,
     device_set: DeviceSet,
     snapshot: &DeviceDiscoverySnapshot,
+    constraints: &[DeclaredPlacementConstraint],
 ) -> Result<BoundDistributedPlan, BindError> {
     let admitted = AdmittedLogicalPlan::admit(
         plan.logical_distributed_plan_hash.clone(),
         plan.partitions.iter().cloned(),
-        [],
+        constraints.iter().cloned(),
     )
     .map_err(|error| BindError::TopologyMismatch {
         detail: format!("translated plan failed logical admission: {error:?}"),
