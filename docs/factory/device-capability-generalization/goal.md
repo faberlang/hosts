@@ -83,7 +83,7 @@ Lowered to [`delivery.md`](delivery.md) as DCG-1..4; unit 3 re-scoped to the con
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | DCG-1 | pending | — | — | fields |
-| DCG-2 | pending | — | — | policy gate |
+| DCG-2 | done | 873fb60b (reconcile) | `20bf066` | policy gate on generic launch-resource fields; prior seat ended after the feat landed on main |
 | DCG-3 | pending | — | — | dtype consistency ratchet |
 | DCG-4 | pending | — | — | plan checks |
 
