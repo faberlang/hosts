@@ -8,7 +8,7 @@
 //! `libcuda.so.1` at `/lib/x86_64-linux-gnu/libcuda.so.1`). It requires three
 //! artifacts: the PTX file (compiler-emitted LLVM IR lowered through an
 //! NVPTX backend), the kernel descriptor JSON sidecar, and this test binary
-//! (compiled from the `faber-host-macos-arm64` crate).
+//! (compiled from the `host-cuda` crate).
 //!
 //! ## Prerequisites
 //!
@@ -50,7 +50,7 @@
 //!
 //! # Step 4: Build and run the proof (GPU machine)
 //! cd /path/to/faberlang/hosts
-//! cargo test --manifest-path macos-arm64/Cargo.toml --test cuda_host_proof -- --nocapture
+//! cargo test -p host-cuda --test cuda_host_proof -- --nocapture
 //! ```
 //!
 //! ## Option B — Full script (GPU machine has everything)
@@ -82,9 +82,7 @@
 //! shapes, and explicit `launch` geometry. The G3 launch recipe stays
 //! grid `ceil(N / 256)`, block 256 (independent of the sidecar's workgroup).
 
-use faber_host_macos_arm64::{
-    CudaHostSession, NVVM_DESCRIPTOR_SCHEMA_VERSION, NVVM_DESCRIPTOR_TARGET,
-};
+use host_cuda::{CudaHostSession, NVVM_DESCRIPTOR_SCHEMA_VERSION, NVVM_DESCRIPTOR_TARGET};
 use serde::Deserialize;
 
 /// Sentinel bit pattern: every output byte is 0xFE. Prefilled into the output

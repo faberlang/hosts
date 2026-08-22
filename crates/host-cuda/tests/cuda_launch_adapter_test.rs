@@ -3,16 +3,16 @@
 
 use std::collections::BTreeMap;
 
-use faber_host_macos_arm64::cuda_host::FakeCudaDriver;
-use faber_host_macos_arm64::cuda_launch_adapter::{
+use host_cuda::cuda_host::FakeCudaDriver;
+use host_cuda::cuda_launch_adapter::{
     launch_descriptor, parse_descriptor, AdapterBufferRole, NumericOracle, NvvmElementType,
     NVVM_DESCRIPTOR_SCHEMA_VERSION,
 };
-use faber_host_macos_arm64::device_descriptor::{
+use host_cuda::CudaHostSession;
+use host_device_core::device_descriptor::{
     E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH,
     E_DEVICE_SHAPE_MISMATCH,
 };
-use faber_host_macos_arm64::CudaHostSession;
 
 /// The emitted `rung-0-matmul` v3 descriptor shape
 /// (`examples/gpu-workload/rung-0-matmul.fab` → `[2,3] × [3,2] → [2,2]`):

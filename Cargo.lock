@@ -485,11 +485,11 @@ dependencies = [
  "consolum",
  "faber",
  "host-coordinator",
+ "host-cuda",
  "host-device-core",
  "host-kernel",
  "http",
  "hygiene-ratchet",
- "libloading",
  "metal",
  "processus",
  "serde",
@@ -737,6 +737,18 @@ dependencies = [
  "faber",
  "hygiene-ratchet",
  "sha2",
+]
+
+[[package]]
+name = "host-cuda"
+version = "0.1.0"
+dependencies = [
+ "faber",
+ "host-coordinator",
+ "host-device-core",
+ "libloading",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

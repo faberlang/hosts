@@ -8,8 +8,8 @@
 
 pub mod component;
 pub mod composite_host;
-pub mod cuda_host;
-pub mod cuda_launch_adapter;
+pub use host_cuda as cuda_host;
+pub use host_cuda as cuda_launch_adapter;
 pub use host_device_core::device_descriptor;
 pub mod device_execute;
 pub mod device_host;

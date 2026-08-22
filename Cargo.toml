@@ -6,6 +6,7 @@ members = [
     "crates/consolum",
     "crates/host-coordinator",
     "crates/host-device-core",
+    "crates/host-cuda",
     "crates/http",
     "crates/processus",
     "crates/provider-contracts",

@@ -10,6 +10,7 @@ publish = false
 faber = { path = "../../faber/runtime/rust" }
 host-coordinator = { path = "../crates/host-coordinator" }
 host-device-core = { path = "../crates/host-device-core" }
+host-cuda = { path = "../crates/host-cuda" }
 host-kernel = { path = "../crates/host-kernel" }
 aleator = { path = "../crates/aleator" }
 consolum = { path = "../crates/consolum" }
@@ -20,12 +21,6 @@ tempus = { path = "../crates/tempus" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasmtime = "45"
-# Real CUDA Driver API binding for the SystemCudaDriver (lane C, G2). The one
-# justified driver dependency (cuda-first-product-proof goal §Normalized spec —
-# host): dlopen libcuda.so.1 and convert symbols to raw fn pointers at load time
-# (libloading::Symbol is not Send; the driver must stay Box<dyn CudaDriver>).
-libloading = "0.8"
-
 # Real Metal binding for the SystemMetalDriver (lane M, M2). macOS-only crate;
 # cfg-gated so the host crate compiles on Linux for CUDA proof runs (G3).
 [target.'cfg(target_os = "macos")'.dependencies]
