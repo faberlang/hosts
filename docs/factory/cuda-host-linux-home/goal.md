@@ -1,6 +1,6 @@
 # GOAL: cuda-host-linux-home — the CUDA host runtime is a peer product surface, not a macOS tenant
 
-**Status**: planned — pre-implementation; drafted 2026-08-21 from campaign evidence F3.1/F3.4; not lowered
+**Status**: active — lowered 2026-08-21 ([`delivery.md`](delivery.md) CLH-1..5; goal-check READY; priority — CLH-2 unlocks ELP-04; awaiting Mind dispatch)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.1, F3.4)
@@ -68,6 +68,8 @@ unconditionally — resolved by sibling goal device-route-backend-parity).
 | 3 | Module cache + teardown/leak-counter closure + adapter tests | 1 | none |
 | 4 | Linux build/run proof leg in scripta (pharos) | 1, 3 | none |
 
+Lowered to [`delivery.md`](delivery.md) as CLH-1..5: the extraction unit splits into CLH-1 (neutral `host-device-core` crate — forced by the trait/descriptor/registry types both backends share) + CLH-2 (`host-cuda` crate); unit 3 re-scoped (production `ProgramSession` already loads once per session and hash-shares modules; remaining debt is the real-driver deferred `cuModuleUnload`, zero real `DriverCounters`, and the adapter's per-launch reload — delivery §0).
+
 ## Validation
 
 - `cargo test --workspace` in hosts (macos-arm64 suite unchanged-green).
@@ -79,10 +81,11 @@ unconditionally — resolved by sibling goal device-route-backend-parity).
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | extraction |
-| 2 | pending | — | — | manifest host |
-| 3 | pending | — | — | module cache |
-| 4 | pending | — | — | linux proof |
+| CLH-1 | pending | — | — | host-device-core extraction |
+| CLH-2 | pending | — | — | host-cuda extraction (unlocks ELP-04) |
+| CLH-3 | pending | — | — | manifest host |
+| CLH-4 | pending | — | — | module lifecycle debt |
+| CLH-5 | pending | — | — | linux proof |
 
 ## Open questions
 

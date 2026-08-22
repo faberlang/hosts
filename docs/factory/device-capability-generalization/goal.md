@@ -1,6 +1,6 @@
 # GOAL: device-capability-generalization — the capability model describes and gates every backend
 
-**Status**: planned — pre-implementation; drafted 2026-08-21 from campaign evidence F3.3; dtype unit rides device-session-byte-surface
+**Status**: active — lowered 2026-08-21 ([`delivery.md`](delivery.md) DCG-1..4; goal-check READY; unit 3 re-scoped — F16 landed with ELP-07, consistency ratchet remains; awaiting Mind dispatch)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.3)
@@ -71,6 +71,8 @@ the model is too CUDA-shaped to gate Metal and too thin to launch CUDA.
 | 3 | DtypeSurface↔DeviceDataType consistency test (F16/BF16 slots with the byte-surface goal) | byte-surface unit 3 | none |
 | 4 | bound_plan fail-closed limit checks + tests | 1 | none |
 
+Lowered to [`delivery.md`](delivery.md) as DCG-1..4; unit 3 re-scoped to the consistency ratchet (F16 already landed via byte-surface DSB-3; BF16 slotless pending radix placement-debt-audit F2).
+
 ## Validation
 
 - `cargo test -p host-coordinator -p faber-host-macos-arm64` in hosts.
@@ -80,10 +82,10 @@ the model is too CUDA-shaped to gate Metal and too thin to launch CUDA.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | fields |
-| 2 | pending | — | — | policy gate |
-| 3 | pending | — | — | dtype consistency |
-| 4 | pending | — | — | plan checks |
+| DCG-1 | pending | — | — | fields |
+| DCG-2 | pending | — | — | policy gate |
+| DCG-3 | pending | — | — | dtype consistency ratchet |
+| DCG-4 | pending | — | — | plan checks |
 
 ## Open questions
 
