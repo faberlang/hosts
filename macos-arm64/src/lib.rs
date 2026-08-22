@@ -15,6 +15,7 @@ pub mod device_execute;
 pub mod device_host;
 pub use host_device_core::device_registry;
 pub mod device_runtime_set;
+pub mod distributed_translate;
 pub mod kernel;
 pub mod manifest;
 pub mod metal_host;
