@@ -82,7 +82,7 @@ Lowered to [`delivery.md`](delivery.md) as CLH-1..5: the extraction unit splits 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | CLH-1 | pending | — | — | host-device-core extraction |
-| CLH-2 | pending | — | — | host-cuda extraction (unlocks ELP-04) |
+| CLH-2 | done | prior seat (ended) | 2804c0d | host-cuda extraction landed; cargo check/test -p host-cuda and cargo test --workspace green; aliases clean (reconciled 2026-08-22) |
 | CLH-3 | pending | — | — | manifest host |
 | CLH-4 | pending | — | — | module lifecycle debt |
 | CLH-5 | pending | — | — | linux proof |
