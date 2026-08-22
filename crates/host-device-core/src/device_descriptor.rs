@@ -374,9 +374,14 @@ pub struct DescriptorBuffer {
 impl DescriptorBuffer {
     /// The byte length this slot expects on the device.
     #[must_use]
-    pub fn byte_length(&self) -> u64 {
-        self.element_count * u64::from(self.element_ty.byte_width() as u32)
+    pub fn byte_length(&self) -> Option<u64> {
+        checked_byte_length(self.element_count, self.element_ty)
     }
+}
+
+/// Checked byte length for a version-keyed buffer shape.
+fn checked_byte_length(element_count: u64, element_ty: DeviceDataType) -> Option<u64> {
+    element_count.checked_mul(element_ty.byte_width() as u64)
 }
 
 /// One kernel of a descriptor: entry, typed slots, and launch shape.
@@ -749,6 +754,22 @@ impl DeviceDescriptor {
                 return Err(errors::descriptor(format!(
                     "device descriptor buffer {} version {} has a zero element count",
                     version.buffer_id, version.version
+                )));
+            }
+            let Some(byte_length) = checked_byte_length(version.element_count, version.element_ty)
+            else {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor buffer {} version {} has an overflowing element count {} for {}",
+                    version.buffer_id,
+                    version.version,
+                    version.element_count,
+                    version.element_ty.spelling()
+                )));
+            };
+            if usize::try_from(byte_length).is_err() {
+                return Err(errors::shape_mismatch(format!(
+                    "device descriptor buffer {} version {} needs {} bytes, which overflows the host address space",
+                    version.buffer_id, version.version, byte_length
                 )));
             }
             if let Some(first) = versions.iter().find(|first| {

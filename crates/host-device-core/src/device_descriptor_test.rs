@@ -55,3 +55,66 @@ fn placement_discriminant_maps_to_device_data_type() {
     assert_eq!(DeviceDataType::F64.placement_discriminant(), Some(12));
     assert_eq!(DeviceDataType::BF16.placement_discriminant(), None);
 }
+
+#[test]
+fn byte_length_rejects_u64_overflow() {
+    let buffer = DescriptorBuffer {
+        buffer_id: 1,
+        buffer_name: "overflow".to_owned(),
+        semantic_value: 1,
+        role: DeviceBufferRole::InOut,
+        lifetime: DeviceBufferLifetime::PerProgram,
+        initialization: DeviceBufferInitialization::ZeroFill,
+        binding: 0,
+        element_ty: DeviceDataType::F32,
+        element_count: u64::MAX,
+        version: 1,
+    };
+
+    assert_eq!(buffer.byte_length(), None);
+}
+
+#[test]
+fn validate_rejects_overflowing_buffer_byte_length() {
+    let count = u64::MAX;
+    let slot = DescriptorBuffer {
+        buffer_id: 1,
+        buffer_name: "overflow".to_owned(),
+        semantic_value: 1,
+        role: DeviceBufferRole::InOut,
+        lifetime: DeviceBufferLifetime::PerProgram,
+        initialization: DeviceBufferInitialization::ZeroFill,
+        binding: 0,
+        element_ty: DeviceDataType::F32,
+        element_count: count,
+        version: 1,
+    };
+    let descriptor = DeviceDescriptor {
+        backend: DeviceBackend::Metal,
+        module_image: vec![1],
+        kernels: vec![DescriptorKernel {
+            entry: "kernel".to_owned(),
+            buffers: vec![slot],
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+        }],
+        launches: vec![DescriptorLaunch {
+            id: 1,
+            kernel_index: 0,
+        }],
+        buffer_versions: vec![DescriptorBufferVersion {
+            buffer_id: 1,
+            version: 1,
+            element_ty: DeviceDataType::F32,
+            element_count: count,
+        }],
+        program_lifetime: DeviceProgramLifetime::SingleRun,
+        data_flow: Vec::new(),
+        roots: vec![1],
+        results: Vec::new(),
+        end_of_run_results: Vec::new(),
+    };
+
+    let error = descriptor.validate().expect_err("overflowing descriptor");
+    assert_eq!(error.code, E_DEVICE_SHAPE_MISMATCH);
+}

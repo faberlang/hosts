@@ -503,6 +503,16 @@ fn copy_resident_inputs(
     Ok(copies)
 }
 
+fn zero_fill_buffer(
+    runtime: &mut DeviceRuntime,
+    handle: &DeviceHandle,
+    byte_length: u64,
+) -> HostResult<()> {
+    let zero_count = usize::try_from(byte_length / 4)
+        .map_err(|_| HostError::internal("zero-fill element count overflows usize"))?;
+    runtime.copy_in_f32(handle, &vec![0.0; zero_count])
+}
+
 /// Copy this kernel's declared host inputs into their slots for this
 /// execution, returning the number of copy-ins performed. `PerStep`
 /// mode copies every declared Input slot (`SingleRun`); `ResidentStep`
@@ -648,20 +658,25 @@ impl<'host> ProgramSession<'host> {
                 let mut slots = Vec::with_capacity(kernel.buffers.len());
                 for slot in &kernel.buffers {
                     let key = (slot.buffer_id, slot.version);
+                    let byte_length = slot.byte_length().ok_or_else(|| {
+                        descriptor_errors::shape_mismatch(format!(
+                            "device buffer `{}` (id {}) has an overflowing byte length",
+                            slot.buffer_name, slot.buffer_id
+                        ))
+                    })?;
                     buffer_meta.entry(key).or_insert(SessionBufferMeta {
                         name: slot.buffer_name.clone(),
                         semantic_value: slot.semantic_value,
                         role: slot.role,
                         element_ty: slot.element_ty,
                         element_count: slot.element_count,
-                        byte_length: slot.byte_length(),
+                        byte_length,
                         lifetime: slot.lifetime,
                         initialization: slot.initialization,
                     });
                     if !buffers.contains_key(&key)
                         && slot.lifetime == DeviceBufferLifetime::PerProgram
                     {
-                        let byte_length = slot.byte_length();
                         if let Some(shared) =
                             share.and_then(|share| share.buffers.get(&slot.semantic_value))
                         {
@@ -680,17 +695,20 @@ impl<'host> ProgramSession<'host> {
                             buffers.insert(key, shared.handle);
                             shared_keys.insert(key);
                         } else {
-                            let handle = runtime.alloc_bytes(byte_length as usize)?;
+                            let byte_length_usize = usize::try_from(byte_length).map_err(|_| {
+                                descriptor_errors::shape_mismatch(format!(
+                                    "device buffer `{}` (id {}) needs {} bytes, which overflows the host address space",
+                                    slot.buffer_name, slot.buffer_id, byte_length
+                                ))
+                            })?;
+                            let handle = runtime.alloc_bytes(byte_length_usize)?;
                             // G4 (F5): honor the carried initialization axis —
                             // ZeroFill persistent state (accumulation buffers,
                             // optimizer state) is zeroed EXACTLY ONCE at
                             // allocation so repeated executions accumulate onto
                             // a defined initial state.
                             if slot.initialization == DeviceBufferInitialization::ZeroFill {
-                                runtime.copy_in_f32(
-                                    &handle,
-                                    &vec![0.0; slot.element_count as usize],
-                                )?;
+                                zero_fill_buffer(runtime, &handle, byte_length)?;
                             }
                             buffers.insert(key, handle);
                             owned_handles.push(handle);
@@ -1478,8 +1496,7 @@ impl<'host> ProgramSession<'host> {
                 .get(&key)
                 .copied()
                 .ok_or_else(|| HostError::internal("session state buffer disappeared"))?;
-            self.runtime
-                .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
+            zero_fill_buffer(&mut self.runtime, &handle, meta.byte_length)?;
             cleared += 1;
         }
         Ok(cleared)
@@ -1793,6 +1810,12 @@ impl<'host> ProgramSession<'host> {
                 .buffer_meta
                 .get(&key)
                 .ok_or_else(|| HostError::internal("session buffer metadata disappeared"))?;
+            let byte_length = usize::try_from(meta.byte_length).map_err(|_| {
+                descriptor_errors::shape_mismatch(format!(
+                    "device buffer `{}` (id {}) needs {} bytes, which overflows the host address space",
+                    meta.name, key.0, meta.byte_length
+                ))
+            })?;
             let handle = if use_intermediate_pool {
                 match self.inner.intermediate_pool.checkout(key) {
                     Some(handle) => {
@@ -1801,19 +1824,18 @@ impl<'host> ProgramSession<'host> {
                     }
                     None => {
                         pool_allocations += 1;
-                        self.runtime.alloc_bytes(meta.byte_length as usize)?
+                        self.runtime.alloc_bytes(byte_length)?
                     }
                 }
             } else {
-                self.runtime.alloc_bytes(meta.byte_length as usize)?
+                self.runtime.alloc_bytes(byte_length)?
             };
             // G4 (F5): honor the carried initialization axis at every
             // checkout — a ZeroFill step buffer (per-step accumulation state)
             // is reset before it comes live, whether its handle was newly
             // allocated or reused from the pool.
             if meta.initialization == DeviceBufferInitialization::ZeroFill {
-                self.runtime
-                    .copy_in_f32(&handle, &vec![0.0; meta.element_count as usize])?;
+                zero_fill_buffer(&mut self.runtime, &handle, meta.byte_length)?;
             }
             self.inner.buffers.insert(key, handle);
         }
