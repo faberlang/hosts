@@ -1,6 +1,6 @@
 # GOAL: md3h-virtual-partition-host — every device run admits through a virtual partition
 
-**Status**: active — W0 LANDED+Mind-verified 2026-08-22 (R1 `6b503ef5c` 580/0, F1 `be69f5ace` 179/0+fixtures, H1 `34aa2cc` with burgus-Metal + pharos-CUDA identity receipts); W1 H2 LANDED (`cb79d8f` DeviceRuntimeSet + real backend, absorbs MD1-H1/MD3-S1) + X1 LANDED (`8ec2abd` real-backend fault suite); H3 LANDED (`295eb2a` implicit_local N=1 admission; hygiene `26e191ea`/`68c24046`/`f5370d5d`) + H4 LANDED (H4p1 `5e0cec9`/`7f2276f` translation, H4p2 `57cb94ce` distributed-image CLI); spine H1→H2→H3→C1→P1→C2 (C1 running; P1/P2 remain)
+**Status**: done — all seven hosts units landed (H1 `34aa2cc`, H2 `cb79d8f`, H3 `295eb2a`, H4 `57cb94ce`, X1 `8ec2abd`, P1 `b6eb130` + radix seam receipt `91ff94bed`, P2 `a6096eb` + evidence `eb1c76fca`); closeout 2026-08-22: `cargo test -p faber-host-macos-arm64` green and `cargo test -p host-coordinator --lib` 137 passed; pharos CUDA 8:1 mechanics PASS with assertion tail + plan hashes; 8:8 deferred with RunPod gate (NOT ATTEMPTED, not failed).
 **Created**: 2026-08-21
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3H + the 2026-08-21 operator amendment (uniform N=1; eight-rank bind); lowered spec [`md3h-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3h-delivery.md)
@@ -66,13 +66,13 @@ ledger authority):
 
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
-| MD3H-H1 | Multi-ordinal discovery into physical-identity facts; ordinal-0 hardcode removed | — | none |
+| MD3H-H1 | Multi-ordinal discovery into physical-identity facts; ordinal-0 hardcode removed | — | `34aa2cc` |
 | MD3H-H2 | `DeviceRuntimeSet` + real `DeviceExecutionBackend` (absorbs MD1-H1/MD3-S1) | MD3H-H1 | `cb79d8f` |
 | MD3H-H3 | CompositeHost + device-execute uniform admission; partition-free path deleted | MD3H-H2 + **MD3H-WIN** window | `295eb2a` |
 | MD3H-H4 | Distributed-section ingestion + mirror translation + CLI arg surface | MD3H-F1 (radix), MD3H-H2 | `57cb94ce` |
 | MD3H-X1 | Real-backend fault injection suite (no partial commit) | MD3H-H2 | `8ec2abd` |
-| MD3H-P2 | 8:1 mechanics proof + honest receipts + NOT ATTEMPTED 8:8 row | MD3H-H3, MD3H-H4, MD3H-F1 | none |
-| MD3H-P1 | N=1 parity on existing single-device fixtures (co-tracked with radix) | MD3H-C1 (radix) | none |
+| MD3H-P2 | 8:1 mechanics proof + honest receipts + NOT ATTEMPTED 8:8 row | MD3H-H3, MD3H-H4, MD3H-F1 | `a6096eb` + evidence `eb1c76fca` |
+| MD3H-P1 | N=1 parity on existing single-device fixtures (co-tracked with radix) | MD3H-C1 (radix) | `b6eb130` + radix `91ff94bed` |
 
 Pre-dependencies on radix units are named by ID (`MD3H-F1`, `MD3H-C1`,
 `MD3H-R1`); routing/ordering is the Mind's. The spine is
@@ -92,13 +92,41 @@ to H3 on disjoint files once H2 lands.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| MD3H-H1 | pending | — | — | discovery |
+| MD3H-H1 | done | hand | `34aa2cc` | structural: per-ordinal CUDA + Metal enumeration into discovery facts; ordinal remains a locator while PCI UUID / driver UUID and Metal registry identities remain distinct. W0 burgus-Metal + pharos-CUDA identity receipts were recorded. |
 | MD3H-H2 | done | hand | `cb79d8f` | structural: DeviceRuntimeSet + DeviceRuntimeBackend (no host-coordinator trait extension). measured: absent in this commit — live Metal/CUDA tests env-gated PENDING when not admitted; no burgus/pharos machine receipt |
 | MD3H-H3 | done | hand | `295eb2a` | structural: VirtualDevicePartition::implicit_local N=1 → BoundPlanKind::ImplicitLocal; partition-free product construction deleted; DeviceSelection backend-kind-only; N=1 coordinator-free (copy_ins=2, TransportClass::None). Hygiene `26e191ea`/`68c24046`/`f5370d5d`. measured: detached `cargo test -p host-coordinator` 134 passed; `cargo test -p faber-host-macos-arm64` wasm 3 passed. No live pharos CUDA admission receipt |
 | MD3H-H4 | done | hand | `57cb94ce` | structural: H4p1 `5e0cec9`/`7f2276f` F1 postcard → transaction mirror; OnePhysicalPerPartition TopologyMismatch on 1-physical snapshot; OQ-2 macos-arm64 radix-mir-fmir dep (host-coordinator serde-free). H4p2 `57cb94ce` `--distributed-image` + `--bind-count`. measured: detached distributed_translate_test 10 passed; device_execute_cli_test 38 passed; package green. Residual: live pharos CUDA CLI spawn not exercised on burgus |
 | MD3H-X1 | done | hand | `8ec2abd` | structural: 5 Metal + 1 CUDA fault tests (cancel/timeout/kernel/transfer/device-loss; no partial publication). measured: absent in this commit — live tests skip when Metal/CUDA not admitted; CUDA helper is pending-when-unreachable |
-| MD3H-P2 | pending | — | — | 8:1 proof |
-| MD3H-P1 | pending | — | — | parity (with radix) |
+| MD3H-P2 | done | hand | `a6096eb` + radix evidence `eb1c76fca` | measured: pharos CUDA 8:1 mechanics PASS. Assertion tail: `physical_device_count=1`, `virtual_partition_count=8`, `fixture_identity_class=virtual`, `transport_class=host_staged`, `hardware_isolation_claimed=false`, `bind_shape=8:1`, `transaction_state=prepared`; snapshot `a4015cf258c8cac0e424bafb516a9d94f2525bf536b0c34bc9407345c6e00387`; logical plan `sha256:84e98067c1ea23e5b1cb3167851f72354731f0eddf0e562835309ad228684bd4`; bound plan `sha256:06a6716ca57b64dfa379ca341063fa9d247d5e87b67b9279d24fced378d98d46`. Promotion to 8 physical rejected as `TopologyMismatch`. Residual 8:8 is deferred with the RunPod 8× same-SKU gate (`NOT ATTEMPTED`, not failed). |
+| MD3H-P1 | done | hand | `b6eb130` + radix `91ff94bed` | measured: cross-backend Metal + CUDA parity. Both backends run the same numeric session twice with outputs `[4.0, 6.0]`, `launches=1`, `copy_ins=2`, `readbacks=1`, `transfers=3`, and zero live handles after teardown. Radix host-seam receipt is 1:1 with `communication_graph_edge_count=0` and `hardware_isolation_claimed=false`. |
+
+## Closeout (2026-08-22)
+
+The hosts goal is closed independently of the parent campaign. The named
+closeout gates are green:
+
+- `cargo test -p faber-host-macos-arm64` passed all non-ignored host tests.
+  The P2 pharos test remains ignored locally because it requires the admitted
+  CUDA machine; its measured pharos run is recorded in the radix evidence
+  receipt below.
+- `cargo test -p host-coordinator --lib` passed 137 tests.
+- P1 cross-backend parity is measured on Metal and CUDA in
+  `macos-arm64/tests/composite_host_admission_test.rs` and through the radix
+  host seam. N=1 preserves the numeric/session/leak bars and the distributed
+  receipt has zero communication edges.
+- P2's measured pharos CUDA proof is the 8:1 mechanics row only. Its assertion
+  tail and plan hashes are recorded in
+  `radix/docs/factory/gpu-inference-multi-device/md3h-8on1-evidence.md` at
+  commit `eb1c76fca`; the one-device promotion rejection is
+  `TopologyMismatch`.
+- The 8:8 row is deferred with the named RunPod 8× same-SKU gate. It is
+  `NOT ATTEMPTED`, not failed, and this goal makes no physical-capacity or
+  speedup claim. The 8:2 row is likewise not attempted.
+
+The parent `gpu-inference-multi-device` campaign remains active. This archive
+closes only the hosts-side MD3H goal; campaign work outside it, including the
+MD3I token/sequence commit stage, the Gradus PML5 executed oracle, and later
+MD4A–MD7 stages, remains open/planned in the campaign record.
 
 ## Open questions
 
