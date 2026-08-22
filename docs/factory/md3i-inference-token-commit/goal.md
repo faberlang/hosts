@@ -5,7 +5,7 @@
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3I + the 2026-08-21 amendment (MD3I follows MD3H); lowered spec [`md3i-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3i-delivery.md); frozen session facts [`gi4-contract.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-contract.md) §1–§6; ownership amendment [`gi4-ownership-amendment.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-ownership-amendment.md)
 **Repos:** `hosts` (primary: `macos-arm64` product host — the commit binding is a consumers-side layer; `host-coordinator` is **read-only**), `radix` (fixture surface only)
-**Related:** archived [`md3h-virtual-partition-host`](../md3h-virtual-partition-host/goal.md) (uniform virtual-partition path + real backend + distributed seam) · archived [`kv-cache-model-session`](../../../../radix/docs/archived/kv-cache-model-session/goal.md) (D1/D4 logical sequence machine MD3I binds) · device-executor M8 / gpu-production-readiness (seam adjacency — see MD3I-WIN)
+**Related:** archived [`md3h-virtual-partition-host`](../archived/md3h-virtual-partition-host/goal.md) (uniform virtual-partition path + real backend + distributed seam) · archived [`kv-cache-model-session`](../../../../radix/docs/archived/kv-cache-model-session/goal.md) (D1/D4 logical sequence machine MD3I binds) · device-executor M8 / gpu-production-readiness (seam adjacency — see MD3I-WIN)
 
 ---
 
@@ -60,6 +60,9 @@ authority):
    fixtures.
 8. **P2** 8:1 token-commit mechanics proof with honest receipts; 8:8
    NOT ATTEMPTED (RunPod hardware gate).
+9. **C3** (radix-owned) closeout: exit-gate evidence table + CAMPAIGN
+   status + this goal's ledger (the `md3i-closeout.md` doc lives in the
+   radix campaign dir).
 
 ### Non-goals
 
@@ -82,11 +85,15 @@ authority):
 | MD3I-X1 | token-commit fault suite (tests, disjoint from C2 files) | MD3I-C2, MD3I-F2 |
 | MD3I-P1 | N=1 parity on existing single-device fixtures (co-tracked with radix) | MD3I-C2 |
 | MD3I-P2 | 8:1 token-commit mechanics proof + honest receipts + NOT ATTEMPTED 8:8 | MD3I-C2, MD3I-F1, MD3I-X1 |
+| MD3I-C3 | closeout: exit-gate table, CAMPAIGN status, this ledger (radix-owned closeout doc) | all units |
 
 Pre-dependencies on radix units are named by ID (`MD3I-F1`); routing/ordering
-is the Mind's. The spine is C1 → S1 ‖ F2 → C2 (one writer on the
-`macos-arm64` hot files); X1 runs parallel to C2 on disjoint files once C2
-lands; P1/P2 are the proof wave.
+is the Mind's. The spine is C1 → S1 ‖ F2 → C2 → X1 ‖ P1 → P2 → C3.
+C2 is a **named mega-row** with one writer on the `macos-arm64` hot files —
+it dispatches alone behind the MD3I-WIN gate, never in parallel. X1 (fault
+suite) and P1 (N=1 parity) run **after** C2, in parallel with each other on
+disjoint files; P2 follows X1; C3 closes out all nine units (this ledger's
+C3 row is ticked by the radix closeout).
 
 ## Validation
 
@@ -109,6 +116,7 @@ lands; P1/P2 are the proof wave.
 | MD3I-X1 | planned | — | — | — |
 | MD3I-P1 | planned | — | — | — |
 | MD3I-P2 | planned | — | — | — |
+| MD3I-C3 | planned | — | — | closeout edits this ledger + CAMPAIGN status; radix `md3i-closeout.md` is the primary closeout doc owner |
 
 ## Open questions
 
