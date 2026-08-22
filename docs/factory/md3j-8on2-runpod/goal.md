@@ -99,7 +99,7 @@ device-executor M8, `cuda-host-linux-home`), never a process-only
 | MD3J-F1 | landed | hand | radix 5bf4ce6d8 + hosts c192dd4 | 8GiB fixtures + over-budget variant; graph bytes preserved; 186 fmir tests green |
 | MD3J-B1 | landed | hand | hosts 6614514 (red) + 8593996 (green) | split policy 8:2; 21/21; deterministic 4+4; fail-closed both directions |
 | MD3J-B2 | landed | hand | hosts 5c5d756 (red) + 216e1c5 (green) | oq2_default_headroom_policy floor(api_total x 0.9); BindError::BudgetExceeded class + byte facts; 25/25 + 137+1; host-coordinator touch = one ADDITIVE BindError variant (disclosed) |
-| MD3J-P1 | planned | — | — | gate MD3J-RP: operator mail for pod admission (RunPod account operator-held) |
+| MD3J-P1 | planned | — | — | gate MD3J-RP REDUCED (operator 2026-08-22): runpodctl 2.9.0 installed; earlier trials auto-provisioned+tore down; the gate is ONLY a valid RUNPOD_API_KEY in the seat env — then P1 self-provisions (2x same-SKU dc-a100 default) and tears down |
 | MD3J-C1 | planned | — | — | closeout edits this ledger + CAMPAIGN MD3J status |
 
 ## Open questions
