@@ -185,23 +185,217 @@ fn qkv_projection_applies_qwen_bias_and_gqa_rope_in_one_body() {
 #[test]
 fn residual_rms_norm_preserves_residual_then_rms_order() {
     let bind = BindDescriptor::row_major(vec![2, 4], [1, 1, 1]);
-    let residual = [0.25f32, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0];
+    let residual_values = [0.25f32, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0];
     let skip = [0.5f32, 0.25, -0.25, 0.75, -0.5, 0.5, -0.75, 1.0];
     let gamma = [1.0f32, 0.9, 1.1, 0.8];
     let mut summed = [0.0f32; 8];
     let mut expected = [0.0f32; 8];
-    residual(&bind, &residual, &skip, &mut summed).expect("residual baseline");
+    residual(&bind, &residual_values, &skip, &mut summed).expect("residual baseline");
     rms(&bind, &summed, &gamma, &mut expected, 1e-5).expect("RMS baseline");
 
     let selected = select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::RowMajor)
         .expect("ResidualRmsNorm selector")
         .expect("ResidualRmsNorm body selected");
     let mut actual = [0.0f32; 8];
-    dispatch_residual_rms_norm(selected, &bind, &residual, &skip, &gamma, &mut actual, 1e-5)
-        .expect("ResidualRmsNorm body");
+    dispatch_residual_rms_norm(
+        selected,
+        &bind,
+        &residual_values,
+        &skip,
+        &gamma,
+        &mut actual,
+        1e-5,
+    )
+    .expect("ResidualRmsNorm body");
     assert_eq!(actual, expected, "fused arithmetic order changed");
     assert!(matches!(
         select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::Flat),
         Err(KernelBodyError::InvalidBind(message)) if message.contains("not servable")
     ));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupedExpertAnalog {
+    name: &'static str,
+    rows: usize,
+    columns: usize,
+}
+
+const GROUPED_EXPERT_ANALOGS: [GroupedExpertAnalog; 2] = [
+    GroupedExpertAnalog {
+        name: "smollm2-360m-gqa",
+        rows: 3,
+        columns: 5,
+    },
+    GroupedExpertAnalog {
+        name: "qwen2.5-0.5b-gqa",
+        rows: 7,
+        columns: 2,
+    },
+];
+
+const GROUPED_EXPERT_K: usize = 32;
+const GROUPED_EXPERT_COUNT: usize = 2;
+
+fn grouped_q8_0_block(value: i8) -> Vec<u8> {
+    let mut block = vec![0x00, 0x3c]; // f16 scale = 1.0
+    block.extend(std::iter::repeat_n(value as u8, GROUPED_EXPERT_K));
+    block
+}
+
+fn grouped_expert_activation(fixture: GroupedExpertAnalog) -> Vec<f32> {
+    (0..fixture.rows * GROUPED_EXPERT_K)
+        .map(|index| {
+            let row = index / GROUPED_EXPERT_K;
+            let element = index % GROUPED_EXPERT_K;
+            0.5 + row as f32 * 0.25 + element as f32 * 0.01
+        })
+        .collect()
+}
+
+fn grouped_expert_packed_weights(fixture: GroupedExpertAnalog, tied: bool) -> Vec<u8> {
+    (0..GROUPED_EXPERT_COUNT)
+        .flat_map(|expert| {
+            (0..fixture.columns).flat_map(move |column| {
+                let value = if tied {
+                    column + 1
+                } else {
+                    expert * 2 + column + 1
+                };
+                grouped_q8_0_block(value as i8)
+            })
+        })
+        .collect()
+}
+
+fn grouped_expert_reference(fixture: GroupedExpertAnalog, tied: bool) -> (Vec<Vec<f32>>, Vec<f32>) {
+    let activation = grouped_expert_activation(fixture);
+    let mut intermediates =
+        vec![vec![0.0f32; fixture.rows * fixture.columns]; GROUPED_EXPERT_COUNT];
+    for (expert, rows) in intermediates.iter_mut().enumerate() {
+        for row in 0..fixture.rows {
+            for column in 0..fixture.columns {
+                let value = if tied {
+                    column + 1
+                } else {
+                    expert * 2 + column + 1
+                };
+                let weight = value as f32;
+                rows[row * fixture.columns + column] = (0..GROUPED_EXPERT_K)
+                    .map(|element| activation[row * GROUPED_EXPERT_K + element] * weight)
+                    .sum();
+            }
+        }
+    }
+    let mut accumulated = vec![0.0f32; fixture.rows * fixture.columns];
+    for rows in &intermediates {
+        for (output, value) in accumulated.iter_mut().zip(rows) {
+            *output += *value;
+        }
+    }
+    (intermediates, accumulated)
+}
+
+fn grouped_expert_bind(fixture: GroupedExpertAnalog, experts: usize) -> GroupedExpertGemmBind {
+    GroupedExpertGemmBind::contiguous(
+        fixture.rows as u64,
+        GROUPED_EXPERT_K as u64,
+        fixture.columns as u64,
+        experts as u64,
+        QuantizedFormat::Q8_0,
+        [fixture.columns as u32, fixture.rows as u32, 1],
+    )
+}
+
+#[test]
+fn grouped_expert_gemm_matches_gqa_shape_analogs_and_accumulates_segments() {
+    for fixture in GROUPED_EXPERT_ANALOGS {
+        let bind = grouped_expert_bind(fixture, GROUPED_EXPERT_COUNT);
+        let shapes = [[GROUPED_EXPERT_K as u64, fixture.columns as u64]; GROUPED_EXPERT_COUNT];
+        let activation = grouped_expert_activation(fixture);
+        let packed = grouped_expert_packed_weights(fixture, false);
+        let (expected_intermediates, expected) = grouped_expert_reference(fixture, false);
+        let mut actual = vec![0.0f32; fixture.rows * fixture.columns];
+        dispatch_grouped_expert_gemm(
+            GroupedExpertGemmKernel::Packed,
+            &bind,
+            &shapes,
+            &activation,
+            &packed,
+            &mut actual,
+        )
+        .unwrap_or_else(|error| panic!("{} grouped body: {error}", fixture.name));
+        assert_eq!(actual, expected, "{} accumulated output", fixture.name);
+
+        // Run each segment as a one-expert dispatch.  This checks the packed
+        // weights and each expert intermediate independently of accumulation.
+        let one_expert_bind = grouped_expert_bind(fixture, 1);
+        let expert_stride = bind.packed_expert_stride_bytes as usize;
+        for expert in 0..GROUPED_EXPERT_COUNT {
+            let start = expert * expert_stride;
+            let end = start + expert_stride;
+            let mut intermediate = vec![0.0f32; fixture.rows * fixture.columns];
+            dispatch_grouped_expert_gemm(
+                GroupedExpertGemmKernel::Packed,
+                &one_expert_bind,
+                &[[GROUPED_EXPERT_K as u64, fixture.columns as u64]],
+                &activation,
+                &packed[start..end],
+                &mut intermediate,
+            )
+            .unwrap_or_else(|error| panic!("{} expert {expert}: {error}", fixture.name));
+            assert_eq!(
+                intermediate, expected_intermediates[expert],
+                "{} expert {expert} intermediate",
+                fixture.name
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_expert_gemm_tied_contributions_are_byte_deterministic() {
+    let fixture = GROUPED_EXPERT_ANALOGS[0];
+    let bind = grouped_expert_bind(fixture, GROUPED_EXPERT_COUNT);
+    let shapes = [[GROUPED_EXPERT_K as u64, fixture.columns as u64]; GROUPED_EXPERT_COUNT];
+    let activation = grouped_expert_activation(fixture);
+    let packed = grouped_expert_packed_weights(fixture, true);
+    let (_, expected) = grouped_expert_reference(fixture, true);
+    let mut first = vec![0.0f32; fixture.rows * fixture.columns];
+    let mut second = vec![0.0f32; fixture.rows * fixture.columns];
+    for output in [&mut first, &mut second] {
+        dispatch_grouped_expert_gemm(
+            GroupedExpertGemmKernel::Packed,
+            &bind,
+            &shapes,
+            &activation,
+            &packed,
+            output,
+        )
+        .expect("tied grouped expert body");
+    }
+    assert_eq!(first, expected, "tied expert accumulation oracle");
+    assert_eq!(first, second, "expert traversal must be deterministic");
+}
+
+#[test]
+fn grouped_expert_gemm_rejects_mixed_shape_batches_before_buffer_access() {
+    let fixture = GROUPED_EXPERT_ANALOGS[0];
+    let bind = grouped_expert_bind(fixture, GROUPED_EXPERT_COUNT);
+    let mixed_shapes = [[GROUPED_EXPERT_K as u64, fixture.columns as u64], [31, 1]];
+    let mut output = [f32::NAN; 15];
+    let error = dispatch_grouped_expert_gemm(
+        GroupedExpertGemmKernel::Packed,
+        &bind,
+        &mixed_shapes,
+        &[],
+        &[],
+        &mut output,
+    )
+    .expect_err("mixed-shape expert batch must fail closed");
+    assert!(matches!(
+        error,
+        KernelBodyError::ShapeMismatch(message) if message.contains("mixed-shape")
+    ));
+    assert!(output.iter().all(|value| value.is_nan()));
 }

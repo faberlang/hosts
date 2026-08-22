@@ -373,6 +373,199 @@ impl QuantizedGemvBind {
     }
 }
 
+/// Layout family for one grouped expert GEMM body.
+///
+/// The body accepts one rank-2 activation and a contiguous rank-3 expert
+/// weight region.  `Rank3Experts` is the only layout admitted here; an
+/// unsupported layout must be resolved by the plan owner before dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedExpertGemmLayout {
+    /// Expert weights are segmented as `[expert, k, n]` packed slices.
+    Rank3Experts,
+    /// Sentinel used by callers that have not proved a servable layout.
+    Unsupported,
+}
+
+/// Bind facts for one grouped expert GEMM invocation.
+///
+/// Activations are logical `[rows, k]`, outputs are `[rows, n]`, and packed
+/// weights are logical `[experts, k, n]`.  Each output column owns a stream of
+/// packed blocks, and each expert owns a fixed-size slice of those columns.
+/// The body never infers any of these spans from a byte-buffer length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupedExpertGemmBind {
+    /// Number of activation/output rows (`M`).
+    pub rows: u64,
+    /// Contracted activation width (`K`).
+    pub k: u64,
+    /// Output width per expert (`N`).
+    pub n: u64,
+    /// Number of active expert slices in the packed region.
+    pub experts: u64,
+    /// Physical element stride between activation rows.
+    pub input_row_stride: u64,
+    /// Physical element stride between output rows.
+    pub output_row_stride: u64,
+    /// Physical byte stride between packed columns in one expert slice.
+    pub packed_column_stride_bytes: u64,
+    /// Physical byte stride between expert slices.
+    pub packed_expert_stride_bytes: u64,
+    /// Packed weight format delegated to the landed per-format substrate.
+    pub format: QuantizedFormat,
+    /// Shape family selected by the executor.
+    pub layout: GroupedExpertGemmLayout,
+    /// Backend-neutral launch grid carried into the plan record.
+    pub grid: [u32; 3],
+}
+
+impl GroupedExpertGemmBind {
+    /// Construct a contiguous rank-3 expert bind.
+    #[must_use]
+    pub fn contiguous(
+        rows: u64,
+        k: u64,
+        n: u64,
+        experts: u64,
+        format: QuantizedFormat,
+        grid: [u32; 3],
+    ) -> Self {
+        let packed_column_stride_bytes = k
+            .div_ceil(format.block_elements())
+            .saturating_mul(format.block_bytes());
+        let packed_expert_stride_bytes = n.saturating_mul(packed_column_stride_bytes);
+        Self {
+            rows,
+            k,
+            n,
+            experts,
+            input_row_stride: k,
+            output_row_stride: n,
+            packed_column_stride_bytes,
+            packed_expert_stride_bytes,
+            format,
+            layout: GroupedExpertGemmLayout::Rank3Experts,
+            grid,
+        }
+    }
+
+    /// Validate static shape, stride, dispatch, and packed-span facts before
+    /// a grouped body touches any buffer.
+    pub fn validate(&self) -> Result<(), KernelBodyError> {
+        if self.rows == 0 || self.k == 0 || self.n == 0 || self.experts == 0 {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM has a zero dimension",
+            ));
+        }
+        if self.layout != GroupedExpertGemmLayout::Rank3Experts {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM layout is not servable",
+            ));
+        }
+        if self.input_row_stride == 0
+            || self.output_row_stride == 0
+            || self.packed_column_stride_bytes == 0
+            || self.packed_expert_stride_bytes == 0
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM has a zero stride",
+            ));
+        }
+        if self.grid.iter().any(|axis| *axis == 0) {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM has a zero dispatch axis",
+            ));
+        }
+        if !self.k.is_multiple_of(self.format.block_elements()) {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM K is not block aligned",
+            ));
+        }
+        let blocks_per_column = self.k / self.format.block_elements();
+        let minimum_column_bytes = blocks_per_column
+            .checked_mul(self.format.block_bytes())
+            .ok_or(KernelBodyError::InvalidBind(
+                "grouped expert GEMM packed column span overflow",
+            ))?;
+        if self.packed_column_stride_bytes < minimum_column_bytes {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM packed column stride is too small",
+            ));
+        }
+        let minimum_expert_bytes = self.n.checked_mul(self.packed_column_stride_bytes).ok_or(
+            KernelBodyError::InvalidBind("grouped expert GEMM expert stride overflow"),
+        )?;
+        if self.packed_expert_stride_bytes < minimum_expert_bytes {
+            return Err(KernelBodyError::InvalidBind(
+                "grouped expert GEMM expert stride is too small",
+            ));
+        }
+        self.input_span().ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM input span overflow",
+        ))?;
+        self.output_span().ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM output span overflow",
+        ))?;
+        self.weight_span().ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM weight span overflow",
+        ))?;
+        Ok(())
+    }
+
+    fn input_span(self) -> Option<u64> {
+        self.k
+            .checked_sub(1)
+            .and_then(|last| last.checked_add(1))
+            .and_then(|width| {
+                self.rows
+                    .checked_sub(1)
+                    .and_then(|last| last.checked_mul(self.input_row_stride))
+                    .and_then(|last| last.checked_add(width))
+            })
+    }
+
+    fn output_span(self) -> Option<u64> {
+        self.n
+            .checked_sub(1)
+            .and_then(|last| last.checked_add(1))
+            .and_then(|width| {
+                self.rows
+                    .checked_sub(1)
+                    .and_then(|last| last.checked_mul(self.output_row_stride))
+                    .and_then(|last| last.checked_add(width))
+            })
+    }
+
+    fn weight_span(self) -> Option<u64> {
+        let column_bytes = self
+            .k
+            .checked_div(self.format.block_elements())?
+            .checked_mul(self.format.block_bytes())?;
+        self.experts
+            .checked_sub(1)?
+            .checked_mul(self.packed_expert_stride_bytes)?
+            .checked_add(
+                self.n
+                    .checked_sub(1)?
+                    .checked_mul(self.packed_column_stride_bytes)?,
+            )?
+            .checked_add(column_bytes)
+    }
+
+    fn validate_expert_shapes(self, shapes: &[[u64; 2]]) -> Result<(), KernelBodyError> {
+        if shapes.len() != checked_usize(self.experts)? {
+            return Err(KernelBodyError::ShapeMismatch(
+                "grouped expert GEMM rank-3 expert count disagrees with the bind",
+            ));
+        }
+        if shapes.iter().any(|shape| shape != &[self.k, self.n]) {
+            return Err(KernelBodyError::ShapeMismatch(
+                "grouped expert GEMM mixed-shape expert batch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Layout family for one grouped Q/K/V projection body.
 ///
 /// The grouped layout is the only layout the body can materialize without
@@ -1755,6 +1948,115 @@ fn gemv_q6_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
         buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
     }
     Ok(())
+}
+
+/// One bind-parameterized grouped expert GEMM body for the Metal library.
+///
+/// The packed region is segmented by expert, then by output column, and the
+/// existing per-format [`block_value`] substrate decodes each block at use.
+/// One dispatch walks active experts in ascending order, computes each expert
+/// GEMM, and accumulates the intermediate into the output without creating a
+/// whole-model f32 weight matrix.
+pub fn grouped_expert_gemm(
+    bind: &GroupedExpertGemmBind,
+    expert_shapes: &[[u64; 2]],
+    activation: &[f32],
+    packed_weights: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    bind.validate()?;
+    bind.validate_expert_shapes(expert_shapes)?;
+    let input_span = checked_usize(bind.input_span().ok_or(KernelBodyError::InvalidBind(
+        "grouped expert GEMM input span overflow",
+    ))?)?;
+    let output_span = checked_usize(bind.output_span().ok_or(KernelBodyError::InvalidBind(
+        "grouped expert GEMM output span overflow",
+    ))?)?;
+    let weight_span = checked_usize(bind.weight_span().ok_or(KernelBodyError::InvalidBind(
+        "grouped expert GEMM weight span overflow",
+    ))?)?;
+    if activation.len() < input_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert activation",
+            required: input_span as u64,
+            actual: activation.len(),
+        });
+    }
+    if output.len() < output_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert output",
+            required: output_span as u64,
+            actual: output.len(),
+        });
+    }
+    if packed_weights.len() < weight_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert packed weights",
+            required: weight_span as u64,
+            actual: packed_weights.len(),
+        });
+    }
+
+    let rows = checked_usize(bind.rows)?;
+    let k = checked_usize(bind.k)?;
+    let n = checked_usize(bind.n)?;
+    let experts = checked_usize(bind.experts)?;
+    let input_stride = checked_usize(bind.input_row_stride)?;
+    let output_stride = checked_usize(bind.output_row_stride)?;
+    let column_stride = checked_usize(bind.packed_column_stride_bytes)?;
+    let expert_stride = checked_usize(bind.packed_expert_stride_bytes)?;
+    let block_elements = checked_usize(bind.format.block_elements())?;
+    let block_bytes = checked_usize(bind.format.block_bytes())?;
+    let blocks = k / block_elements;
+
+    for row in 0..rows {
+        for column in 0..n {
+            let mut accumulated = 0.0f32;
+            for expert in 0..experts {
+                let mut intermediate = 0.0f32;
+                for block_index in 0..blocks {
+                    let block_base =
+                        expert * expert_stride + column * column_stride + block_index * block_bytes;
+                    let block = &packed_weights[block_base..block_base + block_bytes];
+                    let activation_base = row * input_stride + block_index * block_elements;
+                    for element in 0..block_elements {
+                        let weight = block_value(bind.format, block, element)?;
+                        intermediate += activation[activation_base + element] * weight;
+                    }
+                }
+                accumulated += intermediate;
+            }
+            output[row * output_stride + column] = accumulated;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch key for the grouped expert GEMM body.
+///
+/// This is deliberately separate from [`LibraryKernel`]: the body unit does
+/// not mint a plan variant or perform plan-op recognition.  M8 owns that
+/// compiled-plan admission seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedExpertGemmKernel {
+    /// Packed rank-3 expert slices with the landed per-format dequant path.
+    Packed,
+}
+
+/// Dispatch the explicitly selected grouped expert GEMM body.
+pub fn dispatch_grouped_expert_gemm(
+    kernel: GroupedExpertGemmKernel,
+    bind: &GroupedExpertGemmBind,
+    expert_shapes: &[[u64; 2]],
+    activation: &[f32],
+    packed_weights: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        GroupedExpertGemmKernel::Packed => {
+            grouped_expert_gemm(bind, expert_shapes, activation, packed_weights, output)
+        }
+    }
 }
 
 /// Select the decode GEMV library body from executor-plan facts.
