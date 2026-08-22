@@ -1,9 +1,12 @@
 //! CLI device-descriptor execute surface.
 //!
 //! The command `faber-host-macos-arm64 device-execute` is the packed device
-//! run exposed over files + JSON (the same `construct_composite_host` /
-//! `create_program_session` / `session.execute` path the composite host
-//! already owns). The wire is the CLI arg surface:
+//! run exposed over files + JSON. Construction admits through
+//! [`crate::composite_host::CompositeHost::new`] (discover →
+//! `implicit_local` → [`crate::composite_host::BoundPlanKind::ImplicitLocal`])
+//! and then runs the
+//! bound session (`create_program_session` / `session.execute`). Partition-free
+//! product construction is deleted. The wire is the CLI arg surface:
 //!
 //! ```text
 //! faber-host-macos-arm64 device-execute \
@@ -592,10 +595,7 @@ pub fn run_device_execute(args: &DeviceExecuteArgs) -> HostResult<DeviceExecuteR
         .backend
         .unwrap_or_else(|| selection_for_backend(descriptor.backend));
     let host_started = Instant::now();
-    let mut host = CompositeHost::new(CompositeHostConfig {
-        selection,
-        requires_device: true,
-    })?;
+    let mut host = open_device_host(selection)?;
     let host_construct_us = elapsed_us(host_started);
     retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
     let session_started = Instant::now();
@@ -709,10 +709,7 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
     let selection = args
         .backend
         .unwrap_or_else(|| selection_for_backend(prefill.backend));
-    let mut host = CompositeHost::new(CompositeHostConfig {
-        selection,
-        requires_device: true,
-    })?;
+    let mut host = open_device_host(selection)?;
     retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
     let mut paired = host.prepare_paired_session(
         &prefill,
@@ -968,10 +965,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
         ));
     }
 
-    let mut host = CompositeHost::new(CompositeHostConfig {
-        selection,
-        requires_device: true,
-    })?;
+    let mut host = open_device_host(selection)?;
     retain_mapped_weights(&mut host, mapped_weights.as_ref())?;
     let mut session = PreparedResidentSession::prepare_with_weight_bytes(
         &mut host,
@@ -1660,6 +1654,15 @@ fn read_u64_at(bytes: &[u8], off: usize, what: &str) -> HostResult<u64> {
     let mut raw = [0u8; 8];
     raw.copy_from_slice(slice);
     Ok(u64::from_le_bytes(raw))
+}
+
+fn open_device_host(selection: DeviceSelection) -> HostResult<CompositeHost> {
+    let host = CompositeHost::new(CompositeHostConfig {
+        selection,
+        requires_device: true,
+    })?;
+    host.require_implicit_local()?;
+    Ok(host)
 }
 
 fn retain_mapped_weights(

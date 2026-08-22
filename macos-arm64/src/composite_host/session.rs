@@ -584,7 +584,7 @@ impl<'host> ProgramSession<'host> {
     ///   `E_DEVICE_SHAPE_MISMATCH` — typed descriptor conflicts (see
     ///   [`DeviceDescriptor::validate`]);
     /// - session-level failures (module load, allocation) bubble through.
-    pub fn new(
+    pub(crate) fn new(
         runtime: &'host mut DeviceRuntime,
         descriptor: &DeviceDescriptor,
         device_name: String,

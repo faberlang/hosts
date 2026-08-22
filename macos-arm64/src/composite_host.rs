@@ -35,6 +35,18 @@
 //! [`CompositeHost::new`] with the route's selection; this module owns the
 //! host-side component and the policy decision itself.
 //!
+//! # Uniform virtual-partition admission (MD3H-H3)
+//!
+//! Every device-carrying product host admits through one
+//! [`VirtualDevicePartition`] and executes a bound plan. Construction is
+//! discover → admit [`VirtualDevicePartition::implicit_local`] (N=1) → bind
+//! [`BoundPlanKind::ImplicitLocal`] → execute the bound session. There is no
+//! partition-free product construction: the one-runtime field is the M=1
+//! member of a [`DeviceRuntimeSet`]. [`DeviceSelection`] remains backend
+//! kind only (`Auto` / `Metal` / `Cuda`); ranks never enter it. N=1 stays
+//! coordinator-free — empty communication graph, no extra copies, no
+//! `ExecutionTransaction`.
+//!
 //! # A8: device execution is not provider routing
 //!
 //! The composite host holds the frame/kernel-effects host ([`HostKernel`])
@@ -69,16 +81,43 @@ pub use session::{
 };
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use host_coordinator::bound_plan::{BoundDistributedPlan, BoundPlanKind};
 pub use host_coordinator::DeviceBackend;
 
-use crate::device_descriptor::{errors as descriptor_errors, DeviceDescriptor};
+use host_coordinator::bound_plan::{
+    bind, AdmittedLogicalPlan, LogicalPartitionId, PartitionBinding,
+};
+use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
+use host_coordinator::device_set::DeviceSet;
+use host_coordinator::discovery::{
+    ComputeCapability, DeviceCapabilities, DeviceDiscoveryEntry, DeviceDiscoverySnapshot,
+    DeviceHealth, DeviceMemory, DtypeSurface, ProbeProvenance,
+};
+use host_coordinator::partition::{
+    FixtureIdentityClass, PartitionBudgetLedger, SafePhysicalLimit, TransportClass,
+    VirtualDevicePartition, VirtualDevicePartitionId,
+};
+
+use crate::device_descriptor::{errors as descriptor_errors, sha256_hex, DeviceDescriptor};
 use crate::device_host::DeviceRuntime;
+use crate::device_runtime_set::DeviceRuntimeSet;
 
 use self::invocation_binding::RopeConfig;
-use crate::kernel::{HostKernel, HostResult};
+use crate::kernel::{HostError, HostKernel, HostResult};
 use crate::manifest::CapabilityManifest;
 use crate::Frame;
+
+/// Logical-plan hash of the host-synthesized N=1 implicit-local plan.
+/// Physical ids never enter this domain (MD-A1/A15/A17).
+#[must_use]
+pub fn implicit_local_n1_logical_hash() -> String {
+    format!("sha256:{}", sha256_hex(b"md3h-implicit-local-n1"))
+}
+
+/// Opaque logical partition identity of the N=1 implicit-local plan.
+pub const IMPLICIT_LOCAL_PARTITION: &str = "implicit-local";
 
 /// Product request for host backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,10 +186,14 @@ impl CompositeHostConfig {
 pub enum CompositeDeviceState {
     /// No device session (CPU-only route).
     CpuOnly,
-    /// A live device session plus its selected-hardware name (A9 receipts).
+    /// An admitted device session: the M=1 runtime-set member bound by the
+    /// implicit-local plan, plus its selected-hardware name (A9 receipts).
     Device {
-        /// The selected native session.
-        runtime: DeviceRuntime,
+        /// Physical sessions by identity. Product N=1 is always M=1.
+        set: DeviceRuntimeSet,
+        /// Discover → admit → bind result. Product N=1 is always
+        /// [`BoundPlanKind::ImplicitLocal`].
+        bound_plan: BoundDistributedPlan,
         /// Human-readable selected-hardware name from the admission probe.
         device_name: String,
     },
@@ -235,11 +278,13 @@ pub struct CompositeHost {
 
 impl CompositeHost {
     /// Construct the composite host under the one host-construction policy:
-    /// resolve the selection against the live admission probes, then open the
-    /// device session (fail-closed) or run CPU-only.
+    /// resolve the selection against the live admission probes, then discover
+    /// → admit `implicit_local` → bind [`BoundPlanKind::ImplicitLocal`] over
+    /// an M=1 [`DeviceRuntimeSet`], or run CPU-only.
     ///
     /// # Errors
-    /// - `E_BACKEND_UNAVAILABLE` — the resolved backend cannot be opened;
+    /// - `E_BACKEND_UNAVAILABLE` — the resolved backend cannot be opened or
+    ///   does not enumerate exactly one physical device;
     /// - `E_NO_DEVICE_PROGRAM` — explicit backend on a payload-less route.
     pub fn new(config: CompositeHostConfig) -> HostResult<Self> {
         let admitted = admitted_backends();
@@ -248,11 +293,16 @@ impl CompositeHost {
         let device = match resolved {
             None => CompositeDeviceState::CpuOnly,
             Some(backend) => {
-                let runtime = DeviceRuntime::open(backend)?;
-                CompositeDeviceState::Device {
-                    runtime,
-                    device_name: backend_device_name(backend),
-                }
+                let snapshot = discover_backend(backend)?;
+                let identity = select_singleton_device(&snapshot, backend)?;
+                let set = DeviceRuntimeSet::open_live([identity.clone()])?;
+                admit_implicit_local(
+                    set,
+                    snapshot,
+                    identity,
+                    FixtureIdentityClass::Virtual,
+                    backend_device_name(backend),
+                )?
             }
         };
         Ok(Self {
@@ -261,16 +311,24 @@ impl CompositeHost {
         })
     }
 
-    /// Inject a device session directly (sequencing tests only; the driver
-    /// fakes bypass the admission probes). Not a product construction path —
-    /// product construction always goes through [`CompositeHost::new`].
+    /// Inject a device session (sequencing tests only; the driver fakes
+    /// bypass live probes). Still admits `implicit_local` against a synthetic
+    /// snapshot — partition-free product construction is deleted. Product
+    /// construction always goes through [`CompositeHost::new`].
     pub fn with_device(runtime: DeviceRuntime, device_name: impl Into<String>) -> HostResult<Self> {
+        let device_name = device_name.into();
+        let identity = injected_physical_id(runtime.backend(), &device_name);
+        let snapshot = synthetic_snapshot(identity.clone());
+        let set = DeviceRuntimeSet::from_members([(identity.clone(), runtime)])?;
         Ok(Self {
             kernel: HostKernel::new(),
-            device: CompositeDeviceState::Device {
-                runtime,
-                device_name: device_name.into(),
-            },
+            device: admit_implicit_local(
+                set,
+                snapshot,
+                identity,
+                FixtureIdentityClass::Synthetic,
+                device_name,
+            )?,
         })
     }
 
@@ -286,21 +344,84 @@ impl CompositeHost {
         &mut self.kernel
     }
 
-    /// The live device session, when the host carries one.
+    /// The live device session, when the host carries one — the M=1 member
+    /// bound by the implicit-local plan.
     #[must_use]
     pub fn device(&self) -> Option<&DeviceRuntime> {
-        match &self.device {
-            CompositeDeviceState::CpuOnly => None,
-            CompositeDeviceState::Device { runtime, .. } => Some(runtime),
-        }
+        let CompositeDeviceState::Device {
+            set, bound_plan, ..
+        } = &self.device
+        else {
+            return None;
+        };
+        set.get(bound_implicit_device(bound_plan)?)
     }
 
     /// The live device session (mutable).
     #[must_use]
     pub fn device_mut(&mut self) -> Option<&mut DeviceRuntime> {
-        match &mut self.device {
+        let id = match &self.device {
+            CompositeDeviceState::Device { bound_plan, .. } => {
+                bound_implicit_device(bound_plan).cloned()
+            }
             CompositeDeviceState::CpuOnly => None,
-            CompositeDeviceState::Device { runtime, .. } => Some(runtime),
+        }?;
+        match &mut self.device {
+            CompositeDeviceState::Device { set, .. } => set.get_mut(&id),
+            CompositeDeviceState::CpuOnly => None,
+        }
+    }
+
+    /// The bound plan this device host admitted. `None` on the CPU-only route.
+    #[must_use]
+    pub fn bound_plan(&self) -> Option<&BoundDistributedPlan> {
+        match &self.device {
+            CompositeDeviceState::Device { bound_plan, .. } => Some(bound_plan),
+            CompositeDeviceState::CpuOnly => None,
+        }
+    }
+
+    /// The runtime set whose M=1 member is the product session. `None` on
+    /// the CPU-only route.
+    #[must_use]
+    pub fn runtime_set(&self) -> Option<&DeviceRuntimeSet> {
+        match &self.device {
+            CompositeDeviceState::Device { set, .. } => Some(set),
+            CompositeDeviceState::CpuOnly => None,
+        }
+    }
+
+    /// Fail unless this host admitted exactly one `implicit_local` partition
+    /// and bound [`BoundPlanKind::ImplicitLocal`]. A run that bypassed
+    /// partition admission cannot execute.
+    pub fn require_implicit_local(&self) -> HostResult<&BoundDistributedPlan> {
+        let plan = self.bound_plan().ok_or_else(|| {
+            descriptor_errors::no_device_program(
+                "composite host has no bound plan; partition-free device construction is deleted",
+            )
+        })?;
+        if !plan.is_degenerate() {
+            return Err(HostError::invalid_args(
+                "N=1 product execution requires BoundPlanKind::ImplicitLocal",
+            ));
+        }
+        match plan.kind() {
+            BoundPlanKind::ImplicitLocal {
+                virtual_partition: Some(partition),
+                ..
+            } if partition.is_active() => Ok(plan),
+            BoundPlanKind::ImplicitLocal {
+                virtual_partition: None,
+                ..
+            } => Err(HostError::invalid_args(
+                "implicit-local bind is missing the admitted VirtualDevicePartition",
+            )),
+            BoundPlanKind::ImplicitLocal { .. } => Err(HostError::invalid_args(
+                "implicit-local VirtualDevicePartition is not active",
+            )),
+            BoundPlanKind::Distributed { .. } => Err(HostError::invalid_args(
+                "N=1 product execution requires BoundPlanKind::ImplicitLocal",
+            )),
         }
     }
 
@@ -356,6 +477,7 @@ impl CompositeHost {
         &mut self,
         descriptor: &DeviceDescriptor,
     ) -> HostResult<ProgramSession<'_>> {
+        self.require_implicit_local()?;
         let device_name = self.device_name().to_owned();
         let runtime = self.device_mut().ok_or_else(|| {
             descriptor_errors::no_device_program(
@@ -379,6 +501,7 @@ impl CompositeHost {
         model_identity: impl Into<String>,
         session_identity: impl Into<String>,
     ) -> HostResult<PairedProgramSession<'_>> {
+        self.require_implicit_local()?;
         let device_name = self.device_name().to_owned();
         let runtime = self.device_mut().ok_or_else(|| {
             descriptor_errors::no_device_program(
@@ -459,6 +582,7 @@ impl CompositeHost {
         descriptor: &DeviceDescriptor,
         weights: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<PreparedResidentSession<'_>> {
+        self.require_implicit_local()?;
         let device_name = self.device_name().to_owned();
         let runtime = self.device_mut().ok_or_else(|| {
             descriptor_errors::no_device_program(
@@ -485,5 +609,150 @@ fn backend_device_name(backend: DeviceBackend) -> String {
         DeviceBackend::Cuda => crate::cuda_host::probe_cuda_environment()
             .nvidia_smi
             .unwrap_or_else(|| "cuda".to_owned()),
+    }
+}
+
+fn discover_backend(backend: DeviceBackend) -> HostResult<DeviceDiscoverySnapshot> {
+    let probe_utc_nanos = probe_utc_nanos();
+    match backend {
+        DeviceBackend::Metal => crate::metal_host::discover_metal_snapshot(probe_utc_nanos),
+        DeviceBackend::Cuda => crate::cuda_host::discover_cuda_snapshot(probe_utc_nanos),
+    }
+}
+
+fn probe_utc_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn select_singleton_device(
+    snapshot: &DeviceDiscoverySnapshot,
+    backend: DeviceBackend,
+) -> HostResult<PhysicalDeviceId> {
+    let matching: Vec<&DeviceDiscoveryEntry> = snapshot
+        .devices()
+        .values()
+        .filter(|entry| entry.backend() == backend)
+        .collect();
+    match matching.as_slice() {
+        [only] => Ok(only.identity.clone()),
+        [] => Err(descriptor_errors::backend_unavailable(format!(
+            "requested backend `{}` enumerated no physical devices",
+            backend.spelling()
+        ))),
+        _ => Err(descriptor_errors::backend_unavailable(format!(
+            "requested backend `{}` enumerated {} physical devices; DeviceSelection names backend kind only and cannot choose among ranks",
+            backend.spelling(),
+            matching.len()
+        ))),
+    }
+}
+
+fn injected_physical_id(backend: DeviceBackend, device_name: &str) -> PhysicalDeviceId {
+    match backend {
+        DeviceBackend::Metal => PhysicalDeviceId::metal(device_name),
+        DeviceBackend::Cuda => PhysicalDeviceId::cuda(device_name, None),
+    }
+}
+
+fn synthetic_snapshot(identity: PhysicalDeviceId) -> DeviceDiscoverySnapshot {
+    DeviceDiscoverySnapshot::from_enumerated(
+        0,
+        [DeviceDiscoveryEntry {
+            ordinal: DeviceOrdinal::new(0),
+            identity,
+            device_model: Some("synthetic".to_owned()),
+            capabilities: DeviceCapabilities {
+                compute_capability: ComputeCapability { major: 0, minor: 0 },
+                sm_count: 0,
+                dtype_surface: DtypeSurface::empty(),
+                max_threads_per_workgroup: 1024,
+                workgroup_shared_memory_min_bytes: 32_768,
+                workgroup_shared_memory_max_bytes: 32_768,
+                collective_width: 32,
+                unified_memory: true,
+            },
+            memory: DeviceMemory {
+                tool_report_total_mib: None,
+                api_total_bytes: 0,
+            },
+            health: DeviceHealth::Healthy,
+            health_generation: DeviceHealthGeneration::initial(),
+            probe_provenance: ProbeProvenance {
+                probe: "md3h-h3 injected".to_owned(),
+                tool_versions: "synthetic".to_owned(),
+            },
+        }],
+    )
+}
+
+fn n1_ledger() -> PartitionBudgetLedger {
+    // N=1 invents no transfer/collective/scratch budget for uniformity.
+    PartitionBudgetLedger {
+        weight_bytes: 0,
+        kv_cache_bytes: 0,
+        activation_scratch_bytes: 0,
+        module_storage_bytes: 0,
+        allocator_overhead_bytes: 0,
+        transfer_staging_bytes: 0,
+        concurrent_state_bytes: 0,
+    }
+}
+
+fn admit_implicit_local(
+    set: DeviceRuntimeSet,
+    snapshot: DeviceDiscoverySnapshot,
+    identity: PhysicalDeviceId,
+    fixture: FixtureIdentityClass,
+    device_name: String,
+) -> HostResult<CompositeDeviceState> {
+    if set.len() != 1 || !set.contains(&identity) {
+        return Err(HostError::invalid_args(
+            "N=1 product admission requires the bound PhysicalDeviceId to be the M=1 runtime-set member",
+        ));
+    }
+    let partition = VirtualDevicePartition::implicit_local(
+        VirtualDevicePartitionId::new(1),
+        identity.clone(),
+        n1_ledger(),
+        SafePhysicalLimit::new(u64::MAX),
+    )
+    .map_err(|error| {
+        HostError::invalid_args(format!("implicit_local admission rejected: {error:?}"))
+    })?;
+    let logical = LogicalPartitionId::new(IMPLICIT_LOCAL_PARTITION);
+    let admitted =
+        AdmittedLogicalPlan::admit(implicit_local_n1_logical_hash(), [logical.clone()], [])
+            .map_err(|error| {
+                HostError::invalid_args(format!("N=1 logical plan admission rejected: {error:?}"))
+            })?;
+    let mut bindings = BTreeMap::new();
+    bindings.insert(
+        logical,
+        PartitionBinding::with_virtual_partition(identity.clone(), partition),
+    );
+    let plan = bind(
+        &admitted,
+        bindings,
+        DeviceSet::from_members([identity]),
+        &snapshot,
+        DeviceHealthGeneration::initial(),
+        fixture,
+        TransportClass::None,
+    )
+    .map_err(|error| HostError::invalid_args(format!("N=1 bind rejected: {error:?}")))?;
+    Ok(CompositeDeviceState::Device {
+        set,
+        bound_plan: plan,
+        device_name,
+    })
+}
+
+fn bound_implicit_device(plan: &BoundDistributedPlan) -> Option<&PhysicalDeviceId> {
+    match plan.kind() {
+        BoundPlanKind::ImplicitLocal { device, .. } => Some(device),
+        BoundPlanKind::Distributed { .. } => None,
     }
 }
