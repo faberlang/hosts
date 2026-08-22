@@ -96,7 +96,7 @@ device-executor M8, `cuda-host-linux-home`), never a process-only
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| MD3J-F1 | planned | — | — | — |
+| MD3J-F1 | landed | hand | radix 5bf4ce6d8 + hosts c192dd4 | 8GiB fixtures + over-budget variant; graph bytes preserved; 186 fmir tests green |
 | MD3J-B1 | landed | hand | hosts 6614514 (red) + 8593996 (green) | split policy 8:2; 21/21; deterministic 4+4; fail-closed both directions |
 | MD3J-B2 | planned | — | — | — |
 | MD3J-P1 | planned | — | — | gate MD3J-RP: operator mail for pod admission (RunPod account operator-held) |
