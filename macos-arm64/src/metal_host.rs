@@ -306,6 +306,17 @@ pub struct MetalPhysicalDevice {
     /// `recommendedMaxWorkingSetSize` bytes (unified memory has no separate
     /// nvidia-smi-style tool total).
     pub api_total_bytes: u64,
+    /// `MTLDevice.maxThreadsPerThreadgroup` width — the device-level
+    /// threadgroup ceiling (the launch-time reject stays on the pipeline).
+    pub max_threads_per_workgroup: u32,
+    /// `MTLDevice.maxThreadgroupMemoryLength` (Metal has no opt-in tier).
+    pub workgroup_shared_memory_min_bytes: u32,
+    /// Same as min: Metal exposes one threadgroup-memory ceiling.
+    pub workgroup_shared_memory_max_bytes: u32,
+    /// Apple GPU simdgroup width (no device-level query; 32 on Apple Silicon).
+    pub collective_width: u32,
+    /// `MTLDevice.hasUnifiedMemory`.
+    pub unified_memory: bool,
 }
 
 impl MetalPhysicalDevice {
@@ -320,6 +331,11 @@ impl MetalPhysicalDevice {
                 compute_capability: ComputeCapability { major: 0, minor: 0 },
                 sm_count: 0,
                 dtype_surface: DtypeSurface::empty(),
+                max_threads_per_workgroup: self.max_threads_per_workgroup,
+                workgroup_shared_memory_min_bytes: self.workgroup_shared_memory_min_bytes,
+                workgroup_shared_memory_max_bytes: self.workgroup_shared_memory_max_bytes,
+                collective_width: self.collective_width,
+                unified_memory: self.unified_memory,
             },
             memory: DeviceMemory {
                 tool_report_total_mib: None,
@@ -352,6 +368,16 @@ pub fn discover_metal_snapshot(probe_utc_nanos: u64) -> HostResult<DeviceDiscove
     ))
 }
 
+/// Apple GPU simdgroup width. Metal has no device-level query analogous to
+/// CUDA `CU_DEVICE_ATTRIBUTE_WARP_SIZE`; simdgroups are 32 threads.
+#[cfg(target_os = "macos")]
+const METAL_COLLECTIVE_WIDTH: u32 = 32;
+
+#[cfg(target_os = "macos")]
+fn mtl_nsuinteger_as_u32(value: metal::NSUInteger) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn metal_devices_from_system() -> Vec<MetalPhysicalDevice> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -362,18 +388,27 @@ fn metal_devices_from_system() -> Vec<MetalPhysicalDevice> {
         Device::all()
             .into_iter()
             .enumerate()
-            .map(|(index, device)| MetalPhysicalDevice {
-                ordinal: index as u32,
-                registry_id: device.registry_id().to_string(),
-                device_model: {
-                    let name = device.name();
-                    if name.is_empty() {
-                        None
-                    } else {
-                        Some(name.to_owned())
-                    }
-                },
-                api_total_bytes: device.recommended_max_working_set_size(),
+            .map(|(index, device)| {
+                let threadgroup = device.max_threads_per_threadgroup();
+                let shared = mtl_nsuinteger_as_u32(device.max_threadgroup_memory_length());
+                MetalPhysicalDevice {
+                    ordinal: index as u32,
+                    registry_id: device.registry_id().to_string(),
+                    device_model: {
+                        let name = device.name();
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some(name.to_owned())
+                        }
+                    },
+                    api_total_bytes: device.recommended_max_working_set_size(),
+                    max_threads_per_workgroup: mtl_nsuinteger_as_u32(threadgroup.width),
+                    workgroup_shared_memory_min_bytes: shared,
+                    workgroup_shared_memory_max_bytes: shared,
+                    collective_width: METAL_COLLECTIVE_WIDTH,
+                    unified_memory: device.has_unified_memory(),
+                }
             })
             .collect()
     }

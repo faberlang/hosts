@@ -23,6 +23,11 @@ fn synthetic_cuda(ordinal: u32, pci_uuid: &str, driver_uuid: Option<&str>) -> Cu
         compute_capability_major: 12,
         compute_capability_minor: 0,
         sm_count: 48,
+        max_threads_per_workgroup: 1024,
+        workgroup_shared_memory_min_bytes: 49_152,
+        workgroup_shared_memory_max_bytes: 101_376,
+        collective_width: 32,
+        unified_memory: false,
         driver_version: Some("595.71.05".to_owned()),
     }
 }
@@ -33,6 +38,11 @@ fn synthetic_metal(ordinal: u32, registry_id: &str) -> MetalPhysicalDevice {
         registry_id: registry_id.to_owned(),
         device_model: Some(format!("synthetic-metal-{ordinal}")),
         api_total_bytes: 36_123_000_000,
+        max_threads_per_workgroup: 1024,
+        workgroup_shared_memory_min_bytes: 32_768,
+        workgroup_shared_memory_max_bytes: 32_768,
+        collective_width: 32,
+        unified_memory: true,
     }
 }
 

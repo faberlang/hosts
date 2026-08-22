@@ -523,6 +523,16 @@ pub struct CudaPhysicalDevice {
     pub compute_capability_minor: u32,
     /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
     pub sm_count: u32,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK`.
+    pub max_threads_per_workgroup: u32,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`.
+    pub workgroup_shared_memory_min_bytes: u32,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`.
+    pub workgroup_shared_memory_max_bytes: u32,
+    /// `CU_DEVICE_ATTRIBUTE_WARP_SIZE`.
+    pub collective_width: u32,
+    /// `CU_DEVICE_ATTRIBUTE_INTEGRATED` (1 → unified with host memory).
+    pub unified_memory: bool,
     /// nvidia-smi driver version, when present.
     pub driver_version: Option<String>,
 }
@@ -546,6 +556,11 @@ impl CudaPhysicalDevice {
                 },
                 sm_count: self.sm_count,
                 dtype_surface: DtypeSurface::empty(),
+                max_threads_per_workgroup: self.max_threads_per_workgroup,
+                workgroup_shared_memory_min_bytes: self.workgroup_shared_memory_min_bytes,
+                workgroup_shared_memory_max_bytes: self.workgroup_shared_memory_max_bytes,
+                collective_width: self.collective_width,
+                unified_memory: self.unified_memory,
             },
             memory: DeviceMemory {
                 tool_report_total_mib: self.tool_report_total_mib,
@@ -712,6 +727,29 @@ fn identify_cuda_device(
             .unwrap_or(0),
             sm_count: cuda_device_attribute(api, handle, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
                 .unwrap_or(0),
+            max_threads_per_workgroup: cuda_device_attribute(
+                api,
+                handle,
+                CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            )
+            .unwrap_or(0),
+            workgroup_shared_memory_min_bytes: cuda_device_attribute(
+                api,
+                handle,
+                CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            )
+            .unwrap_or(0),
+            workgroup_shared_memory_max_bytes: cuda_device_attribute(
+                api,
+                handle,
+                CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )
+            .unwrap_or(0),
+            collective_width: cuda_device_attribute(api, handle, CU_DEVICE_ATTRIBUTE_WARP_SIZE)
+                .unwrap_or(0),
+            unified_memory: cuda_device_attribute(api, handle, CU_DEVICE_ATTRIBUTE_INTEGRATED)
+                .unwrap_or(0)
+                != 0,
             driver_version: smi_row.and_then(|row| row.driver_version.clone()),
         },
     })
@@ -1132,12 +1170,22 @@ impl SystemCudaDriver {
 /// `CUresult` success code (`cudaError_t`); any non-zero value is an error.
 const CUDA_SUCCESS: i32 = 0;
 
+/// `CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK`.
+const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 1;
+/// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`.
+const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
+/// `CU_DEVICE_ATTRIBUTE_WARP_SIZE`.
+const CU_DEVICE_ATTRIBUTE_WARP_SIZE: i32 = 10;
 /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+/// `CU_DEVICE_ATTRIBUTE_INTEGRATED`.
+const CU_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 18;
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`.
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`.
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+/// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`.
+const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 
 #[repr(C)]
 struct CuUuid {

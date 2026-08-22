@@ -125,6 +125,11 @@ fn entry(ordinal: u32, device: PhysicalDeviceId) -> DeviceDiscoveryEntry {
             compute_capability: ComputeCapability { major: 0, minor: 0 },
             sm_count: 0,
             dtype_surface: DtypeSurface::empty(),
+            max_threads_per_workgroup: 1024,
+            workgroup_shared_memory_min_bytes: 32_768,
+            workgroup_shared_memory_max_bytes: 32_768,
+            collective_width: 32,
+            unified_memory: true,
         },
         memory: DeviceMemory {
             tool_report_total_mib: None,

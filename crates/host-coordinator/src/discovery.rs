@@ -76,7 +76,7 @@ pub struct DeviceDiscoveryEntry {
     pub identity: PhysicalDeviceId,
     /// Vendor model descriptor, e.g. `"NVIDIA GeForce RTX 5070"` (T1 §2).
     pub device_model: Option<String>,
-    /// Capability facts (compute capability, SM count, dtype surface).
+    /// Capability facts (CUDA identity, generic launch-resource limits, dtype surface).
     pub capabilities: DeviceCapabilities,
     /// Memory totals — both reports kept distinct (T1 §8).
     pub memory: DeviceMemory,
@@ -98,6 +98,10 @@ impl DeviceDiscoveryEntry {
 }
 
 /// Capability facts that gate admission.
+///
+/// `compute_capability` and `sm_count` are CUDA identity facts. The five
+/// launch-resource fields are generic and populated per backend from live
+/// device queries (CUDA block / Metal threadgroup; warp / simdgroup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceCapabilities {
     /// Compute capability (e.g. `12.0` for the RTX 5070, Blackwell).
@@ -106,6 +110,16 @@ pub struct DeviceCapabilities {
     pub sm_count: u32,
     /// Raw arithmetic dtype surface the device executes (T1 §2 smoke).
     pub dtype_surface: DtypeSurface,
+    /// Maximum threads in one workgroup (CUDA block / Metal threadgroup).
+    pub max_threads_per_workgroup: u32,
+    /// Minimum guaranteed workgroup shared memory, bytes.
+    pub workgroup_shared_memory_min_bytes: u32,
+    /// Maximum opt-in workgroup shared memory, bytes.
+    pub workgroup_shared_memory_max_bytes: u32,
+    /// Collective width (CUDA warp / Metal simdgroup).
+    pub collective_width: u32,
+    /// True when the device shares host memory (integrated / unified).
+    pub unified_memory: bool,
 }
 
 /// Compute capability `major.minor` (12.0 on the RTX 5070).
@@ -342,6 +356,17 @@ impl DeviceDiscoverySnapshot {
             push_bool(&mut out, ds.bf16);
             push_bool(&mut out, ds.i8);
             push_bool(&mut out, ds.i32);
+            push_u32(&mut out, entry.capabilities.max_threads_per_workgroup);
+            push_u32(
+                &mut out,
+                entry.capabilities.workgroup_shared_memory_min_bytes,
+            );
+            push_u32(
+                &mut out,
+                entry.capabilities.workgroup_shared_memory_max_bytes,
+            );
+            push_u32(&mut out, entry.capabilities.collective_width);
+            push_bool(&mut out, entry.capabilities.unified_memory);
             // Memory — both reports, kept distinct.
             push_bool(&mut out, entry.memory.tool_report_total_mib.is_some());
             if let Some(mib) = entry.memory.tool_report_total_mib {

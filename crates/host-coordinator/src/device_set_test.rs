@@ -46,6 +46,11 @@ fn t1_entry() -> DeviceDiscoveryEntry {
                 i8: true,
                 i32: true,
             },
+            max_threads_per_workgroup: 1024,
+            workgroup_shared_memory_min_bytes: 49_152,
+            workgroup_shared_memory_max_bytes: 101_376,
+            collective_width: 32,
+            unified_memory: false,
         },
         memory: DeviceMemory {
             tool_report_total_mib: Some(12_227),
@@ -80,6 +85,11 @@ fn synthetic_entry(ordinal: u32, identity: PhysicalDeviceId) -> DeviceDiscoveryE
             },
             sm_count: 48,
             dtype_surface: DtypeSurface::empty(),
+            max_threads_per_workgroup: 1024,
+            workgroup_shared_memory_min_bytes: 49_152,
+            workgroup_shared_memory_max_bytes: 101_376,
+            collective_width: 32,
+            unified_memory: false,
         },
         memory: DeviceMemory {
             tool_report_total_mib: None,

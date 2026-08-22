@@ -47,6 +47,11 @@ fn t1_entry() -> DeviceDiscoveryEntry {
                 i8: true,
                 i32: true,
             },
+            max_threads_per_workgroup: 1024,
+            workgroup_shared_memory_min_bytes: 49_152,
+            workgroup_shared_memory_max_bytes: 101_376,
+            collective_width: 32,
+            unified_memory: false,
         },
         memory: DeviceMemory {
             tool_report_total_mib: Some(T1_NVIDIA_SMI_MIB),
@@ -105,6 +110,14 @@ fn t1_pharos_facts_round_trip() {
     assert!(entry.capabilities.dtype_surface.bf16);
     assert!(entry.capabilities.dtype_surface.i8);
     assert!(entry.capabilities.dtype_surface.i32);
+    assert_eq!(entry.capabilities.max_threads_per_workgroup, 1024);
+    assert_eq!(entry.capabilities.workgroup_shared_memory_min_bytes, 49_152);
+    assert_eq!(
+        entry.capabilities.workgroup_shared_memory_max_bytes,
+        101_376
+    );
+    assert_eq!(entry.capabilities.collective_width, 32);
+    assert!(!entry.capabilities.unified_memory);
 
     // Memory: BOTH reports kept distinct — never conflated (T1 §8). 12227 MiB
     // (nvidia-smi) is not the same number as 12 343 705 600 B (driver).
@@ -278,6 +291,81 @@ fn from_enumerated_two_same_backend_devices_are_distinguishable() {
     assert_eq!(b, &second.identity);
 }
 
+fn fake_metal_entry() -> DeviceDiscoveryEntry {
+    DeviceDiscoveryEntry {
+        ordinal: DeviceOrdinal::new(0),
+        identity: PhysicalDeviceId::metal("4278190081"),
+        device_model: Some("Apple M-series".to_owned()),
+        capabilities: DeviceCapabilities {
+            compute_capability: ComputeCapability { major: 0, minor: 0 },
+            sm_count: 0,
+            dtype_surface: DtypeSurface::empty(),
+            max_threads_per_workgroup: 1024,
+            workgroup_shared_memory_min_bytes: 32_768,
+            workgroup_shared_memory_max_bytes: 32_768,
+            collective_width: 32,
+            unified_memory: true,
+        },
+        memory: DeviceMemory {
+            tool_report_total_mib: None,
+            api_total_bytes: 36_123_000_000,
+        },
+        health: DeviceHealth::Healthy,
+        health_generation: DeviceHealthGeneration::initial(),
+        probe_provenance: ProbeProvenance {
+            probe: "MTLCopyAllDevices".to_owned(),
+            tool_versions: "Metal framework".to_owned(),
+        },
+    }
+}
+
+/// DCG-1: fake Metal and CUDA snapshots populate all five generic
+/// launch-resource fields with distinct per-backend shapes.
+#[test]
+fn fake_metal_and_cuda_snapshots_populate_distinct_launch_resources() {
+    let cuda_snap = DeviceDiscoverySnapshot::from_enumerated(PROBE_TIME, [t1_entry()]);
+    let metal_snap = DeviceDiscoverySnapshot::from_enumerated(PROBE_TIME, [fake_metal_entry()]);
+    let cuda = cuda_snap
+        .entry(DeviceOrdinal::new(0))
+        .expect("cuda ordinal 0")
+        .capabilities;
+    let metal = metal_snap
+        .entry(DeviceOrdinal::new(0))
+        .expect("metal ordinal 0")
+        .capabilities;
+
+    assert_eq!(cuda.max_threads_per_workgroup, 1024);
+    assert_eq!(cuda.workgroup_shared_memory_min_bytes, 49_152);
+    assert_eq!(cuda.workgroup_shared_memory_max_bytes, 101_376);
+    assert_eq!(cuda.collective_width, 32);
+    assert!(!cuda.unified_memory);
+
+    assert_eq!(metal.max_threads_per_workgroup, 1024);
+    assert_eq!(metal.workgroup_shared_memory_min_bytes, 32_768);
+    assert_eq!(metal.workgroup_shared_memory_max_bytes, 32_768);
+    assert_eq!(metal.collective_width, 32);
+    assert!(metal.unified_memory);
+
+    assert_ne!(cuda, metal);
+    assert_ne!(
+        cuda.workgroup_shared_memory_min_bytes,
+        metal.workgroup_shared_memory_min_bytes
+    );
+    assert_ne!(
+        cuda.workgroup_shared_memory_max_bytes,
+        metal.workgroup_shared_memory_max_bytes
+    );
+    assert_ne!(cuda.unified_memory, metal.unified_memory);
+    assert_eq!(
+        cuda_snap.entry(DeviceOrdinal::new(0)).unwrap().backend(),
+        DeviceBackend::Cuda
+    );
+    assert_eq!(
+        metal_snap.entry(DeviceOrdinal::new(0)).unwrap().backend(),
+        DeviceBackend::Metal
+    );
+}
+
 /// Reusing an ordinal across samples never merges identities: the later
 /// facts mint a distinct id and `change_against` reports replacement.
 #[test]
@@ -372,11 +460,11 @@ fn hex_decode(hex: &str) -> [u8; 32] {
 /// evidence durable: any change to the T1 facts or the canonical encoding
 /// breaks this golden test.
 ///
-/// Computed 2026-08-05 from the MD1-D2 pharos re-run (facts unchanged) via
-/// the `t1_snapshot()` fixture — see
-/// `~/work/ianzepp/trials/multi-device-md1/raw/receipt.md`.
+/// Computed 2026-08-21 after DCG-1 added generic launch-resource fields to
+/// the canonical encoding (prior hash `9ca98f77629c571080fc9d7d59ed04d6d69b513fc908532f89872c9fb25c324d`
+/// from the 2026-08-05 MD1-D2 pharos re-run).
 const T1_PHAROS_FIXTURE_HASH_HEX: &str =
-    "9ca98f77629c571080fc9d7d59ed04d6d69b513fc908532f89872c9fb25c324d";
+    "2fea169d29aa07f0e950f48e89683d657ffb88b7ce195c9db1b6f7be9f0e9003";
 
 /// MD1-D2: the pharos snapshot fixture validates and is byte-deterministic —
 /// its content-addressed id is frozen evidence.
