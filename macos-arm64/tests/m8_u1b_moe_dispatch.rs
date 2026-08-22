@@ -874,6 +874,15 @@ fn synthetic_moe_layer_plan_path_run_on_metal() {
             "m8-u1b plan-path step {step}: readbacks={} max-dev={max_dev} ids={ids:?} weights={weights:?}",
             receipt.readbacks
         );
+        // M8-U1c StageTiming evidence rows (probe-class; no llama bar).
+        println!(
+            "m8-u1c stage-timing step {step}: copy_in_us={} gpu_encode_submit_wait_us={} readback_us={} launch_gpu_us={:?} launches={}",
+            receipt.copy_in_us,
+            receipt.gpu_encode_submit_wait_us,
+            receipt.readback_us,
+            receipt.launch_gpu_us,
+            receipt.launches
+        );
     }
 
     prepared.teardown().expect("teardown");

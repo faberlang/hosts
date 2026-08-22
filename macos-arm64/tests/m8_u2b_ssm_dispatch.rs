@@ -762,6 +762,14 @@ fn synthetic_ssm_layer_prefill_and_decode_plan_path_run_on_metal() {
                 "m8-u2b plan-path {arm} step {step}: submissions={} launches={:?} readbacks={} max-dev={max_dev}",
                 receipt.launches, receipt.launch_ids, receipt.readbacks
             );
+            // M8-U2c StageTiming evidence rows (probe-class; no llama bar).
+            println!(
+                "m8-u2c stage-timing {arm} step {step}: copy_in_us={} gpu_encode_submit_wait_us={} readback_us={} launch_gpu_us={:?}",
+                receipt.copy_in_us,
+                receipt.gpu_encode_submit_wait_us,
+                receipt.readback_us,
+                receipt.launch_gpu_us
+            );
         }
 
         prepared.teardown().expect("teardown");
