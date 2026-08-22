@@ -44,6 +44,21 @@ fn full_dtypes() -> DtypeSurface {
     }
 }
 
+/// DCG-1 Metal-shaped snapshot: CUDA identity facts are zero sentinels;
+/// generic launch-resource fields are populated.
+fn metal_caps() -> DeviceCapabilities {
+    DeviceCapabilities {
+        compute_capability: ComputeCapability { major: 0, minor: 0 },
+        sm_count: 0,
+        dtype_surface: DtypeSurface::empty(),
+        max_threads_per_workgroup: 1024,
+        workgroup_shared_memory_min_bytes: 32_768,
+        workgroup_shared_memory_max_bytes: 32_768,
+        collective_width: 32,
+        unified_memory: true,
+    }
+}
+
 fn entry(
     ordinal: u32,
     identity: PhysicalDeviceId,
@@ -211,12 +226,11 @@ fn c2_11_review_test_each_gate_rejects_and_objectives_rank_only_survivors() {
             device: a.clone(),
             required: ledger(10),
             required_capabilities: RequiredCapabilities {
-                min_compute_capability: None,
-                min_sm_count: None,
                 required_dtypes: DtypeSurface {
                     bf16: true,
                     ..DtypeSurface::empty()
                 },
+                ..RequiredCapabilities::default()
             },
         }],
         vec![],
@@ -486,12 +500,11 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
             device: a.clone(),
             required: ledger(10),
             required_capabilities: RequiredCapabilities {
-                min_compute_capability: None,
-                min_sm_count: None,
                 required_dtypes: DtypeSurface {
                     f64: true,
                     ..DtypeSurface::empty()
                 },
+                ..RequiredCapabilities::default()
             },
         }],
         vec![],
@@ -504,12 +517,11 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
             device: a.clone(),
             required: ledger(10),
             required_capabilities: RequiredCapabilities {
-                min_compute_capability: None,
-                min_sm_count: None,
                 required_dtypes: DtypeSurface {
                     bf16: true,
                     ..DtypeSurface::empty()
                 },
+                ..RequiredCapabilities::default()
             },
         }],
         vec![],
@@ -526,8 +538,7 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
                     major: 13,
                     minor: 0,
                 }),
-                min_sm_count: None,
-                required_dtypes: DtypeSurface::empty(),
+                ..RequiredCapabilities::default()
             },
         }],
         vec![],
@@ -540,9 +551,8 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
             device: a.clone(),
             required: ledger(10),
             required_capabilities: RequiredCapabilities {
-                min_compute_capability: None,
                 min_sm_count: Some(128),
-                required_dtypes: DtypeSurface::empty(),
+                ..RequiredCapabilities::default()
             },
         }],
         vec![],
@@ -607,6 +617,163 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
         .violations[0];
     assert_eq!(sms.gate, GateClass::Compatibility);
     assert!(sms.failing_fact.contains("128"));
+}
+
+/// DCG-2: a Metal-shaped snapshot evaluates on generic launch-resource
+/// fields. An in-limits plan is admitted; a plan whose workgroup demand
+/// exceeds the device ceiling is rejected with the compatibility gate.
+#[test]
+fn compatibility_gate_evaluates_metal_on_generic_launch_resources() {
+    let metal = PhysicalDeviceId::metal("4278190081");
+    let snap = snapshot(vec![entry(0, metal.clone(), Some(metal_caps()))]);
+    let constraints = constraints(
+        &snap,
+        BTreeMap::from([(metal.clone(), SafePhysicalLimit::new(1_000_000))]),
+    );
+    let selection = DeviceSetSelection::explicit([metal.clone()]);
+    let objectives = [Objective::Latency];
+
+    let admitted = CandidatePlan::new(
+        "metal-in-limits".to_owned(),
+        vec![DeviceAssignment {
+            device: metal.clone(),
+            required: ledger(10),
+            required_capabilities: RequiredCapabilities {
+                threads_per_workgroup: Some(256),
+                workgroup_shared_memory_bytes: Some(16_384),
+                min_collective_width: Some(32),
+                require_unified_memory: true,
+                ..RequiredCapabilities::default()
+            },
+        }],
+        vec![],
+        10,
+        ObjectiveFacts::default(),
+    );
+    let oversized = CandidatePlan::new(
+        "metal-oversize-threadgroup".to_owned(),
+        vec![DeviceAssignment {
+            device: metal.clone(),
+            required: ledger(10),
+            required_capabilities: RequiredCapabilities {
+                threads_per_workgroup: Some(2048),
+                ..RequiredCapabilities::default()
+            },
+        }],
+        vec![],
+        10,
+        ObjectiveFacts::default(),
+    );
+
+    let outcome = evaluate_all(
+        &snap,
+        &selection,
+        &constraints,
+        &objectives,
+        &[admitted, oversized],
+    );
+
+    assert_eq!(outcome.ranked.len(), 1);
+    assert_eq!(outcome.ranked[0].plan, "metal-in-limits");
+    assert_eq!(outcome.rejected.len(), 1);
+    assert_eq!(outcome.rejected[0].plan, "metal-oversize-threadgroup");
+    let violation = &outcome.rejected[0].violations[0];
+    assert_eq!(violation.gate, GateClass::Compatibility);
+    assert_eq!(violation.device.as_ref(), Some(&metal));
+    assert!(violation.failing_fact.contains("2048"));
+    assert!(violation.failing_fact.contains("1024"));
+    assert!(violation.failing_fact.contains("max_threads_per_workgroup"));
+}
+
+/// DCG-2: unpopulated generic launch-resource facts (CUDA zero sentinels)
+/// and CUDA identity demanded of Metal reject as unevaluable — never a
+/// fake comparison against zero.
+#[test]
+fn compatibility_gate_fails_closed_when_launch_resources_unevaluable() {
+    let cuda = PhysicalDeviceId::cuda(UUID_A, None);
+    let cuda_snap = snapshot(vec![entry(
+        0,
+        cuda.clone(),
+        Some(DeviceCapabilities {
+            compute_capability: ComputeCapability {
+                major: 12,
+                minor: 0,
+            },
+            sm_count: 48,
+            dtype_surface: full_dtypes(),
+            max_threads_per_workgroup: 0,
+            workgroup_shared_memory_min_bytes: 0,
+            workgroup_shared_memory_max_bytes: 0,
+            collective_width: 0,
+            unified_memory: false,
+        }),
+    )]);
+    let cuda_constraints = constraints(
+        &cuda_snap,
+        BTreeMap::from([(cuda.clone(), SafePhysicalLimit::new(1_000_000))]),
+    );
+    let cuda_plan = CandidatePlan::new(
+        "cuda-unpopulated-threads".to_owned(),
+        vec![DeviceAssignment {
+            device: cuda.clone(),
+            required: ledger(10),
+            required_capabilities: RequiredCapabilities {
+                threads_per_workgroup: Some(256),
+                ..RequiredCapabilities::default()
+            },
+        }],
+        vec![],
+        10,
+        ObjectiveFacts::default(),
+    );
+    let cuda_outcome = evaluate_all(
+        &cuda_snap,
+        &DeviceSetSelection::explicit([cuda.clone()]),
+        &cuda_constraints,
+        &[Objective::Latency],
+        &[cuda_plan],
+    );
+    assert_eq!(cuda_outcome.ranked.len(), 0);
+    assert_eq!(cuda_outcome.rejected.len(), 1);
+    let cuda_v = &cuda_outcome.rejected[0].violations[0];
+    assert_eq!(cuda_v.gate, GateClass::Compatibility);
+    assert!(cuda_v.failing_fact.contains("unevaluable"));
+    assert!(cuda_v.failing_fact.contains("max_threads_per_workgroup"));
+
+    let metal = PhysicalDeviceId::metal("4278190081");
+    let metal_snap = snapshot(vec![entry(0, metal.clone(), Some(metal_caps()))]);
+    let metal_constraints = constraints(
+        &metal_snap,
+        BTreeMap::from([(metal.clone(), SafePhysicalLimit::new(1_000_000))]),
+    );
+    let metal_plan = CandidatePlan::new(
+        "metal-cuda-identity".to_owned(),
+        vec![DeviceAssignment {
+            device: metal.clone(),
+            required: ledger(10),
+            required_capabilities: RequiredCapabilities {
+                min_compute_capability: Some(ComputeCapability {
+                    major: 12,
+                    minor: 0,
+                }),
+                ..RequiredCapabilities::default()
+            },
+        }],
+        vec![],
+        10,
+        ObjectiveFacts::default(),
+    );
+    let metal_outcome = evaluate_all(
+        &metal_snap,
+        &DeviceSetSelection::explicit([metal]),
+        &metal_constraints,
+        &[Objective::Latency],
+        &[metal_plan],
+    );
+    assert_eq!(metal_outcome.ranked.len(), 0);
+    let metal_v = &metal_outcome.rejected[0].violations[0];
+    assert_eq!(metal_v.gate, GateClass::Compatibility);
+    assert!(metal_v.failing_fact.contains("unevaluable"));
 }
 
 /// Topology gate: only admitted directed links may be traversed;

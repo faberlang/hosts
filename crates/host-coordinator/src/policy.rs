@@ -11,9 +11,11 @@
 //!      selection rejects (MD1-Q3 default; replacement detection, naming
 //!      contract §1).
 //!    - [`GateClass::Compatibility`] — every operation placed on a device
-//!      must be executable there (C2 §1.2 compatibility): compute
-//!      capability, SM count, and dtype surface from the snapshot's
-//!      capability facts.
+//!      must be executable there (C2 §1.2 compatibility): generic
+//!      launch-resource fields and dtype surface from the snapshot's
+//!      capability facts. `compute_capability` / `sm_count` are CUDA
+//!      identity facts, consumed only on CUDA when populated — never
+//!      fake-evaluated on Metal or from a zero sentinel.
 //!    - [`GateClass::RequiredMemory`] — the declared requirements per device
 //!      (including [`crate::partition`] budgets, MD1-V1) must fit that
 //!      device's declared admitted budget ([`SafePhysicalLimit`] — a policy
@@ -42,6 +44,7 @@
 //! the violated gate + exact failing fact, and selected devices with ranks +
 //! objective scores, plus a determinism fingerprint.
 
+use crate::backend::DeviceBackend;
 use crate::device_identity::{
     push_bool, push_str, push_u64, DeviceHealthGeneration, PhysicalDeviceId,
 };
@@ -50,7 +53,8 @@ use crate::device_set::{
     SelectionError,
 };
 use crate::discovery::{
-    ComputeCapability, DeviceDiscoveryEntry, DeviceDiscoverySnapshot, DtypeSurface,
+    ComputeCapability, DeviceCapabilities, DeviceDiscoveryEntry, DeviceDiscoverySnapshot,
+    DtypeSurface,
 };
 use crate::partition::{PartitionBudgetLedger, SafePhysicalLimit};
 use std::cmp::Ordering;
@@ -63,8 +67,9 @@ pub enum GateClass {
     /// Health-epoch membership (C2 §2 *healthy*/*degraded*; MD1-Q3 default):
     /// only current-epoch members are selectable.
     HealthEpochMembership,
-    /// Compatibility — dtype/quantization support from the snapshot's
-    /// capability facts (compute capability, SM count, dtype surface).
+    /// Compatibility — dtype support and generic launch-resource limits
+    /// from the snapshot's capability facts. Compute capability and SM
+    /// count stay CUDA identity facts.
     Compatibility,
     /// Required memory per device (incl. partition budgets) + declared
     /// total (C2 §1.2 required memory).
@@ -314,12 +319,30 @@ pub struct DeclaredConstraints {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequiredCapabilities {
     /// Minimum compute capability (`major.minor`), when required.
+    ///
+    /// CUDA identity: evaluable only on a CUDA device with a populated
+    /// (non-zero) capability. Other backends, and a CUDA zero sentinel,
+    /// reject as unevaluable rather than comparing zeros.
     pub min_compute_capability: Option<ComputeCapability>,
-    /// Minimum SM count, when required.
+    /// Minimum SM count, when required. Same CUDA-identity rule as
+    /// [`Self::min_compute_capability`].
     pub min_sm_count: Option<u32>,
     /// Required dtypes: only the `true` bits are required; a device whose
     /// surface lacks any required dtype fails the compatibility gate.
     pub required_dtypes: DtypeSurface,
+    /// Declared workgroup thread demand. Rejects when it exceeds the
+    /// device `max_threads_per_workgroup` ceiling. A zero device ceiling
+    /// is unevaluable, not a fake limit of zero.
+    pub threads_per_workgroup: Option<u32>,
+    /// Declared workgroup shared-memory demand, bytes. Rejects when it
+    /// exceeds the device `workgroup_shared_memory_max_bytes` opt-in
+    /// ceiling. A zero device ceiling is unevaluable.
+    pub workgroup_shared_memory_bytes: Option<u32>,
+    /// Minimum collective width (warp / simdgroup), when required. A zero
+    /// device width is unevaluable.
+    pub min_collective_width: Option<u32>,
+    /// When true, the device must report `unified_memory`.
+    pub require_unified_memory: bool,
 }
 
 impl Default for RequiredCapabilities {
@@ -330,6 +353,10 @@ impl Default for RequiredCapabilities {
             min_compute_capability: None,
             min_sm_count: None,
             required_dtypes: DtypeSurface::empty(),
+            threads_per_workgroup: None,
+            workgroup_shared_memory_bytes: None,
+            min_collective_width: None,
+            require_unified_memory: false,
         }
     }
 }
@@ -626,8 +653,10 @@ fn gate_membership(plan: &CandidatePlan, set: &DeviceSet) -> Vec<GateViolation> 
 }
 
 /// Gate 2: every operation placed on a device must be executable there —
-/// compute capability, SM count, and dtype surface from the snapshot's
-/// capability facts (C2 §1.2 compatibility).
+/// generic launch-resource fields and dtype surface (C2 §1.2 compatibility).
+/// CUDA identity facts (`compute_capability`, `sm_count`) are consumed only
+/// on CUDA when populated; a zero sentinel or a non-CUDA backend is
+/// unevaluable, never a fake comparison against zero.
 fn gate_compatibility(
     plan: &CandidatePlan,
     discovery: &DeviceDiscoverySnapshot,
@@ -635,30 +664,34 @@ fn gate_compatibility(
     let mut out = Vec::new();
     for assignment in &plan.assignments {
         let Some(entry) = find_device(discovery, &assignment.device) else {
-            out.push(GateViolation {
-                gate: GateClass::Compatibility,
-                device: Some(assignment.device.clone()),
-                failing_fact: format!(
+            out.push(compat_violation(
+                Some(assignment.device.clone()),
+                format!(
                     "no capability facts recorded for {} in the snapshot",
                     assignment.device
                 ),
-            });
+            ));
             continue;
         };
         let caps = &entry.capabilities;
         let required = &assignment.required_capabilities;
+        let backend = entry.backend();
+        let device = &assignment.device;
 
         if let Some(required_cc) = required.min_compute_capability {
-            let got = caps.compute_capability;
-            if (got.major, got.minor) < (required_cc.major, required_cc.minor) {
-                out.push(GateViolation {
-                    gate: GateClass::Compatibility,
-                    device: Some(assignment.device.clone()),
-                    failing_fact: format!(
-                        "compute capability {}.{} is below required {}.{}",
-                        got.major, got.minor, required_cc.major, required_cc.minor
-                    ),
-                });
+            match evaluable_compute_capability(backend, caps.compute_capability) {
+                Ok(got) => {
+                    if (got.major, got.minor) < (required_cc.major, required_cc.minor) {
+                        out.push(compat_violation(
+                            Some(device.clone()),
+                            format!(
+                                "compute capability {}.{} is below required {}.{}",
+                                got.major, got.minor, required_cc.major, required_cc.minor
+                            ),
+                        ));
+                    }
+                }
+                Err(fact) => out.push(compat_violation(Some(device.clone()), fact)),
             }
         }
 
@@ -666,31 +699,133 @@ fn gate_compatibility(
             if dtype_supported(required.required_dtypes, name)
                 && !dtype_supported(caps.dtype_surface, name)
             {
-                out.push(GateViolation {
-                    gate: GateClass::Compatibility,
-                    device: Some(assignment.device.clone()),
-                    failing_fact: format!(
-                        "device {} lacks required dtype {name}",
-                        assignment.device
-                    ),
-                });
+                out.push(compat_violation(
+                    Some(device.clone()),
+                    format!("device {device} lacks required dtype {name}"),
+                ));
             }
         }
 
         if let Some(required_sms) = required.min_sm_count {
-            if caps.sm_count < required_sms {
-                out.push(GateViolation {
-                    gate: GateClass::Compatibility,
-                    device: Some(assignment.device.clone()),
-                    failing_fact: format!(
-                        "sm count {} is below required {}",
-                        caps.sm_count, required_sms
-                    ),
-                });
+            match evaluable_sm_count(backend, caps.sm_count) {
+                Ok(got) => {
+                    if got < required_sms {
+                        out.push(compat_violation(
+                            Some(device.clone()),
+                            format!("sm count {got} is below required {required_sms}"),
+                        ));
+                    }
+                }
+                Err(fact) => out.push(compat_violation(Some(device.clone()), fact)),
             }
         }
+
+        gate_generic_launch_resources(device, caps, required, &mut out);
     }
     out
+}
+
+fn gate_generic_launch_resources(
+    device: &PhysicalDeviceId,
+    caps: &DeviceCapabilities,
+    required: &RequiredCapabilities,
+    out: &mut Vec<GateViolation>,
+) {
+    if let Some(demand) = required.threads_per_workgroup {
+        match evaluable_launch_limit(caps.max_threads_per_workgroup, "max_threads_per_workgroup") {
+            Ok(limit) if demand > limit => out.push(compat_violation(
+                Some(device.clone()),
+                format!(
+                    "threads per workgroup {demand} exceeds device max_threads_per_workgroup {limit}"
+                ),
+            )),
+            Ok(_) => {}
+            Err(fact) => out.push(compat_violation(Some(device.clone()), fact)),
+        }
+    }
+
+    if let Some(demand) = required.workgroup_shared_memory_bytes {
+        match evaluable_launch_limit(
+            caps.workgroup_shared_memory_max_bytes,
+            "workgroup_shared_memory_max_bytes",
+        ) {
+            Ok(limit) if demand > limit => out.push(compat_violation(
+                Some(device.clone()),
+                format!("workgroup shared memory {demand} bytes exceeds device max {limit} bytes"),
+            )),
+            Ok(_) => {}
+            Err(fact) => out.push(compat_violation(Some(device.clone()), fact)),
+        }
+    }
+
+    if let Some(required_width) = required.min_collective_width {
+        match evaluable_launch_limit(caps.collective_width, "collective_width") {
+            Ok(got) if got < required_width => out.push(compat_violation(
+                Some(device.clone()),
+                format!("collective width {got} is below required {required_width}"),
+            )),
+            Ok(_) => {}
+            Err(fact) => out.push(compat_violation(Some(device.clone()), fact)),
+        }
+    }
+
+    if required.require_unified_memory && !caps.unified_memory {
+        out.push(compat_violation(
+            Some(device.clone()),
+            format!("device {device} does not provide required unified memory"),
+        ));
+    }
+}
+
+fn compat_violation(device: Option<PhysicalDeviceId>, failing_fact: String) -> GateViolation {
+    GateViolation {
+        gate: GateClass::Compatibility,
+        device,
+        failing_fact,
+    }
+}
+
+/// CUDA identity `compute_capability` is evaluable only on CUDA with a
+/// populated (non-zero) value.
+fn evaluable_compute_capability(
+    backend: DeviceBackend,
+    got: ComputeCapability,
+) -> Result<ComputeCapability, String> {
+    if backend != DeviceBackend::Cuda {
+        return Err(format!(
+            "compute capability is unevaluable on {} (CUDA identity fact)",
+            backend.spelling()
+        ));
+    }
+    if got.major == 0 && got.minor == 0 {
+        return Err("compute capability is unevaluable (device reports 0.0)".to_owned());
+    }
+    Ok(got)
+}
+
+/// CUDA identity `sm_count` is evaluable only on CUDA with a populated
+/// (non-zero) value.
+fn evaluable_sm_count(backend: DeviceBackend, got: u32) -> Result<u32, String> {
+    if backend != DeviceBackend::Cuda {
+        return Err(format!(
+            "sm count is unevaluable on {} (CUDA identity fact)",
+            backend.spelling()
+        ));
+    }
+    if got == 0 {
+        return Err("sm count is unevaluable (device reports 0)".to_owned());
+    }
+    Ok(got)
+}
+
+/// A zero launch-resource field is a missing measurement, not a real limit
+/// of zero — comparing against it would fake-evaluate.
+fn evaluable_launch_limit(value: u32, field: &'static str) -> Result<u32, String> {
+    if value == 0 {
+        Err(format!("{field} is unevaluable (device reports 0)"))
+    } else {
+        Ok(value)
+    }
 }
 
 /// Gate 3: the declared requirements per device (incl. partition budgets)
