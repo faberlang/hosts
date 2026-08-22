@@ -11,13 +11,7 @@ pub use host_device_core::kernel;
 pub mod cuda_host;
 pub mod cuda_launch_adapter;
 
-pub use cuda_host::{
-    discover_cuda_snapshot, enumerate_cuda_physical_devices, probe_cuda_environment, CudaEnvReport,
-    CudaHandleId, CudaHostSession, CudaPhysicalDevice, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
-    E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED,
-};
-pub use cuda_launch_adapter::{
-    launch_descriptor, parse_descriptor, AdapterBufferRole, AdapterLaunchReceipt, NumericOracle,
-    NvvmElementType, NvvmLaunchBuffer, NvvmLaunchPlan, OracleCheck, NVVM_DESCRIPTOR_SCHEMA_VERSION,
-    NVVM_DESCRIPTOR_TARGET,
-};
+// Re-export the complete backend surfaces so product aliases preserve the
+// old `crate::cuda_host::...` and `crate::cuda_launch_adapter::...` paths.
+pub use cuda_host::*;
+pub use cuda_launch_adapter::*;
