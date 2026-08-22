@@ -13,6 +13,8 @@
 //! are responsible for turning the descriptor into backend binding/uniform
 //! arguments; this module never guesses a shape from a buffer length.
 
+use super::moe::RouterSelectionBind;
+
 /// Version of the target-neutral library-v0 bind descriptor consumed by these
 /// bodies.  This is an additive executor-plan extension, not a replacement for
 /// the existing device descriptor schema.
@@ -1416,6 +1418,15 @@ pub enum KernelBodyError {
         /// Supplied bytes available to the block decoder.
         actual: usize,
     },
+    /// A router logit is not finite and cannot participate in selection
+    /// (device-side router policy: non-finite fails closed, mirroring the
+    /// PM3 host seam).
+    NonFiniteLogit {
+        /// Activation row that produced the logit.
+        row: u64,
+        /// Declared expert whose logit is not finite.
+        expert: u64,
+    },
 }
 
 impl std::fmt::Display for KernelBodyError {
@@ -1442,6 +1453,10 @@ impl std::fmt::Display for KernelBodyError {
             } => write!(
                 f,
                 "library packed {format} block has {actual} bytes, needs {required}"
+            ),
+            Self::NonFiniteLogit { row, expert } => write!(
+                f,
+                "router logit for expert {expert} at row {row} is non-finite"
             ),
         }
     }
@@ -1601,7 +1616,7 @@ fn get_scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
-fn block_value(
+pub(crate) fn block_value(
     format: QuantizedFormat,
     block: &[u8],
     element: usize,
@@ -2041,6 +2056,10 @@ pub fn grouped_expert_gemm(
 pub enum GroupedExpertGemmKernel {
     /// Packed rank-3 expert slices with the landed per-format dequant path.
     Packed,
+    /// Device-side grouped dispatch reading the active expert ids/weights
+    /// from the grouped-dispatch device buffers (M8-U1b ruling).  The CPU
+    /// parity body proves the arithmetic the minted Metal body must match.
+    Device,
 }
 
 /// Dispatch the explicitly selected grouped expert GEMM body.
@@ -2056,6 +2075,192 @@ pub fn dispatch_grouped_expert_gemm(
         GroupedExpertGemmKernel::Packed => {
             grouped_expert_gemm(bind, expert_shapes, activation, packed_weights, output)
         }
+        GroupedExpertGemmKernel::Device => Err(KernelBodyError::InvalidBind(
+            "Device grouped dispatch requires the ids/weights dispatch seam",
+        )),
+    }
+}
+
+/// Grouped expert GEMM reading the active expert set from the grouped-
+/// dispatch ids/weights device buffers.
+///
+/// The bind's `experts` field names the total expert slices in the packed
+/// region; the active width is the per-row ids/weights width supplied here.
+/// For each active slot the body computes that expert's packed GEMM
+/// intermediate, scales it by the slot's router weight, and accumulates.
+/// When every expert is active with unit weight this reduces exactly to the
+/// [`grouped_expert_gemm`] reference accumulation.  This is the CPU parity
+/// oracle for the minted `grouped_expert_gemm` Metal body.
+pub fn grouped_expert_gemm_selected(
+    bind: &GroupedExpertGemmBind,
+    activation: &[f32],
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+    packed_weights: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    bind.validate()?;
+    let rows = checked_usize(bind.rows)?;
+    let k = checked_usize(bind.k)?;
+    let n = checked_usize(bind.n)?;
+    let experts = checked_usize(bind.experts)?;
+    let input_stride = checked_usize(bind.input_row_stride)?;
+    let output_stride = checked_usize(bind.output_row_stride)?;
+    let column_stride = checked_usize(bind.packed_column_stride_bytes)?;
+    let expert_stride = checked_usize(bind.packed_expert_stride_bytes)?;
+    let block_elements = checked_usize(bind.format.block_elements())?;
+    let block_bytes = checked_usize(bind.format.block_bytes())?;
+    let blocks = k / block_elements;
+
+    let input_span = rows
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(input_stride))
+        .and_then(|last| last.checked_add(k))
+        .ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM input span overflow",
+        ))?;
+    let output_span = rows
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(output_stride))
+        .and_then(|last| last.checked_add(n))
+        .ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM output span overflow",
+        ))?;
+    let column_span = n
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(column_stride))
+        .and_then(|last| {
+            blocks
+                .checked_mul(block_bytes)
+                .and_then(|column_bytes| last.checked_add(column_bytes))
+        })
+        .ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM packed column span overflow",
+        ))?;
+    let weight_span = experts
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(expert_stride))
+        .and_then(|last| last.checked_add(column_span))
+        .ok_or(KernelBodyError::InvalidBind(
+            "grouped expert GEMM packed weight span overflow",
+        ))?;
+    let dispatch_span =
+        rows.checked_mul(expert_ids.len() / rows)
+            .ok_or(KernelBodyError::InvalidBind(
+                "grouped expert GEMM dispatch span overflow",
+            ))?;
+    if activation.len() < input_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert activation",
+            required: input_span as u64,
+            actual: activation.len(),
+        });
+    }
+    if output.len() < output_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert output",
+            required: output_span as u64,
+            actual: output.len(),
+        });
+    }
+    if packed_weights.len() < weight_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "grouped expert packed weights",
+            required: weight_span as u64,
+            actual: packed_weights.len(),
+        });
+    }
+    let active = expert_ids.len() / rows;
+    if expert_ids.len() % rows != 0 || expert_weights.len() % rows != 0 {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch ids/weights are not a full row width",
+        ));
+    }
+    if active == 0 {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch ids have no active experts",
+        ));
+    }
+    if active > experts {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch ids exceed the packed expert count",
+        ));
+    }
+    if expert_ids.len() != dispatch_span || expert_weights.len() != dispatch_span {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch ids/weights widths disagree",
+        ));
+    }
+    if let Some((_slot, _expert)) = expert_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, expert)| u64::from(*expert) >= bind.experts)
+    {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch id is out of the packed expert range",
+        ));
+    }
+    if let Some((_slot, _)) = expert_weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite())
+    {
+        return Err(KernelBodyError::ShapeMismatch(
+            "grouped expert dispatch weight is non-finite",
+        ));
+    }
+
+    for row in 0..rows {
+        for column in 0..n {
+            let mut accumulated = 0.0f32;
+            for slot in 0..active {
+                let expert = usize::try_from(expert_ids[row * active + slot]).map_err(|_| {
+                    KernelBodyError::InvalidBind("grouped expert dispatch id exceeds host usize")
+                })?;
+                let weight = expert_weights[row * active + slot];
+                let mut intermediate = 0.0f32;
+                for block_index in 0..blocks {
+                    let block_base =
+                        expert * expert_stride + column * column_stride + block_index * block_bytes;
+                    let block = &packed_weights[block_base..block_base + block_bytes];
+                    let activation_base = row * input_stride + block_index * block_elements;
+                    for element in 0..block_elements {
+                        let weight_value = block_value(bind.format, block, element)?;
+                        intermediate += activation[activation_base + element] * weight_value;
+                    }
+                }
+                accumulated += weight * intermediate;
+            }
+            output[row * output_stride + column] = accumulated;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch the device-selected grouped expert GEMM body.
+pub fn dispatch_grouped_expert_gemm_selected(
+    kernel: GroupedExpertGemmKernel,
+    bind: &GroupedExpertGemmBind,
+    activation: &[f32],
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+    packed_weights: &[u8],
+    output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        GroupedExpertGemmKernel::Device => grouped_expert_gemm_selected(
+            bind,
+            activation,
+            expert_ids,
+            expert_weights,
+            packed_weights,
+            output,
+        ),
+        GroupedExpertGemmKernel::Packed => Err(KernelBodyError::InvalidBind(
+            "Packed grouped dispatch requires the expert-shape seam",
+        )),
     }
 }
 
@@ -2477,6 +2682,27 @@ pub enum LibraryDispatch<'a> {
         output: &'a mut [f32],
         epsilon: f32,
     },
+    /// The device-side router selection body (packed router GEMV +
+    /// deterministic top-k/softmax writing the grouped-dispatch buffers).
+    RouterSelection {
+        library_entry: Option<&'a str>,
+        bind: &'a RouterSelectionBind,
+        activation: &'a [f32],
+        router_weight: &'a [u8],
+        expert_ids: &'a mut [u32],
+        expert_weights: &'a mut [f32],
+    },
+    /// The grouped expert body reading the active expert set from the
+    /// grouped-dispatch ids/weights device buffers.
+    GroupedExpertGemm {
+        library_entry: Option<&'a str>,
+        bind: &'a GroupedExpertGemmBind,
+        activation: &'a [f32],
+        expert_ids: &'a [u32],
+        expert_weights: &'a [f32],
+        packed_weights: &'a [u8],
+        output: &'a mut [f32],
+    },
 }
 
 /// Dispatch a plan-selected library request through its production selector
@@ -2525,6 +2751,52 @@ pub fn dispatch_selected(request: LibraryDispatch<'_>) -> Result<(), KernelBodyE
                 ),
             )?;
             dispatch_residual_rms_norm(kernel, bind, residual, skip, gamma, output, epsilon)
+        }
+        LibraryDispatch::RouterSelection {
+            library_entry,
+            bind,
+            activation,
+            router_weight,
+            expert_ids,
+            expert_weights,
+        } => {
+            if library_entry != Some("RouterSelection") {
+                return Err(KernelBodyError::InvalidBind(
+                    "RouterSelection dispatch disagrees with library_entry",
+                ));
+            }
+            super::moe::dispatch_router_selection(
+                super::moe::RouterSelectionKernel::Device,
+                bind,
+                activation,
+                router_weight,
+                expert_ids,
+                expert_weights,
+            )
+        }
+        LibraryDispatch::GroupedExpertGemm {
+            library_entry,
+            bind,
+            activation,
+            expert_ids,
+            expert_weights,
+            packed_weights,
+            output,
+        } => {
+            if library_entry != Some("GroupedExpertGemm") {
+                return Err(KernelBodyError::InvalidBind(
+                    "GroupedExpertGemm dispatch disagrees with library_entry",
+                ));
+            }
+            dispatch_grouped_expert_gemm_selected(
+                GroupedExpertGemmKernel::Device,
+                bind,
+                activation,
+                expert_ids,
+                expert_weights,
+                packed_weights,
+                output,
+            )
         }
     }
 }
