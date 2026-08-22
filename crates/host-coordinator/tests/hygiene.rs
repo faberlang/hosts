@@ -14,8 +14,10 @@ fn config() -> ScanConfig {
 
 const BUDGETS: Budgets = Budgets {
     unwrap: 0,
-    // WHY: invariant expects in bind/capability plus "write to String cannot fail".
-    expect: 13,
+    // WHY: invariant expects in bind/capability plus "write to String cannot fail";
+    // transport.rs::SourceValue::slice::byte_index converts a validated byte
+    // offset that is guaranteed to fit the host pointer width.
+    expect: 14,
     panic: 0,
     unreachable: 0,
     todo: 0,
