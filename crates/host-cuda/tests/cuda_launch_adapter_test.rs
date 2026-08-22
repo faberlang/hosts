@@ -405,8 +405,8 @@ fn execute_launches_matmul_and_matches_oracle() {
     assert_eq!(receipt.zero_fills, 0, "rung-0 has no accumulation buffers");
     assert_eq!(receipt.readbacks, 1, "one output buffer read back");
     assert_eq!(
-        receipt.releases, 4,
-        "3 buffers + module released after the launch"
+        receipt.releases, 3,
+        "3 per-launch buffers released after the launch"
     );
     let output = receipt
         .outputs
@@ -417,13 +417,57 @@ fn execute_launches_matmul_and_matches_oracle() {
     assert!(oracle.matched);
     assert_eq!(oracle.max_abs_delta, 0.0);
 
-    // Leak-free bar (S2-2 posture): nothing persists after the launch.
-    assert_eq!(session.live_handle_count(), 0);
+    // The module is session-owned: it remains live after the launch and is
+    // released at the explicit session teardown boundary.
+    assert_eq!(session.live_handle_count(), 1);
     let counters = session.driver_counters();
     assert_eq!(counters.module_loads, 1);
-    assert_eq!(counters.module_releases, 1);
+    assert_eq!(counters.module_releases, 0);
     assert_eq!(counters.buffer_allocs, 3);
     assert_eq!(counters.buffer_releases, 3);
+    session.teardown().expect("session module teardown");
+    assert_eq!(session.live_handle_count(), 0);
+    assert_eq!(session.driver_counters().module_releases, 1);
+}
+
+#[test]
+fn execute_reuses_identical_ptx_module_for_session_launches() {
+    let mut session = fake_session();
+    let ptx = b"// fake compiler-owned PTX bytes";
+    for _ in 0..2 {
+        let receipt = launch_descriptor(
+            &mut session,
+            RUNG0_MATMUL_DESCRIPTOR.as_bytes(),
+            ptx,
+            &rung0_inputs(),
+            Some(&rung0_oracle()),
+        )
+        .expect("adapter launch");
+        assert_eq!(receipt.releases, 3, "only per-launch buffers are released");
+    }
+
+    let counters = session.driver_counters();
+    assert_eq!(
+        counters.module_loads, 1,
+        "identical PTX loads once per session"
+    );
+    assert_eq!(counters.module_releases, 0, "module lives until teardown");
+    assert_eq!(counters.buffer_allocs, 6);
+    assert_eq!(counters.buffer_releases, 6);
+    assert_eq!(
+        session.live_handle_count(),
+        1,
+        "the cached module remains live"
+    );
+
+    session.teardown().expect("session module teardown");
+    let counters = session.driver_counters();
+    assert_eq!(counters.module_loads, 1);
+    assert_eq!(
+        counters.module_releases, 1,
+        "one cached module release at teardown"
+    );
+    assert_eq!(session.live_handle_count(), 0);
 }
 
 #[test]
@@ -441,7 +485,10 @@ fn execute_rejects_missing_input() {
     .expect_err("a missing input buffer must fail closed");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
     assert!(err.message.contains("binding 1"), "{}", err.message);
-    // Error-path teardown: the failed launch leaks nothing.
+    // The failed launch releases its buffers; the session-owned module stays
+    // cached until teardown.
+    assert_eq!(session.live_handle_count(), 1);
+    session.teardown().expect("session module teardown");
     assert_eq!(session.live_handle_count(), 0);
 }
 
@@ -459,6 +506,8 @@ fn execute_rejects_wrong_input_length() {
     )
     .expect_err("a wrong-sized input must fail closed");
     assert_eq!(err.code, E_DEVICE_SHAPE_MISMATCH);
+    assert_eq!(session.live_handle_count(), 1);
+    session.teardown().expect("session module teardown");
     assert_eq!(session.live_handle_count(), 0);
 }
 
@@ -479,6 +528,8 @@ fn execute_propagates_entry_mismatch() {
     )
     .expect_err("a module without the declared entry must fail closed");
     assert_eq!(err.code, E_DEVICE_ENTRY_MISMATCH);
+    assert_eq!(session.live_handle_count(), 1);
+    session.teardown().expect("session module teardown");
     assert_eq!(session.live_handle_count(), 0);
 }
 

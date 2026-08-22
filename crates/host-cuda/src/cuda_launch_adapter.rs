@@ -14,7 +14,8 @@
 //!    codes from [`crate::device_descriptor`] before any driver call. Grid/
 //!    block axes must be non-zero and fit `u32` — an out-of-range axis is
 //!    rejected, never saturated to `u32::MAX`.
-//! 2. **Load module** — the PTX bytes are loaded once per launch.
+//! 2. **Load module** — the PTX bytes are loaded once per session and reused
+//!    by later launches with the same image.
 //! 3. **Allocate from the descriptor** — every storage buffer is allocated
 //!    with the byte length derived from its descriptor element count and the
 //!    kernel's byte width (never from re-derived text).
@@ -37,9 +38,10 @@
 //!    rows; an optional numeric oracle (`|a−b| ≤ atol + rtol·|b|`) verifies
 //!    the first output row.
 //!
-//! The adapter releases every handle it allocates (buffers + module) on
-//! success AND on error, so a failed launch never leaks at the driver
-//! boundary (S2-2 posture).
+//! The adapter releases every buffer handle it allocates on success AND on
+//! error. The module handle is session-owned and remains cached until session
+//! teardown, so a failed launch never reloads the same PTX image (S2-2
+//! posture).
 //!
 //! # Schema-constant tracking (U-01 residual a)
 //!
@@ -907,8 +909,8 @@ fn launch_authority_conflict(entry: &str, detail: impl std::fmt::Display) -> Hos
 /// otherwise). An optional [`NumericOracle`] is checked against the first
 /// output row.
 ///
-/// The adapter releases every handle it allocates on success AND on error, so
-/// a failed launch never leaks at the driver boundary.
+/// The adapter releases every per-launch buffer handle on success AND on
+/// error. The session-owned module remains cached until session teardown.
 ///
 /// # Errors
 /// - `E_DEVICE_DTYPE_MISMATCH` — the kernel is not f32 (the session transfer
@@ -939,12 +941,11 @@ pub fn execute_launch_plan(
         ));
     }
     let mut handles: Vec<CudaHandleId> = Vec::with_capacity(plan.buffers.len());
-    let mut module: Option<CudaHandleId> = None;
-    // Error-path teardown (S2-3 posture): a failure at any stage runs the
-    // ordered release below before the error escapes.
+    // Error-path teardown (S2-3 posture): a failure at any stage releases the
+    // per-launch buffers before the error escapes. The module is session-owned
+    // and remains cached for a later launch with the same PTX image.
     let outcome = (|| -> HostResult<AdapterLaunchReceipt> {
-        let module_handle = session.load_module(ptx)?;
-        module = Some(module_handle);
+        let module_handle = session.load_cached_module(ptx)?;
         for buffer in &plan.buffers {
             let byte_length = buffer_byte_length(buffer, plan.element_ty, &plan.entry)?;
             handles.push(session.alloc_bytes(byte_length)?);
@@ -1039,16 +1040,12 @@ pub fn execute_launch_plan(
         })
     })();
 
-    // Teardown: release every allocated buffer and the module, success or
-    // failure, before the receipt (or the error) escapes.
+    // Teardown: release every per-launch buffer, success or failure, before
+    // the receipt (or the error) escapes. The cached module is released by
+    // the owning session's teardown boundary.
     let mut releases = 0usize;
     for handle in &handles {
         if session.release(*handle).is_ok() {
-            releases += 1;
-        }
-    }
-    if let Some(module_handle) = module {
-        if session.release(module_handle).is_ok() {
             releases += 1;
         }
     }

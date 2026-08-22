@@ -20,7 +20,7 @@ use host_coordinator::discovery::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::device_descriptor::DeviceDataType;
+use crate::device_descriptor::{fnv1a64, DeviceDataType};
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
@@ -129,19 +129,27 @@ pub trait CudaDriver: Send {
     fn sync(&mut self) -> HostResult<()>;
     fn copy_out(&mut self, token: u64, len_bytes: usize) -> HostResult<Vec<u8>>;
     fn free(&mut self, token: u64) -> HostResult<()>;
-    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). Real
-    /// drivers report all-zero (their leak evidence is the S2-8 real-device
-    /// gate); the fake drivers track cumulative loads/releases so tests can
-    /// prove the cache policy at the driver boundary.
+    /// Driver-level lifecycle counters (S2-2 module-cache leak bar). Drivers
+    /// report cumulative loads/releases and buffer allocs/releases; the fake
+    /// and real implementations use the same observation surface.
     fn counters(&self) -> DriverCounters {
         DriverCounters::default()
     }
+}
+
+/// One PTX image retained by the session-scoped module cache.
+struct CachedModule {
+    image: Vec<u8>,
+    handle: CudaHandleId,
 }
 
 /// Product-facing session: opaque handles + ordered lifecycle.
 pub struct CudaHostSession {
     driver: Box<dyn CudaDriver>,
     handles: HandleRegistry<CudaHandleKind>,
+    /// Session-owned modules keyed by FNV-1a image hash, with the image bytes
+    /// retained so a hash collision cannot alias two different PTX images.
+    module_cache: BTreeMap<u64, Vec<CachedModule>>,
     admitted: bool,
     /// HostProvided once-init copies issued through this session.
     uploads: usize,
@@ -177,6 +185,7 @@ impl CudaHostSession {
         Ok(Self {
             driver,
             handles: HandleRegistry::new(),
+            module_cache: BTreeMap::new(),
             admitted,
             uploads: 0,
         })
@@ -217,6 +226,58 @@ impl CudaHostSession {
         }
         let token = self.driver.load_module(image)?;
         Ok(self.insert(CudaHandleKind::Module, token))
+    }
+
+    /// Load a PTX image once for this session and reuse its handle on later
+    /// launches. The hash is only the lookup bucket; retained image bytes
+    /// make collisions fail closed into separate cache entries.
+    pub(crate) fn load_cached_module(&mut self, image: &[u8]) -> HostResult<CudaHandleId> {
+        self.require_admitted()?;
+        if image.is_empty() {
+            return Err(HostError::invalid_args("CUDA module image is empty"));
+        }
+        let hash = fnv1a64(image);
+        if let Some(cached) = self
+            .module_cache
+            .get(&hash)
+            .and_then(|modules| modules.iter().find(|module| module.image == image))
+        {
+            return Ok(cached.handle);
+        }
+        let handle = self.load_module(image)?;
+        self.module_cache
+            .entry(hash)
+            .or_default()
+            .push(CachedModule {
+                image: image.to_vec(),
+                handle,
+            });
+        Ok(handle)
+    }
+
+    /// Release all modules owned by the session cache. The adapter keeps
+    /// cached modules alive across launches; callers may invoke this explicit
+    /// teardown to observe the release counters, and `Drop` repeats it
+    /// idempotently as the fallback boundary.
+    pub fn teardown(&mut self) -> HostResult<()> {
+        let handles: Vec<CudaHandleId> = self
+            .module_cache
+            .values()
+            .flat_map(|modules| modules.iter().map(|module| module.handle))
+            .collect();
+        let mut first_error = None;
+        for handle in handles {
+            if let Err(error) = self.release(handle) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn alloc_bytes(&mut self, len_bytes: usize) -> HostResult<CudaHandleId> {
@@ -381,7 +442,17 @@ impl CudaHostSession {
         let Some(handle) = self.handles.remove(id.0) else {
             return Err(cuda_invalid_handle(id));
         };
+        if matches!(handle.kind, CudaHandleKind::Module) {
+            self.remove_cached_module(id);
+        }
         self.driver.free(handle.backend_token)
+    }
+
+    fn remove_cached_module(&mut self, id: CudaHandleId) {
+        self.module_cache.retain(|_, modules| {
+            modules.retain(|module| module.handle != id);
+            !modules.is_empty()
+        });
     }
 
     /// Control-frame representation of a handle (opaque id only; no payload).
@@ -421,6 +492,12 @@ impl CudaHostSession {
             },
             None => Err(cuda_invalid_handle(id)),
         }
+    }
+}
+
+impl Drop for CudaHostSession {
+    fn drop(&mut self) {
+        let _ = self.teardown();
     }
 }
 
@@ -855,6 +932,8 @@ struct SystemCudaDriver {
     /// Locator only; identity lives on [`CudaPhysicalDevice`].
     enumerated_device: Option<i32>,
     next_token: u64,
+    /// Cumulative lifecycle counters from successful real Driver API calls.
+    counters: DriverCounters,
 }
 
 /// Opaque Driver API handle (`CUmodule`). Raw pointers are not `Send`; this
@@ -943,6 +1022,7 @@ impl CudaDriver for SystemCudaDriver {
         let token = self.next_token;
         self.next_token += 1;
         self.modules.insert(token, OpaqueHandle(module));
+        self.counters.module_loads += 1;
         Ok(token)
     }
 
@@ -958,6 +1038,7 @@ impl CudaDriver for SystemCudaDriver {
         let token = self.next_token;
         self.next_token += 1;
         self.buffers.insert(token, device_ptr);
+        self.counters.buffer_allocs += 1;
         Ok(token)
     }
 
@@ -1134,12 +1215,24 @@ impl CudaDriver for SystemCudaDriver {
                     "cuMemFree failed with CUDA result {result}"
                 )));
             }
+            self.counters.buffer_releases += 1;
+            return Ok(());
         }
-        // Module teardown (cuModuleUnload) is deferred for the one-shot proof
-        // process and recorded here, not silent: the process exits right after
-        // the proof and the driver reclaims the module at teardown.
-        self.modules.remove(&token);
+        if let Some(module) = self.modules.remove(&token) {
+            let api = self.current_api()?;
+            let result = unsafe { (api.cu_module_unload)(module.0) };
+            if result != CUDA_SUCCESS {
+                return Err(cuda_driver(format!(
+                    "cuModuleUnload failed with CUDA result {result}"
+                )));
+            }
+            self.counters.module_releases += 1;
+        }
         Ok(())
+    }
+
+    fn counters(&self) -> DriverCounters {
+        self.counters
     }
 }
 
@@ -1216,6 +1309,7 @@ struct CudaDriverApi {
     cu_device_primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, i32) -> i32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
+    cu_module_unload: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32,
     cu_launch_kernel: unsafe extern "C" fn(
@@ -1271,6 +1365,7 @@ unsafe fn resolve_cuda_api(library: &libloading::Library) -> HostResult<CudaDriv
             cu_device_primary_ctx_retain: resolve_symbol(library, b"cuDevicePrimaryCtxRetain\0")?,
             cu_ctx_set_current: resolve_symbol(library, b"cuCtxSetCurrent\0")?,
             cu_module_load_data: resolve_symbol(library, b"cuModuleLoadData\0")?,
+            cu_module_unload: resolve_symbol(library, b"cuModuleUnload\0")?,
             cu_module_get_function: resolve_symbol(library, b"cuModuleGetFunction\0")?,
             cu_launch_kernel: resolve_symbol(library, b"cuLaunchKernel\0")?,
             cu_mem_alloc: resolve_symbol(library, b"cuMemAlloc_v2\0")?,
