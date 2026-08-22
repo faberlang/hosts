@@ -24,7 +24,7 @@ use super::inference_state::{
     SequencePhase, SessionError, E_KV_STALE,
 };
 use super::session::{ProgramInner, ProgramSession};
-use super::DeviceExecutionReceipt;
+use super::{DeviceExecutionReceipt, KvCacheTimingReceipt};
 
 /// One prepared prefill/scalar-decode pair over one runtime and model owner.
 pub struct PairedProgramSession<'host> {
@@ -207,6 +207,19 @@ impl<'host> PairedProgramSession<'host> {
         self.resets = self.resets.saturating_add(1);
         self.reset_cleared = receipt.previous_valid_len as usize;
         Ok(receipt)
+    }
+
+    /// The latest F4H1 timing for the selected paired program.
+    #[must_use]
+    pub fn kv_cache_timing(&self, mode: DeviceExecuteInvocationMode) -> KvCacheTimingReceipt {
+        let program = match mode {
+            DeviceExecuteInvocationMode::Prefill => &self.prefill,
+            DeviceExecuteInvocationMode::ScalarDecode => &self.decode,
+        };
+        program
+            .as_ref()
+            .map(ProgramInner::kv_cache_timing)
+            .unwrap_or_else(KvCacheTimingReceipt::not_measured)
     }
 
     /// Number of successful prefill/decode dispatches.

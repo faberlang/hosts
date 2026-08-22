@@ -394,6 +394,10 @@ impl ProgramInner {
     pub(crate) fn module_hash(&self) -> u64 {
         self.module_hash
     }
+
+    pub(crate) fn kv_cache_timing(&self) -> KvCacheTimingReceipt {
+        self.kv_cache_timing
+    }
 }
 
 fn elapsed_us(start: Instant) -> u64 {

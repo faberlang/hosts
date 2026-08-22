@@ -52,8 +52,8 @@ use serde::{Deserialize, Serialize};
 use crate::composite_host::invocation_binding::RopeConfig;
 use crate::composite_host::{
     admitted_backends, resolve_device_selection, CompositeHost, CompositeHostConfig,
-    DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection, PairedProgramSession,
-    PreparedResidentSession, PreparedSessionReceipt,
+    DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection, KvCacheTimingReceipt,
+    PairedProgramSession, PreparedResidentSession,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -1019,12 +1019,12 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                 let started = Instant::now();
                 let receipt = paired.execute_invocation(&invocation)?;
                 let wall_us = elapsed_us(started);
-                let mut wire = DeviceExecuteReceipt::from_host(&receipt);
-                wire.kernel_count = match invocation.mode {
+                let kernel_count = match invocation.mode {
                     DeviceExecuteInvocationMode::Prefill => prefill.kernels.len(),
                     DeviceExecuteInvocationMode::ScalarDecode => decode.kernels.len(),
                 };
-                wire.stage_timing = stage_timing(wall_us, &receipt);
+                let timing = paired.kv_cache_timing(invocation.mode);
+                let wire = project_v2_invocation_receipt(&receipt, timing, kernel_count, wall_us);
                 load.operation = "invoke".to_owned();
                 apply_paired_lifecycle(&mut load, &paired);
                 load.receipt = Some(wire);
@@ -1260,10 +1260,10 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                 let started = Instant::now();
                 let host_receipt = session.execute_step(&inputs)?;
                 let wall_us = elapsed_us(started);
-                let timing = session.receipt();
+                let timing = session.receipt().timing;
                 let mut receipt = DeviceExecuteReceipt::from_host_with_phase_timing(
                     &host_receipt,
-                    f4h1_phase_timing(&timing),
+                    f4h1_phase_timing(timing),
                 );
                 receipt.kernel_count = descriptor.kernels.len();
                 receipt.stage_timing = stage_timing(wall_us, &host_receipt);
@@ -1423,8 +1423,21 @@ fn f4h1_measurement_us<T: Serialize>(measurement: T) -> u64 {
         .unwrap_or_default()
 }
 
-fn f4h1_phase_timing(receipt: &PreparedSessionReceipt) -> DevicePhaseTiming {
-    let phase = &receipt.timing.steady_state;
+fn project_v2_invocation_receipt(
+    receipt: &DeviceExecutionReceipt,
+    timing: KvCacheTimingReceipt,
+    kernel_count: usize,
+    wall_us: u64,
+) -> DeviceExecuteReceipt {
+    let mut wire =
+        DeviceExecuteReceipt::from_host_with_phase_timing(receipt, f4h1_phase_timing(timing));
+    wire.kernel_count = kernel_count;
+    wire.stage_timing = stage_timing(wall_us, receipt);
+    wire
+}
+
+fn f4h1_phase_timing(timing: KvCacheTimingReceipt) -> DevicePhaseTiming {
+    let phase = timing.steady_state;
     DevicePhaseTiming {
         encode_us: f4h1_measurement_us(phase.encode.duration_us),
         submit_us: f4h1_measurement_us(phase.submit.duration_us),
@@ -2570,4 +2583,84 @@ fn read_file(path: &Path) -> HostResult<Vec<u8>> {
             path.display()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composite_host::{
+        CompletionBoundary, KvCacheLifecycleReceipt, KvCacheMeasurement, KvCachePhaseTiming,
+        KvCacheTimingReceipt, KvCacheTimingSpan,
+    };
+    use std::collections::BTreeMap;
+
+    fn measured_span(duration_us: u64) -> KvCacheTimingSpan {
+        KvCacheTimingSpan {
+            start_us: KvCacheMeasurement::measured(100),
+            end_us: KvCacheMeasurement::measured(100 + duration_us),
+            duration_us: KvCacheMeasurement::measured(duration_us),
+        }
+    }
+
+    fn sample_receipt() -> DeviceExecutionReceipt {
+        DeviceExecutionReceipt {
+            backend: DeviceBackend::Metal,
+            device_name: "test-device".to_owned(),
+            module_hash: 1,
+            launches: 1,
+            launch_ids: vec![1],
+            launch_entries: vec!["kernel".to_owned()],
+            copy_ins: 0,
+            outputs: BTreeMap::new(),
+            allocated_buffers: Vec::new(),
+            allocated_buffer_versions: Vec::new(),
+            pool_allocations: 0,
+            pool_reuses: 0,
+            pool_returns: 0,
+            program_lifetime: DeviceProgramLifetime::SingleRun,
+            per_program_buffers: Vec::new(),
+            per_program_buffer_versions: Vec::new(),
+            per_step_buffers: Vec::new(),
+            per_step_buffer_versions: Vec::new(),
+            observation_buffers: Vec::new(),
+            observation_buffer_versions: Vec::new(),
+            resource_graph: Vec::new(),
+            data_flow_edges: Vec::new(),
+            syncs: 1,
+            transfers: 0,
+            readbacks: 0,
+            releases: 0,
+            completion_boundary: CompletionBoundary::StepSync { after_launch: 1 },
+            program_graph_hash: "graph".to_owned(),
+            copy_in_us: 0,
+            gpu_encode_submit_wait_us: 0,
+            readback_us: 0,
+            launch_gpu_us: Vec::new(),
+            launch_gpu_start_us: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn v2_receipt_carries_measured_encode_and_submit_phase_timing() {
+        let timing = KvCacheTimingReceipt {
+            setup_phase: KvCachePhaseTiming::not_measured(),
+            steady_state: KvCachePhaseTiming {
+                gpu_body: measured_span(7),
+                encode: measured_span(11),
+                submit: measured_span(13),
+                wait: KvCacheTimingSpan::not_measured(),
+            },
+            slack_us: KvCacheMeasurement::derived(2),
+            lifecycle: KvCacheLifecycleReceipt::zero(),
+        };
+        let wire = project_v2_invocation_receipt(&sample_receipt(), timing, 1, 20);
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&receipt_to_json(&wire).expect("encode receipt"))
+                .expect("parse receipt");
+
+        assert_eq!(wire.encode_us, 11);
+        assert_eq!(wire.submit_us, 13);
+        assert_eq!(encoded["encode_us"], 11);
+        assert_eq!(encoded["submit_us"], 13);
+    }
 }

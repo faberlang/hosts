@@ -73,7 +73,9 @@ pub use inference_state::{
 };
 pub use paired_session::PairedProgramSession;
 pub use receipt::{
-    CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback, ReceiptBuffer,
+    CompletionBoundary, DataFlowEdge, DeviceExecutionReceipt, EndOfRunReadback,
+    KvCacheLifecycleReceipt, KvCacheMeasurement, KvCachePhaseTiming, KvCacheTimingReceipt,
+    KvCacheTimingSpan, ReceiptBuffer,
 };
 pub use session::{
     DeviceByteBuffer, KvCacheBindingSession, PreparedResidentSession, PreparedSessionCounters,
