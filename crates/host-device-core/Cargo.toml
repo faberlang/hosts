@@ -1,0 +1,12 @@
+[package]
+name = "host-device-core"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral device descriptor, session, and lifecycle primitives for Faber hosts"
+license = "MIT"
+publish = false
+
+[dependencies]
+faber = { path = "../../../faber/runtime/rust" }
+host-coordinator = { path = "../host-coordinator" }
+serde = { version = "1", features = ["derive"] }

@@ -485,6 +485,7 @@ dependencies = [
  "consolum",
  "faber",
  "host-coordinator",
+ "host-device-core",
  "host-kernel",
  "http",
  "hygiene-ratchet",
@@ -736,6 +737,15 @@ dependencies = [
  "faber",
  "hygiene-ratchet",
  "sha2",
+]
+
+[[package]]
+name = "host-device-core"
+version = "0.1.0"
+dependencies = [
+ "faber",
+ "host-coordinator",
+ "serde",
 ]
 
 [[package]]

@@ -7,18 +7,17 @@
 //! socket later, but it should still be routed as a frame with structured
 //! terminal success or failure.
 
-pub mod frame_data;
+pub use host_device_core::kernel::frame_data;
 pub mod library;
 pub mod valor_wire;
 
-mod error;
 mod frame;
 mod host;
 mod router;
 mod syscall;
 
-pub use error::{HostError, HostResult};
 pub use frame::{Frame, FrameData, Status};
 pub use host::HostKernel;
+pub use host_device_core::kernel::{HostError, HostResult};
 pub use router::{Conversation, Direction, Router};
 pub use syscall::{HostEcho, Syscall, SyscallInfo};

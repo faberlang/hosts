@@ -5,6 +5,7 @@ members = [
     "crates/aleator",
     "crates/consolum",
     "crates/host-coordinator",
+    "crates/host-device-core",
     "crates/http",
     "crates/processus",
     "crates/provider-contracts",

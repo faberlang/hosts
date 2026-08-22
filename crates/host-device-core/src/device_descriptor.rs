@@ -1769,10 +1769,10 @@ fn role_conflict(first: DeviceBufferRole, second: DeviceBufferRole) -> bool {
 
 /// Stable error constructors shared by the descriptor validator, the
 /// composite host, and the launch adapters.
-pub(crate) mod errors {
+pub mod errors {
     use super::{HostError, E_BACKEND_UNAVAILABLE, E_NO_DEVICE_PROGRAM};
 
-    pub(crate) fn backend_unavailable(message: impl Into<String>) -> HostError {
+    pub fn backend_unavailable(message: impl Into<String>) -> HostError {
         HostError {
             code: E_BACKEND_UNAVAILABLE.to_owned(),
             message: message.into(),
@@ -1780,7 +1780,7 @@ pub(crate) mod errors {
         }
     }
 
-    pub(crate) fn no_device_program(message: impl Into<String>) -> HostError {
+    pub fn no_device_program(message: impl Into<String>) -> HostError {
         HostError {
             code: E_NO_DEVICE_PROGRAM.to_owned(),
             message: message.into(),
@@ -1788,7 +1788,7 @@ pub(crate) mod errors {
         }
     }
 
-    pub(crate) fn shape_mismatch(message: impl Into<String>) -> HostError {
+    pub fn shape_mismatch(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_SHAPE_MISMATCH.to_owned(),
             message: message.into(),
@@ -1796,7 +1796,7 @@ pub(crate) mod errors {
         }
     }
 
-    pub(crate) fn descriptor(message: impl Into<String>) -> HostError {
+    pub fn descriptor(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_DESCRIPTOR.to_owned(),
             message: message.into(),
@@ -1804,7 +1804,7 @@ pub(crate) mod errors {
         }
     }
 
-    pub(crate) fn abi_mismatch(message: impl Into<String>) -> HostError {
+    pub fn abi_mismatch(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_ABI_MISMATCH.to_owned(),
             message: message.into(),
@@ -1812,7 +1812,7 @@ pub(crate) mod errors {
         }
     }
 
-    pub(crate) fn dtype_mismatch(message: impl Into<String>) -> HostError {
+    pub fn dtype_mismatch(message: impl Into<String>) -> HostError {
         HostError {
             code: super::E_DEVICE_DTYPE_MISMATCH.to_owned(),
             message: message.into(),
