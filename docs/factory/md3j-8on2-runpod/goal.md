@@ -97,7 +97,7 @@ device-executor M8, `cuda-host-linux-home`), never a process-only
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | MD3J-F1 | planned | — | — | — |
-| MD3J-B1 | planned | — | — | — |
+| MD3J-B1 | landed | hand | hosts 6614514 (red) + 8593996 (green) | split policy 8:2; 21/21; deterministic 4+4; fail-closed both directions |
 | MD3J-B2 | planned | — | — | — |
 | MD3J-P1 | planned | — | — | gate MD3J-RP: operator mail for pod admission (RunPod account operator-held) |
 | MD3J-C1 | planned | — | — | closeout edits this ledger + CAMPAIGN MD3J status |
