@@ -181,3 +181,27 @@ fn qkv_projection_applies_qwen_bias_and_gqa_rope_in_one_body() {
         Err(KernelBodyError::InvalidBind(message)) if message.contains("not servable")
     ));
 }
+
+#[test]
+fn residual_rms_norm_preserves_residual_then_rms_order() {
+    let bind = BindDescriptor::row_major(vec![2, 4], [1, 1, 1]);
+    let residual = [0.25f32, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0];
+    let skip = [0.5f32, 0.25, -0.25, 0.75, -0.5, 0.5, -0.75, 1.0];
+    let gamma = [1.0f32, 0.9, 1.1, 0.8];
+    let mut summed = [0.0f32; 8];
+    let mut expected = [0.0f32; 8];
+    residual(&bind, &residual, &skip, &mut summed).expect("residual baseline");
+    rms(&bind, &summed, &gamma, &mut expected, 1e-5).expect("RMS baseline");
+
+    let selected = select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::RowMajor)
+        .expect("ResidualRmsNorm selector")
+        .expect("ResidualRmsNorm body selected");
+    let mut actual = [0.0f32; 8];
+    dispatch_residual_rms_norm(selected, &bind, &residual, &skip, &gamma, &mut actual, 1e-5)
+        .expect("ResidualRmsNorm body");
+    assert_eq!(actual, expected, "fused arithmetic order changed");
+    assert!(matches!(
+        select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::Flat),
+        Err(KernelBodyError::InvalidBind(message)) if message.contains("not servable")
+    ));
+}

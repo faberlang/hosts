@@ -7,8 +7,9 @@
 //! change dispatch policy.
 
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_gemv, select_decode_gemv, GemvKernel, KernelBodyError, QuantizedFormat,
-    QuantizedGemvBind,
+    dispatch_gemv, dispatch_residual_rms_norm, residual, rms, select_decode_gemv,
+    select_residual_rms_norm, BindDescriptor, BindLayout, GemvKernel, KernelBodyError,
+    QuantizedFormat, QuantizedGemvBind,
 };
 
 const K: usize = 32;
@@ -439,4 +440,135 @@ fn dispatch_selection_fails_closed_on_uniform_or_vocabulary_drift() {
         select_decode_gemv(Some("unowned_future_projection"), 1).is_err(),
         "unowned vocabulary must fail closed"
     );
+}
+
+#[derive(Debug, Clone)]
+struct ResidualRmsFixture {
+    rows: usize,
+    width: usize,
+    stride: usize,
+    residual: Vec<f32>,
+    skip: Vec<f32>,
+    gamma: Vec<f32>,
+}
+
+impl ResidualRmsFixture {
+    fn for_rung(rung: Rung, strided: bool) -> Self {
+        let rows = KV_A_CAPACITY_ROWS;
+        let width = rung.q_per_kv * rung.kv_heads * 4;
+        let stride = if strided { width + 3 } else { width };
+        let mut residual = vec![0.0; rows * stride];
+        let mut skip = vec![0.0; rows * stride];
+        for row in 0..rows {
+            for column in 0..width {
+                let offset = row * stride + column;
+                residual[offset] = 0.125 + row as f32 * 0.03125 + column as f32 * 0.001;
+                skip[offset] = -0.25 + row as f32 * 0.017 + column as f32 * 0.0005;
+            }
+        }
+        let gamma = (0..width)
+            .map(|column| 0.75 + (column % 7) as f32 * 0.025)
+            .collect();
+        Self {
+            rows,
+            width,
+            stride,
+            residual,
+            skip,
+            gamma,
+        }
+    }
+
+    fn bind(&self, strided: bool) -> BindDescriptor {
+        if strided {
+            BindDescriptor::strided(
+                vec![self.rows as u64, self.width as u64],
+                vec![self.stride as u64, 1],
+                [self.width as u32, 1, 1],
+            )
+        } else {
+            BindDescriptor::row_major(
+                vec![self.rows as u64, self.width as u64],
+                [self.width as u32, 1, 1],
+            )
+        }
+    }
+}
+
+fn residual_rms_logical_row(values: &[f32], row: usize, width: usize, stride: usize) -> Vec<f32> {
+    values[row * stride..row * stride + width].to_vec()
+}
+
+#[test]
+fn residual_rms_norm_selection_parity_receipt_covers_both_rungs_and_bind_paths() {
+    for rung in RUNGS {
+        for strided in [false, true] {
+            let fixture = ResidualRmsFixture::for_rung(rung, strided);
+            let bind = fixture.bind(strided);
+            let mut composed_residual = vec![f32::NAN; fixture.rows * fixture.stride];
+            residual(
+                &bind,
+                &fixture.residual,
+                &fixture.skip,
+                &mut composed_residual,
+            )
+            .expect("composed residual baseline");
+            let mut baseline = vec![f32::NAN; fixture.rows * fixture.stride];
+            rms(
+                &bind,
+                &composed_residual,
+                &fixture.gamma,
+                &mut baseline,
+                1e-5,
+            )
+            .expect("composed RMS baseline");
+
+            let selected = select_residual_rms_norm(Some("ResidualRmsNorm"), bind.layout)
+                .expect("ResidualRmsNorm selection")
+                .expect("ResidualRmsNorm body selected");
+            let mut actual = vec![f32::NAN; fixture.rows * fixture.stride];
+            dispatch_residual_rms_norm(
+                selected,
+                &bind,
+                &fixture.residual,
+                &fixture.skip,
+                &fixture.gamma,
+                &mut actual,
+                1e-5,
+            )
+            .expect("selected ResidualRmsNorm body");
+
+            let last_row = PREFIX_BEFORE;
+            let actual_last =
+                residual_rms_logical_row(&actual, last_row, fixture.width, fixture.stride);
+            let baseline_last =
+                residual_rms_logical_row(&baseline, last_row, fixture.width, fixture.stride);
+            let residuals = actual_last
+                .iter()
+                .zip(&baseline_last)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .collect::<Vec<_>>();
+            let max_ulp = actual_last
+                .iter()
+                .zip(&baseline_last)
+                .map(|(actual, expected)| ulp_distance(*actual, *expected))
+                .max()
+                .unwrap_or(0);
+            assert_eq!(argmax(&actual_last), argmax(&baseline_last));
+            assert_eq!(max_ulp, 0, "ResidualRmsNorm arithmetic order changed");
+            assert!(actual_last.iter().all(|value| value.is_finite()));
+            assert!(baseline_last.iter().all(|value| value.is_finite()));
+            eprintln!(
+                "M4-U2b parity receipt: rung={} entry=Some(ResidualRmsNorm) layout={} last_row={:?} baseline={:?} residuals={:?} max_ulp={} rms=1 launch/layer",
+                rung.name,
+                if strided { "strided" } else { "row_major" },
+                actual_last,
+                baseline_last,
+                residuals,
+                max_ulp,
+            );
+        }
+    }
+    assert!(select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::Flat).is_err());
+    assert!(select_residual_rms_norm(Some("rms"), BindLayout::RowMajor).is_err());
 }

@@ -879,6 +879,104 @@ pub fn dispatch_qkv_projection(
         LibraryKernel::CausalAttention => Err(KernelBodyError::InvalidBind(
             "QKV dispatch received CausalAttention",
         )),
+        LibraryKernel::ResidualRmsNorm => Err(KernelBodyError::InvalidBind(
+            "QKV dispatch received ResidualRmsNorm",
+        )),
+    }
+}
+
+/// Select the single residual-plus-RMS body from executor-plan facts.
+///
+/// The selected body preserves the existing two-step arithmetic order: first
+/// materialize `residual + skip`, then accumulate RMS, then apply epsilon and
+/// affine gamma.  Flat and RoPE layouts are not admitted because this body
+/// requires a row axis and a final normalization axis.
+pub fn select_residual_rms_norm(
+    library_entry: Option<&str>,
+    layout: BindLayout,
+) -> Result<Option<LibraryKernel>, KernelBodyError> {
+    if !matches!(layout, BindLayout::RowMajor | BindLayout::Strided) {
+        return Err(KernelBodyError::InvalidBind(
+            "ResidualRmsNorm layout is not servable",
+        ));
+    }
+    match library_entry {
+        Some("ResidualRmsNorm") => Ok(Some(LibraryKernel::ResidualRmsNorm)),
+        None => Ok(None),
+        _ => Err(KernelBodyError::InvalidBind(
+            "ResidualRmsNorm selection disagrees with library_entry",
+        )),
+    }
+}
+
+/// Fused residual addition followed by RMS normalization over the last axis.
+///
+/// This is the single-body counterpart to [`residual`] followed by [`rms`].
+/// The intermediate row is materialized before the reduction so the scalar
+/// addition, sum-of-squares, epsilon, and affine multiplication order remains
+/// identical to the existing bodies.
+pub fn residual_rms_norm(
+    bind: &BindDescriptor,
+    residual: &[f32],
+    skip: &[f32],
+    gamma: &[f32],
+    output: &mut [f32],
+    epsilon: f32,
+) -> Result<(), KernelBodyError> {
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(KernelBodyError::InvalidEpsilon);
+    }
+    checked_span(bind, "residual", residual.len())?;
+    checked_span(bind, "skip", skip.len())?;
+    ensure_output(bind, output)?;
+    let width = checked_usize(*bind.dims.last().unwrap_or(&0))?;
+    if gamma.len() < width {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "gamma",
+            required: width as u64,
+            actual: gamma.len(),
+        });
+    }
+    for_each_row(bind, |_, base, width, stride| {
+        let mut summed = vec![0.0f32; width];
+        for col in 0..width {
+            let offset = base + col * stride;
+            summed[col] = residual[offset] + skip[offset];
+        }
+        let mut sumsq = 0.0f32;
+        for value in &summed {
+            sumsq += *value * *value;
+        }
+        let mean = sumsq / width as f32;
+        let scale = 1.0f32 / (mean + epsilon).sqrt();
+        for col in 0..width {
+            let offset = base + col * stride;
+            output[offset] = summed[col] * scale * gamma[col];
+        }
+    })?;
+    Ok(())
+}
+
+/// Dispatch the selected single-body residual-plus-RMS normalization.
+pub fn dispatch_residual_rms_norm(
+    kernel: LibraryKernel,
+    bind: &BindDescriptor,
+    residual: &[f32],
+    skip: &[f32],
+    gamma: &[f32],
+    output: &mut [f32],
+    epsilon: f32,
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        LibraryKernel::ResidualRmsNorm => {
+            residual_rms_norm(bind, residual, skip, gamma, output, epsilon)
+        }
+        LibraryKernel::CausalAttention => Err(KernelBodyError::InvalidBind(
+            "ResidualRmsNorm dispatch received CausalAttention",
+        )),
+        LibraryKernel::QkvProjection => Err(KernelBodyError::InvalidBind(
+            "ResidualRmsNorm dispatch received QkvProjection",
+        )),
     }
 }
 
@@ -2035,6 +2133,8 @@ pub enum LibraryKernel {
     CausalAttention,
     /// One grouped Q/K/V projection body with bind-supplied weights/views.
     QkvProjection,
+    /// One residual-add plus RMS-normalization body with bind-supplied views.
+    ResidualRmsNorm,
 }
 
 /// Dispatch one plan-selected library kernel.
@@ -2054,6 +2154,9 @@ pub fn dispatch(
         LibraryKernel::CausalAttention => causal_attention(bind, q, k, v, output),
         LibraryKernel::QkvProjection => Err(KernelBodyError::InvalidBind(
             "QKV projection requires its grouped bind and three outputs",
+        )),
+        LibraryKernel::ResidualRmsNorm => Err(KernelBodyError::InvalidBind(
+            "ResidualRmsNorm requires its row bind and five arguments",
         )),
     }
 }
