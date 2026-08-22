@@ -1,6 +1,6 @@
 # GOAL: device-capability-generalization — the capability model describes and gates every backend
 
-**Status**: active — DCG-1 LANDED (`edf34b6` generic launch-resource fields); DCG-3 LANDED (`6f2cc93` dtype consistency ratchet); DCG-4 pending
+**Status**: active — DCG-1 LANDED (`edf34b6` generic launch-resource fields); DCG-2 LANDED (`20bf066` policy gate); DCG-3 LANDED (`6f2cc93` dtype consistency ratchet); DCG-4 LANDED (`a15a060` bound_plan limits)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.3)
@@ -85,7 +85,7 @@ Lowered to [`delivery.md`](delivery.md) as DCG-1..4; unit 3 re-scoped to the con
 | DCG-1 | done | hand | `edf34b6` | structural: DeviceCapabilities gains workgroup/shared/collective/unified fields; Metal MTLDevice + CUDA cuDeviceGetAttribute population. measured: fake snapshots only (CUDA 1024/49152/101376/32/false vs Metal 1024/32768/32768/32/true); no live-device query receipt |
 | DCG-2 | done | 873fb60b (reconcile) | `20bf066` | policy gate on generic launch-resource fields; prior seat ended after the feat landed on main |
 | DCG-3 | done | hand | `6f2cc93` | structural: test-only ratchet. measured: F16 named (placement discriminant 10); BF16 nameable, placement discriminant None pending radix F2 |
-| DCG-4 | pending | — | — | plan checks |
+| DCG-4 | done | 873fb60b | `a15a060` | bound_plan fail-closed launch-resource limits |
 
 ## Open questions
 
