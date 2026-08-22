@@ -1,8 +1,8 @@
 //! PPE-P2: pure cursor-to-binding projection tests.
 
 use faber_host_macos_arm64::composite_host::invocation_binding::{
-    project_invocation_bindings, RopeConfig, KV_PREFIX_IDS, PROMPT_TOKENS, Q_PREFIX_IDS, ROPE_COS,
-    ROPE_SIN,
+    project_invocation_bindings, RopeConfig, INVOCATION_STATE, KV_PREFIX_IDS, PROMPT_TOKENS,
+    Q_PREFIX_IDS, ROPE_COS, ROPE_SIN,
 };
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DeviceBufferInitialization,
@@ -207,4 +207,29 @@ fn malformed_cursor_facts_fail_before_projection() {
     let error = project_invocation_bindings(&descriptor, &mismatched_after, &[], ROPE)
         .expect_err("valid length must match prefix plus query rows");
     assert_eq!(error.code, "E_INVALID_ARGS");
+}
+
+#[test]
+fn decode_capacity_rope_table_is_indexed_by_absolute_position() {
+    let pairs = ROPE.head_dim as u64 / 2;
+    let rows = 8u64;
+    let mut descriptor = descriptor(1, pairs * rows, Some(4));
+    descriptor.kernels[0]
+        .buffers
+        .push(input(6, INVOCATION_STATE, 4));
+    let invocation = decode_invocation(Some(42), 5, 5, 6);
+    let projected = project_invocation_bindings(&descriptor, &invocation, &[1], ROPE)
+        .expect("capacity-table decode projection");
+    let cos = projected.get(&2).expect("cos");
+    assert_eq!(cos.len(), (pairs * rows) as usize);
+    let row = 5usize;
+    for pair in 0..pairs as usize {
+        let angle = 5.0_f64 * ROPE.theta.powf(-(2.0 * pair as f64) / f64::from(ROPE.head_dim));
+        assert_eq!(
+            cos[row * pairs as usize + pair].to_bits(),
+            (angle.cos() as f32).to_bits()
+        );
+    }
+    let cursor = projected.get(&6).expect("cursor");
+    assert_eq!(cursor, &[5.0, 6.0, 1.0, 7.0]);
 }
