@@ -10,6 +10,7 @@
 pub use host_device_core::kernel::frame_data;
 pub mod library;
 pub mod moe;
+pub mod ssm;
 pub mod ssm_conv1d;
 pub mod ssm_scan;
 pub mod valor_wire;
