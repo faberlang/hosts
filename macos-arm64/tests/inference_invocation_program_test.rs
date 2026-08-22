@@ -39,6 +39,8 @@ const WEIGHT_ALLOCATION: u32 = 10;
 
 const PREFILL_ARTIFACT: &[u8] = b"prefill-module";
 const DECODE_ARTIFACT: &[u8] = b"decode-module";
+const VERIFICATION_ARTIFACT: &[u8] = b"verification-module";
+const VERIFICATION_QUERY_ROWS: u32 = 3;
 
 fn arena_capacity_bytes(positions: u64) -> u64 {
     LAYERS * KV_HEADS * positions * HEAD_DIM * F32_WIDTH
@@ -164,6 +166,8 @@ fn admitted(capacity: u32, prefill_query_rows: u32) -> AdmittedDescriptor {
         identity: ModelIdentity::new("dense-rung", 1),
         prefill_artifact: PREFILL_ARTIFACT.to_vec(),
         decode_artifact: DECODE_ARTIFACT.to_vec(),
+        verification_artifact: VERIFICATION_ARTIFACT.to_vec(),
+        verification_query_rows: VERIFICATION_QUERY_ROWS,
         prefill_query_rows,
         weights: vec![weight_allocation(WEIGHT_ALLOCATION)],
         kv: kv_descriptor(capacity),
@@ -225,8 +229,8 @@ fn admit_prepares_both_graphs_before_first_invocation() {
     assert_eq!(programs.residency().phase(), SequencePhase::Fresh);
     assert_eq!(programs.residency().valid_len(), 0);
     assert_eq!(programs.artifact_prepares(), 1);
-    assert_eq!(programs.module_loads(), 2);
-    assert_eq!(programs.compiles(), 2);
+    assert_eq!(programs.module_loads(), 3);
+    assert_eq!(programs.compiles(), 3);
     assert_eq!(programs.weight_uploads(), 1);
 
     let prefill = programs.select(InvocationMode::Prefill);
@@ -269,6 +273,30 @@ fn prefill_is_m_t_and_scalar_decode_is_m_1() {
         decode.query_rows(),
         "Prefill(M=T) and ScalarDecode(M=1) are distinct graphs"
     );
+}
+
+#[test]
+fn verification_program_is_materialized_as_a_distinct_multi_row_graph() {
+    let mut programs = admit_programs(8, 4);
+    let selected = programs.select(InvocationMode::Verification);
+    assert_eq!(selected.mode(), InvocationMode::Verification);
+    assert_eq!(selected.query_rows(), VERIFICATION_QUERY_ROWS);
+    assert_eq!(selected.artifact(), VERIFICATION_ARTIFACT);
+    assert_eq!(
+        selected.artifact(),
+        programs.residency().model().artifacts().verification()
+    );
+    assert_ne!(selected.artifact(), programs.select(InvocationMode::ScalarDecode).artifact());
+
+    let prefill = programs
+        .begin_selected(InvocationMode::Prefill)
+        .expect("prefill admits");
+    programs.commit(&prefill).expect("prefill commits");
+    let verification = programs
+        .begin_selected(InvocationMode::Verification)
+        .expect("materialized verification admits at committed L");
+    assert_eq!(verification.coordinates().prefix_before, 4);
+    assert_eq!(verification.coordinates().query_rows, VERIFICATION_QUERY_ROWS);
 }
 
 #[test]
@@ -319,10 +347,11 @@ fn both_programs_share_one_residency_and_identical_handles() {
 fn switching_mode_does_not_load_compile_allocate_or_upload() {
     let programs = admit_programs(8, 4);
     let before = snapshot_lifecycle(&programs);
-    assert_eq!(before, (2, 2, 4, 1, 1));
+    assert_eq!(before, (3, 3, 4, 1, 1));
 
     let _ = programs.select(InvocationMode::Prefill);
     let _ = programs.select(InvocationMode::ScalarDecode);
+    let _ = programs.select(InvocationMode::Verification);
     let _ = programs.select(InvocationMode::Prefill);
     let _ = programs.resolve(InvocationMode::ScalarDecode);
     assert_lifecycle_unchanged(&programs, before, "select/resolve");

@@ -22,6 +22,9 @@ use crate::device_descriptor::{
 
 /// Scalar-decode query-row width. Never inferred from sequence length.
 pub const SCALAR_DECODE_QUERY_ROWS: u32 = 1;
+/// Verification artifact query-row width. The materialized artifact is an
+/// explicit multi-row graph and is never substituted with the scalar loop.
+pub const VERIFICATION_QUERY_ROWS: u32 = 3;
 
 fn invalid_args(message: impl Into<String>) -> SessionError {
     SessionError {
@@ -104,6 +107,8 @@ pub struct AdmittedDescriptor {
     pub identity: ModelIdentity,
     pub prefill_artifact: Vec<u8>,
     pub decode_artifact: Vec<u8>,
+    pub verification_artifact: Vec<u8>,
+    pub verification_query_rows: u32,
     pub prefill_query_rows: u32,
     pub weights: Vec<DescriptorAllocation>,
     pub kv: KvCacheDescriptor,
@@ -117,6 +122,7 @@ pub struct InvocationPrograms {
     residency: SessionResidency,
     prefill: InvocationGraph,
     scalar_decode: InvocationGraph,
+    verification: InvocationGraph,
     kv: KvCacheDescriptor,
     module_loads: u32,
     compiles: u32,
@@ -128,6 +134,22 @@ impl InvocationPrograms {
     pub fn admit(descriptor: AdmittedDescriptor) -> Result<Self, SessionError> {
         if descriptor.prefill_query_rows == 0 {
             return Err(invalid_args("prefill query_rows (M=T) must be at least 1"));
+        }
+        if descriptor.verification_artifact.is_empty() {
+            return Err(invalid_args(
+                "verification artifact must be materialized before first invocation",
+            ));
+        }
+        if descriptor.verification_query_rows == 0 {
+            return Err(invalid_args(
+                "verification query_rows must be at least 1",
+            ));
+        }
+        if descriptor.verification_query_rows > descriptor.capacity {
+            return Err(invalid_args(format!(
+                "verification M={} exceeds capacity {}",
+                descriptor.verification_query_rows, descriptor.capacity
+            )));
         }
         if descriptor.prefill_query_rows > descriptor.capacity {
             return Err(invalid_args(format!(
@@ -150,6 +172,7 @@ impl InvocationPrograms {
             identity: descriptor.identity,
             prefill_artifact: descriptor.prefill_artifact,
             decode_artifact: descriptor.decode_artifact,
+            verification_artifact: descriptor.verification_artifact,
             weights: descriptor.weights,
         };
         let residency = SessionResidency::prepare(model, sequence)?;
@@ -164,11 +187,16 @@ impl InvocationPrograms {
             scalar_decode: InvocationGraph {
                 mode: InvocationMode::ScalarDecode,
                 query_rows: SCALAR_DECODE_QUERY_ROWS,
+                launch_bindings: launch_bindings.clone(),
+            },
+            verification: InvocationGraph {
+                mode: InvocationMode::Verification,
+                query_rows: descriptor.verification_query_rows,
                 launch_bindings,
             },
             kv: descriptor.kv,
-            module_loads: 2,
-            compiles: 2,
+            module_loads: 3,
+            compiles: 3,
         })
     }
 
@@ -191,6 +219,11 @@ impl InvocationPrograms {
         &self.scalar_decode
     }
 
+    #[must_use]
+    pub fn verification(&self) -> &InvocationGraph {
+        &self.verification
+    }
+
     /// Admitted B5 KV plan. Launch bindings keep declared indices and order.
     #[must_use]
     pub fn kv(&self) -> &KvCacheDescriptor {
@@ -203,11 +236,7 @@ impl InvocationPrograms {
         let graph = match mode {
             InvocationMode::Prefill => &self.prefill,
             InvocationMode::ScalarDecode => &self.scalar_decode,
-            // SV-E2 session shape; no verification program exists until SV-E3
-            // materializes it. Fail closed rather than alias the scalar loop.
-            InvocationMode::Verification => {
-                panic!("verification program is not materialized until SV-E3")
-            }
+            InvocationMode::Verification => &self.verification,
         };
         SelectedProgram {
             graph,

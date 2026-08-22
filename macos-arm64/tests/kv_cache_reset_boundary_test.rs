@@ -112,6 +112,7 @@ fn model_spec() -> ModelSpec {
         identity: ModelIdentity::new("dense-rung", 1),
         prefill_artifact: b"prefill-module".to_vec(),
         decode_artifact: b"decode-module".to_vec(),
+        verification_artifact: b"verification-module".to_vec(),
         weights: vec![weight_allocation()],
     }
 }

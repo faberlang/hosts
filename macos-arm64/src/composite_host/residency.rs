@@ -179,12 +179,14 @@ impl ModelIdentity {
     }
 }
 
-/// Prefill and scalar-decode module artifacts. Both are prepared before the
-/// first invocation; decode must not load or compile lazily.
+/// Prefill, scalar-decode, and verification module artifacts. Every admitted
+/// invocation graph is prepared before the first invocation; no route loads or
+/// compiles lazily when the mode changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedArtifacts {
     prefill: Vec<u8>,
     scalar_decode: Vec<u8>,
+    verification: Vec<u8>,
 }
 
 impl PreparedArtifacts {
@@ -199,14 +201,16 @@ impl PreparedArtifacts {
     }
 
     #[must_use]
+    pub fn verification(&self) -> &[u8] {
+        &self.verification
+    }
+
+    #[must_use]
     pub fn for_mode(&self, mode: InvocationMode) -> &[u8] {
         match mode {
             InvocationMode::Prefill => &self.prefill,
             InvocationMode::ScalarDecode => &self.scalar_decode,
-            // SV-E2 session shape; no verification artifact exists until SV-E3.
-            InvocationMode::Verification => {
-                panic!("verification artifact is not materialized until SV-E3")
-            }
+            InvocationMode::Verification => &self.verification,
         }
     }
 }
@@ -216,6 +220,7 @@ pub struct ModelSpec {
     pub identity: ModelIdentity,
     pub prefill_artifact: Vec<u8>,
     pub decode_artifact: Vec<u8>,
+    pub verification_artifact: Vec<u8>,
     pub weights: Vec<DescriptorAllocation>,
 }
 
@@ -246,6 +251,11 @@ impl ModelResidency {
                 "scalar-decode artifact must be prepared before first invocation",
             ));
         }
+        if spec.verification_artifact.is_empty() {
+            return Err(invalid_args(
+                "verification artifact must be prepared before first invocation",
+            ));
+        }
         if spec.weights.is_empty() {
             return Err(invalid_args(
                 "model residency requires at least one weight allocation",
@@ -263,6 +273,7 @@ impl ModelResidency {
             artifacts: PreparedArtifacts {
                 prefill: spec.prefill_artifact,
                 scalar_decode: spec.decode_artifact,
+                verification: spec.verification_artifact,
             },
             weights,
             weight_uploads: 1,
