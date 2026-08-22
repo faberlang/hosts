@@ -9,6 +9,7 @@
 
 pub use host_device_core::kernel::frame_data;
 pub mod library;
+pub mod ssm_conv1d;
 pub mod valor_wire;
 
 mod frame;
