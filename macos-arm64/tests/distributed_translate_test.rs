@@ -28,6 +28,33 @@ use host_coordinator::partition::FixtureIdentityClass;
 const EIGHT_RANK: &[u8] = include_bytes!("fixtures/md3h/eight-rank.postcard");
 const ONE_PARTITION: &[u8] = include_bytes!("fixtures/md3h/one-partition.postcard");
 
+// MD3J-F1 budget-declared 8-rank artifacts (the `md3j` fixture path the F1
+// seat checks in), consumed as postcard bytes. Both are wire-legal —
+// rejection of the over-budget variant is hosts-side admission, never decode.
+const EIGHT_RANK_EIGHT_GIB: &[u8] = include_bytes!("fixtures/md3j/eight-rank.postcard");
+const EIGHT_RANK_OVER_BUDGET: &[u8] =
+    include_bytes!("fixtures/md3j/eight-rank-over-budget.postcard");
+
+// MD3J-F1 declared budgets carried by the md3j fixtures (partition 0 of the
+// over-budget variant declares OVER_BUDGET_BYTES; every other partition
+// declares EIGHT_GIB_BYTES).
+const EIGHT_GIB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const OVER_BUDGET_BYTES: u64 = 80 * 1024 * 1024 * 1024;
+
+// The test snapshots' driver-API total and the OQ-2 default headroom
+// policy limit over it — floor of api_total_bytes × 0.9 (a named policy,
+// never the raw total, never the declared budget).
+const SNAPSHOT_API_TOTAL_BYTES: u64 = 12_343_705_600;
+const POLICY_LIMIT_BYTES: u64 =
+    (SNAPSHOT_API_TOTAL_BYTES / 10) * 9 + ((SNAPSHOT_API_TOTAL_BYTES % 10) * 9) / 10;
+
+// MD3J-B2 equal-limit boundary: driver-API totals whose OQ-2 policy limit
+// lands exactly on the MD3H default budget's declared ledger total (160 MiB
+// declaration → 80 MiB), and one byte below it. floor(93_206_756 × 0.9) =
+// 83_886_080; floor(93_206_755 × 0.9) = 83_886_079.
+const POLICY_LIMIT_EXACT_API_TOTAL: u64 = 93_206_756;
+const POLICY_LIMIT_MINUS_ONE_API_TOTAL: u64 = 93_206_755;
+
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 const SNAPSHOT_UUID: &str = "GPU-3e017562-9ec3-da9a-962d-b8bd5f9e24be";
 
@@ -70,6 +97,32 @@ fn one_physical_snapshot() -> DeviceDiscoverySnapshot {
     DeviceDiscoverySnapshot::from_enumerated(
         PROBE_TIME,
         [snapshot_entry(0, snapshot_device(), "synthetic 8:1 fixture")],
+    )
+}
+
+/// MD3J-B2 boundary helper: a single-device snapshot whose driver-API
+/// memory total is tuned so the OQ-2 policy limit lands on a chosen byte
+/// value (the equal-limit boundary fixtures).
+fn snapshot_entry_with_api_total(
+    ordinal: u32,
+    identity: PhysicalDeviceId,
+    model: &str,
+    api_total_bytes: u64,
+) -> DeviceDiscoveryEntry {
+    let mut entry = snapshot_entry(ordinal, identity, model);
+    entry.memory.api_total_bytes = api_total_bytes;
+    entry
+}
+
+fn single_device_snapshot_with_api_total(api_total_bytes: u64) -> DeviceDiscoverySnapshot {
+    DeviceDiscoverySnapshot::from_enumerated(
+        PROBE_TIME,
+        [snapshot_entry_with_api_total(
+            0,
+            snapshot_device(),
+            "synthetic OQ-2 boundary fixture",
+            api_total_bytes,
+        )],
     )
 }
 
@@ -496,5 +549,98 @@ fn eight_rank_bind_count_eight_rejects_topology_mismatch() {
         error.message.contains("TopologyMismatch"),
         "CLI bind-count 8 must stay TopologyMismatch-class, got {}",
         error.message
+    );
+}
+
+// MD3J-B2: policy-derived safe limit + BudgetExceeded class. The safe
+// limit is the bound device's snapshot memory fact under the named OQ-2
+// headroom policy (floor of api_total_bytes × 0.9) — never the raw total,
+// never the declared budget.
+
+/// The F1 8 GiB budget-declared image admits when the OQ-2 policy limit
+/// over the bound device's driver-API total exceeds the declaration
+/// (8 GiB < floor(12_343_705_600 × 0.9) = 11_109_335_040).
+#[test]
+fn eight_gib_declared_bind_admits_under_policy_limit() {
+    assert!(
+        POLICY_LIMIT_BYTES > EIGHT_GIB_BYTES,
+        "the OQ-2 policy limit must sit above the 8 GiB declaration"
+    );
+    let translated = translate_device_section_bytes(EIGHT_RANK_EIGHT_GIB)
+        .expect("8 GiB budget-declared postcard translates");
+    let snapshot = two_physical_snapshot();
+    let bound = bind_translated(
+        &translated,
+        &snapshot,
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+    )
+    .expect("8 GiB declaration on a device whose policy limit exceeds it admits");
+    assert_eq!(bound.device_set().len(), 2);
+}
+
+/// MD3J-B2 red row: the F1 over-budget variant (partition 0 declaring
+/// 80 GiB) rejects at admission with the `BudgetExceeded` class surfaced
+/// as its own bind error carrying both byte facts — never the generic
+/// `InvalidPartitionBinding` and never an admit.
+#[test]
+fn over_budget_fixture_rejects_budget_exceeded_class_with_byte_facts() {
+    assert!(
+        OVER_BUDGET_BYTES > POLICY_LIMIT_BYTES,
+        "the over-budget declaration must sit above the OQ-2 policy limit"
+    );
+    let translated = translate_device_section_bytes(EIGHT_RANK_OVER_BUDGET)
+        .expect("over-budget postcard translates");
+    let snapshot = two_physical_snapshot();
+    let error = bind_translated(
+        &translated,
+        &snapshot,
+        BindPolicy::SplitAcrossMembership { bind_count: 2 },
+    )
+    .expect_err("over-budget declaration must reject at admission");
+    assert!(
+        !matches!(error, BindError::InvalidPartitionBinding { .. }),
+        "over-budget must be its own BudgetExceeded class, got {error:?}"
+    );
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("BudgetExceeded"),
+        "rejection must name the BudgetExceeded class, got {rendered}"
+    );
+    assert!(
+        rendered.contains("declared_total_bytes") && rendered.contains("policy_limit_bytes"),
+        "rejection must carry both byte facts, got {rendered}"
+    );
+}
+
+/// Equal-budget-to-limit is decided by the policy (`<=` admits): the
+/// crafted snapshot's driver-API total (93_206_756) yields an OQ-2 policy
+/// limit of exactly 83_886_080 bytes — the MD3H default budget's declared
+/// ledger total (160 MiB declaration → 80 MiB).
+#[test]
+fn equal_budget_to_policy_limit_admits() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("MD3H 8-rank translates");
+    let snapshot = single_device_snapshot_with_api_total(POLICY_LIMIT_EXACT_API_TOTAL);
+    let bound = bind_translated(&translated, &snapshot, BindPolicy::ColocateOnSnapshot)
+        .expect("declared total equal to the policy limit admits (<=)");
+    assert_eq!(bound.device_set().len(), 1);
+}
+
+/// MD3J-B2 red row: one byte less of driver-API total pushes the policy
+/// limit below the declared total — strict `>` rejects with the
+/// `BudgetExceeded` class, not the generic binding failure.
+#[test]
+fn strictly_over_policy_limit_rejects_budget_exceeded() {
+    let translated = translate_device_section_bytes(EIGHT_RANK).expect("MD3H 8-rank translates");
+    let snapshot = single_device_snapshot_with_api_total(POLICY_LIMIT_MINUS_ONE_API_TOTAL);
+    let error = bind_translated(&translated, &snapshot, BindPolicy::ColocateOnSnapshot)
+        .expect_err("declared total strictly above the policy limit must reject");
+    assert!(
+        !matches!(error, BindError::InvalidPartitionBinding { .. }),
+        "over-policy-limit must be its own BudgetExceeded class, got {error:?}"
+    );
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("BudgetExceeded") && rendered.contains("policy_limit_bytes"),
+        "rejection must surface the BudgetExceeded class with the policy limit, got {rendered}"
     );
 }
