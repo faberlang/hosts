@@ -22,8 +22,9 @@
 //! - **Bind contract**: rejects a stale/unadmitted logical hash, an
 //!   unknown/replaced [`PhysicalDeviceId`] (MD1 health-epoch rule), a device
 //!   set that does not match the plan's declared partition set/bindings
-//!   (topology mismatch), and any binding that would violate a declared
-//!   [`DeclaredPlacementConstraint`].
+//!   (topology mismatch), any binding that would violate a declared
+//!   [`DeclaredPlacementConstraint`], and a declared [`LaunchResourceDemand`]
+//!   that exceeds the bound device's generic launch-resource limits.
 //! - **MD-A15 degenerate**: a single-partition logical plan binds to the
 //!   implicit/local partition ([`BoundPlanKind::ImplicitLocal`]) with **no**
 //!   distributed wrapper, transfer graph, or `ExecutionTransaction` —
@@ -41,7 +42,7 @@
 use crate::backend::DeviceBackend;
 use crate::device_identity::{push_str, push_u64, DeviceHealthGeneration, PhysicalDeviceId};
 use crate::device_set::{DeviceSet, MembershipError};
-use crate::discovery::{DeviceDiscoverySnapshot, DeviceDiscoverySnapshotId};
+use crate::discovery::{DeviceCapabilities, DeviceDiscoverySnapshot, DeviceDiscoverySnapshotId};
 use crate::partition::{
     FixtureIdentityClass, PartitionReceipt, TransportClass, VirtualDevicePartition,
 };
@@ -105,6 +106,23 @@ pub enum DeclaredPlacementConstraint {
     },
 }
 
+/// Declared launch-resource demand of an admitted logical plan (DCG-4).
+///
+/// Checked at [`bind`] against each bound device's generic
+/// [`DeviceCapabilities`] fields. `None` on a field leaves that check
+/// undeclared. A declared demand that exceeds the device ceiling, or a
+/// zero/missing device fact, rejects fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaunchResourceDemand {
+    /// Declared workgroup thread volume. Rejects when it exceeds the device
+    /// `max_threads_per_workgroup` ceiling.
+    pub threads_per_workgroup: Option<u32>,
+    /// Declared workgroup shared-memory demand, bytes. Rejects when it
+    /// exceeds the device `workgroup_shared_memory_max_bytes` opt-in
+    /// ceiling.
+    pub workgroup_shared_memory_bytes: Option<u32>,
+}
+
 /// Why the runtime admission path rejected a logical-plan reference
 /// ([`AdmittedLogicalPlan::admit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +160,7 @@ pub struct AdmittedLogicalPlan {
     logical_distributed_plan_hash: String,
     declared_partitions: BTreeSet<LogicalPartitionId>,
     declared_constraints: Vec<DeclaredPlacementConstraint>,
+    launch_resource_demand: LaunchResourceDemand,
 }
 
 impl AdmittedLogicalPlan {
@@ -181,7 +200,24 @@ impl AdmittedLogicalPlan {
             logical_distributed_plan_hash: hash,
             declared_partitions: partitions,
             declared_constraints: constraints,
+            launch_resource_demand: LaunchResourceDemand::default(),
         })
+    }
+
+    /// Attach a declared launch-resource demand checked at [`bind`].
+    ///
+    /// Absence (the default from [`Self::admit`]) leaves the limits
+    /// undeclared. Existing topology-only admits bind unchanged.
+    #[must_use]
+    pub fn with_launch_resource_demand(mut self, demand: LaunchResourceDemand) -> Self {
+        self.launch_resource_demand = demand;
+        self
+    }
+
+    /// The declared launch-resource demand. All fields are `None` when undeclared.
+    #[must_use]
+    pub const fn launch_resource_demand(&self) -> LaunchResourceDemand {
+        self.launch_resource_demand
     }
 
     /// The admitted opaque logical-plan hash.
@@ -325,6 +361,15 @@ pub enum BindError {
         /// The failing fact.
         detail: String,
     },
+    /// A declared [`LaunchResourceDemand`] exceeds the bound device's
+    /// generic launch-resource limit, or the device fact is unevaluable
+    /// (zero sentinel / missing snapshot entry).
+    LaunchResourceLimit {
+        /// The bound device whose limit failed.
+        device: PhysicalDeviceId,
+        /// The failing fact.
+        detail: String,
+    },
 }
 
 /// The topology-bound plan (naming contract §3).
@@ -369,6 +414,9 @@ pub struct BoundDistributedPlan {
 ///    same physical device and be active.
 /// 4. **Declared placement constraints** — the first violated constraint in
 ///    declaration order rejects.
+/// 5. **Launch-resource limits** — a declared threadgroup or shared-memory
+///    demand that exceeds the bound device's generic capability fields
+///    rejects fail-closed (DCG-4).
 ///
 /// A single-partition admitted plan binds to the implicit/local partition
 /// ([`BoundPlanKind::ImplicitLocal`]) — no distributed wrapper (MD-A15).
@@ -376,8 +424,9 @@ pub struct BoundDistributedPlan {
 /// # Errors
 ///
 /// Returns [`BindError`] when the snapshot is stale, membership fails, the
-/// binding topology does not match, a virtual partition is inconsistent, or
-/// a declared placement constraint is violated.
+/// binding topology does not match, a virtual partition is inconsistent, a
+/// declared placement constraint is violated, or a declared launch-resource
+/// demand exceeds the bound device's generic limits.
 ///
 /// # Panics
 ///
@@ -470,6 +519,9 @@ pub fn bind(
             });
         }
     }
+
+    // 5. Declared launch-resource limits against each bound device.
+    check_launch_resource_limits(admitted.launch_resource_demand(), &bound_devices, snapshot)?;
 
     let snapshot_id = snapshot.id();
     let kind = if admitted.is_single_partition() {
@@ -681,6 +733,83 @@ fn constraint_unknown_partition(
         | DeclaredPlacementConstraint::RequiredBackend { partitions, .. } => {
             partitions.iter().find(|p| !declared.contains(*p)).cloned()
         }
+    }
+}
+
+/// Fail-closed launch-resource checks against every bound device (DCG-4).
+///
+/// Undeclared fields (`None`) skip that check. A zero device ceiling or a
+/// missing snapshot entry is unevaluable, never a fake limit of zero.
+fn check_launch_resource_limits(
+    demand: LaunchResourceDemand,
+    bound_devices: &BTreeSet<PhysicalDeviceId>,
+    snapshot: &DeviceDiscoverySnapshot,
+) -> Result<(), BindError> {
+    if demand.threads_per_workgroup.is_none() && demand.workgroup_shared_memory_bytes.is_none() {
+        return Ok(());
+    }
+    for device in bound_devices {
+        let Some(caps) = snapshot_caps(snapshot, device) else {
+            return Err(launch_limit_error(
+                device,
+                format!("no capability facts recorded for {device} in the snapshot"),
+            ));
+        };
+        if let Some(threads) = demand.threads_per_workgroup {
+            let limit =
+                evaluable_launch_limit(caps.max_threads_per_workgroup, "max_threads_per_workgroup")
+                    .map_err(|detail| launch_limit_error(device, detail))?;
+            if threads > limit {
+                return Err(launch_limit_error(
+                    device,
+                    format!(
+                        "threads per workgroup {threads} exceeds device max_threads_per_workgroup {limit}"
+                    ),
+                ));
+            }
+        }
+        if let Some(bytes) = demand.workgroup_shared_memory_bytes {
+            let limit = evaluable_launch_limit(
+                caps.workgroup_shared_memory_max_bytes,
+                "workgroup_shared_memory_max_bytes",
+            )
+            .map_err(|detail| launch_limit_error(device, detail))?;
+            if bytes > limit {
+                return Err(launch_limit_error(
+                    device,
+                    format!(
+                        "workgroup shared memory {bytes} bytes exceeds device max {limit} bytes"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_caps<'a>(
+    snapshot: &'a DeviceDiscoverySnapshot,
+    device: &PhysicalDeviceId,
+) -> Option<&'a DeviceCapabilities> {
+    snapshot
+        .devices()
+        .values()
+        .find(|entry| &entry.identity == device)
+        .map(|entry| &entry.capabilities)
+}
+
+fn evaluable_launch_limit(value: u32, field: &'static str) -> Result<u32, String> {
+    if value == 0 {
+        Err(format!("{field} is unevaluable (device reports 0)"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn launch_limit_error(device: &PhysicalDeviceId, detail: String) -> BindError {
+    BindError::LaunchResourceLimit {
+        device: device.clone(),
+        detail,
     }
 }
 

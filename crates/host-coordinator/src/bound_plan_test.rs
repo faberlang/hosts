@@ -7,7 +7,7 @@
 use crate::backend::DeviceBackend;
 use crate::bound_plan::{
     bind, AdmitError, AdmittedLogicalPlan, BindError, BoundDistributedPlan, BoundPlanKind,
-    DeclaredPlacementConstraint, LogicalPartitionId, PartitionBinding,
+    DeclaredPlacementConstraint, LaunchResourceDemand, LogicalPartitionId, PartitionBinding,
 };
 use crate::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use crate::device_set::{DeviceSet, MembershipError};
@@ -783,4 +783,102 @@ fn bound_hash_is_sensitive_to_binding_facts() {
     )
     .unwrap();
     assert_ne!(fresh_plan.bound_distributed_plan_hash(), baseline_hash);
+}
+
+/// DCG-4: a plan whose declared threadgroup volume exceeds the bound
+/// device's `max_threads_per_workgroup` rejects with the named typed error.
+#[test]
+fn bind_rejects_oversized_threadgroup_demand() {
+    let snapshot = one_device_snapshot();
+    let admitted =
+        admitted_two_partition_plan().with_launch_resource_demand(LaunchResourceDemand {
+            threads_per_workgroup: Some(2048),
+            workgroup_shared_memory_bytes: None,
+        });
+    let err = bind_plan(
+        &admitted,
+        two_partition_bindings(
+            (device_a(), Some(vp(1, device_a()))),
+            (device_a(), Some(vp(2, device_a()))),
+        ),
+        DeviceSet::from_members([device_a()]),
+        &snapshot,
+    )
+    .expect_err("oversized threadgroup demand must reject before launch");
+    assert!(
+        matches!(
+            err,
+            BindError::LaunchResourceLimit { ref device, ref detail }
+                if device == &device_a()
+                    && detail.contains("2048")
+                    && detail.contains("1024")
+                    && detail.contains("max_threads_per_workgroup")
+        ),
+        "expected LaunchResourceLimit naming the threadgroup ceiling, got {err:?}"
+    );
+}
+
+/// DCG-4: a plan whose declared shared-memory demand exceeds the bound
+/// device's `workgroup_shared_memory_max_bytes` rejects with the named error.
+#[test]
+fn bind_rejects_oversized_shared_memory_demand() {
+    let snapshot = one_device_snapshot();
+    let admitted =
+        admitted_two_partition_plan().with_launch_resource_demand(LaunchResourceDemand {
+            threads_per_workgroup: None,
+            workgroup_shared_memory_bytes: Some(200_000),
+        });
+    let err = bind_plan(
+        &admitted,
+        two_partition_bindings(
+            (device_a(), Some(vp(1, device_a()))),
+            (device_a(), Some(vp(2, device_a()))),
+        ),
+        DeviceSet::from_members([device_a()]),
+        &snapshot,
+    )
+    .expect_err("oversized shared-memory demand must reject before launch");
+    assert!(
+        matches!(
+            err,
+            BindError::LaunchResourceLimit { ref device, ref detail }
+                if device == &device_a()
+                    && detail.contains("200000")
+                    && detail.contains("101376")
+        ),
+        "expected LaunchResourceLimit naming the shared-memory ceiling, got {err:?}"
+    );
+}
+
+/// DCG-4: an in-limits launch-resource demand binds the same plan as a
+/// demand-free admit of the same topology.
+#[test]
+fn bind_admits_in_limits_launch_resource_demand_unchanged() {
+    let snapshot = one_device_snapshot();
+    let bindings = two_partition_bindings(
+        (device_a(), Some(vp(1, device_a()))),
+        (device_a(), Some(vp(2, device_a()))),
+    );
+    let device_set = DeviceSet::from_members([device_a()]);
+
+    let without = bind_plan(
+        &admitted_two_partition_plan(),
+        bindings.clone(),
+        device_set.clone(),
+        &snapshot,
+    )
+    .expect("demand-free two-partition fixture binds");
+
+    let with = bind_plan(
+        &admitted_two_partition_plan().with_launch_resource_demand(LaunchResourceDemand {
+            threads_per_workgroup: Some(256),
+            workgroup_shared_memory_bytes: Some(16_384),
+        }),
+        bindings,
+        device_set,
+        &snapshot,
+    )
+    .expect("in-limits launch-resource demand binds");
+
+    assert_eq!(with, without);
 }
