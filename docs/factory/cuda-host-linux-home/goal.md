@@ -1,6 +1,6 @@
 # GOAL: cuda-host-linux-home — the CUDA host runtime is a peer product surface, not a macOS tenant
 
-**Status**: active — lowered 2026-08-21 ([`delivery.md`](delivery.md) CLH-1..5; goal-check READY; priority — CLH-2 unlocks ELP-04; awaiting Mind dispatch)
+**Status**: active — CLH-1 LANDED (`ab4610d` host-device-core extraction); CLH-3 LANDED (`50c2796` manifest host from admitted backend); CLH-4/5 pending (CLH-2 unlocks ELP-04)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.1, F3.4)
@@ -81,9 +81,9 @@ Lowered to [`delivery.md`](delivery.md) as CLH-1..5: the extraction unit splits 
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| CLH-1 | pending | — | — | host-device-core extraction |
+| CLH-1 | done | hand | `ab4610d` | structural: `crates/host-device-core` pure move + path aliases; macos-arm64 re-exports. measured: none in this commit (no test-count or Linux-build receipt) |
 | CLH-2 | done | prior seat (ended) | 2804c0d | host-cuda extraction landed; cargo check/test -p host-cuda and cargo test --workspace green; aliases clean (reconciled 2026-08-22) |
-| CLH-3 | pending | — | — | manifest host |
+| CLH-3 | done | hand | `50c2796` | structural: `from_parts` takes host identity; `HOST_CUDA_LINUX = "cuda-linux"`. measured: commit adds 3 tests (CUDA host ≠ macos-arm64; Metal/CPU keep macos-arm64) — pass counts not recorded here |
 | CLH-4 | pending | — | — | module lifecycle debt |
 | CLH-5 | pending | — | — | linux proof |
 

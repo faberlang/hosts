@@ -1,6 +1,6 @@
 # GOAL: md3h-virtual-partition-host — every device run admits through a virtual partition
 
-**Status**: active — W0 LANDED+Mind-verified 2026-08-22 (R1 `6b503ef5c` 580/0, F1 `be69f5ace` 179/0+fixtures, H1 `34aa2cc` with burgus-Metal + pharos-CUDA identity receipts); W1 H2 DISPATCHED (`5c6d3347` — DeviceRuntimeSet + real backend, absorbs MD1-H1/MD3-S1); spine H1→H2→H3→C1→P1→C2; MD3H-WIN gate before H3
+**Status**: active — W0 LANDED+Mind-verified 2026-08-22 (R1 `6b503ef5c` 580/0, F1 `be69f5ace` 179/0+fixtures, H1 `34aa2cc` with burgus-Metal + pharos-CUDA identity receipts); W1 H2 LANDED (`cb79d8f` DeviceRuntimeSet + real backend, absorbs MD1-H1/MD3-S1) + X1 LANDED (`8ec2abd` real-backend fault suite); spine H1→H2→H3→C1→P1→C2; MD3H-WIN gate before H3
 **Created**: 2026-08-21
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3H + the 2026-08-21 operator amendment (uniform N=1; eight-rank bind); lowered spec [`md3h-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3h-delivery.md)
@@ -67,10 +67,10 @@ ledger authority):
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
 | MD3H-H1 | Multi-ordinal discovery into physical-identity facts; ordinal-0 hardcode removed | — | none |
-| MD3H-H2 | `DeviceRuntimeSet` + real `DeviceExecutionBackend` (absorbs MD1-H1/MD3-S1) | MD3H-H1 | none |
+| MD3H-H2 | `DeviceRuntimeSet` + real `DeviceExecutionBackend` (absorbs MD1-H1/MD3-S1) | MD3H-H1 | `cb79d8f` |
 | MD3H-H3 | CompositeHost + device-execute uniform admission; partition-free path deleted | MD3H-H2 + **MD3H-WIN** window | none |
 | MD3H-H4 | Distributed-section ingestion + mirror translation + CLI arg surface | MD3H-F1 (radix), MD3H-H2 | none |
-| MD3H-X1 | Real-backend fault injection suite (no partial commit) | MD3H-H2 | none |
+| MD3H-X1 | Real-backend fault injection suite (no partial commit) | MD3H-H2 | `8ec2abd` |
 | MD3H-P2 | 8:1 mechanics proof + honest receipts + NOT ATTEMPTED 8:8 row | MD3H-H3, MD3H-H4, MD3H-F1 | none |
 | MD3H-P1 | N=1 parity on existing single-device fixtures (co-tracked with radix) | MD3H-C1 (radix) | none |
 
@@ -93,10 +93,10 @@ to H3 on disjoint files once H2 lands.
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | MD3H-H1 | pending | — | — | discovery |
-| MD3H-H2 | pending | — | — | runtime set + real backend |
+| MD3H-H2 | done | hand | `cb79d8f` | structural: DeviceRuntimeSet + DeviceRuntimeBackend (no host-coordinator trait extension). measured: absent in this commit — live Metal/CUDA tests env-gated PENDING when not admitted; no burgus/pharos machine receipt |
 | MD3H-H3 | pending | — | — | uniform admission (MD3H-WIN gated) |
 | MD3H-H4 | pending | — | — | ingestion + translation |
-| MD3H-X1 | pending | — | — | fault suite |
+| MD3H-X1 | done | hand | `8ec2abd` | structural: 5 Metal + 1 CUDA fault tests (cancel/timeout/kernel/transfer/device-loss; no partial publication). measured: absent in this commit — live tests skip when Metal/CUDA not admitted; CUDA helper is pending-when-unreachable |
 | MD3H-P2 | pending | — | — | 8:1 proof |
 | MD3H-P1 | pending | — | — | parity (with radix) |
 

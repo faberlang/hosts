@@ -1,6 +1,6 @@
 # GOAL: device-capability-generalization — the capability model describes and gates every backend
 
-**Status**: active — lowered 2026-08-21 ([`delivery.md`](delivery.md) DCG-1..4; goal-check READY; unit 3 re-scoped — F16 landed with ELP-07, consistency ratchet remains; awaiting Mind dispatch)
+**Status**: active — DCG-1 LANDED (`edf34b6` generic launch-resource fields); DCG-3 LANDED (`6f2cc93` dtype consistency ratchet); DCG-4 pending
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.3)
@@ -66,9 +66,9 @@ the model is too CUDA-shaped to gate Metal and too thin to launch CUDA.
 
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
-| 1 | Generic fields + per-backend population (Metal from MTLDevice incl. the private threadgroup limit; CUDA from cuDeviceGetAttribute) + tests | — | none |
+| 1 | Generic fields + per-backend population (Metal from MTLDevice incl. the private threadgroup limit; CUDA from cuDeviceGetAttribute) + tests | — | `edf34b6` |
 | 2 | Policy gate on generic fields (both backends evaluable) + a Metal-device gate test | 1 | none |
-| 3 | DtypeSurface↔DeviceDataType consistency test (F16/BF16 slots with the byte-surface goal) | byte-surface unit 3 | none |
+| 3 | DtypeSurface↔DeviceDataType consistency test (F16/BF16 slots with the byte-surface goal) | byte-surface unit 3 | `6f2cc93` |
 | 4 | bound_plan fail-closed limit checks + tests | 1 | none |
 
 Lowered to [`delivery.md`](delivery.md) as DCG-1..4; unit 3 re-scoped to the consistency ratchet (F16 already landed via byte-surface DSB-3; BF16 slotless pending radix placement-debt-audit F2).
@@ -82,9 +82,9 @@ Lowered to [`delivery.md`](delivery.md) as DCG-1..4; unit 3 re-scoped to the con
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| DCG-1 | pending | — | — | fields |
+| DCG-1 | done | hand | `edf34b6` | structural: DeviceCapabilities gains workgroup/shared/collective/unified fields; Metal MTLDevice + CUDA cuDeviceGetAttribute population. measured: fake snapshots only (CUDA 1024/49152/101376/32/false vs Metal 1024/32768/32768/32/true); no live-device query receipt |
 | DCG-2 | done | 873fb60b (reconcile) | `20bf066` | policy gate on generic launch-resource fields; prior seat ended after the feat landed on main |
-| DCG-3 | pending | — | — | dtype consistency ratchet |
+| DCG-3 | done | hand | `6f2cc93` | structural: test-only ratchet. measured: F16 named (placement discriminant 10); BF16 nameable, placement discriminant None pending radix F2 |
 | DCG-4 | pending | — | — | plan checks |
 
 ## Open questions
