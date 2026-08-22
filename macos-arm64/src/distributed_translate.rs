@@ -311,10 +311,9 @@ fn translate_dtype(spelling: &str) -> Result<MirroredDtype, TranslateError> {
     }
 }
 
-fn translate_layout(layout: WireStorageLayout) -> MirroredStorageLayout {
+fn translate_layout(_layout: WireStorageLayout) -> MirroredStorageLayout {
     // Wire storage (host-owned vs device-handle) is not the tensor layout
     // the transfer mirror consumes. F1 fixtures are dense element storage.
-    let _ = layout;
     MirroredStorageLayout::Dense
 }
 

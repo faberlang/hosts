@@ -204,7 +204,7 @@ impl DeviceRuntimeBackend {
         let handles = self.resources.remove(partition).unwrap_or_default();
         if let Ok(runtime) = self.runtime_mut(partition) {
             for handle in handles {
-                let _ = runtime.release(&handle);
+                drop(runtime.release(&handle));
             }
         }
         self.reservations.remove(partition);
@@ -289,7 +289,7 @@ impl DeviceExecutionBackend for DeviceRuntimeBackend {
                 format!("partition {partition} already holds a reservation"),
             ));
         }
-        let _ = self.device_of(partition)?;
+        self.device_of(partition)?;
         if reservation.output_buffer_bytes() > 0 {
             let len = usize::try_from(reservation.output_buffer_bytes()).map_err(|_| {
                 BackendError::allocation(partition.clone(), "output_buffer_bytes overflows usize")
