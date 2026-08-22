@@ -353,6 +353,21 @@ pub enum BindError {
         /// The failing fact.
         detail: String,
     },
+    /// A binding's declared requirements exceed the policy-derived safe
+    /// physical limit — admission-time only, deterministic fail-closed,
+    /// before any allocation (the `AdmissionError::BudgetExceeded`
+    /// taxonomy surfaced at the bind seam; MD3J-B2).
+    BudgetExceeded {
+        /// The offending logical partition.
+        partition: LogicalPartitionId,
+        /// The declared total; `None` when the declared classes overflowed
+        /// `u64` (still fail-closed).
+        declared_total_bytes: Option<u64>,
+        /// The policy-declared ceiling that was exceeded — the named
+        /// headroom policy, never the raw memory total, never the declared
+        /// budget.
+        policy_limit_bytes: u64,
+    },
     /// A declared [`DeclaredPlacementConstraint`] is violated by the
     /// bindings.
     ConstraintViolation {

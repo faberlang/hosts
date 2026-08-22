@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use faber_host_macos_arm64::device_execute::prepare_distributed_image;
 use faber_host_macos_arm64::distributed_translate::{
     bind_policy_for_declared_count, bind_translated, bind_translated_with_constraints,
-    translate_device_section_bytes, BindPolicy, TranslateError,
+    oq2_default_headroom_policy_bytes, translate_device_section_bytes, BindPolicy, TranslateError,
 };
 use host_coordinator::bound_plan::{BindError, DeclaredPlacementConstraint, LogicalPartitionId};
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
@@ -54,6 +54,7 @@ const POLICY_LIMIT_BYTES: u64 =
 // 83_886_080; floor(93_206_755 × 0.9) = 83_886_079.
 const POLICY_LIMIT_EXACT_API_TOTAL: u64 = 93_206_756;
 const POLICY_LIMIT_MINUS_ONE_API_TOTAL: u64 = 93_206_755;
+const MD3H_DEFAULT_BUDGET_BYTES: u64 = 160 * 1024 * 1024;
 
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 const SNAPSHOT_UUID: &str = "GPU-3e017562-9ec3-da9a-962d-b8bd5f9e24be";
@@ -562,6 +563,11 @@ fn eight_rank_bind_count_eight_rejects_topology_mismatch() {
 /// (8 GiB < floor(12_343_705_600 × 0.9) = 11_109_335_040).
 #[test]
 fn eight_gib_declared_bind_admits_under_policy_limit() {
+    assert_eq!(
+        oq2_default_headroom_policy_bytes(SNAPSHOT_API_TOTAL_BYTES),
+        POLICY_LIMIT_BYTES,
+        "the named policy must derive the documented OQ-2 limit"
+    );
     assert!(
         POLICY_LIMIT_BYTES > EIGHT_GIB_BYTES,
         "the OQ-2 policy limit must sit above the 8 GiB declaration"
@@ -597,19 +603,29 @@ fn over_budget_fixture_rejects_budget_exceeded_class_with_byte_facts() {
         BindPolicy::SplitAcrossMembership { bind_count: 2 },
     )
     .expect_err("over-budget declaration must reject at admission");
-    assert!(
-        !matches!(error, BindError::InvalidPartitionBinding { .. }),
-        "over-budget must be its own BudgetExceeded class, got {error:?}"
-    );
-    let rendered = format!("{error:?}");
-    assert!(
-        rendered.contains("BudgetExceeded"),
-        "rejection must name the BudgetExceeded class, got {rendered}"
-    );
-    assert!(
-        rendered.contains("declared_total_bytes") && rendered.contains("policy_limit_bytes"),
-        "rejection must carry both byte facts, got {rendered}"
-    );
+    match error {
+        BindError::BudgetExceeded {
+            partition,
+            declared_total_bytes,
+            policy_limit_bytes,
+        } => {
+            assert_eq!(
+                partition.as_str(),
+                "vp:1",
+                "partition 0 is the over-budget declaration and admits first"
+            );
+            assert_eq!(
+                declared_total_bytes,
+                Some(OVER_BUDGET_BYTES / 2),
+                "the rejection must carry the declared ledger total"
+            );
+            assert_eq!(
+                policy_limit_bytes, POLICY_LIMIT_BYTES,
+                "the rejection must carry the policy-declared limit"
+            );
+        }
+        other => panic!("over-budget must be BudgetExceeded-class, got {other:?}"),
+    }
 }
 
 /// Equal-budget-to-limit is decided by the policy (`<=` admits): the
@@ -618,6 +634,11 @@ fn over_budget_fixture_rejects_budget_exceeded_class_with_byte_facts() {
 /// ledger total (160 MiB declaration → 80 MiB).
 #[test]
 fn equal_budget_to_policy_limit_admits() {
+    assert_eq!(
+        oq2_default_headroom_policy_bytes(POLICY_LIMIT_EXACT_API_TOTAL),
+        MD3H_DEFAULT_BUDGET_BYTES / 2,
+        "the boundary snapshot's policy limit must equal the declared total"
+    );
     let translated = translate_device_section_bytes(EIGHT_RANK).expect("MD3H 8-rank translates");
     let snapshot = single_device_snapshot_with_api_total(POLICY_LIMIT_EXACT_API_TOTAL);
     let bound = bind_translated(&translated, &snapshot, BindPolicy::ColocateOnSnapshot)
@@ -634,13 +655,20 @@ fn strictly_over_policy_limit_rejects_budget_exceeded() {
     let snapshot = single_device_snapshot_with_api_total(POLICY_LIMIT_MINUS_ONE_API_TOTAL);
     let error = bind_translated(&translated, &snapshot, BindPolicy::ColocateOnSnapshot)
         .expect_err("declared total strictly above the policy limit must reject");
-    assert!(
-        !matches!(error, BindError::InvalidPartitionBinding { .. }),
-        "over-policy-limit must be its own BudgetExceeded class, got {error:?}"
-    );
-    let rendered = format!("{error:?}");
-    assert!(
-        rendered.contains("BudgetExceeded") && rendered.contains("policy_limit_bytes"),
-        "rejection must surface the BudgetExceeded class with the policy limit, got {rendered}"
-    );
+    match error {
+        BindError::BudgetExceeded {
+            partition,
+            declared_total_bytes,
+            policy_limit_bytes,
+        } => {
+            assert_eq!(partition.as_str(), "vp:1");
+            assert_eq!(declared_total_bytes, Some(MD3H_DEFAULT_BUDGET_BYTES / 2));
+            assert_eq!(
+                policy_limit_bytes,
+                MD3H_DEFAULT_BUDGET_BYTES / 2 - 1,
+                "one byte below the declared total is strictly above the policy limit"
+            );
+        }
+        other => panic!("over-policy-limit must be BudgetExceeded-class, got {other:?}"),
+    }
 }

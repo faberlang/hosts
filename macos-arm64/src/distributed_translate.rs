@@ -34,8 +34,8 @@ use host_coordinator::execution_transaction::{
     TransferDirectionMirror, TransferOperationMirror, TransferRef, TransportPathMirror,
 };
 use host_coordinator::partition::{
-    AdmissionRequest, FixtureIdentityClass, PartitionBudgetLedger, SafePhysicalLimit,
-    TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
+    AdmissionError, AdmissionRequest, FixtureIdentityClass, PartitionBudgetLedger,
+    SafePhysicalLimit, TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
 };
 use radix_mir_fmir::schema::{
     FmirDeviceSection, WireCollectiveKind, WireExecutionCommitBoundary, WireExecutionOperation,
@@ -141,6 +141,22 @@ pub fn bind_policy_for_declared_count(
     Err(TranslateError::Unsupported(format!(
         "declared bind count {bind_count} for {partition_count} partitions is not 1 (colocate), {partition_count} (one physical per partition), or a divisor (split); richer bind negotiation waits for MD5"
     )))
+}
+
+/// MD3J-B2 (OQ-2 default): the named safe-limit headroom policy.
+///
+/// The admission ceiling for one partition on one physical device is floor
+/// of the bound device's driver-API memory total × 0.9 — a policy fact,
+/// never the raw total and never the declared budget ("partition budget =
+/// physical size" stays forbidden wording). Computed per bound device from
+/// its discovery-snapshot memory facts; revisable by the Mind with the
+/// derivation named in the receipt.
+#[must_use]
+pub const fn oq2_default_headroom_policy_bytes(api_total_bytes: u64) -> u64 {
+    // floor(api_total_bytes × 0.9) without overflowing u64: for
+    // api_total_bytes = 10q + r, floor(9(10q + r)/10) = 9q + floor(9r/10).
+    let (quotient, remainder) = (api_total_bytes / 10, api_total_bytes % 10);
+    quotient * 9 + (remainder * 9) / 10
 }
 
 /// An admitted FMIR distributed section translated into the transaction
@@ -463,6 +479,7 @@ fn bind_colocate(
             index as u64 + 1,
             device.clone(),
             partition_budget(plan, partition),
+            safe_limit_bytes_for(snapshot, &device)?,
         )?;
         bindings.insert(
             partition.clone(),
@@ -504,6 +521,7 @@ fn bind_one_physical_per_partition(
             index as u64 + 1,
             device.clone(),
             partition_budget(plan, partition),
+            safe_limit_bytes_for(snapshot, &device)?,
         )?;
         bindings.insert(
             partition.clone(),
@@ -561,6 +579,7 @@ fn bind_split_across_membership(
             index as u64 + 1,
             device.clone(),
             partition_budget(plan, partition),
+            safe_limit_bytes_for(snapshot, &device)?,
         )?;
         bindings.insert(
             partition.clone(),
@@ -576,19 +595,46 @@ fn bind_split_across_membership(
     )
 }
 
+/// The OQ-2 safe physical limit for one bound device: the named headroom
+/// policy applied to the device's discovery-snapshot memory fact. Fail-
+/// closed — a device with no snapshot entry (e.g. a fabricated promotion
+/// rank) can never receive a policy limit.
+fn safe_limit_bytes_for(
+    snapshot: &DeviceDiscoverySnapshot,
+    device: &PhysicalDeviceId,
+) -> Result<u64, BindError> {
+    snapshot
+        .devices()
+        .values()
+        .find(|entry| &entry.identity == device)
+        .map(|entry| oq2_default_headroom_policy_bytes(entry.memory.api_total_bytes))
+        .ok_or_else(|| BindError::TopologyMismatch {
+            detail: format!(
+                "bound device {device} has no snapshot memory facts; the OQ-2 safe limit cannot be derived"
+            ),
+        })
+}
+
 fn admit_virtual(
     seed: u64,
     device: PhysicalDeviceId,
     budget_bytes: u64,
+    safe_limit_bytes: u64,
 ) -> Result<VirtualDevicePartition, BindError> {
     let ledger = partition_ledger(budget_bytes);
     VirtualDevicePartition::admit(
         AdmissionRequest::new(VirtualDevicePartitionId::new(seed), device.clone(), ledger),
-        SafePhysicalLimit::new(budget_bytes),
+        SafePhysicalLimit::new(safe_limit_bytes),
     )
-    .map_err(|_| BindError::InvalidPartitionBinding {
-        partition: LogicalPartitionId::new(format!("vp:{seed}")),
-        detail: format!("virtual partition vp:{seed} exceeded safe physical limit {budget_bytes}"),
+    .map_err(|error| match error {
+        AdmissionError::BudgetExceeded {
+            declared_total_bytes,
+            policy_limit_bytes,
+        } => BindError::BudgetExceeded {
+            partition: LogicalPartitionId::new(format!("vp:{seed}")),
+            declared_total_bytes,
+            policy_limit_bytes,
+        },
     })
 }
 
