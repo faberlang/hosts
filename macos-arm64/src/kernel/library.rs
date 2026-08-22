@@ -373,6 +373,515 @@ impl QuantizedGemvBind {
     }
 }
 
+/// Layout family for one grouped Q/K/V projection body.
+///
+/// The grouped layout is the only layout the body can materialize without
+/// inventing a permutation or a second launch.  Unknown and unsupported
+/// layout families remain explicit so selection fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QkvProjectionLayout {
+    /// Q is `[kv_group, q_head, row, d]`; K/V are `[kv_group, row, d]`.
+    Grouped,
+    /// Sentinel used by callers that have not proved a servable layout.
+    Unsupported,
+}
+
+/// One weight source consumed by the shape-generic Q/K/V body.
+///
+/// Dense f32 is retained for the GI2-2 numeric class.  Packed sources use the
+/// same R-PACK-02 bind and dequantization path as decode GEMV; the body never
+/// infers a packed layout from a byte length.
+#[derive(Debug, Clone, Copy)]
+pub enum QkvProjectionWeight<'a> {
+    /// Column-major logical `[hidden, output]` f32 weights, with each output
+    /// column stored contiguously (`column * hidden + k`).
+    Dense(&'a [f32]),
+    /// One packed column stream per output column.
+    Quantized {
+        /// Typed shape/format facts for the packed source.
+        bind: QuantizedGemvBind,
+        /// R-PACK-02 bytes addressed by `bind`.
+        packed: &'a [u8],
+    },
+}
+
+/// Bind facts for the single-launch grouped Q/K/V projection body.
+///
+/// All shape and physical-stride facts are carried here.  In particular, a
+/// caller cannot turn a Q/K/V selection into a body by assuming contiguous
+/// output or by deriving GQA dimensions from a supplied slice length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QkvProjectionBind {
+    /// Number of activation rows in this invocation.
+    pub rows: u64,
+    /// Activation width / contracted weight dimension.
+    pub hidden: u64,
+    /// Number of KV groups.
+    pub kv_heads: u64,
+    /// Query heads sharing one KV group.
+    pub q_per_kv: u64,
+    /// Elements in one attention head.
+    pub head_dim: u64,
+    /// Physical row stride of the activation view.
+    pub input_row_stride: u64,
+    /// Physical element stride within one activation row.
+    pub input_element_stride: u64,
+    /// Physical strides for logical Q `[group, q_head, row, d]`.
+    pub q_output_strides: [u64; 4],
+    /// Physical strides for logical K/V `[group, row, d]`.
+    pub kv_output_strides: [u64; 3],
+    /// Shape family selected by the executor.
+    pub layout: QkvProjectionLayout,
+    /// Whether Q/K use the rotate-half (NeoX/Qwen) pairing.
+    pub rotate_half: bool,
+    /// Backend-neutral launch grid carried with the bind.
+    pub grid: [u32; 3],
+}
+
+impl QkvProjectionBind {
+    /// Construct the canonical grouped contiguous output layout.
+    #[must_use]
+    pub fn grouped(
+        rows: u64,
+        hidden: u64,
+        kv_heads: u64,
+        q_per_kv: u64,
+        head_dim: u64,
+        grid: [u32; 3],
+    ) -> Self {
+        let q_output_strides = [
+            q_per_kv.saturating_mul(rows).saturating_mul(head_dim),
+            rows.saturating_mul(head_dim),
+            head_dim,
+            1,
+        ];
+        let kv_output_strides = [rows.saturating_mul(head_dim), head_dim, 1];
+        Self {
+            rows,
+            hidden,
+            kv_heads,
+            q_per_kv,
+            head_dim,
+            input_row_stride: hidden,
+            input_element_stride: 1,
+            q_output_strides,
+            kv_output_strides,
+            layout: QkvProjectionLayout::Grouped,
+            rotate_half: false,
+            grid,
+        }
+    }
+
+    /// Validate all static shape, stride, and grid facts before any buffer is
+    /// accessed by the body.
+    pub fn validate(&self) -> Result<(), KernelBodyError> {
+        if self.rows == 0
+            || self.hidden == 0
+            || self.kv_heads == 0
+            || self.q_per_kv == 0
+            || self.head_dim == 0
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "QKV projection bind has a zero dimension",
+            ));
+        }
+        if self.layout != QkvProjectionLayout::Grouped {
+            return Err(KernelBodyError::InvalidBind(
+                "QKV projection layout is not servable",
+            ));
+        }
+        if self.grid.iter().any(|axis| *axis == 0) {
+            return Err(KernelBodyError::InvalidBind(
+                "QKV projection bind has a zero dispatch axis",
+            ));
+        }
+        if self
+            .q_output_strides
+            .iter()
+            .chain(self.kv_output_strides.iter())
+            .any(|stride| *stride == 0)
+        {
+            return Err(KernelBodyError::InvalidBind(
+                "QKV projection bind has a zero output stride",
+            ));
+        }
+        self.kv_heads
+            .checked_mul(self.q_per_kv)
+            .and_then(|heads| heads.checked_mul(self.head_dim))
+            .filter(|width| *width == self.hidden)
+            .ok_or(KernelBodyError::ShapeMismatch(
+                "QKV hidden width does not equal kv_heads * q_per_kv * head_dim",
+            ))?;
+        self.rows
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(self.input_row_stride))
+            .and_then(|last| {
+                self.hidden
+                    .checked_sub(1)
+                    .and_then(|width| width.checked_mul(self.input_element_stride))
+                    .and_then(|width| last.checked_add(width))
+            })
+            .and_then(|last| last.checked_add(1))
+            .ok_or(KernelBodyError::InvalidBind("QKV activation span overflow"))?;
+        attention_span(
+            &[self.kv_heads, self.q_per_kv, self.rows, self.head_dim],
+            &self.q_output_strides,
+        )?;
+        attention_span(
+            &[self.kv_heads, self.rows, self.head_dim],
+            &self.kv_output_strides,
+        )?;
+        if self.rotate_half && !self.head_dim.is_multiple_of(2) {
+            return Err(KernelBodyError::ShapeMismatch(
+                "QKV rotate-half head width must be even",
+            ));
+        }
+        Ok(())
+    }
+
+    fn q_width(self) -> usize {
+        (self.kv_heads * self.q_per_kv * self.head_dim) as usize
+    }
+
+    fn kv_width(self) -> usize {
+        (self.kv_heads * self.head_dim) as usize
+    }
+}
+
+fn qkv_weight_values(
+    bind: &QkvProjectionBind,
+    weight: QkvProjectionWeight<'_>,
+    activation: &[f32],
+    row_base: usize,
+    output_width: usize,
+) -> Result<Vec<f32>, KernelBodyError> {
+    match weight {
+        QkvProjectionWeight::Dense(values) => {
+            let required = checked_usize(bind.hidden.checked_mul(output_width as u64).ok_or(
+                KernelBodyError::InvalidBind("QKV dense weight span overflow"),
+            )?)?;
+            if values.len() < required {
+                return Err(KernelBodyError::BufferTooShort {
+                    buffer: "QKV dense weight",
+                    required: required as u64,
+                    actual: values.len(),
+                });
+            }
+            let hidden = checked_usize(bind.hidden)?;
+            let input_stride = checked_usize(bind.input_element_stride)?;
+            let mut output = vec![0.0f32; output_width];
+            for column in 0..output_width {
+                let mut sum = 0.0f32;
+                for element in 0..hidden {
+                    sum += activation[row_base + element * input_stride]
+                        * values[column * hidden + element];
+                }
+                output[column] = sum;
+            }
+            Ok(output)
+        }
+        QkvProjectionWeight::Quantized {
+            bind: weight_bind,
+            packed,
+        } => {
+            if weight_bind.k != bind.hidden || weight_bind.n != output_width as u64 {
+                return Err(KernelBodyError::ShapeMismatch(
+                    "QKV packed weight dimensions do not match the projection bind",
+                ));
+            }
+            let mut row_bind = weight_bind;
+            row_bind.input_stride = bind.input_element_stride;
+            row_bind.output_stride = 1;
+            row_bind.grid = bind.grid;
+            let mut output = vec![0.0f32; output_width];
+            dispatch_gemv(
+                GemvKernel::Quantized,
+                &row_bind,
+                &activation[row_base..],
+                packed,
+                &mut output,
+            )?;
+            Ok(output)
+        }
+    }
+}
+
+fn qkv_add_bias(
+    values: &mut [f32],
+    bias: Option<&[f32]>,
+    name: &'static str,
+) -> Result<(), KernelBodyError> {
+    let Some(bias) = bias else {
+        return Ok(());
+    };
+    if bias.len() < values.len() {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: name,
+            required: values.len() as u64,
+            actual: bias.len(),
+        });
+    }
+    for (value, offset) in values.iter_mut().zip(bias) {
+        *value += *offset;
+    }
+    Ok(())
+}
+
+fn qkv_rotate(values: &mut [f32], head_dim: usize, rotate_half: bool, cos: &[f32], sin: &[f32]) {
+    let half = head_dim / 2;
+    for head in values.chunks_exact_mut(head_dim) {
+        let source = head.to_vec();
+        for pair in 0..half {
+            let (left, right) = if rotate_half {
+                (pair, pair + half)
+            } else {
+                (pair * 2, pair * 2 + 1)
+            };
+            head[left] = source[left] * cos[pair] - source[right] * sin[pair];
+            head[right] = source[left] * sin[pair] + source[right] * cos[pair];
+        }
+    }
+}
+
+/// One bind-parameterized Q/K/V projection body.
+///
+/// Q and K receive the optional bias before the optional RoPE rotation; V
+/// receives its bias but no rotation.  The three matrices are reduced in one
+/// body and written directly to their grouped output views.  A mismatch in
+/// the optional bias or RoPE bind is rejected before touching output memory.
+pub fn qkv_projection(
+    bind: &QkvProjectionBind,
+    activation: &[f32],
+    q_weight: QkvProjectionWeight<'_>,
+    k_weight: QkvProjectionWeight<'_>,
+    v_weight: QkvProjectionWeight<'_>,
+    q_bias: Option<&[f32]>,
+    k_bias: Option<&[f32]>,
+    v_bias: Option<&[f32]>,
+    cos: Option<&[f32]>,
+    sin: Option<&[f32]>,
+    q_output: &mut [f32],
+    k_output: &mut [f32],
+    v_output: &mut [f32],
+) -> Result<(), KernelBodyError> {
+    bind.validate()?;
+    let input_span = checked_usize(
+        (bind.rows - 1)
+            .checked_mul(bind.input_row_stride)
+            .and_then(|last| {
+                (bind.hidden - 1)
+                    .checked_mul(bind.input_element_stride)
+                    .and_then(|width| last.checked_add(width))
+            })
+            .and_then(|last| last.checked_add(1))
+            .ok_or(KernelBodyError::InvalidBind("QKV activation span overflow"))?,
+    )?;
+    if activation.len() < input_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "QKV activation",
+            required: input_span as u64,
+            actual: activation.len(),
+        });
+    }
+    let q_span = checked_usize(attention_span(
+        &[bind.kv_heads, bind.q_per_kv, bind.rows, bind.head_dim],
+        &bind.q_output_strides,
+    )?)?;
+    let kv_span = checked_usize(attention_span(
+        &[bind.kv_heads, bind.rows, bind.head_dim],
+        &bind.kv_output_strides,
+    )?)?;
+    if q_output.len() < q_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "QKV Q output",
+            required: q_span as u64,
+            actual: q_output.len(),
+        });
+    }
+    if k_output.len() < kv_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "QKV K output",
+            required: kv_span as u64,
+            actual: k_output.len(),
+        });
+    }
+    if v_output.len() < kv_span {
+        return Err(KernelBodyError::BufferTooShort {
+            buffer: "QKV V output",
+            required: kv_span as u64,
+            actual: v_output.len(),
+        });
+    }
+    let q_width = bind.q_width();
+    let kv_width = bind.kv_width();
+    let bias_present = [q_bias.is_some(), k_bias.is_some(), v_bias.is_some()];
+    if bias_present.iter().any(|present| *present) && !bias_present.iter().all(|present| *present) {
+        return Err(KernelBodyError::InvalidBind(
+            "QKV bias bind must provide Q, K, and V together",
+        ));
+    }
+    if cos.is_some() != sin.is_some() {
+        return Err(KernelBodyError::InvalidBind(
+            "QKV RoPE bind must provide cosine and sine tables together",
+        ));
+    }
+    let table_width = checked_usize(bind.head_dim / 2)?;
+    if let (Some(cos), Some(sin)) = (cos, sin) {
+        let table_len = checked_usize(bind.rows * bind.head_dim / 2)?;
+        if cos.len() < table_len || sin.len() < table_len {
+            return Err(KernelBodyError::BufferTooShort {
+                buffer: "QKV RoPE table",
+                required: table_len as u64,
+                actual: cos.len().min(sin.len()),
+            });
+        }
+    }
+    for row in 0..checked_usize(bind.rows)? {
+        let row_base = checked_usize(
+            (row as u64)
+                .checked_mul(bind.input_row_stride)
+                .ok_or(KernelBodyError::InvalidBind("QKV input row index overflow"))?,
+        )?;
+        let mut q = qkv_weight_values(bind, q_weight, activation, row_base, q_width)?;
+        let mut k = qkv_weight_values(bind, k_weight, activation, row_base, kv_width)?;
+        let mut v = qkv_weight_values(bind, v_weight, activation, row_base, kv_width)?;
+        qkv_add_bias(&mut q, q_bias, "QKV Q bias")?;
+        qkv_add_bias(&mut k, k_bias, "QKV K bias")?;
+        qkv_add_bias(&mut v, v_bias, "QKV V bias")?;
+        if let (Some(cos), Some(sin)) = (cos, sin) {
+            let table_base = row * table_width;
+            qkv_rotate(
+                &mut q,
+                checked_usize(bind.head_dim)?,
+                bind.rotate_half,
+                &cos[table_base..table_base + table_width],
+                &sin[table_base..table_base + table_width],
+            );
+            qkv_rotate(
+                &mut k,
+                checked_usize(bind.head_dim)?,
+                bind.rotate_half,
+                &cos[table_base..table_base + table_width],
+                &sin[table_base..table_base + table_width],
+            );
+        }
+        let row_u64 = row as u64;
+        for group in 0..checked_usize(bind.kv_heads)? {
+            for query_head in 0..checked_usize(bind.q_per_kv)? {
+                for dimension in 0..checked_usize(bind.head_dim)? {
+                    let column = (group * checked_usize(bind.q_per_kv)? + query_head)
+                        * checked_usize(bind.head_dim)?
+                        + dimension;
+                    let offset = checked_usize(
+                        (group as u64)
+                            .checked_mul(bind.q_output_strides[0])
+                            .and_then(|value| {
+                                (query_head as u64)
+                                    .checked_mul(bind.q_output_strides[1])
+                                    .and_then(|head| value.checked_add(head))
+                            })
+                            .and_then(|value| {
+                                row_u64
+                                    .checked_mul(bind.q_output_strides[2])
+                                    .and_then(|row| value.checked_add(row))
+                            })
+                            .and_then(|value| {
+                                (dimension as u64)
+                                    .checked_mul(bind.q_output_strides[3])
+                                    .and_then(|dimension| value.checked_add(dimension))
+                            })
+                            .ok_or(KernelBodyError::InvalidBind("QKV Q output index overflow"))?,
+                    )?;
+                    q_output[offset] = q[column];
+                }
+            }
+            for dimension in 0..checked_usize(bind.head_dim)? {
+                let column = group * checked_usize(bind.head_dim)? + dimension;
+                let offset = checked_usize(
+                    (group as u64)
+                        .checked_mul(bind.kv_output_strides[0])
+                        .and_then(|value| {
+                            row_u64
+                                .checked_mul(bind.kv_output_strides[1])
+                                .and_then(|row| value.checked_add(row))
+                        })
+                        .and_then(|value| {
+                            (dimension as u64)
+                                .checked_mul(bind.kv_output_strides[2])
+                                .and_then(|dimension| value.checked_add(dimension))
+                        })
+                        .ok_or(KernelBodyError::InvalidBind("QKV KV output index overflow"))?,
+                )?;
+                k_output[offset] = k[column];
+                v_output[offset] = v[column];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Select the single QKV body from executor-plan facts.
+///
+/// Both prefill (`decode_gemv = 0`) and scalar decode (`decode_gemv = 1`)
+/// select the same bind-parameterized body.  Unknown entries and unservable
+/// layouts fail closed rather than silently falling back to three launches.
+pub fn select_qkv_projection(
+    library_entry: Option<&str>,
+    decode_gemv: u32,
+    layout: QkvProjectionLayout,
+) -> Result<Option<LibraryKernel>, KernelBodyError> {
+    if layout != QkvProjectionLayout::Grouped {
+        return Err(KernelBodyError::InvalidBind(
+            "QKV projection layout is not servable",
+        ));
+    }
+    match (library_entry, decode_gemv) {
+        (Some("QkvProjection"), 0 | 1) => Ok(Some(LibraryKernel::QkvProjection)),
+        (Some("QkvProjection"), _) => Err(KernelBodyError::InvalidBind(
+            "QKV projection decode uniform is not 0 or 1",
+        )),
+        (None, 0 | 1) => Ok(None),
+        _ => Err(KernelBodyError::InvalidBind(
+            "QKV projection selection disagrees with library_entry",
+        )),
+    }
+}
+
+/// Dispatch the selected single-body QKV projection.
+pub fn dispatch_qkv_projection(
+    kernel: LibraryKernel,
+    bind: &QkvProjectionBind,
+    activation: &[f32],
+    weights: [QkvProjectionWeight<'_>; 3],
+    biases: [Option<&[f32]>; 3],
+    rope: Option<(&[f32], &[f32])>,
+    outputs: [&mut [f32]; 3],
+) -> Result<(), KernelBodyError> {
+    match kernel {
+        LibraryKernel::QkvProjection => {
+            let [q_output, k_output, v_output] = outputs;
+            qkv_projection(
+                bind,
+                activation,
+                weights[0],
+                weights[1],
+                weights[2],
+                biases[0],
+                biases[1],
+                biases[2],
+                rope.map(|(cos, _)| cos),
+                rope.map(|(_, sin)| sin),
+                q_output,
+                k_output,
+                v_output,
+            )
+        }
+        LibraryKernel::CausalAttention => Err(KernelBodyError::InvalidBind(
+            "QKV dispatch received CausalAttention",
+        )),
+    }
+}
+
 /// Layout family for the fused attention library body.
 ///
 /// `Grouped` is the canonical `[kv_group, q_head, query, head_dim]` query and
@@ -1524,6 +2033,8 @@ pub fn causal_attention(
 pub enum LibraryKernel {
     /// Scale + causal scores + softmax + context for one KV-group batch.
     CausalAttention,
+    /// One grouped Q/K/V projection body with bind-supplied weights/views.
+    QkvProjection,
 }
 
 /// Dispatch one plan-selected library kernel.
@@ -1541,6 +2052,9 @@ pub fn dispatch(
 ) -> Result<(), KernelBodyError> {
     match kernel {
         LibraryKernel::CausalAttention => causal_attention(bind, q, k, v, output),
+        LibraryKernel::QkvProjection => Err(KernelBodyError::InvalidBind(
+            "QKV projection requires its grouped bind and three outputs",
+        )),
     }
 }
 
