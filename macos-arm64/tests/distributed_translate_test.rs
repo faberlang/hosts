@@ -1,12 +1,15 @@
-//! MD3H-H4 part 1: FMIR distributed wire → transaction mirror, F1 fixtures.
+//! MD3H-H4: FMIR distributed wire → transaction mirror, F1 fixtures, CLI bind.
 //!
 //! Consumes MD3H-F1 postcard artifacts (`be69f5ace`) as built bytes. The
-//! 8:1-promoted-as-8-physical rejection is the red-first row.
+//! 8:1-promoted-as-8-physical rejection is the red-first row (now green).
+//! Declared `--bind-count` maps onto that policy and prepares.
 
 use std::collections::BTreeSet;
 
+use faber_host_macos_arm64::device_execute::prepare_distributed_image;
 use faber_host_macos_arm64::distributed_translate::{
-    bind_translated, translate_device_section_bytes, BindPolicy,
+    bind_policy_for_declared_count, bind_translated, translate_device_section_bytes, BindPolicy,
+    TranslateError,
 };
 use host_coordinator::bound_plan::BindError;
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
@@ -154,5 +157,64 @@ fn eight_rank_promoted_as_eight_physical_rejects_topology_mismatch() {
     assert!(
         matches!(error, BindError::TopologyMismatch { .. }),
         "8:1-promoted-as-8-physical must be TopologyMismatch-class, got {error:?}"
+    );
+}
+
+#[test]
+fn declared_bind_count_one_colocates() {
+    assert_eq!(
+        bind_policy_for_declared_count(8, 1).expect("bind-count 1"),
+        BindPolicy::ColocateOnSnapshot
+    );
+    assert_eq!(
+        bind_policy_for_declared_count(1, 1).expect("1:1"),
+        BindPolicy::ColocateOnSnapshot
+    );
+}
+
+#[test]
+fn declared_bind_count_matching_partitions_is_one_physical_each() {
+    assert_eq!(
+        bind_policy_for_declared_count(8, 8).expect("bind-count 8"),
+        BindPolicy::OnePhysicalPerPartition
+    );
+}
+
+#[test]
+fn declared_bind_count_two_is_unsupported() {
+    let error = bind_policy_for_declared_count(8, 2).expect_err("8:2 waits for MD5");
+    assert!(
+        matches!(error, TranslateError::Unsupported(_)),
+        "8:2 must stay unsupported at this seam, got {error:?}"
+    );
+}
+
+#[test]
+fn eight_rank_bind_count_one_prepares_on_one_physical_cuda_snapshot() {
+    let snapshot = one_physical_snapshot();
+    let receipt = prepare_distributed_image(EIGHT_RANK, &snapshot, 1)
+        .expect("F1 8-rank image prepares 8:1 on a 1-physical CUDA snapshot");
+    assert_eq!(receipt.physical_device_count, 1);
+    assert_eq!(receipt.virtual_partition_count, 8);
+    assert_eq!(receipt.fixture_identity_class, "virtual");
+    assert_eq!(receipt.hardware_isolation_claimed, false);
+    assert_eq!(receipt.bind_shape, "8:1");
+    assert!(receipt.communication_graph_edge_count > 0);
+    assert_eq!(receipt.transaction_state, "prepared");
+    assert!(receipt.logical_distributed_plan_hash.starts_with("sha256:"));
+    assert!(receipt.bound_distributed_plan_hash.starts_with("sha256:"));
+    assert_eq!(receipt.physical_device_ids.len(), 1);
+    assert_eq!(receipt.virtual_partition_ids.len(), 8);
+}
+
+#[test]
+fn eight_rank_bind_count_eight_rejects_topology_mismatch() {
+    let snapshot = one_physical_snapshot();
+    let error = prepare_distributed_image(EIGHT_RANK, &snapshot, 8)
+        .expect_err("bind-count 8 on a 1-physical snapshot must reject");
+    assert!(
+        error.message.contains("TopologyMismatch"),
+        "CLI bind-count 8 must stay TopologyMismatch-class, got {}",
+        error.message
     );
 }

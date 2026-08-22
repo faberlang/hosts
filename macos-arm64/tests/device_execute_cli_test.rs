@@ -291,6 +291,88 @@ fn parse_device_execute_args_accepts_control_owner_flag() {
 }
 
 #[test]
+fn parse_device_execute_args_accepts_distributed_image_and_bind_count() {
+    let args = [
+        "--backend".to_owned(),
+        "cuda".to_owned(),
+        "--distributed-image".to_owned(),
+        "eight-rank.postcard".to_owned(),
+        "--bind-count".to_owned(),
+        "1".to_owned(),
+    ];
+    let parsed = parse_device_execute_args(&args).expect("distributed flags");
+    assert_eq!(
+        parsed.distributed_image.as_deref(),
+        Some(std::path::Path::new("eight-rank.postcard"))
+    );
+    assert_eq!(parsed.bind_count, Some(1));
+    assert_eq!(
+        parsed.backend,
+        Some(faber_host_macos_arm64::composite_host::DeviceSelection::Cuda)
+    );
+}
+
+#[test]
+fn parse_device_execute_args_requires_distributed_image_and_bind_count_together() {
+    let image_only = [
+        "--distributed-image".to_owned(),
+        "eight-rank.postcard".to_owned(),
+    ];
+    let err = parse_device_execute_args(&image_only).expect_err("image without bind-count");
+    assert!(err.contains("--bind-count"), "{err}");
+
+    let count_only = ["--bind-count".to_owned(), "8".to_owned()];
+    let err = parse_device_execute_args(&count_only).expect_err("bind-count without image");
+    assert!(err.contains("--distributed-image"), "{err}");
+}
+
+#[test]
+fn parse_device_execute_args_rejects_distributed_with_control() {
+    let args = [
+        "--control".to_owned(),
+        "--distributed-image".to_owned(),
+        "eight-rank.postcard".to_owned(),
+        "--bind-count".to_owned(),
+        "1".to_owned(),
+    ];
+    let err = parse_device_execute_args(&args).expect_err("control + distributed");
+    assert!(err.contains("one-shot prepare"), "{err}");
+}
+
+#[test]
+fn cli_device_execute_usage_names_distributed_image() {
+    let output = Command::new(env!("CARGO_BIN_EXE_faber-host-macos-arm64"))
+        .args(["device-execute"])
+        .output()
+        .expect("run device-execute");
+    assert_eq!(output.status.code(), Some(64));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--distributed-image"), "{stderr}");
+    assert!(stderr.contains("--bind-count"), "{stderr}");
+}
+
+#[test]
+fn cli_distributed_image_missing_file_exits_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.postcard");
+    let output = Command::new(env!("CARGO_BIN_EXE_faber-host-macos-arm64"))
+        .args([
+            "device-execute",
+            "--backend",
+            "metal",
+            "--distributed-image",
+            missing.to_str().expect("utf8"),
+            "--bind-count",
+            "1",
+        ])
+        .output()
+        .expect("run device-execute");
+    assert_eq!(output.status.code(), Some(2));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(json["code"], "E_INVALID_ARGS");
+}
+
+#[test]
 fn control_protocol_accepts_lifecycle_verbs_and_lossless_inputs() {
     let load = parse_control_request(br#"{"op":"load"}"#).expect("load");
     assert_eq!(load.verb, DeviceExecuteControlVerb::Load);

@@ -122,6 +122,26 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
 
 fn device_execute(args: &[String]) -> Result<ExitCode, String> {
     let parsed = faber_host_macos_arm64::device_execute::parse_device_execute_args(args)?;
+    if parsed.distributed_image.is_some() {
+        return match faber_host_macos_arm64::device_execute::run_distributed_prepare(&parsed) {
+            Ok(receipt) => {
+                let json =
+                    faber_host_macos_arm64::device_execute::distributed_prepare_receipt_to_json(
+                        &receipt,
+                    )
+                    .map_err(|error| error.to_string())?;
+                std::io::Write::write_all(&mut std::io::stdout(), &json)
+                    .map_err(|error| format!("failed to write JSON: {error}"))?;
+                println!();
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                print_json(&error)?;
+                Ok(ExitCode::from(2))
+            }
+        };
+    }
     if parsed.control {
         return match faber_host_macos_arm64::device_execute::run_device_execute_control(&parsed) {
             Ok(()) => Ok(ExitCode::SUCCESS),
@@ -156,5 +176,8 @@ fn print_usage() {
     println!("  faber-host-macos-arm64 component-call <component> <export> <route-code>");
     println!(
         "  faber-host-macos-arm64 device-execute [--control] [--backend auto|metal|cuda] --descriptor <json> --module <bin> --inputs <json> [--weights <gguf> --weight-map <json>]"
+    );
+    println!(
+        "  faber-host-macos-arm64 device-execute [--backend auto|metal|cuda] --distributed-image <postcard> --bind-count <n>"
     );
 }

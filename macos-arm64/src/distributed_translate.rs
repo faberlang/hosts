@@ -1,10 +1,11 @@
 //! FMIR distributed-section → host-coordinator transaction-mirror translation
-//! (MD3H-H4 part 1).
+//! (MD3H-H4).
 //!
 //! Ingests an admitted FMIR device-section postcard (MD3H-F1 built artifacts)
 //! and produces [`TransactionOperation`] / [`TransactionCommitBoundary`]
 //! mirrors with deterministic canonical bytes. Bind policy maps the translated
-//! virtual partitions onto a discovery snapshot.
+//! virtual partitions onto a discovery snapshot. The `device-execute` CLI
+//! carries the image plus a declared bind count (OQ-5).
 //!
 //! ## OQ-2 — translation dependency route
 //!
@@ -95,6 +96,37 @@ pub enum BindPolicy {
     OnePhysicalPerPartition,
 }
 
+/// Map the CLI declared bind count onto [`BindPolicy`].
+///
+/// `--bind-count 1` colocates every virtual partition on the snapshot
+/// (8:1). `--bind-count` equal to the partition count claims one physical
+/// per partition (8:8). Any other count is unsupported at this seam
+/// (OQ-5 — richer bind negotiation waits for MD5).
+///
+/// # Errors
+///
+/// Returns [`TranslateError::Unsupported`] when `bind_count` is 0 or is
+/// neither 1 nor the partition count.
+pub fn bind_policy_for_declared_count(
+    partition_count: usize,
+    bind_count: u32,
+) -> Result<BindPolicy, TranslateError> {
+    if bind_count == 0 {
+        return Err(TranslateError::Unsupported(
+            "declared bind count 0 is not a legal bind".to_owned(),
+        ));
+    }
+    if bind_count == 1 {
+        return Ok(BindPolicy::ColocateOnSnapshot);
+    }
+    if bind_count as usize == partition_count {
+        return Ok(BindPolicy::OnePhysicalPerPartition);
+    }
+    Err(TranslateError::Unsupported(format!(
+        "declared bind count {bind_count} for {partition_count} partitions is not 1 (colocate) or {partition_count} (one physical per partition); richer bind negotiation waits for MD5"
+    )))
+}
+
 /// An admitted FMIR distributed section translated into the transaction
 /// mirror vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +173,16 @@ impl TranslatedDistributedPlan {
         }
         out.extend_from_slice(&self.commit_boundary.canonical_bytes());
         out
+    }
+
+    /// Communication-graph edge count: transfers, collectives, and barriers.
+    /// Launches are not edges. N=1 is zero.
+    #[must_use]
+    pub fn communication_graph_edge_count(&self) -> u64 {
+        self.operations
+            .iter()
+            .filter(|operation| !matches!(operation, TransactionOperation::Launch { .. }))
+            .count() as u64
     }
 }
 
