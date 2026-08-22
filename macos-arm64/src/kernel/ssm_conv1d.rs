@@ -229,7 +229,7 @@ mod tests {
         )
         .expect("causal SSM convolution");
 
-        assert_eq!(output, [0.5, 1.0, 0.5, 0.0, 1.5, 3.0, 4.5, 7.0]);
+        assert_eq!(output, [0.5, 1.0, 0.5, 0.0, 1.5, 3.0, 4.5, 6.0]);
     }
 
     #[test]

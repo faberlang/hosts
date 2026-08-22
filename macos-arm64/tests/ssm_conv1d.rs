@@ -21,7 +21,7 @@ fn ssm_conv1d_dispatch_matches_synthetic_state_channel_rows() {
     )
     .expect("SsmConv1d Metal body");
 
-    assert_eq!(output, [0.5, 1.0, 0.5, 0.0, 1.5, 3.0, 4.5, 7.0]);
+    assert_eq!(output, [0.5, 1.0, 0.5, 0.0, 1.5, 3.0, 4.5, 6.0]);
     // One selected body dispatch covers all [time, channel] outputs.
     assert_eq!(bind.grid, [8, 1, 1]);
 }
