@@ -13,11 +13,12 @@ use std::time::Duration;
 use faber_host_macos_arm64::device_execute::prepare_distributed_image;
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::distributed_translate::{
-    bind_policy_for_declared_count, bind_translated, translate_device_section_bytes,
+    bind_policy_for_declared_count, bind_translated, oq2_default_headroom_policy_bytes,
+    translate_device_section_bytes,
 };
 use faber_host_macos_arm64::{
-    discover_cuda_snapshot, enumerate_cuda_physical_devices, probe_cuda_environment,
-    CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram,
+    CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram, discover_cuda_snapshot,
+    enumerate_cuda_physical_devices, probe_cuda_environment,
 };
 use host_coordinator::bound_plan::{BoundDistributedPlan, LogicalPartitionId};
 use host_coordinator::device_identity::PhysicalDeviceId;
@@ -30,6 +31,10 @@ use host_coordinator::transport::{CopyPath, TransferBudget};
 const EIGHT_RANK: &[u8] = include_bytes!("fixtures/md3j/eight-rank.postcard");
 const OVER_BUDGET_EIGHT_RANK: &[u8] =
     include_bytes!("fixtures/md3j/eight-rank-over-budget.postcard");
+const REALCARD_OVER_BUDGET_EIGHT_RANK: &[u8] =
+    include_bytes!("fixtures/md3j/eight-rank-over-budget-realcard.postcard");
+const OVER_BUDGET_DECLARED_TOTAL_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+const REALCARD_OVER_BUDGET_DECLARED_TOTAL_BYTES: u64 = 79 * 1024 * 1024 * 1024;
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 
 // The transaction backend only needs a tiny elementwise kernel for the one
@@ -141,12 +146,16 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
     assert_eq!(receipt_82.bind_shape, "8:2");
     assert!(receipt_82.communication_graph_edge_count > 0);
     assert_eq!(receipt_82.snapshot_id, snapshot.id().hex());
-    assert!(receipt_82
-        .logical_distributed_plan_hash
-        .starts_with("sha256:"));
-    assert!(receipt_82
-        .bound_distributed_plan_hash
-        .starts_with("sha256:"));
+    assert!(
+        receipt_82
+            .logical_distributed_plan_hash
+            .starts_with("sha256:")
+    );
+    assert!(
+        receipt_82
+            .bound_distributed_plan_hash
+            .starts_with("sha256:")
+    );
     assert_eq!(receipt_82.transaction_state, "prepared");
 
     let translated = translate_device_section_bytes(EIGHT_RANK)
@@ -220,15 +229,47 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
     );
     assert_eq!(receipt_81.bind_shape, "8:1");
 
-    let over_budget = prepare_distributed_image(OVER_BUDGET_EIGHT_RANK, &snapshot, 2)
-        .expect_err("over-budget F1 variant must reject before execution");
-    assert_eq!(over_budget.code, "E_INVALID_ARGS");
+    // The original F1 over-budget variant is intentionally only over the
+    // small synthetic B2 snapshot. Its 40 GiB ledger declaration admits on a
+    // real 80 GiB A100, so pin the correct big-card behavior here.
+    let real_card_admits_40gib = prepare_distributed_image(OVER_BUDGET_EIGHT_RANK, &snapshot, 2)
+        .expect("40 GiB ledger declaration admits on the real A100 policy shape");
+    assert_eq!(real_card_admits_40gib.bind_shape, "8:2");
+    assert_eq!(
+        OVER_BUDGET_DECLARED_TOTAL_BYTES,
+        40 * 1024 * 1024 * 1024,
+        "the retained synthetic over-budget fixture must remain the 40 GiB case"
+    );
+
+    // The real-card variant uses a 79 GiB ledger declaration. For the
+    // observed 80 GiB A100 shape, floor(80 GiB × 0.9) is 77,309,411,328
+    // bytes, so this variant must reject before any runtime is opened.
+    let realcard_over_budget =
+        prepare_distributed_image(REALCARD_OVER_BUDGET_EIGHT_RANK, &snapshot, 2)
+            .expect_err("real-card over-budget variant must reject before execution");
+    assert_eq!(realcard_over_budget.code, "E_INVALID_ARGS");
+    let policy_limit_bytes = snapshot
+        .devices()
+        .values()
+        .next()
+        .expect("real A100 snapshot has a first device")
+        .memory
+        .api_total_bytes;
+    let policy_limit_bytes = oq2_default_headroom_policy_bytes(policy_limit_bytes);
     assert!(
-        over_budget.message.contains("BudgetExceeded")
-            && over_budget.message.contains("declared_total_bytes")
-            && over_budget.message.contains("policy_limit_bytes"),
-        "over-budget row must retain the BudgetExceeded class and byte facts: {}",
-        over_budget.message
+        policy_limit_bytes < REALCARD_OVER_BUDGET_DECLARED_TOTAL_BYTES,
+        "real-card fixture declaration must exceed the observed OQ-2 policy limit"
+    );
+    assert!(
+        realcard_over_budget.message.contains("BudgetExceeded")
+            && realcard_over_budget.message.contains(&format!(
+                "declared_total_bytes: Some({REALCARD_OVER_BUDGET_DECLARED_TOTAL_BYTES})"
+            ))
+            && realcard_over_budget
+                .message
+                .contains(&format!("policy_limit_bytes: {policy_limit_bytes}")),
+        "real-card BudgetExceeded row must retain both byte facts: {}",
+        realcard_over_budget.message
     );
 
     eprintln!(
@@ -263,8 +304,12 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
         receipt_81.logical_distributed_plan_hash, receipt_81.bound_distributed_plan_hash
     );
     eprintln!(
-        "MD3J-P1 BudgetExceeded row: class=BudgetExceeded message={}",
-        over_budget.message
+        "MD3J-P1 40GiB-on-80GB admission row: class=admitted bind_shape={} transaction_state={}",
+        real_card_admits_40gib.bind_shape, real_card_admits_40gib.transaction_state
+    );
+    eprintln!(
+        "MD3J-P1 BudgetExceeded row: class=BudgetExceeded declared_total_bytes={} policy_limit_bytes={} message={}",
+        REALCARD_OVER_BUDGET_DECLARED_TOTAL_BYTES, policy_limit_bytes, realcard_over_budget.message
     );
     eprintln!(
         "MD3J-P1 honest exclusions: No physical-capacity or speedup claim. AllocationFailure under real physical pressure is NOT tested. 8:8 stays deferred behind the RunPod 8x same-SKU gate; this rung does not close it and emits no 8:8 row beyond NOT ATTEMPTED. P2P/peer admission is NOT ATTEMPTED; cross-physical transfers are host-staged."
