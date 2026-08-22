@@ -97,9 +97,13 @@ pub fn project_invocation_bindings(
 
     let required = match invocation.mode {
         DeviceExecuteInvocationMode::Prefill => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", ""],
-        DeviceExecuteInvocationMode::ScalarDecode => {
-            [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, Q_PREFIX_IDS, ""]
-        }
+        DeviceExecuteInvocationMode::ScalarDecode => [
+            PROMPT_TOKENS,
+            ROPE_COS,
+            ROPE_SIN,
+            Q_PREFIX_IDS,
+            KV_PREFIX_IDS,
+        ],
     };
     let required = required.into_iter().filter(|name| !name.is_empty());
     let inputs = declared_input_specs(descriptor, required)?;
@@ -158,14 +162,12 @@ pub fn project_invocation_bindings(
             inputs.get(Q_PREFIX_IDS),
             prefix_ids_for(inputs.get(Q_PREFIX_IDS), Q_PREFIX_IDS)?,
         )?;
-        if let Some(spec) = optional_input_spec(descriptor, KV_PREFIX_IDS)? {
-            insert_checked(
-                &mut projected,
-                KV_PREFIX_IDS,
-                Some(&spec),
-                prefix_ids_for(Some(&spec), KV_PREFIX_IDS)?,
-            )?;
-        }
+        insert_checked(
+            &mut projected,
+            KV_PREFIX_IDS,
+            inputs.get(KV_PREFIX_IDS),
+            prefix_ids_for(inputs.get(KV_PREFIX_IDS), KV_PREFIX_IDS)?,
+        )?;
     }
     Ok(projected)
 }

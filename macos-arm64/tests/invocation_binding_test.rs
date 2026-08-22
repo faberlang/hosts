@@ -128,6 +128,24 @@ fn decode_projects_only_declared_per_invocation_buffers() {
 }
 
 #[test]
+fn decode_requires_declared_kv_prefix_ids() {
+    let mut descriptor = descriptor(1, 4, None);
+    descriptor.kernels[0]
+        .buffers
+        .push(input(4, Q_PREFIX_IDS, 4));
+    let invocation = decode_invocation(Some(42), 3, 3, 4);
+
+    let error = project_invocation_bindings(&descriptor, &invocation, &[1, 2], ROPE)
+        .expect_err("decode without kv prefix ids must fail closed");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error.message.contains(KV_PREFIX_IDS),
+        "missing KV prefix ids must be named in the error, got {}",
+        error.message
+    );
+}
+
+#[test]
 fn decode_prefix_ids_follow_declared_gather_width_not_sequence_len() {
     // Dense M=1 gather tables are the logical Q/K/V span (960), not valid_len.
     let descriptor = descriptor(1, 4, Some(960));
