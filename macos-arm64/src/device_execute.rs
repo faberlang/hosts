@@ -1024,7 +1024,14 @@ fn run_device_execute_control_v2(args: &DeviceExecuteArgs) -> HostResult<()> {
                     DeviceExecuteInvocationMode::ScalarDecode => decode.kernels.len(),
                 };
                 let timing = paired.kv_cache_timing(invocation.mode);
-                let wire = project_v2_invocation_receipt(&receipt, timing, kernel_count, wall_us);
+                let host_product_work_us = paired.host_product_work_us();
+                let wire = project_v2_invocation_receipt(
+                    &receipt,
+                    timing,
+                    kernel_count,
+                    wall_us,
+                    host_product_work_us,
+                );
                 load.operation = "invoke".to_owned();
                 apply_paired_lifecycle(&mut load, &paired);
                 load.receipt = Some(wire);
@@ -1428,10 +1435,12 @@ fn project_v2_invocation_receipt(
     timing: KvCacheTimingReceipt,
     kernel_count: usize,
     wall_us: u64,
+    host_product_work_us: u64,
 ) -> DeviceExecuteReceipt {
     let mut wire =
         DeviceExecuteReceipt::from_host_with_phase_timing(receipt, f4h1_phase_timing(timing));
     wire.kernel_count = kernel_count;
+    wire.host_product_work_us = host_product_work_us;
     wire.stage_timing = stage_timing(wall_us, receipt);
     wire
 }
@@ -2144,6 +2153,10 @@ pub struct DeviceExecuteReceipt {
     /// Blocking device wait wall copied from the F4H1 steady-state phase.
     #[serde(default)]
     pub wait_us: u64,
+    /// Direct host-product work measured around the v2 cursor/binding and
+    /// transaction-commit path. This is not a residual of the invocation wall.
+    #[serde(default)]
+    pub host_product_work_us: u64,
     /// Deprecated fused encode + submit + wait wall. Prefer the phase fields.
     #[serde(default)]
     pub gpu_encode_submit_wait_us: u64,
@@ -2246,6 +2259,7 @@ impl DeviceExecuteReceipt {
             encode_us: timing.encode_us,
             submit_us: timing.submit_us,
             wait_us: timing.wait_us,
+            host_product_work_us: 0,
             gpu_encode_submit_wait_us: receipt.gpu_encode_submit_wait_us,
             launch_gpu_us: receipt.launch_gpu_us.clone(),
             launch_gpu_start_us: receipt.launch_gpu_start_us.clone(),
@@ -2641,7 +2655,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_receipt_carries_measured_encode_and_submit_phase_timing() {
+    fn v2_receipt_carries_measured_phase_and_host_product_timing() {
         let timing = KvCacheTimingReceipt {
             setup_phase: KvCachePhaseTiming::not_measured(),
             steady_state: KvCachePhaseTiming {
@@ -2653,14 +2667,17 @@ mod tests {
             slack_us: KvCacheMeasurement::derived(2),
             lifecycle: KvCacheLifecycleReceipt::zero(),
         };
-        let wire = project_v2_invocation_receipt(&sample_receipt(), timing, 1, 20);
+        let wire = project_v2_invocation_receipt(&sample_receipt(), timing, 1, 20, 5);
         let encoded: serde_json::Value =
             serde_json::from_slice(&receipt_to_json(&wire).expect("encode receipt"))
                 .expect("parse receipt");
 
         assert_eq!(wire.encode_us, 11);
         assert_eq!(wire.submit_us, 13);
+        assert_eq!(wire.host_product_work_us, 5);
+        assert_eq!(wire.wait_us, 0);
         assert_eq!(encoded["encode_us"], 11);
         assert_eq!(encoded["submit_us"], 13);
+        assert_eq!(encoded["host_product_work_us"], 5);
     }
 }

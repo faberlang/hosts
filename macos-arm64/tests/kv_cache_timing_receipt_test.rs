@@ -111,3 +111,23 @@ fn lifecycle_receipt_carries_residency_and_cache_byte_facts() {
     assert_eq!(receipt.lifecycle.old_prefix_copy_bytes, 4096);
     assert_eq!(receipt.lifecycle.full_cache_clear_bytes, 8192);
 }
+
+#[test]
+fn f7_receipt_addendum_names_option_a_and_fused_sync_ruling() {
+    let addendum = include_str!("kv_cache_timing_receipt.receipt.md");
+
+    for needle in [
+        "Option **(a)** is accepted",
+        "host_product_work_us",
+        "fused term without an independent clock",
+        "stays `not_measured` with\nthat fusion reason",
+        "fused-sync separation is deferred",
+        "`unattributed` also stays",
+        "`not_measured`; this unit does not invent a residual",
+    ] {
+        assert!(
+            addendum.contains(needle),
+            "receipt addendum missing {needle}"
+        );
+    }
+}

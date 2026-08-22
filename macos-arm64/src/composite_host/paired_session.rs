@@ -11,6 +11,7 @@
 //! warm-up subtracted.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::composite_host::invocation_binding::{project_invocation_bindings, RopeConfig};
 use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
@@ -51,6 +52,10 @@ pub struct PairedProgramSession<'host> {
     /// Driver upload-counter baseline captured before once-init, so
     /// prepare-time HostProvided copies are included in the derived count.
     uploads_at_prepare: usize,
+    /// Direct host-clock work around the selected v2 device invocation:
+    /// cursor/binding projection plus transaction commit. This is a named
+    /// product term, not a residual derived from the invocation wall.
+    host_product_work_us: u64,
 }
 
 impl<'host> PairedProgramSession<'host> {
@@ -134,6 +139,7 @@ impl<'host> PairedProgramSession<'host> {
             prefill_pool_warmed: false,
             decode_pool_warmed: false,
             uploads_at_prepare,
+            host_product_work_us: 0,
         })
     }
 
@@ -148,6 +154,7 @@ impl<'host> PairedProgramSession<'host> {
         invocation: &DeviceExecuteInvocation,
     ) -> HostResult<DeviceExecutionReceipt> {
         let mode = invocation_mode(invocation.mode);
+        let host_product_work_started = Instant::now();
         let query_rows = invocation_query_rows(invocation, self.prompt_tokens.len())?;
         let mut tx = self
             .state
@@ -174,22 +181,29 @@ impl<'host> PairedProgramSession<'host> {
             }
         };
         tx.record_possible_mutation(FailureStage::Dispatch);
+        let pre_dispatch_host_product_work_us = elapsed_us(host_product_work_started);
         let result = match invocation.mode {
             DeviceExecuteInvocationMode::Prefill => self.execute_prefill(&inputs),
             DeviceExecuteInvocationMode::ScalarDecode => self.execute_decode(&inputs),
         };
         match result {
-            Ok(receipt) => match self.state.commit_transaction(&tx) {
-                Ok(_) => {
-                    self.reuses += 1;
-                    Ok(receipt)
+            Ok(receipt) => {
+                let commit_started = Instant::now();
+                let commit_result = self.state.commit_transaction(&tx);
+                match commit_result {
+                    Ok(_) => {
+                        self.reuses += 1;
+                        self.host_product_work_us = pre_dispatch_host_product_work_us
+                            .saturating_add(elapsed_us(commit_started));
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        drop(self.state.fail(&tx));
+                        drop(self.release_all());
+                        Err(session_error(error))
+                    }
                 }
-                Err(error) => {
-                    drop(self.state.fail(&tx));
-                    drop(self.release_all());
-                    Err(session_error(error))
-                }
-            },
+            }
             Err(error) => {
                 drop(self.state.fail(&tx));
                 drop(self.release_all());
@@ -220,6 +234,14 @@ impl<'host> PairedProgramSession<'host> {
             .as_ref()
             .map(ProgramInner::kv_cache_timing)
             .unwrap_or_else(KvCacheTimingReceipt::not_measured)
+    }
+
+    /// Direct host-clock work measured around the latest successful v2
+    /// invocation. This is intentionally separate from the fused device
+    /// timing fields and is never reconstructed from invocation wall time.
+    #[must_use]
+    pub fn host_product_work_us(&self) -> u64 {
+        self.host_product_work_us
     }
 
     /// Number of successful prefill/decode dispatches.
@@ -431,6 +453,10 @@ impl Drop for PairedProgramSession<'_> {
     fn drop(&mut self) {
         drop(self.release_all());
     }
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn execute_inner(
