@@ -92,7 +92,11 @@ impl HostKernel {
     }
 
     pub fn manifest(&self) -> CapabilityManifest {
-        CapabilityManifest::from_parts(self.syscalls(), self.registered_providers.clone())
+        self.manifest_for(CapabilityManifest::HOST_MACOS_ARM64)
+    }
+
+    pub(crate) fn manifest_for(&self, host: impl Into<String>) -> CapabilityManifest {
+        CapabilityManifest::from_parts(host, self.syscalls(), self.registered_providers.clone())
     }
 
     pub fn syscalls(&self) -> Vec<SyscallInfo> {

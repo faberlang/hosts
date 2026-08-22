@@ -28,7 +28,8 @@ use faber_host_macos_arm64::device_registry::FakeFailureStage;
 use faber_host_macos_arm64::kernel::{frame_data, HostError};
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
-    CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession, Status,
+    CapabilityManifest, CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession,
+    Status,
 };
 use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 
@@ -538,6 +539,26 @@ fn device_carrying_composite_is_discovery_visible() {
     let host = metal_composite("add_one").expect("metal composite");
     assert!(host.is_device_active());
     assert!(!host.manifest().builtins.is_empty());
+}
+
+#[test]
+fn cuda_admitted_composite_manifest_host_is_not_macos_arm64() {
+    let host = cuda_composite("add_one").expect("cuda composite");
+    let manifest = host.manifest();
+    assert_eq!(manifest.host, CapabilityManifest::HOST_CUDA_LINUX);
+    assert_ne!(manifest.host, "macos-arm64");
+}
+
+#[test]
+fn metal_admitted_composite_keeps_macos_arm64_host_identity() {
+    let host = metal_composite("add_one").expect("metal composite");
+    assert_eq!(host.manifest().host, "macos-arm64");
+}
+
+#[test]
+fn cpu_composite_keeps_macos_arm64_host_identity() {
+    let host = CompositeHost::new(CompositeHostConfig::cpu()).expect("cpu composite");
+    assert_eq!(host.manifest().host, "macos-arm64");
 }
 
 // ---------------------------------------------------------------------------

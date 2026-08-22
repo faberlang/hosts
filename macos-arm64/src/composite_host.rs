@@ -317,10 +317,18 @@ impl CompositeHost {
         self.kernel.route(request)
     }
 
-    /// Discovery receipt: the capability manifest of the kernel-effects host.
+    /// Discovery receipt: the capability manifest of the kernel-effects host,
+    /// with `host` derived from the admitted device backend.
     #[must_use]
     pub fn manifest(&self) -> CapabilityManifest {
-        self.kernel.manifest()
+        let host = match self.device() {
+            Some(runtime) => match runtime.backend() {
+                DeviceBackend::Cuda => CapabilityManifest::HOST_CUDA_LINUX,
+                DeviceBackend::Metal => CapabilityManifest::HOST_MACOS_ARM64,
+            },
+            None => CapabilityManifest::HOST_MACOS_ARM64,
+        };
+        self.kernel.manifest_for(host)
     }
 
     /// Create a program-scoped session for one device program (S2-1).
