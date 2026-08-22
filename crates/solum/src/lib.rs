@@ -144,7 +144,7 @@ fn digest_file(opener: &Valor) -> HostResult<ProviderReply> {
     let mut file = File::open(&path)
         .map_err(|error| HostError::internal(format!("solum:digestio open failed: {error}")))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buf)

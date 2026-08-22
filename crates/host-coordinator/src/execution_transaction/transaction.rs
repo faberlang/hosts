@@ -24,7 +24,11 @@ use crate::execution_transaction::state_machine::{
 use crate::partition::PartitionBudgetLedger;
 use crate::transport::TransportReceipt;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+fn duration_as_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// The generic `ExecutionTransaction` coordinator (MD3-X1).
 ///
@@ -59,6 +63,12 @@ impl ExecutionTransaction {
     /// plan. The MD-A15 single-partition degenerate and an empty snapshot are
     /// rejected at construction. The snapshot is fixed here — it is the
     /// accepted plan and never grows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstructError::DegeneratePlan`] for the MD-A15 singleton
+    /// degenerate, or [`ConstructError::EmptySnapshot`] when `operations` is
+    /// empty.
     #[must_use]
     pub fn new(
         id: TransactionId,
@@ -204,6 +214,20 @@ impl ExecutionTransaction {
     /// On success the reservation is held on the backend and recorded (the
     /// prepare receipt). On any failure nothing is reserved and the
     /// transaction stays `New`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError`] when the state is not `New`, topology or
+    /// snapshot checks fail, an admitted budget is missing, the derived
+    /// reservation exceeds a ledger class, or the backend cannot hold the
+    /// reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a degenerate plan reaches prepare (construction rejects
+    /// that case) or if a later step observes a partition the earlier
+    /// topology check already validated.
+    #[allow(clippy::too_many_lines)] // sequential prepare gates stay in declaration order
     pub fn prepare(
         &mut self,
         backend: &mut dyn DeviceExecutionBackend,
@@ -325,7 +349,7 @@ impl ExecutionTransaction {
         self.operation_keys = operation_keys;
         self.reservation = Some(reservation);
         self.declared_write_set = derive_declared_write_set(&self.operations);
-        self.timings.prepare_nanos = start.elapsed().as_nanos() as u64;
+        self.timings.prepare_nanos = duration_as_nanos_u64(start.elapsed());
         self.state = TransactionState::Prepared;
         Ok(())
     }
@@ -339,6 +363,11 @@ impl ExecutionTransaction {
     /// transaction moves to `Failed` (the recorded failure); no partial
     /// publication is possible and `abort` completes teardown. Retry is
     /// disabled — `execute` cannot run again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecuteError`] when the state is not `Prepared`, an
+    /// operation is outside the snapshot, or the backend fails a dispatch.
     pub fn execute(
         &mut self,
         backend: &mut dyn DeviceExecutionBackend,
@@ -353,11 +382,11 @@ impl ExecutionTransaction {
         let snapshot = self.operations.clone();
         for operation in &snapshot {
             if let Err(error) = self.execute_operation(backend, operation) {
-                self.timings.execute_nanos = start.elapsed().as_nanos() as u64;
+                self.timings.execute_nanos = duration_as_nanos_u64(start.elapsed());
                 return Err(error);
             }
         }
-        self.timings.execute_nanos = start.elapsed().as_nanos() as u64;
+        self.timings.execute_nanos = duration_as_nanos_u64(start.elapsed());
         Ok(())
     }
 
@@ -368,6 +397,11 @@ impl ExecutionTransaction {
     /// snapshot fails with [`ExecuteError::OperationOutsideSnapshot`]
     /// (no silent growth, S3). On success the operation's staged writes are
     /// staged and its completed events are recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecuteError`] when the state is not `Executing`, the
+    /// operation is not an exact snapshot member, or the backend fails.
     pub fn execute_operation(
         &mut self,
         backend: &mut dyn DeviceExecutionBackend,
@@ -424,6 +458,11 @@ impl ExecutionTransaction {
     /// reservation is released and the receipt records the abstract
     /// publication ordinal. A publication failure moves the transaction to
     /// `Failed` (nothing published) — `abort` then completes teardown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommitError`] when the state is not `Executing`, the
+    /// declared boundary is not yet reached, or atomic publication fails.
     pub fn commit(
         &mut self,
         backend: &mut dyn DeviceExecutionBackend,
@@ -471,7 +510,7 @@ impl ExecutionTransaction {
             publication_ordinal: ordinal,
         });
         self.state = TransactionState::Committed;
-        self.timings.finalize_nanos = start.elapsed().as_nanos() as u64;
+        self.timings.finalize_nanos = duration_as_nanos_u64(start.elapsed());
         let receipt = self.build_receipt();
         self.receipt = Some(receipt.clone());
         Ok(receipt)
@@ -485,6 +524,16 @@ impl ExecutionTransaction {
     /// reservation are **released**. The receipt records the abort decision
     /// with the reason. Idempotent: aborting an already-aborted transaction
     /// returns its receipt. A committed transaction cannot be aborted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AbortError::AlreadyCommitted`] when the transaction has
+    /// already committed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an already-aborted transaction has no receipt (abort always
+    /// records one).
     pub fn abort(
         &mut self,
         backend: &mut dyn DeviceExecutionBackend,
@@ -536,7 +585,7 @@ impl ExecutionTransaction {
         self.failure = Some(failure.clone());
         self.state = TransactionState::Aborted(failure.clone());
         self.decision = Some(TransactionDecision::Aborted { failure });
-        self.timings.finalize_nanos = start.elapsed().as_nanos() as u64;
+        self.timings.finalize_nanos = duration_as_nanos_u64(start.elapsed());
         let receipt = self.build_receipt();
         self.receipt = Some(receipt.clone());
         Ok(receipt)

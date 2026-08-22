@@ -151,6 +151,11 @@ impl AdmittedLogicalPlan {
     ///   (FC17/FC11) — anything else is rejected as stale/unadmitted.
     /// - At least one partition must be declared.
     /// - Every declared constraint must reference only declared partitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitError`] when the hash spelling is invalid, no
+    /// partitions are declared, or a constraint names an unknown partition.
     #[must_use]
     pub fn admit(
         logical_distributed_plan_hash: impl Into<String>,
@@ -338,6 +343,7 @@ pub struct BoundDistributedPlan {
     snapshot_id: DeviceDiscoverySnapshotId,
     fixture_identity_class: FixtureIdentityClass,
     transport_class: TransportClass,
+    #[allow(clippy::struct_field_names)] // contract identity, not a struct-name prefix
     bound_distributed_plan_hash: String,
 }
 
@@ -366,6 +372,17 @@ pub struct BoundDistributedPlan {
 ///
 /// A single-partition admitted plan binds to the implicit/local partition
 /// ([`BoundPlanKind::ImplicitLocal`]) — no distributed wrapper (MD-A15).
+///
+/// # Errors
+///
+/// Returns [`BindError`] when the snapshot is stale, membership fails, the
+/// binding topology does not match, a virtual partition is inconsistent, or
+/// a declared placement constraint is violated.
+///
+/// # Panics
+///
+/// Panics if a single-partition admitted plan has no binding after the
+/// topology-shape check (a programmer invariant).
 #[must_use]
 pub fn bind(
     admitted: &AdmittedLogicalPlan,

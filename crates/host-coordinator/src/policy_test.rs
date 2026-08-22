@@ -144,6 +144,7 @@ fn gate_classes(outcome: &PolicyOutcome) -> Vec<GateClass> {
 /// objective ranks only plans that already pass every gate; no objective ever
 /// rejects.
 #[test]
+#[allow(clippy::too_many_lines)] // one table covering every C2 §1.1 gate
 fn c2_11_review_test_each_gate_rejects_and_objectives_rank_only_survivors() {
     let a = PhysicalDeviceId::cuda(UUID_A, None);
     let b = PhysicalDeviceId::cuda(UUID_B, None);
@@ -440,6 +441,7 @@ fn cs1_split_passes_whole_on_one_fails_budget_exceeded() {
 /// count from the snapshot's capability facts; a plan with no declared
 /// capability requirements is compatible with every surface.
 #[test]
+#[allow(clippy::too_many_lines)] // walks dtype, compute-capability, and SM-count rejections
 fn compatibility_gate_rejects_unsupported_capabilities() {
     let a = PhysicalDeviceId::cuda(UUID_A, None);
     let mut reduced = full_dtypes();
@@ -596,6 +598,7 @@ fn compatibility_gate_rejects_unsupported_capabilities() {
 /// NOT-ATTEMPTED, rejected, and absent links are never assumed. A self-move
 /// is a local copy, not a link traversal.
 #[test]
+#[allow(clippy::too_many_lines)] // walks admitted / NOT-ATTEMPTED / rejected / absent rows
 fn topology_gate_rejects_non_admitted_links() {
     let a = PhysicalDeviceId::cuda(UUID_A, None);
     let b = PhysicalDeviceId::cuda(UUID_B, None);
@@ -1110,6 +1113,7 @@ fn objectives_never_reject_a_plan_without_facts() {
 /// failing fact, and selected devices with ranks + objective scores, plus a
 /// determinism fingerprint.
 #[test]
+#[allow(clippy::too_many_lines)] // pins the explained receipt shape in one test
 fn receipt_names_snapshot_constraints_rejected_and_selected() {
     let a = PhysicalDeviceId::cuda(UUID_A, None);
     let b = PhysicalDeviceId::cuda(UUID_B, None);

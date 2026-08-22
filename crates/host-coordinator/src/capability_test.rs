@@ -134,8 +134,8 @@ fn tri_state_has_exactly_three_variants_and_no_cpu_fallback() {
     for cap in &record.per_family {
         let decided = match &cap.result {
             CapabilityResult::Unsupported { reason } => !reason.is_empty(),
-            CapabilityResult::SupportedDirect { .. } => true,
-            CapabilityResult::SupportedWithExplicitConversion { .. } => true,
+            CapabilityResult::SupportedDirect { .. }
+            | CapabilityResult::SupportedWithExplicitConversion { .. } => true,
         };
         assert!(
             decided,
@@ -346,6 +346,7 @@ fn boolean(v: &Valor) -> bool {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // pins the committed evidence record field-by-field
 fn committed_evidence_record_is_hash_accounted_and_matches_the_initial_contract() {
     let Some(record) = load_record() else {
         return;

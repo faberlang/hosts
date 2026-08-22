@@ -121,6 +121,7 @@ pub struct ComputeCapability {
 /// f32/f64/f16/bf16/i8/i32 all PASS). Independent of host `DeviceDataType`
 /// abstractions and never `U8`-as-quantization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::struct_excessive_bools)] // independent measured dtype flags, not a config bag
 pub struct DtypeSurface {
     /// f32 executed PASS.
     pub f32: bool,
@@ -220,6 +221,10 @@ impl DeviceDiscoverySnapshot {
     /// [`DeviceDiscoveryEntry::ordinal`] must equal its `BTreeMap` key (the
     /// locator is recorded per device); a mismatch is a programmer error and
     /// panics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any entry's ordinal does not match its map key.
     #[must_use]
     pub fn new(
         probe_utc_nanos: u64,
@@ -512,6 +517,7 @@ impl Sha256 {
         h.finalize()
     }
 
+    #[allow(clippy::many_single_char_names)] // FIPS 180-4 working variables a–h
     fn compress(&mut self, block: &[u8]) {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().enumerate().take(16) {

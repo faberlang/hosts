@@ -62,6 +62,10 @@ const TRANSFER_BYTES: u64 = 8192;
 const BROADCAST_BYTES: u64 = 2048;
 const LAUNCH_B_OUTPUT_BYTES: u64 = 16_384;
 
+fn fixture_len(n: u64) -> usize {
+    usize::try_from(n).expect("fixture byte count fits usize")
+}
+
 fn device_a() -> PhysicalDeviceId {
     PhysicalDeviceId::cuda(UUID_A, None)
 }
@@ -1320,7 +1324,7 @@ fn receipt_carries_the_selected_transport_records() {
         MirroredDtype::F32,
         MirroredStorageLayout::Dense,
         0,
-        vec![3u8; TRANSFER_BYTES as usize],
+        vec![3u8; fixture_len(TRANSFER_BYTES)],
     );
     let outcome = adapter
         .copy(&spec, &source, &partition_id(1))

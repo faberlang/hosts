@@ -124,6 +124,10 @@ impl BackendError {
 /// [`DeviceExecutionBackend::retire`].
 pub trait DeviceExecutionBackend {
     /// Reserve the declared transaction resources for one partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the runtime cannot hold the reservation.
     fn reserve(
         &mut self,
         partition: &LogicalPartitionId,
@@ -131,6 +135,10 @@ pub trait DeviceExecutionBackend {
     ) -> Result<(), BackendError>;
 
     /// Run one operation of the accepted plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the runtime cannot run the operation.
     fn run_operation(&mut self, operation: &TransactionOperation) -> Result<(), BackendError>;
 
     /// Whether a previously dispatched operation's event has completed
@@ -139,9 +147,19 @@ pub trait DeviceExecutionBackend {
 
     /// Stage one declared write into the staged write-set. Staging the same
     /// write twice is an error (the write-set is declared once).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the write is already staged or the
+    /// runtime cannot stage it.
     fn stage_write(&mut self, write: &StagedWrite) -> Result<(), BackendError>;
 
     /// Publish every staged write atomically — all or nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when atomic publication fails; nothing is
+    /// published.
     fn publish(&mut self) -> Result<(), BackendError>;
 
     /// The total bytes currently staged.

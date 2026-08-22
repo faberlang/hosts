@@ -42,6 +42,7 @@ impl BudgetClass {
 /// (S3). Staging charges class 6 (`transfer_staging_bytes`); output buffers,
 /// events, and transaction scratch charge class 3 (`activation_scratch_bytes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::struct_field_names)] // ledger-class units; `_bytes` is the charged quantity
 pub struct ReservationRecord {
     /// Class 6: typed transfer staging buffers (in-flight copies at full
     /// size).

@@ -463,6 +463,11 @@ pub struct PolicyRequest<'a> {
 /// memory/capability/topology constraints fail before any allocation.
 /// Deterministic for one frozen snapshot + selection + declared
 /// constraints/objectives.
+///
+/// # Panics
+///
+/// Panics if `request.constraints.topology` was not measured from
+/// `request.discovery`.
 #[must_use]
 pub fn evaluate(request: &PolicyRequest) -> PolicyOutcome {
     assert_eq!(
@@ -826,19 +831,19 @@ fn rank_plans(
         .into_iter()
         .enumerate()
         .map(|(rank, ((_idx, plan), values, devices))| {
-            let scores = objectives
+            let objective_scores = objectives
                 .iter()
                 .zip(&values)
-                .map(|(objective, value)| ObjectiveScore {
+                .map(|(objective, measured)| ObjectiveScore {
                     objective: *objective,
-                    value: *value,
+                    value: *measured,
                 })
                 .collect();
             RankedPlan {
                 rank: rank + 1,
                 plan: plan.name.clone(),
                 devices: devices.into_iter().collect(),
-                scores,
+                scores: objective_scores,
             }
         })
         .collect()

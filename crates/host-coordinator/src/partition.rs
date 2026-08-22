@@ -289,6 +289,11 @@ impl VirtualDevicePartition {
     /// requirements exceed the partition's safe physical limit (or overflow),
     /// admission is rejected as [`AdmissionError::BudgetExceeded`] before any
     /// allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError::BudgetExceeded`] when the declared total
+    /// exceeds `safe_limit` or overflows `u64`.
     #[must_use]
     pub fn admit(
         request: AdmissionRequest,
@@ -322,6 +327,11 @@ impl VirtualDevicePartition {
     /// or `ExecutionTransaction` coordination. This constructor accepts no
     /// distributed input and this module defines no distributed wrapper
     /// types — the partition is purely local runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError`] with the same fail-closed budget check as
+    /// [`admit`](Self::admit).
     #[must_use]
     pub fn implicit_local(
         id: VirtualDevicePartitionId,

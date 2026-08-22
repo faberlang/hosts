@@ -347,7 +347,7 @@ fn hex_decode(hex: &str) -> [u8; 32] {
     for (i, byte) in hex.as_bytes().chunks_exact(2).enumerate() {
         let hi = (byte[0] as char).to_digit(16).expect("hex digit");
         let lo = (byte[1] as char).to_digit(16).expect("hex digit");
-        out[i] = ((hi << 4) | lo) as u8;
+        out[i] = u8::try_from((hi << 4) | lo).expect("hex nibble pair is a byte");
     }
     out
 }

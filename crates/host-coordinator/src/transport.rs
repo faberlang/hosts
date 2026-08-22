@@ -71,6 +71,14 @@ use crate::execution_transaction::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+fn duration_as_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn byte_index(offset: u64) -> usize {
+    usize::try_from(offset).expect("validated byte offset fits the host pointer width")
+}
+
 // --- T1 measured constants --------------------------------------------------
 
 /// T1 small-copy threshold: below 16 KiB the fixed per-copy latency is
@@ -404,7 +412,7 @@ impl SourceValue {
             range.end() <= self.total_bytes(),
             "range must be validated before slicing"
         );
-        self.bytes[range.offset as usize..range.end() as usize].to_vec()
+        self.bytes[byte_index(range.offset)..byte_index(range.end())].to_vec()
     }
 }
 
@@ -551,6 +559,11 @@ impl std::fmt::Display for TransferRejection {
 /// destination **before any staging is allocated or any byte is moved**.
 /// Rejection order is deterministic: dtype, layout, bounds, generation,
 /// owner, destination.
+///
+/// # Errors
+///
+/// Returns [`TransferRejection`] naming the first violated class (dtype,
+/// layout, bounds, generation, owner, or destination).
 pub fn validate_before_copy(
     spec: &TransferSpec,
     source: &SourceValue,
@@ -881,6 +894,11 @@ impl PeerPairRegistry {
     /// Admit one measured directed pair. A self pair, a measurement without
     /// a directional bandwidth/latency, or a measurement without an evidence
     /// reference is rejected (T2 §6; T1 §7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairAdmissionError`] for a self pair, a measurement without
+    /// bandwidth/latency, or a measurement without an evidence reference.
     pub fn admit(&mut self, measurement: PeerPairMeasurement) -> Result<(), PairAdmissionError> {
         let pair = measurement.pair().clone();
         if pair.source() == pair.destination() {
@@ -1023,8 +1041,8 @@ impl StagingPool {
     }
 
     /// Release a staging buffer.
-    pub fn release(&mut self, id: StagingBufferId) {
-        self.active.remove(&id);
+    pub fn release(&mut self, id: &StagingBufferId) {
+        self.active.remove(id);
     }
 
     /// The currently in-flight staging buffers.
@@ -1187,6 +1205,11 @@ pub trait TransportAdapter {
     /// dtype/layout/bounds/generation/owner/destination mismatch; surfaces
     /// [`TransferError::Timeout`] / [`TransferError::Failed`] /
     /// [`TransferError::BudgetExceeded`] / peer-admission errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError`] on typed/ranged rejection, timeout, copy
+    /// failure, budget over-commit, or an unadmitted peer pair.
     fn copy(
         &mut self,
         spec: &TransferSpec,
@@ -1363,7 +1386,7 @@ impl HostStagedAdapter {
         }
         let destination_bytes = match &self.simulated_failure {
             Some(detail) => {
-                self.staging_pool.release(staging.id.clone());
+                self.staging_pool.release(&staging.id);
                 return Err(TransferError::Failed {
                     transfer: spec.transfer_ref().clone(),
                     detail: detail.clone(),
@@ -1372,13 +1395,13 @@ impl HostStagedAdapter {
             None => source.slice(spec.range()),
         };
         let elapsed = start.elapsed();
-        self.staging_pool.release(staging.id.clone());
+        self.staging_pool.release(&staging.id);
 
         if elapsed > spec.timeout() {
             return Err(TransferError::Timeout {
                 transfer: spec.transfer_ref().clone(),
                 declared_timeout: spec.timeout(),
-                elapsed_nanos: elapsed.as_nanos() as u64,
+                elapsed_nanos: duration_as_nanos_u64(elapsed),
             });
         }
         Ok((staging, destination_bytes, elapsed))
@@ -1436,7 +1459,7 @@ impl TransportAdapter for HostStagedAdapter {
             event: EventId::new(self.next_event),
             timeout: spec.timeout(),
             bytes,
-            elapsed_nanos: elapsed.as_nanos() as u64,
+            elapsed_nanos: duration_as_nanos_u64(elapsed),
             expected_nanos: expected,
             direction,
             destination: destination.clone(),
@@ -1476,6 +1499,11 @@ impl PeerAdapter {
     }
 
     /// Admit one measured directed pair (per-pair flip rule — T2 §6).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairAdmissionError`] when the measurement cannot be
+    /// admitted (see [`PeerPairRegistry::admit`]).
     pub fn admit_pair(
         &mut self,
         measurement: PeerPairMeasurement,

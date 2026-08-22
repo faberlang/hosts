@@ -96,6 +96,11 @@ impl DeviceSet {
     /// covers both an unknown device and a **replaced** device (same ordinal,
     /// different identity facts; replacement detection, naming contract §1) —
     /// and a member recorded under a stale epoch are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MembershipError`] when a member is missing from the snapshot
+    /// or recorded under a stale health generation.
     pub fn validate(
         &self,
         discovery: &DeviceDiscoverySnapshot,
@@ -166,6 +171,12 @@ impl DeviceSetSelection {
     ///   selection.
     /// - `Constraints` selects the snapshot's current-epoch members matching
     ///   the declared shape (backend, exclusions, count bounds).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectionError`] when an explicit id fails membership
+    /// validation or constraint resolution cannot satisfy the declared
+    /// count bounds.
     pub fn resolve(
         &self,
         discovery: &DeviceDiscoverySnapshot,
@@ -309,6 +320,10 @@ pub struct LinkFacts {
 
 impl DeviceLink {
     /// An explicitly admitted directed link with path class + measured facts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from == to` (a [`DeviceLink`] is a directed pair `i→j`, `i≠j`).
     #[must_use]
     pub fn admitted(
         from: PhysicalDeviceId,
@@ -328,6 +343,10 @@ impl DeviceLink {
     }
 
     /// An explicitly NOT-ATTEMPTED directed pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from == to` (a [`DeviceLink`] is a directed pair `i→j`, `i≠j`).
     #[must_use]
     pub fn not_attempted(from: PhysicalDeviceId, to: PhysicalDeviceId) -> Self {
         assert_ne!(
@@ -342,6 +361,10 @@ impl DeviceLink {
     }
 
     /// An explicitly rejected directed pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from == to` (a [`DeviceLink`] is a directed pair `i→j`, `i≠j`).
     #[must_use]
     pub fn rejected(
         from: PhysicalDeviceId,
@@ -400,6 +423,11 @@ impl DeviceTopologySnapshot {
     /// link never joins a device to itself (T1 §3: self is not a P2P row) —
     /// violations are programmer errors and fail fast, matching the discovery
     /// snapshot's assertion style.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a link joins a device to itself or names an endpoint that is
+    /// not in `discovery`.
     #[must_use]
     pub fn new(
         discovery: DeviceDiscoverySnapshot,
@@ -457,6 +485,11 @@ impl DeviceTopologySnapshot {
     /// never assumed (C2 §1.2 topology/peer-access; T1 §3). Endpoints outside
     /// the topology fail. A `from == to` self-move is a local copy, not a
     /// link traversal, and passes without a link row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkGateError`] when an endpoint is unknown, no directed
+    /// row is recorded, or the row is NOT-ATTEMPTED / rejected.
     pub fn traversal_allowed(
         &self,
         from: &PhysicalDeviceId,

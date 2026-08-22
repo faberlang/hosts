@@ -62,6 +62,10 @@ const TRANSFER_RANGE_BYTES: u64 = 1024;
 // The transfer-only transaction (coordinator chain tests).
 const TRANSFER_ONLY_BYTES: u64 = 1024;
 
+fn fixture_len(n: u64) -> usize {
+    usize::try_from(n).expect("fixture byte count fits usize")
+}
+
 fn device_a() -> PhysicalDeviceId {
     PhysicalDeviceId::cuda(UUID_A, None)
 }
@@ -263,7 +267,7 @@ fn base_source() -> SourceValue {
         MirroredDtype::F32,
         MirroredStorageLayout::Dense,
         GENERATION,
-        vec![3u8; SOURCE_TOTAL_BYTES as usize],
+        vec![3u8; fixture_len(SOURCE_TOTAL_BYTES)],
     )
 }
 
@@ -302,7 +306,7 @@ fn dtype_mismatch_rejects_before_copy() {
         MirroredDtype::I32,
         MirroredStorageLayout::Dense,
         GENERATION,
-        vec![3u8; SOURCE_TOTAL_BYTES as usize],
+        vec![3u8; fixture_len(SOURCE_TOTAL_BYTES)],
     );
     let error = adapter
         .copy(&spec, &source, &partition_id(1))
@@ -337,7 +341,7 @@ fn layout_mismatch_rejects_before_copy() {
         MirroredDtype::F32,
         MirroredStorageLayout::BlockPacked,
         GENERATION,
-        vec![3u8; SOURCE_TOTAL_BYTES as usize],
+        vec![3u8; fixture_len(SOURCE_TOTAL_BYTES)],
     );
     let error = adapter
         .copy(&spec, &source, &partition_id(1))
@@ -398,7 +402,7 @@ fn generation_mismatch_rejects_before_copy() {
         MirroredDtype::F32,
         MirroredStorageLayout::Dense,
         GENERATION + 1,
-        vec![3u8; SOURCE_TOTAL_BYTES as usize],
+        vec![3u8; fixture_len(SOURCE_TOTAL_BYTES)],
     );
     let error = adapter
         .copy(&spec, &source, &partition_id(1))
@@ -429,7 +433,7 @@ fn owner_mismatch_rejects_before_copy() {
         MirroredDtype::F32,
         MirroredStorageLayout::Dense,
         GENERATION,
-        vec![3u8; SOURCE_TOTAL_BYTES as usize],
+        vec![3u8; fixture_len(SOURCE_TOTAL_BYTES)],
     );
     let error = adapter
         .copy(&spec, &source, &partition_id(1))
@@ -490,7 +494,7 @@ fn host_staged_copy_is_labeled_timed_and_byte_exact() {
     let outcome = adapter
         .copy(&spec, &source, &partition_id(1))
         .expect("a valid typed/ranged copy succeeds");
-    let expected_bytes: Vec<u8> = source.bytes()[0..TRANSFER_RANGE_BYTES as usize].to_vec();
+    let expected_bytes: Vec<u8> = source.bytes()[0..fixture_len(TRANSFER_RANGE_BYTES)].to_vec();
     assert_eq!(
         outcome.destination_bytes, expected_bytes,
         "the copy must be byte-exact"
@@ -823,7 +827,7 @@ fn transfer_only_transaction(byte_count: u64) -> ExecutionTransaction {
 fn timed_out_copy_surfaces_transfer_error_the_coordinator_aborts_on() {
     let mut transaction = transfer_only_transaction(TRANSFER_ONLY_BYTES);
     let mut backend = AdapterBackend::new(
-        vec![7u8; TRANSFER_ONLY_BYTES as usize],
+        vec![7u8; fixture_len(TRANSFER_ONLY_BYTES)],
         Duration::from_millis(5),
         TransferBudget::declared(1 << 20, 1 << 30),
     );
@@ -854,7 +858,7 @@ fn timed_out_copy_surfaces_transfer_error_the_coordinator_aborts_on() {
 fn failed_copy_surfaces_transfer_error_the_coordinator_aborts_on() {
     let mut transaction = transfer_only_transaction(TRANSFER_ONLY_BYTES);
     let mut backend = AdapterBackend::new(
-        vec![7u8; TRANSFER_ONLY_BYTES as usize],
+        vec![7u8; fixture_len(TRANSFER_ONLY_BYTES)],
         Duration::from_secs(1),
         TransferBudget::declared(1 << 20, 1 << 30),
     );
@@ -1017,7 +1021,7 @@ fn logical_plan_never_carries_the_selected_transport() {
         MirroredDtype::F32,
         MirroredStorageLayout::Dense,
         0,
-        vec![7u8; TRANSFER_RANGE_BYTES as usize],
+        vec![7u8; fixture_len(TRANSFER_RANGE_BYTES)],
     );
     adapter
         .copy(&spec, &source, &partition_id(1))
@@ -1053,7 +1057,7 @@ fn staging_pool_accounts_allocations_and_releases() {
     assert_eq!(buffer.capacity_bytes, 1024);
     assert_eq!(pool.active_count(), 1);
     assert_eq!(pool.allocations(), 1);
-    pool.release(buffer.id.clone());
+    pool.release(&buffer.id);
     assert_eq!(pool.active_count(), 0);
     assert_eq!(pool.allocations(), 1, "allocations count is monotonic");
 }
