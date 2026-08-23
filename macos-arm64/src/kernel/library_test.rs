@@ -183,6 +183,85 @@ fn qkv_projection_applies_qwen_bias_and_gqa_rope_in_one_body() {
 }
 
 #[test]
+fn qkv_projection_rotates_query_rows_at_cursor_position() {
+    // rows=2, one head, head_dim=2 (one RoPE pair per row). The identity
+    // weight publishes the activation rows untouched, so Q carries exactly
+    // the rotation of [1, 2] and [3, 4]; V stays unrotated.
+    let mut bind = QkvProjectionBind::grouped(2, 2, 1, 1, 2, [2, 1, 1]);
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let weight = vec![1.0f32, 0.0, 0.0, 1.0];
+    // Table rows 0/1/2 rotate by 0, quarter, and half turn respectively.
+    let cos = [1.0f32, 0.0, -1.0];
+    let sin = [0.0f32, 1.0, 0.0];
+    let mut run = |rope_position: u64| {
+        bind.rope_position = rope_position;
+        let mut q = vec![0.0f32; 4];
+        let mut k = vec![0.0f32; 4];
+        let mut v = vec![0.0f32; 4];
+        qkv_projection(
+            &bind,
+            &input,
+            QkvProjectionWeight::Dense(&weight),
+            QkvProjectionWeight::Dense(&weight),
+            QkvProjectionWeight::Dense(&weight),
+            None,
+            None,
+            None,
+            Some(&cos),
+            Some(&sin),
+            &mut q,
+            &mut k,
+            &mut v,
+        )
+        .expect("positioned QKV body");
+        (q, v)
+    };
+    // Default position 0: row i rotates at table row i.
+    let (q, v) = run(0);
+    assert!(q.iter().zip([1.0f32, 2.0, -4.0, 3.0]).all(|(a, e)| (a - e).abs() <= 1.0e-6));
+    assert!(v.iter().zip(&input).all(|(a, e)| (a - e).abs() <= 1.0e-6));
+    // Cursor position 1: row i rotates at table row 1 + i.
+    let (q, v) = run(1);
+    assert!(q.iter().zip([-2.0f32, 1.0, -3.0, -4.0]).all(|(a, e)| (a - e).abs() <= 1.0e-6));
+    assert!(v.iter().zip(&input).all(|(a, e)| (a - e).abs() <= 1.0e-6));
+}
+
+#[test]
+fn qkv_projection_fails_closed_when_rope_table_under_covers_cursor_span() {
+    let mut bind = QkvProjectionBind::grouped(2, 2, 1, 1, 2, [2, 1, 1]);
+    bind.rope_position = 1;
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let weight = vec![1.0f32, 0.0, 0.0, 1.0];
+    // Two table rows cover positions 0..1; the cursor span needs 0..=2.
+    let cos = [1.0f32, 0.0];
+    let sin = [0.0f32, 1.0];
+    let mut q = vec![0.0f32; 4];
+    let mut k = vec![0.0f32; 4];
+    let mut v = vec![0.0f32; 4];
+    let error = qkv_projection(
+        &bind,
+        &input,
+        QkvProjectionWeight::Dense(&weight),
+        QkvProjectionWeight::Dense(&weight),
+        QkvProjectionWeight::Dense(&weight),
+        None,
+        None,
+        None,
+        Some(&cos),
+        Some(&sin),
+        &mut q,
+        &mut k,
+        &mut v,
+    )
+    .expect_err("under-covering table must fail closed");
+    assert!(
+        matches!(error, KernelBodyError::BufferTooShort { ref buffer, required: 3, actual: 2 } if *buffer == "QKV RoPE table"),
+        "unexpected error: {error:?}"
+    );
+    assert!(q.iter().all(|value| *value == 0.0));
+}
+
+#[test]
 fn residual_rms_norm_preserves_residual_then_rms_order() {
     let bind = BindDescriptor::row_major(vec![2, 4], [1, 1, 1]);
     let residual_values = [0.25f32, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0];

@@ -1094,6 +1094,9 @@ fn dispatch_fused_qkv_plan(
         .map(|cursor| fused_cursor_position(runtime, buffers, cursor))
         .transpose()?
         .unwrap_or(0);
+    // The carrier rotates query row i at the cursor position + i; the K/V
+    // arenas append at the same offset.
+    bind.rope_position = position;
     let output_offset = position
         .checked_mul(bind.head_dim)
         .and_then(|elements| elements.checked_mul(4))

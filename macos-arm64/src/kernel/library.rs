@@ -629,6 +629,11 @@ pub struct QkvProjectionBind {
     pub layout: QkvProjectionLayout,
     /// Whether Q/K use the rotate-half (NeoX/Qwen) pairing.
     pub rotate_half: bool,
+    /// Absolute RoPE position of query row 0 (the invocation cursor's
+    /// `prefix_before`). Query row `i` rotates at `rope_position + i`, the
+    /// carrier contract; a zero position keeps the table row equal to the
+    /// query row.
+    pub rope_position: u64,
     /// Backend-neutral launch grid carried with the bind.
     pub grid: [u32; 3],
 }
@@ -663,6 +668,7 @@ impl QkvProjectionBind {
             kv_output_strides,
             layout: QkvProjectionLayout::Grouped,
             rotate_half: false,
+            rope_position: 0,
             grid,
         }
     }
@@ -921,7 +927,15 @@ pub fn qkv_projection(
     }
     let table_width = checked_usize(bind.head_dim / 2)?;
     if let (Some(cos), Some(sin)) = (cos, sin) {
-        let table_len = checked_usize(bind.rows * bind.head_dim / 2)?;
+        // Query row i rotates at absolute position rope_position + i, so the
+        // table must cover rows 0..=rope_position + rows - 1, not just the
+        // query-row count.
+        let table_len = checked_usize(
+            bind.rope_position
+                .checked_add(bind.rows)
+                .and_then(|span| span.checked_mul(bind.head_dim / 2))
+                .ok_or(KernelBodyError::InvalidBind("QKV RoPE table span overflow"))?,
+        )?;
         if cos.len() < table_len || sin.len() < table_len {
             return Err(KernelBodyError::BufferTooShort {
                 buffer: "QKV RoPE table",
@@ -943,7 +957,14 @@ pub fn qkv_projection(
         qkv_add_bias(&mut k, k_bias, "QKV K bias")?;
         qkv_add_bias(&mut v, v_bias, "QKV V bias")?;
         if let (Some(cos), Some(sin)) = (cos, sin) {
-            let table_base = row * table_width;
+            let table_base = checked_usize(
+                bind.rope_position
+                    .checked_add(row as u64)
+                    .and_then(|position| position.checked_mul(bind.head_dim / 2))
+                    .ok_or(KernelBodyError::InvalidBind(
+                        "QKV RoPE table row index overflow",
+                    ))?,
+            )?;
             qkv_rotate(
                 &mut q,
                 checked_usize(bind.head_dim)?,
