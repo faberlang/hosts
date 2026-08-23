@@ -11,6 +11,13 @@
 //! materializers remain owned by the target emitter, but the entry names and
 //! grouped output layout are the same ABI that the carrier binds to.
 
+use host_coordinator::DeviceHandle;
+use serde::{Deserialize, Serialize};
+
+use crate::device_descriptor::DeviceDataType;
+use crate::device_host::{DeviceRuntime, DeviceSession};
+use crate::kernel::HostResult;
+
 use super::library::{
     dispatch_selected, BindDescriptor, BindLayout, KernelBodyError, LibraryDispatch,
     QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight,
@@ -210,6 +217,204 @@ pub enum MetalLibraryDispatch<'a> {
     },
 }
 
+/// One device buffer participating in a fused library dispatch.
+///
+/// The binding index is retained separately from the vector position.  In
+/// particular, K/V cache targets are extra resources on the carrier launch;
+/// they must not be mistaken for inputs or dropped when the owning body runs.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedLibraryDeviceBuffer<'a> {
+    /// Device allocation carrying the logical view.
+    pub handle: &'a DeviceHandle,
+    /// Dtype carried by the descriptor for this view.
+    pub dtype: DeviceDataType,
+    /// View offset in bytes.
+    pub byte_offset: u64,
+    /// View span in bytes.
+    pub view_span: u64,
+    /// Explicit descriptor binding index.
+    pub binding_index: u32,
+}
+
+/// A producer fact emitted when the owning fused body executes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FusedLibraryDispatchReceipt {
+    /// Derived carrier entry that selected the library route.
+    pub entry: String,
+    /// Owning body used by the route.
+    pub body: String,
+    /// Q destination binding.
+    pub q_output_binding: u32,
+    /// K destination binding.
+    pub k_output_binding: u32,
+    /// V destination binding.
+    pub v_output_binding: u32,
+}
+
+/// A fully bound CPU bridge for one derived QKV library entry.
+///
+/// This is the production fallback for Metal modules whose carrier function
+/// only publishes Q.  The bridge reads the typed dense views, executes the
+/// same selected body used by the focused library tests, and uploads all
+/// three destinations.  Packed views are rejected here rather than silently
+/// reinterpreted as f32; their owner remains the target-specific carrier.
+pub struct FusedQkvDeviceDispatch<'a> {
+    /// Canonical library selection entry.
+    pub library_entry: &'a str,
+    /// Derived carrier entry that produced this dispatch fact.
+    pub derived_entry: &'a str,
+    /// Decode uniform carried by the plan.
+    pub decode_gemv: u32,
+    /// Fully validated Q/K/V shape and stride facts.
+    pub bind: QkvProjectionBind,
+    /// Activation view.
+    pub activation: FusedLibraryDeviceBuffer<'a>,
+    /// Q/K/V weight views.
+    pub weights: [FusedLibraryDeviceBuffer<'a>; 3],
+    /// Optional Q/K/V bias views.
+    pub biases: [Option<FusedLibraryDeviceBuffer<'a>>; 3],
+    /// Optional cosine/sine RoPE table views.
+    pub rope: Option<(FusedLibraryDeviceBuffer<'a>, FusedLibraryDeviceBuffer<'a>)>,
+    /// Q/K/V output views. K/V are the launch's extra Write resources.
+    pub outputs: [FusedLibraryDeviceBuffer<'a>; 3],
+}
+
+fn dense_storage(
+    runtime: &mut DeviceRuntime,
+    view: FusedLibraryDeviceBuffer<'_>,
+    label: &'static str,
+) -> HostResult<(Vec<f32>, usize, usize)> {
+    if view.dtype != DeviceDataType::F32 {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library CPU bridge requires f32 {label}, got {}",
+            view.dtype.spelling()
+        )));
+    }
+    if view.byte_offset % 4 != 0 || view.view_span % 4 != 0 {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library {label} view is not f32 aligned"
+        )));
+    }
+    let values = runtime.readback_f32(view.handle)?;
+    let start = usize::try_from(view.byte_offset / 4).map_err(|_| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library {label} offset overflows host"
+        ))
+    })?;
+    let span = usize::try_from(view.view_span / 4).map_err(|_| {
+        crate::kernel::HostError::invalid_args(format!("fused library {label} span overflows host"))
+    })?;
+    let end = start.checked_add(span).ok_or_else(|| {
+        crate::kernel::HostError::invalid_args(format!("fused library {label} view overflows host"))
+    })?;
+    if end > values.len() {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library {label} view [{start}..{end}] exceeds {} f32 values",
+            values.len()
+        )));
+    }
+    Ok((values, start, end))
+}
+
+fn dense_view(
+    runtime: &mut DeviceRuntime,
+    view: FusedLibraryDeviceBuffer<'_>,
+    label: &'static str,
+) -> HostResult<Vec<f32>> {
+    let (values, start, end) = dense_storage(runtime, view, label)?;
+    Ok(values[start..end].to_vec())
+}
+
+/// Execute one fully bound fused QKV library body on the Metal session.
+///
+/// The call is deliberately below the generic carrier launch: K/V output
+/// bindings are explicit inputs to this function and are copied back only
+/// after the selected body has written them.  A caller can therefore prove
+/// that the extra Write resources, not a census or a carrier side effect,
+/// produced the cache bytes.
+pub fn dispatch_fused_qkv_device(
+    runtime: &mut DeviceRuntime,
+    request: FusedQkvDeviceDispatch<'_>,
+) -> HostResult<FusedLibraryDispatchReceipt> {
+    if runtime.backend() != host_coordinator::DeviceBackend::Metal {
+        return Err(crate::kernel::HostError::invalid_args(
+            "fused library CPU bridge is a Metal-only route",
+        ));
+    }
+    let activation = dense_view(runtime, request.activation, "activation")?;
+    let weights = [
+        dense_view(runtime, request.weights[0], "Q weight")?,
+        dense_view(runtime, request.weights[1], "K weight")?,
+        dense_view(runtime, request.weights[2], "V weight")?,
+    ];
+    let biases = [
+        request.biases[0]
+            .map(|view| dense_view(runtime, view, "Q bias"))
+            .transpose()?,
+        request.biases[1]
+            .map(|view| dense_view(runtime, view, "K bias"))
+            .transpose()?,
+        request.biases[2]
+            .map(|view| dense_view(runtime, view, "V bias"))
+            .transpose()?,
+    ];
+    let rope = request
+        .rope
+        .map(|(cos, sin)| {
+            Ok((
+                dense_view(runtime, cos, "RoPE cosine")?,
+                dense_view(runtime, sin, "RoPE sine")?,
+            ))
+        })
+        .transpose()?;
+    let (mut q_output, q_start, q_end) = dense_storage(runtime, request.outputs[0], "Q output")?;
+    let (mut k_output, k_start, k_end) = dense_storage(runtime, request.outputs[1], "K output")?;
+    let (mut v_output, v_start, v_end) = dense_storage(runtime, request.outputs[2], "V output")?;
+    let weight_refs = [
+        QkvProjectionWeight::Dense(&weights[0]),
+        QkvProjectionWeight::Dense(&weights[1]),
+        QkvProjectionWeight::Dense(&weights[2]),
+    ];
+    let bias_refs = [
+        biases[0].as_deref(),
+        biases[1].as_deref(),
+        biases[2].as_deref(),
+    ];
+    let rope_refs = rope
+        .as_ref()
+        .map(|(cos, sin)| (cos.as_slice(), sin.as_slice()));
+    dispatch_metal_library(MetalLibraryDispatch::QkvProjection {
+        library_entry: Some(request.library_entry),
+        decode_gemv: request.decode_gemv,
+        layout: request.bind.layout,
+        bind: &request.bind,
+        activation: &activation,
+        weights: weight_refs,
+        biases: bias_refs,
+        rope: rope_refs,
+        outputs: [
+            &mut q_output[q_start..q_end],
+            &mut k_output[k_start..k_end],
+            &mut v_output[v_start..v_end],
+        ],
+    })
+    .map_err(|error| crate::kernel::HostError::invalid_args(error.to_string()))?;
+    for (view, values) in request
+        .outputs
+        .into_iter()
+        .zip([q_output, k_output, v_output])
+    {
+        runtime.copy_in_f32(view.handle, &values)?;
+    }
+    Ok(FusedLibraryDispatchReceipt {
+        entry: request.derived_entry.to_owned(),
+        body: "qkv_projection_cpu".to_owned(),
+        q_output_binding: request.outputs[0].binding_index,
+        k_output_binding: request.outputs[1].binding_index,
+        v_output_binding: request.outputs[2].binding_index,
+    })
+}
+
 /// Dispatch one admitted Metal runtime request through the existing library
 /// selector and body.
 ///
@@ -313,5 +518,99 @@ mod tests {
         assert!(q.iter().all(|value| value.is_nan()));
         assert!(k.iter().all(|value| value.is_nan()));
         assert!(v.iter().all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn production_bridge_binds_kv_write_targets_for_both_gqa_pairings() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+        use host_coordinator::{DeviceBackend, DeviceHandle};
+
+        fn view<'a>(
+            handle: &'a DeviceHandle,
+            count: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: 0,
+                view_span: count * 4,
+                binding_index: binding,
+            }
+        }
+
+        for (kv_heads, q_per_kv, k_binding, v_binding) in [(2, 2, 5, 6), (1, 4, 7, 8)] {
+            let mut runtime = DeviceRuntime::Metal(
+                MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                    .expect("fake Metal admission"),
+            );
+            let head_dim = 2u64;
+            let hidden = kv_heads * q_per_kv * head_dim;
+            let q_width = hidden;
+            let kv_width = kv_heads * head_dim;
+            let activation_values = vec![1.0f32; hidden as usize];
+            let q_weight_values = vec![1.0f32; (hidden * q_width) as usize];
+            let k_weight_values = vec![2.0f32; (hidden * kv_width) as usize];
+            let v_weight_values = vec![3.0f32; (hidden * kv_width) as usize];
+            let q_output_values = vec![0.0f32; q_width as usize];
+            let k_output_values = vec![0.0f32; kv_width as usize];
+            let v_output_values = vec![0.0f32; kv_width as usize];
+            let alloc = |runtime: &mut DeviceRuntime, values: &[f32]| {
+                let handle = runtime
+                    .alloc_bytes(values.len() * 4)
+                    .expect("allocate bridge buffer");
+                runtime
+                    .copy_in_f32(&handle, values)
+                    .expect("initialize bridge buffer");
+                handle
+            };
+            let activation = alloc(&mut runtime, &activation_values);
+            let q_weight = alloc(&mut runtime, &q_weight_values);
+            let k_weight = alloc(&mut runtime, &k_weight_values);
+            let v_weight = alloc(&mut runtime, &v_weight_values);
+            let q_output = alloc(&mut runtime, &q_output_values);
+            let k_output = alloc(&mut runtime, &k_output_values);
+            let v_output = alloc(&mut runtime, &v_output_values);
+            let receipt = dispatch_fused_qkv_device(
+                &mut runtime,
+                FusedQkvDeviceDispatch {
+                    library_entry: "QkvProjection",
+                    derived_entry: "prefill_blk_0_QkvProjection",
+                    decode_gemv: 1,
+                    bind: QkvProjectionBind::grouped(
+                        1,
+                        hidden,
+                        kv_heads,
+                        q_per_kv,
+                        head_dim,
+                        [q_width as u32, 1, 1],
+                    ),
+                    activation: view(&activation, hidden, 0),
+                    weights: [
+                        view(&q_weight, hidden * q_width, 1),
+                        view(&k_weight, hidden * kv_width, 2),
+                        view(&v_weight, hidden * kv_width, 3),
+                    ],
+                    biases: [None, None, None],
+                    rope: None,
+                    outputs: [
+                        view(&q_output, q_width, 4),
+                        view(&k_output, kv_width, k_binding),
+                        view(&v_output, kv_width, v_binding),
+                    ],
+                },
+            )
+            .expect("fused body executes");
+            assert_eq!(receipt.entry, "prefill_blk_0_QkvProjection");
+            assert_eq!(receipt.body, "qkv_projection_cpu");
+            assert_eq!(receipt.k_output_binding, k_binding);
+            assert_eq!(receipt.v_output_binding, v_binding);
+            let k_values = runtime.readback_f32(&k_output).expect("read K output");
+            let v_values = runtime.readback_f32(&v_output).expect("read V output");
+            assert!(k_values.iter().all(|value| *value == hidden as f32 * 2.0));
+            assert!(v_values.iter().all(|value| *value == hidden as f32 * 3.0));
+            assert_eq!(runtime.backend(), DeviceBackend::Metal);
+        }
     }
 }

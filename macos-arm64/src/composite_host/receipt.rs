@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceProgramLifetime,
 };
+use crate::kernel::library_runtime::FusedLibraryDispatchReceipt;
 
 /// A9-style execution receipt: every observable device fact of one
 /// descriptor execution (allocations, launches, transfers, syncs, readbacks,
@@ -33,6 +34,9 @@ pub struct DeviceExecutionReceipt {
     pub launch_ids: Vec<u32>,
     /// Kernel entries dispatched, in exact descriptor launch order.
     pub launch_entries: Vec<String>,
+    /// Producer facts for derived fused-library launches. K/V bindings are
+    /// carried explicitly so a census cannot masquerade as execution.
+    pub fused_library_dispatches: Vec<FusedLibraryDispatchReceipt>,
     /// Host→device copy-ins performed for input slots.
     pub copy_ins: usize,
     /// Declared output readbacks (buffer id → f32 values).

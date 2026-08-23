@@ -19,6 +19,11 @@ use crate::device_host::{
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
 };
 use crate::device_registry::DriverCounters;
+use crate::kernel::library::QkvProjectionBind;
+use crate::kernel::library_runtime::{
+    dispatch_fused_qkv_device, FusedLibraryDeviceBuffer, FusedLibraryDispatchReceipt,
+    FusedQkvDeviceDispatch,
+};
 use crate::kernel::{HostError, HostResult};
 
 use super::receipt::{
@@ -99,6 +104,8 @@ struct SessionKernel {
     entry: String,
     /// Typed buffer slots in launch order.
     slots: Vec<SessionSlot>,
+    /// Optional owning fused QKV body selected from the explicit slot facts.
+    fused_qkv: Option<FusedQkvPlan>,
     /// 3D dispatch grid.
     grid: [u32; 3],
     /// 3D block (threadgroup) shape.
@@ -106,6 +113,7 @@ struct SessionKernel {
 }
 
 /// One buffer slot of a session kernel.
+#[derive(Clone)]
 struct SessionSlot {
     /// Program-level buffer identity.
     buffer_id: u32,
@@ -115,6 +123,33 @@ struct SessionSlot {
     buffer_name: String,
     /// Slot role at this kernel.
     role: DeviceBufferRole,
+    /// Explicit target-neutral binding index.
+    binding: u32,
+    /// Descriptor dtype.
+    element_ty: DeviceDataType,
+    /// Descriptor element count.
+    element_count: u64,
+}
+
+/// A version-keyed device view used by the fused CPU bridge.
+#[derive(Clone, Copy)]
+struct FusedQkvSlot {
+    key: BufferKey,
+    binding: u32,
+    dtype: DeviceDataType,
+    element_count: u64,
+}
+
+/// Explicit dense-f32 facts for one derived QKV library entry.
+#[derive(Clone)]
+struct FusedQkvPlan {
+    bind: QkvProjectionBind,
+    activation: FusedQkvSlot,
+    weights: [FusedQkvSlot; 3],
+    biases: [Option<FusedQkvSlot>; 3],
+    rope: Option<(FusedQkvSlot, FusedQkvSlot)>,
+    outputs: [FusedQkvSlot; 3],
+    cursor: Option<FusedQkvSlot>,
 }
 
 /// One declared observation point cloned from the descriptor at session
@@ -586,6 +621,293 @@ fn copy_declared_inputs(
     Ok(copies)
 }
 
+fn fused_slot(
+    slots: &[SessionSlot],
+    predicate: impl Fn(&SessionSlot) -> bool,
+) -> Option<FusedQkvSlot> {
+    slots
+        .iter()
+        .find(|slot| predicate(slot))
+        .map(|slot| FusedQkvSlot {
+            key: (slot.buffer_id, slot.version),
+            binding: slot.binding,
+            dtype: slot.element_ty,
+            element_count: slot.element_count,
+        })
+}
+
+/// Recognize the dense QKV carrier from its explicit resource facts.
+///
+/// The descriptor carries resource names, dtypes, counts, and binding
+/// indices, but not a second host-side QKV schema. This builder admits only
+/// the fully typed f32 shape where those facts determine one unambiguous
+/// grouped bind. Packed resources remain on their target-owned carrier until
+/// the wire carries their format facts; no packed layout is guessed from a
+/// byte length.
+fn build_fused_qkv_plan(
+    entry: &str,
+    slots: &[SessionSlot],
+    buffer_meta: &BTreeMap<BufferKey, SessionBufferMeta>,
+    grid: [u32; 3],
+) -> Option<FusedQkvPlan> {
+    if !entry.ends_with("_QkvProjection") {
+        return None;
+    }
+    let activation = fused_slot(slots, |slot| {
+        slot.buffer_name.ends_with(".a") && slot.element_ty == DeviceDataType::F32
+    })?;
+    let q_weight = fused_slot(slots, |slot| {
+        slot.buffer_name.ends_with(".attn_q.weight") && slot.element_ty == DeviceDataType::F32
+    })?;
+    let k_weight = fused_slot(slots, |slot| {
+        slot.buffer_name.ends_with(".attn_k.weight") && slot.element_ty == DeviceDataType::F32
+    })?;
+    let v_weight = fused_slot(slots, |slot| {
+        slot.buffer_name.ends_with(".attn_v.weight") && slot.element_ty == DeviceDataType::F32
+    })?;
+    let q_output = fused_slot(slots, |slot| {
+        slot.buffer_name.ends_with(".q_gemv") && slot.element_ty == DeviceDataType::F32
+    })?;
+    let k_output = fused_slot(slots, |slot| {
+        (slot.buffer_name.starts_with("kv.cache_k.") || slot.buffer_name.ends_with(".k_gemv"))
+            && slot.element_ty == DeviceDataType::F32
+            && slot.role != DeviceBufferRole::Input
+    })?;
+    let v_output = fused_slot(slots, |slot| {
+        (slot.buffer_name.starts_with("kv.cache_v.") || slot.buffer_name.ends_with(".v_gemv"))
+            && slot.element_ty == DeviceDataType::F32
+            && slot.role != DeviceBufferRole::Input
+    })?;
+    let cos = fused_slot(slots, |slot| {
+        slot.buffer_name == "prefill.rope.cos" && slot.element_ty == DeviceDataType::F32
+    });
+    let sin = fused_slot(slots, |slot| {
+        slot.buffer_name == "prefill.rope.sin" && slot.element_ty == DeviceDataType::F32
+    });
+    if cos.is_some() != sin.is_some() {
+        return None;
+    }
+    let biases = [
+        fused_slot(slots, |slot| {
+            slot.buffer_name.ends_with(".attn_q.bias") && slot.element_ty == DeviceDataType::F32
+        }),
+        fused_slot(slots, |slot| {
+            slot.buffer_name.ends_with(".attn_k.bias") && slot.element_ty == DeviceDataType::F32
+        }),
+        fused_slot(slots, |slot| {
+            slot.buffer_name.ends_with(".attn_v.bias") && slot.element_ty == DeviceDataType::F32
+        }),
+    ];
+    if biases.iter().any(Option::is_some) && biases.iter().any(Option::is_none) {
+        return None;
+    }
+    let hidden = buffer_meta
+        .values()
+        .find(|meta| meta.name.ends_with(".attn_norm.weight"))
+        .filter(|meta| meta.element_ty == DeviceDataType::F32)
+        .map(|meta| meta.element_count)?;
+    if hidden == 0
+        || activation.element_count % hidden != 0
+        || q_weight.element_count % hidden != 0
+        || k_weight.element_count % hidden != 0
+        || v_weight.element_count != k_weight.element_count
+    {
+        return None;
+    }
+    let rows = activation.element_count / hidden;
+    let q_width = q_weight.element_count / hidden;
+    let kv_width = k_weight.element_count / hidden;
+    if rows == 0
+        || q_width == 0
+        || kv_width == 0
+        || q_output.element_count != rows.saturating_mul(q_width)
+        || q_width % kv_width != 0
+        || q_output
+            .element_count
+            .saturating_mul(q_weight.element_count)
+            != activation
+                .element_count
+                .saturating_mul(q_width)
+                .saturating_mul(q_width)
+    {
+        return None;
+    }
+    let head_dim = cos.zip(sin).and_then(|(cos, _)| {
+        (cos.element_count % rows == 0).then_some(cos.element_count / rows * 2)
+    })?;
+    if head_dim == 0 || kv_width % head_dim != 0 {
+        return None;
+    }
+    let kv_heads = kv_width / head_dim;
+    let q_per_kv = q_width / kv_width;
+    if kv_heads == 0 || q_per_kv == 0 {
+        return None;
+    }
+    let kv_capacity = k_output.element_count / kv_width;
+    if kv_capacity == 0 || k_output.element_count % kv_width != 0 {
+        return None;
+    }
+    let cursor = fused_slot(slots, |slot| slot.buffer_name == "kv.invocation_state");
+    if k_output.key.eq(&v_output.key) || (k_output.binding == v_output.binding) {
+        return None;
+    }
+    let mut bind = QkvProjectionBind::grouped(rows, hidden, kv_heads, q_per_kv, head_dim, grid);
+    bind.kv_output_strides = [kv_capacity.saturating_mul(head_dim), head_dim, 1];
+    Some(FusedQkvPlan {
+        bind,
+        activation,
+        weights: [q_weight, k_weight, v_weight],
+        biases,
+        rope: cos.zip(sin),
+        outputs: [q_output, k_output, v_output],
+        cursor,
+    })
+}
+
+fn resolve_fused_buffer(
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    slot: FusedQkvSlot,
+    byte_offset: u64,
+    view_span: u64,
+) -> HostResult<FusedLibraryDeviceBuffer<'_>> {
+    let handle = buffers
+        .get(&slot.key)
+        .ok_or_else(|| HostError::internal("fused library buffer disappeared during launch"))?;
+    let capacity = handle
+        .len_bytes()
+        .ok_or_else(|| HostError::internal("fused library buffer has no byte length"))?;
+    let end = byte_offset
+        .checked_add(view_span)
+        .ok_or_else(|| HostError::invalid_args("fused library output view overflows"))?;
+    if end > capacity {
+        return Err(HostError::invalid_args(format!(
+            "fused library binding {} view ends at {end}, allocation is {capacity}",
+            slot.binding
+        )));
+    }
+    Ok(FusedLibraryDeviceBuffer {
+        handle,
+        dtype: slot.dtype,
+        byte_offset,
+        view_span,
+        binding_index: slot.binding,
+    })
+}
+
+fn fused_cursor_position(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    cursor: FusedQkvSlot,
+) -> HostResult<u64> {
+    let handle = buffers
+        .get(&cursor.key)
+        .ok_or_else(|| HostError::internal("fused library cursor disappeared during launch"))?;
+    let bytes = runtime.readback_bytes(handle, DeviceDataType::U8)?;
+    let first = bytes
+        .get(..4)
+        .ok_or_else(|| HostError::invalid_args("fused library cursor is shorter than position"))?;
+    Ok(u64::from(u32::from_le_bytes([
+        first[0], first[1], first[2], first[3],
+    ])))
+}
+
+fn dispatch_fused_qkv_plan(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    entry: &str,
+    plan: &FusedQkvPlan,
+) -> HostResult<FusedLibraryDispatchReceipt> {
+    let position = plan
+        .cursor
+        .map(|cursor| fused_cursor_position(runtime, buffers, cursor))
+        .transpose()?
+        .unwrap_or(0);
+    let output_offset = position
+        .checked_mul(plan.bind.head_dim)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| HostError::invalid_args("fused library cursor output offset overflows"))?;
+    let output_views = [
+        resolve_fused_buffer(
+            buffers,
+            plan.outputs[0],
+            0,
+            plan.outputs[0].element_count.saturating_mul(4),
+        )?,
+        resolve_fused_buffer(
+            buffers,
+            plan.outputs[1],
+            output_offset,
+            plan.outputs[1]
+                .element_count
+                .saturating_mul(4)
+                .saturating_sub(output_offset),
+        )?,
+        resolve_fused_buffer(
+            buffers,
+            plan.outputs[2],
+            output_offset,
+            plan.outputs[2]
+                .element_count
+                .saturating_mul(4)
+                .saturating_sub(output_offset),
+        )?,
+    ];
+    let request = FusedQkvDeviceDispatch {
+        library_entry: "QkvProjection",
+        derived_entry: entry,
+        decode_gemv: u32::from(plan.bind.rows == 1),
+        bind: plan.bind,
+        activation: resolve_fused_buffer(
+            buffers,
+            plan.activation,
+            0,
+            plan.activation.element_count.saturating_mul(4),
+        )?,
+        weights: [
+            resolve_fused_buffer(
+                buffers,
+                plan.weights[0],
+                0,
+                plan.weights[0].element_count.saturating_mul(4),
+            )?,
+            resolve_fused_buffer(
+                buffers,
+                plan.weights[1],
+                0,
+                plan.weights[1].element_count.saturating_mul(4),
+            )?,
+            resolve_fused_buffer(
+                buffers,
+                plan.weights[2],
+                0,
+                plan.weights[2].element_count.saturating_mul(4),
+            )?,
+        ],
+        biases: [
+            plan.biases[0]
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .transpose()?,
+            plan.biases[1]
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .transpose()?,
+            plan.biases[2]
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .transpose()?,
+        ],
+        rope: plan
+            .rope
+            .map(|(cos, sin)| {
+                Ok((
+                    resolve_fused_buffer(buffers, cos, 0, cos.element_count * 4)?,
+                    resolve_fused_buffer(buffers, sin, 0, sin.element_count * 4)?,
+                ))
+            })
+            .transpose()?,
+        outputs: output_views,
+    };
+    dispatch_fused_qkv_device(runtime, request)
+}
+
 impl<'host> ProgramSession<'host> {
     /// Create a program session: validate the descriptor, load the module
     /// once, and allocate every distinct **`PerProgram`** buffer once (`PerStep`
@@ -723,11 +1045,17 @@ impl<'host> ProgramSession<'host> {
                         version: slot.version,
                         buffer_name: slot.buffer_name.clone(),
                         role: slot.role,
+                        binding: slot.binding,
+                        element_ty: slot.element_ty,
+                        element_count: slot.element_count,
                     });
                 }
+                let fused_qkv =
+                    build_fused_qkv_plan(&kernel.entry, &slots, &buffer_meta, kernel.grid);
                 kernels.push(SessionKernel {
                     entry: kernel.entry.clone(),
                     slots,
+                    fused_qkv,
                     grid: kernel.grid,
                     block: kernel.block,
                 });
@@ -1534,6 +1862,7 @@ impl<'host> ProgramSession<'host> {
         let mut copy_in_us = 0u64;
         let mut encode_us = 0u64;
         let mut pool_returns = 0usize;
+        let mut fused_library_dispatches = Vec::new();
 
         // Resident decode steps check out this step's PerStep +
         // ObservationPoint buffers from the session-scoped pool. The first
@@ -1596,13 +1925,25 @@ impl<'host> ProgramSession<'host> {
             }
 
             let encode_started = Instant::now();
-            self.runtime.launch_kernel(
-                &self.inner.module_handle,
-                &kernel.entry,
-                &launch_buffers,
-                kernel.grid,
-                kernel.block,
-            )?;
+            if let Some(plan) = &kernel.fused_qkv {
+                // The carrier entry publishes Q only. Route the derived
+                // library entry through its owning body instead, keeping the
+                // extra K/V resources as explicit output targets.
+                fused_library_dispatches.push(dispatch_fused_qkv_plan(
+                    self.runtime,
+                    &self.inner.buffers,
+                    &kernel.entry,
+                    plan,
+                )?);
+            } else {
+                self.runtime.launch_kernel(
+                    &self.inner.module_handle,
+                    &kernel.entry,
+                    &launch_buffers,
+                    kernel.grid,
+                    kernel.block,
+                )?;
+            }
             encode_us = encode_us.saturating_add(elapsed_us(encode_started));
             launch_count += 1;
             launch_ids.push(launch.id);
@@ -1750,6 +2091,7 @@ impl<'host> ProgramSession<'host> {
             launches,
             launch_ids,
             launch_entries,
+            fused_library_dispatches,
             copy_ins,
             outputs: readbacks,
             allocated_buffers: self.allocated_buffers(),

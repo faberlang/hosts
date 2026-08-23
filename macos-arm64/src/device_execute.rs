@@ -65,6 +65,7 @@ use crate::device_host::DeviceSession;
 use crate::distributed_translate::{
     bind_policy_for_declared_count, bind_translated, translate_device_section_bytes, TranslateError,
 };
+use crate::kernel::library_runtime::FusedLibraryDispatchReceipt;
 use crate::kernel::{HostError, HostResult};
 use crate::metal_host::{process_resident_bytes, MappedWeightFile, MappedWeightPaging};
 
@@ -2100,6 +2101,10 @@ pub struct DeviceExecuteReceipt {
     pub launch_ids: Vec<u32>,
     /// Kernel entries dispatched, in order.
     pub launch_entries: Vec<String>,
+    /// Producer facts for derived fused-library launches, including the
+    /// explicit K/V output bindings.
+    #[serde(default)]
+    pub fused_library_dispatches: Vec<FusedLibraryDispatchReceipt>,
     /// Host→device copy-ins.
     pub copy_ins: usize,
     /// Temporary PerStep/ObservationPoint handles allocated by this step.
@@ -2235,6 +2240,7 @@ impl DeviceExecuteReceipt {
             launches: receipt.launches,
             launch_ids: receipt.launch_ids.clone(),
             launch_entries: receipt.launch_entries.clone(),
+            fused_library_dispatches: receipt.fused_library_dispatches.clone(),
             copy_ins: receipt.copy_ins,
             pool_allocations: receipt.pool_allocations,
             pool_reuses: receipt.pool_reuses,
@@ -2624,6 +2630,7 @@ mod tests {
             launches: 1,
             launch_ids: vec![1],
             launch_entries: vec!["kernel".to_owned()],
+            fused_library_dispatches: Vec::new(),
             copy_ins: 0,
             outputs: BTreeMap::new(),
             allocated_buffers: Vec::new(),
