@@ -1,6 +1,6 @@
 # GOAL: md3j-8on2-runpod — 8-on-2 RunPod hardware rung (M=2 multi-aspect proof)
 
-**Status**: planned — lowered 2026-08-22 ([`md3j-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3j-delivery.md)); ready for unit tasking (entry gate met: MD3H archived `7014785`; operator directive `6ac4d2a8` authorizes RunPod 2× same-SKU spend). Runs **parallel to MD3I** — does not displace it.
+**Status**: done — all five units landed 2026-08-22/23 (F1 radix `5bf4ce6d8` + hosts `c192dd4`; B1 hosts `6614514`+`8593996`; B2 hosts `5c5d756`+`216e1c5`; P1 radix `29798174d` + hosts `00581504a` + trials `071641c`; C1 this commit); end-of-goal audit `61bb51d3` verdict **residual-clean** (all evidence claims verified, three P2 dispositions all recorded here); archived.
 **Created**: 2026-08-22
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** operator directive mail `6ac4d2a8` (2026-08-22 — 8-on-2 rung is next in the multi-device test sequence, after MD3H 8:1 PASS, before any 8:8 attempt); lowered spec [`md3j-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3j-delivery.md); 8:1 receipts [`md3h-8on1-evidence.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3h-8on1-evidence.md)
@@ -98,9 +98,9 @@ device-executor M8, `cuda-host-linux-home`), never a process-only
 | --- | --- | --- | --- | --- |
 | MD3J-F1 | landed | hand | radix 5bf4ce6d8 + hosts c192dd4 | 8GiB fixtures + over-budget variant; graph bytes preserved; 186 fmir tests green |
 | MD3J-B1 | landed | hand | hosts 6614514 (red) + 8593996 (green) | split policy 8:2; 21/21; deterministic 4+4; fail-closed both directions |
-| MD3J-B2 | landed | hand | hosts 5c5d756 (red) + 216e1c5 (green) | oq2_default_headroom_policy floor(api_total x 0.9); BindError::BudgetExceeded class + byte facts; 25/25 + 137+1; host-coordinator touch = one ADDITIVE BindError variant (disclosed) |
-| MD3J-P1 | landed | hand | radix 29798174d + hosts 00581504a + evidence 071641c (P1b clean_pass; attempts 1-2 partial: wrong image, then honest fixture-scale gap) | ALL frozen rows verified on-pod: 8:2 bind 4+4, 8:1 comparability, 40GiB admits, 79GiB BudgetExceeded w/ byte facts; ~$9 total spend |
-| MD3J-C1 | planned | — | — | closeout edits this ledger + CAMPAIGN MD3J status |
+| MD3J-B2 | landed | hand | hosts 5c5d756 (red) + 216e1c5 (green) | oq2_default_headroom_policy floor(api_total x 0.9); BindError::BudgetExceeded class + byte facts; 25/25 + 137+1; host-coordinator touch = one ADDITIVE `BindError::BudgetExceeded` variant — **Mind ACCEPTED at C1 closeout** (audit `61bb51d3` finding 2 disposition: additive-only, the only observable surface, partition taxonomy untouched; no code change) |
+| MD3J-P1 | landed | hand | radix 29798174d + hosts 00581504a + evidence 071641c (P1b clean_pass; attempts 1-2 partial: wrong image, then honest fixture-scale gap) | ALL frozen rows verified on-pod: 8:2 bind 4+4, 8:1 comparability, 40GiB admits, 79GiB BudgetExceeded w/ byte facts; spend ~**$1.2–1.6** (derived: ~23 min across 3 pods × $3.18/h quoted rate, per audit `61bb51d3` method — replaces the undisciplined ~$9 figure, which was a 3×1h ceiling, not a measurement) |
+| MD3J-C1 | landed | hand | this commit (closeout) | status lines done + receipts; B2 Mind acceptance recorded; spend corrected ~$9 → ~$1.2–1.6; goal archived to `docs/archived/` |
 
 ## Open questions
 
