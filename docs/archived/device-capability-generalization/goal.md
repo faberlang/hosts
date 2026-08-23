@@ -1,6 +1,6 @@
 # GOAL: device-capability-generalization — the capability model describes and gates every backend
 
-**Status**: active — DCG-1 LANDED (`edf34b6` generic launch-resource fields); DCG-2 LANDED (`20bf066` policy gate); DCG-3 LANDED (`6f2cc93` dtype consistency ratchet); DCG-4 LANDED (`a15a060` bound_plan limits); DCG-1..4 ALL landed — end-of-goal audit in flight bf215302 (2026-08-23)
+**Status**: done — audit e51b74b4 residual closed: BF16 obligation recorded on radix placement-debt-audit F2 (carrier commit in radix); all units landed; archiving 2026-08-23 — DCG-1 LANDED (`edf34b6` generic launch-resource fields); DCG-2 LANDED (`20bf066` policy gate); DCG-3 LANDED (`6f2cc93` dtype consistency ratchet); DCG-4 LANDED (`a15a060` bound_plan limits)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F3.3)
