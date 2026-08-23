@@ -21,8 +21,8 @@ use crate::device_host::{
 use crate::device_registry::DriverCounters;
 use crate::kernel::library::{QuantizedFormat, QkvProjectionBind};
 use crate::kernel::library_runtime::{
-    dispatch_fused_qkv_device, FusedLibraryDeviceBuffer, FusedLibraryDispatchReceipt,
-    FusedQkvDeviceDispatch,
+    dispatch_fused_qkv_device, dispatch_fused_residual_rms_device, FusedLibraryDeviceBuffer,
+    FusedLibraryDispatchReceipt, FusedQkvDeviceDispatch, FusedResidualRmsDeviceDispatch,
 };
 use crate::kernel::{HostError, HostResult};
 
@@ -106,6 +106,9 @@ struct SessionKernel {
     slots: Vec<SessionSlot>,
     /// Optional owning fused QKV body selected from the explicit slot facts.
     fused_qkv: Option<FusedQkvPlan>,
+    /// Optional owning fused residual-plus-RMS body selected from the
+    /// explicit slot facts.
+    fused_residual_rms: Option<FusedResidualRmsPlan>,
     /// 3D dispatch grid.
     grid: [u32; 3],
     /// 3D block (threadgroup) shape.
@@ -165,6 +168,25 @@ struct FusedQkvPlan {
     rope: Option<(FusedQkvSlot, FusedQkvSlot)>,
     outputs: [FusedQkvSlot; 3],
     cursor: Option<FusedQkvSlot>,
+}
+
+/// Explicit facts for one derived residual-plus-RMS library entry. The
+/// carrier kernel normalizes the residual stream only; its compiled body
+/// carries the RMS epsilon as a baked literal, so the epsilon is learned
+/// from the module image at session creation and unresolvable facts fail
+/// closed rather than falling back to the skip-ignoring carrier launch.
+#[derive(Clone)]
+struct FusedResidualRmsPlan {
+    /// Activation rows in this invocation.
+    rows: u64,
+    /// Activation and RMS row width.
+    hidden: u64,
+    /// RMS epsilon parsed from the compiled carrier kernel.
+    epsilon: f32,
+    residual: FusedQkvSlot,
+    skip: FusedQkvSlot,
+    gamma: FusedQkvSlot,
+    output: FusedQkvSlot,
 }
 
 /// One declared observation point cloned from the descriptor at session
@@ -784,6 +806,94 @@ fn build_fused_qkv_plan(
     })
 }
 
+/// Parse the RMS epsilon from one compiled carrier kernel's MSL source.
+///
+/// The wire does not carry the epsilon; the producer bakes it into the
+/// carrier body as the `sqrt(mean + <literal>)` scale expression. The
+/// literal renders through the producer's f32 constant formatter (decimal
+/// digits plus an `f` suffix), so parsing it back is exact. Any other body
+/// shape, a missing literal, or a non-finite/non-positive value is
+/// unresolvable: `None` fails the plan closed.
+fn fused_residual_rms_epsilon(module_image: &[u8], entry: &str) -> Option<f32> {
+    let source = std::str::from_utf8(module_image).ok()?;
+    let declaration = format!("kernel void {entry}(");
+    let body_start = source.find(&declaration)? + declaration.len();
+    let body_end = source[body_start..]
+        .find("kernel void ")
+        .map(|offset| body_start + offset)
+        .unwrap_or(source.len());
+    let body = &source[body_start..body_end];
+    let marker = "sqrt(mean + ";
+    let literal_start = body.find(marker)? + marker.len();
+    let literal = body[literal_start..]
+        .split(')')
+        .next()?
+        .trim()
+        .trim_end_matches(['f', 'F']);
+    let epsilon = literal.parse::<f64>().ok()? as f32;
+    (epsilon.is_finite() && epsilon > 0.0).then_some(epsilon)
+}
+
+/// Recognize the fused residual-plus-RMS carrier from its explicit resource
+/// facts and bind the residual (pre-attention) and skip (attention output)
+/// streams to the library body that adds them.
+///
+/// A `None` return means the entry is not a fused residual/RMS carrier. An
+/// `Err` return is a recognized carrier whose slot or epsilon facts cannot
+/// bind one unambiguous invocation: the fallback carrier launch would
+/// normalize the residual stream and silently discard the skip input, so an
+/// unresolvable plan fails the session instead of guessing.
+fn build_fused_residual_rms_plan(
+    entry: &str,
+    slots: &[SessionSlot],
+    module_image: &[u8],
+) -> HostResult<Option<FusedResidualRmsPlan>> {
+    if !entry.ends_with("_ResidualRmsNorm") {
+        return Ok(None);
+    }
+    let unresolvable = |fact: &str| {
+        HostError::invalid_args(format!(
+            "fused ResidualRmsNorm kernel `{entry}` has unresolvable {fact}"
+        ))
+    };
+    let f32_slot = |predicate: &dyn Fn(&SessionSlot) -> bool, label: &str| {
+        fused_slot(slots, |slot| predicate(slot) && slot.element_ty == DeviceDataType::F32)
+            .ok_or_else(|| unresolvable(label))
+    };
+    let residual = f32_slot(&|slot| slot.buffer_name.ends_with(".h"), "residual slot")?;
+    let skip = f32_slot(&|slot| slot.buffer_name.ends_with(".o"), "skip slot")?;
+    let gamma = f32_slot(
+        &|slot| slot.buffer_name.ends_with(".ffn_norm.weight"),
+        "gamma slot",
+    )?;
+    let output = f32_slot(&|slot| slot.buffer_name.ends_with(".f"), "output slot")?;
+    let hidden = gamma.element_count;
+    if hidden == 0 || residual.element_count % hidden != 0 {
+        return Err(unresolvable("hidden width"));
+    }
+    let rows = residual.element_count / hidden;
+    if rows == 0
+        || skip.element_count != rows * hidden
+        || output.element_count != rows * hidden
+        || gamma.key.eq(&residual.key)
+            || gamma.key.eq(&skip.key)
+            || gamma.key.eq(&output.key)
+    {
+        return Err(unresolvable("slot geometry"));
+    }
+    let epsilon = fused_residual_rms_epsilon(module_image, entry)
+        .ok_or_else(|| unresolvable("RMS epsilon (absent from the compiled carrier body)"))?;
+    Ok(Some(FusedResidualRmsPlan {
+        rows,
+        hidden,
+        epsilon,
+        residual,
+        skip,
+        gamma,
+        output,
+    }))
+}
+
 /// Packed-bytes-per-matrix-row for one GGML format over a contracted width
 /// (R-PACK-02 column stride: `ceil(width / block_elements) * block_bytes`).
 fn fused_packed_row_bytes(hidden: u64, format: QuantizedFormat) -> Option<u64> {
@@ -1052,6 +1162,32 @@ fn dispatch_fused_qkv_plan(
     dispatch_fused_qkv_device(runtime, request)
 }
 
+/// Bind one admitted fused residual-plus-RMS plan and dispatch it through
+/// the owning library body.
+///
+/// The views are dense f32 activations spanning their whole allocation; the
+/// epsilon and row geometry were fixed at session creation.
+fn dispatch_fused_residual_rms_plan(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    plan: &FusedResidualRmsPlan,
+) -> HostResult<()> {
+    let view = |slot: FusedQkvSlot| {
+        resolve_fused_buffer(buffers, slot, 0, slot.element_count.saturating_mul(4), None)
+    };
+    let request = FusedResidualRmsDeviceDispatch {
+        library_entry: "ResidualRmsNorm",
+        rows: plan.rows,
+        hidden: plan.hidden,
+        epsilon: plan.epsilon,
+        residual: view(plan.residual)?,
+        skip: view(plan.skip)?,
+        gamma: view(plan.gamma)?,
+        output: view(plan.output)?,
+    };
+    dispatch_fused_residual_rms_device(runtime, request)
+}
+
 /// Resolve the RoPE pairing for this session's fused QKV bodies.
 ///
 /// The descriptor wire does not carry the rotate-half fact to the host (it
@@ -1272,10 +1408,13 @@ impl<'host> ProgramSession<'host> {
                 }
                 let fused_qkv =
                     build_fused_qkv_plan(&kernel.entry, &slots, &buffer_meta, kernel.grid);
+                let fused_residual_rms =
+                    build_fused_residual_rms_plan(&kernel.entry, &slots, &descriptor.module_image)?;
                 kernels.push(SessionKernel {
                     entry: kernel.entry.clone(),
                     slots,
                     fused_qkv,
+                    fused_residual_rms,
                     grid: kernel.grid,
                     block: kernel.block,
                 });
@@ -2171,6 +2310,15 @@ impl<'host> ProgramSession<'host> {
                     plan,
                     rotate_half,
                 )?);
+            } else if let Some(plan) = &kernel.fused_residual_rms {
+                // The carrier entry normalizes the residual stream only.
+                // Route the derived library entry through the fused body
+                // with the skip stream bound, or the residual add is lost.
+                dispatch_fused_residual_rms_plan(
+                    self.runtime,
+                    &self.inner.buffers,
+                    plan,
+                )?;
             } else {
                 self.runtime.launch_kernel(
                     &self.inner.module_handle,
@@ -3617,5 +3765,140 @@ mod fused_qkv_plan_tests {
         )
         .expect("plan builds; resolution is a dispatch-time fact");
         assert!(finalize_fused_bind(&plan, &BTreeMap::new()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fused_residual_rms_plan_tests {
+    use super::*;
+
+    fn slot(
+        buffer_id: u32,
+        name: &str,
+        role: DeviceBufferRole,
+        binding: u32,
+        element_count: u64,
+    ) -> SessionSlot {
+        SessionSlot {
+            buffer_id,
+            version: 1,
+            buffer_name: name.to_owned(),
+            role,
+            binding,
+            element_ty: DeviceDataType::F32,
+            element_count,
+        }
+    }
+
+    /// Qwen2.5-0.5B prefill layer-0 fused residual/RMS slots: the residual
+    /// is the layer-entry activation, the skip is the attention output
+    /// projection, and the epsilon (1e-6 on this model) is baked into the
+    /// carrier kernel while the neighboring attn_norm uses 1e-5 — the parse
+    /// must bind the ResidualRmsNorm body's own literal.
+    fn qwen_module_image() -> Vec<u8> {
+        format!(
+            concat!(
+                "kernel void prefill_blk_0_attn_norm(float) {{\n",
+                "    float scale = 1.0 / sqrt(mean + 0.00001f);\n",
+                "}}\n",
+                "kernel void prefill_blk_0_ResidualRmsNorm(float) {{\n",
+                "    float mean = sumsq / float(896u);\n",
+                "    float scale = 1.0 / sqrt(mean + 0.000001f);\n",
+                "}}\n",
+                "kernel void prefill_blk_0_ffn_gate(float) {{\n",
+                "    return;\n",
+                "}}\n",
+            )
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn qwen_prefill_plan_binds_both_streams_and_carrier_epsilon() {
+        let slots = vec![
+            slot(400, "prefill.h", DeviceBufferRole::InOut, 0, 15_232),
+            slot(41, "blk.0.ffn_norm.weight", DeviceBufferRole::Input, 1, 896),
+            slot(401, "prefill.blk0.f", DeviceBufferRole::InOut, 2, 15_232),
+            slot(402, "prefill.blk0.o", DeviceBufferRole::InOut, 3, 15_232),
+        ];
+        let plan = build_fused_residual_rms_plan(
+            "prefill_blk_0_ResidualRmsNorm",
+            &slots,
+            &qwen_module_image(),
+        )
+        .expect("qwen prefill residual/RMS plan builds")
+        .expect("entry matched");
+        assert_eq!(plan.rows, 17);
+        assert_eq!(plan.hidden, 896);
+        assert_eq!(plan.epsilon, 1.0e-6f32);
+        assert_eq!(plan.residual.key, (400, 1));
+        assert_eq!(plan.skip.key, (402, 1));
+        assert_eq!(plan.gamma.key, (41, 1));
+        assert_eq!(plan.output.key, (401, 1));
+    }
+
+    #[test]
+    fn non_residual_entry_admits_no_plan() {
+        let plan = build_fused_residual_rms_plan(
+            "prefill_blk_0_attn_norm",
+            &[slot(1, "prefill.h", DeviceBufferRole::InOut, 0, 8)],
+            &qwen_module_image(),
+        )
+        .expect("non-matching entry is not an error");
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn missing_skip_slot_fails_closed() {
+        let slots = vec![
+            slot(400, "prefill.h", DeviceBufferRole::InOut, 0, 15_232),
+            slot(41, "blk.0.ffn_norm.weight", DeviceBufferRole::Input, 1, 896),
+            slot(401, "prefill.blk0.f", DeviceBufferRole::InOut, 2, 15_232),
+        ];
+        let error = build_fused_residual_rms_plan(
+            "prefill_blk_0_ResidualRmsNorm",
+            &slots,
+            &qwen_module_image(),
+        )
+        .err()
+        .expect("a recognized carrier without a skip slot must fail the session");
+        assert!(error.message.contains("skip slot"));
+    }
+
+    #[test]
+    fn epsilon_absent_from_carrier_body_fails_closed() {
+        let slots = vec![
+            slot(400, "prefill.h", DeviceBufferRole::InOut, 0, 15_232),
+            slot(41, "blk.0.ffn_norm.weight", DeviceBufferRole::Input, 1, 896),
+            slot(401, "prefill.blk0.f", DeviceBufferRole::InOut, 2, 15_232),
+            slot(402, "prefill.blk0.o", DeviceBufferRole::InOut, 3, 15_232),
+        ];
+        let image = b"kernel void prefill_blk_0_ResidualRmsNorm(float) {\n return;\n}\n";
+        let error = build_fused_residual_rms_plan(
+            "prefill_blk_0_ResidualRmsNorm",
+            &slots,
+            image,
+        )
+        .err()
+        .expect("an unparseable carrier epsilon must fail the session");
+        assert!(error.message.contains("RMS epsilon"));
+    }
+
+    #[test]
+    fn inconsistent_slot_geometry_fails_closed() {
+        let slots = vec![
+            slot(400, "prefill.h", DeviceBufferRole::InOut, 0, 15_232),
+            slot(41, "blk.0.ffn_norm.weight", DeviceBufferRole::Input, 1, 896),
+            slot(401, "prefill.blk0.f", DeviceBufferRole::InOut, 2, 8_960),
+            slot(402, "prefill.blk0.o", DeviceBufferRole::InOut, 3, 15_232),
+        ];
+        let error = build_fused_residual_rms_plan(
+            "prefill_blk_0_ResidualRmsNorm",
+            &slots,
+            &qwen_module_image(),
+        )
+        .err()
+        .expect("an output width disagreeing with rows*hidden must fail the session");
+        assert!(error.message.contains("slot geometry"));
     }
 }

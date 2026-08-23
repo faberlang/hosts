@@ -554,6 +554,75 @@ pub fn dispatch_fused_qkv_device(
     })
 }
 
+/// A fully bound device view set for one fused residual-plus-RMS dispatch.
+///
+/// The views are dense f32 activations and the gamma weight; the owning body
+/// is the library's residual-add + RMS normalization under a row-major bind.
+pub struct FusedResidualRmsDeviceDispatch<'a> {
+    /// Canonical library entry (`"ResidualRmsNorm"`).
+    pub library_entry: &'a str,
+    /// Activation rows in this invocation.
+    pub rows: u64,
+    /// Activation and RMS row width.
+    pub hidden: u64,
+    /// RMS epsilon carried by the compiled carrier.
+    pub epsilon: f32,
+    /// Residual (pre-attention stream) view.
+    pub residual: FusedLibraryDeviceBuffer<'a>,
+    /// Skip (attention output projection) view.
+    pub skip: FusedLibraryDeviceBuffer<'a>,
+    /// Gamma weight view.
+    pub gamma: FusedLibraryDeviceBuffer<'a>,
+    /// Destination view.
+    pub output: FusedLibraryDeviceBuffer<'a>,
+}
+
+/// Execute one fully bound fused residual-plus-RMS library body on the Metal
+/// session.
+///
+/// The carrier launch publishes the RMS-normalized residual only; the skip
+/// stream rides the launch as an extra read resource the carrier kernel never
+/// touches.  This bridge runs the fused body that consumes both streams and
+/// uploads the destination, so the written bytes prove the residual add ran.
+pub fn dispatch_fused_residual_rms_device(
+    runtime: &mut DeviceRuntime,
+    request: FusedResidualRmsDeviceDispatch<'_>,
+) -> HostResult<()> {
+    if runtime.backend() != host_coordinator::DeviceBackend::Metal {
+        return Err(crate::kernel::HostError::invalid_args(
+            "fused library CPU bridge is a Metal-only route",
+        ));
+    }
+    if request.library_entry != "ResidualRmsNorm" {
+        return Err(crate::kernel::HostError::invalid_args(
+            "fused residual/RMS dispatch disagrees with library_entry",
+        ));
+    }
+    if request.rows == 0 || request.hidden == 0 {
+        return Err(crate::kernel::HostError::invalid_args(
+            "fused residual/RMS dispatch has a zero dimension",
+        ));
+    }
+    let residual = dense_view(runtime, request.residual, "residual")?;
+    let skip = dense_view(runtime, request.skip, "skip")?;
+    let gamma = dense_view(runtime, request.gamma, "gamma")?;
+    let (mut output, out_start, out_end) = dense_storage(runtime, request.output, "output")?;
+    let bind = BindDescriptor::row_major([request.rows, request.hidden], [1, 1, 1]);
+    dispatch_metal_library(MetalLibraryDispatch::ResidualRmsNorm {
+        library_entry: Some(request.library_entry),
+        layout: BindLayout::RowMajor,
+        bind: &bind,
+        residual: &residual,
+        skip: &skip,
+        gamma: &gamma,
+        output: &mut output[out_start..out_end],
+        epsilon: request.epsilon,
+    })
+    .map_err(|error| crate::kernel::HostError::invalid_args(error.to_string()))?;
+    runtime.copy_in_f32(request.output.handle, &output)?;
+    Ok(())
+}
+
 /// Dispatch one admitted Metal runtime request through the existing library
 /// selector and body.
 ///
@@ -750,6 +819,134 @@ mod tests {
             assert!(v_values.iter().all(|value| *value == hidden as f32 * 3.0));
             assert_eq!(runtime.backend(), DeviceBackend::Metal);
         }
+    }
+
+    #[test]
+    fn residual_rms_bridge_adds_skip_before_normalization() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+        use host_coordinator::DeviceHandle;
+
+        fn view<'a>(
+            handle: &'a DeviceHandle,
+            count: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: 0,
+                view_span: count * 4,
+                binding_index: binding,
+                packed_format: None,
+            }
+        }
+
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                .expect("fake Metal admission"),
+        );
+        let rows = 2u64;
+        let hidden = 4u64;
+        let epsilon = 1.0e-6f32;
+        let residual = [1.0f32, -2.0, 3.0, -4.0, 0.5, 0.5, -1.5, 2.5];
+        let skip = [0.25f32, 0.25, -0.25, -0.25, 1.0, -1.0, 2.0, -2.0];
+        let gamma = [1.0f32, 0.5, 2.0, 1.5];
+        let mut expected = vec![0.0f32; (rows * hidden) as usize];
+        for row in 0..rows as usize {
+            let base = row * hidden as usize;
+            let summed: Vec<f32> = (0..hidden as usize)
+                .map(|col| residual[base + col] + skip[base + col])
+                .collect();
+            let sumsq: f32 = summed.iter().map(|value| value * value).sum();
+            let scale = 1.0 / ((sumsq / hidden as f32 + epsilon).sqrt());
+            for col in 0..hidden as usize {
+                expected[base + col] = summed[col] * scale * gamma[col];
+            }
+        }
+        let alloc = |runtime: &mut DeviceRuntime, values: &[f32]| {
+            let handle = runtime
+                .alloc_bytes(values.len() * 4)
+                .expect("allocate bridge buffer");
+            runtime
+                .copy_in_f32(&handle, values)
+                .expect("initialize bridge buffer");
+            handle
+        };
+        let residual_handle = alloc(&mut runtime, &residual);
+        let skip_handle = alloc(&mut runtime, &skip);
+        let gamma_handle = alloc(&mut runtime, &gamma);
+        let output_handle = alloc(&mut runtime, &vec![0.0f32; expected.len()]);
+        dispatch_fused_residual_rms_device(
+            &mut runtime,
+            FusedResidualRmsDeviceDispatch {
+                library_entry: "ResidualRmsNorm",
+                rows,
+                hidden,
+                epsilon,
+                residual: view(&residual_handle, rows * hidden, 0),
+                skip: view(&skip_handle, rows * hidden, 1),
+                gamma: view(&gamma_handle, hidden, 2),
+                output: view(&output_handle, rows * hidden, 3),
+            },
+        )
+        .expect("fused residual/RMS body executes");
+        let written = runtime
+            .readback_f32(&output_handle)
+            .expect("read output buffer");
+        for (actual, want) in written.iter().zip(&expected) {
+            assert!(
+                (actual - want).abs() <= 1.0e-6 * want.abs().max(1.0),
+                "expected {want}, wrote {actual}"
+            );
+        }
+        // Without the skip the first row's scale would normalize the bare
+        // residual: prove the skip changed the bytes.
+        let bare = {
+            let summed: Vec<f32> = residual[..hidden as usize].to_vec();
+            let sumsq: f32 = summed.iter().map(|value| value * value).sum();
+            1.0 / ((sumsq / hidden as f32 + epsilon).sqrt())
+        };
+        let with_skip = expected[0] / gamma[0];
+        assert!((with_skip - bare).abs() > 1.0e-3);
+    }
+
+    #[test]
+    fn residual_rms_bridge_rejects_foreign_entry() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+        use host_coordinator::DeviceHandle;
+
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                .expect("fake Metal admission"),
+        );
+        let handle = runtime
+            .alloc_bytes(16)
+            .expect("allocate bridge buffer");
+        let view = FusedLibraryDeviceBuffer {
+            handle: &handle,
+            dtype: DeviceDataType::F32,
+            byte_offset: 0,
+            view_span: 16,
+            binding_index: 0,
+            packed_format: None,
+        };
+        let error = dispatch_fused_residual_rms_device(
+            &mut runtime,
+            FusedResidualRmsDeviceDispatch {
+                library_entry: "QkvProjection",
+                rows: 1,
+                hidden: 4,
+                epsilon: 1.0e-6,
+                residual: view,
+                skip: view,
+                gamma: view,
+                output: view,
+            },
+        )
+        .expect_err("wrong runtime entry must fail closed");
+        assert!(error.message.contains("disagrees with library_entry"));
     }
 
     #[test]
