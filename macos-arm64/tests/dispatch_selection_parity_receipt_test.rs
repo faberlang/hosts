@@ -3,15 +3,18 @@
 //! The batched body remains the numeric baseline.  The decode GEMV body is
 //! allowed to differ only within the KV-A cross-path logits ruling, and the
 //! receipt keeps the last-row comparison explicit for each accepted selector.
-//! This is deliberately a focused host test: it does not add a kernel or
-//! change dispatch policy.
+//! This remains a focused host test: it exercises the production Metal-library
+//! runtime bridge and does not change dispatch policy.
 
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_gemv, dispatch_residual_rms_norm, dispatch_selected, residual, rms,
-    select_decode_gemv, select_residual_rms_norm, BindDescriptor, BindLayout, GemvKernel,
-    KernelBodyError, LibraryDispatch, QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight,
-    QuantizedFormat, QuantizedGemvBind,
+    dispatch_gemv, residual, rms, select_decode_gemv, select_residual_rms_norm, BindDescriptor,
+    BindLayout, GemvKernel, KernelBodyError, QkvProjectionBind, QkvProjectionLayout,
+    QkvProjectionWeight, QuantizedFormat, QuantizedGemvBind,
 };
+use faber_host_macos_arm64::kernel::library_runtime::{
+    dispatch_metal_library, library_family_msl, LibraryFamilyMslFacts, MetalLibraryDispatch,
+};
+use faber_host_macos_arm64::MetalHostSession;
 
 const K: usize = 32;
 const KV_A_CAPACITY_ROWS: usize = 4;
@@ -618,7 +621,7 @@ fn qkv_single_body_selection_parity_receipt_covers_both_rungs_and_uniforms() {
             ];
             let (q_output, rest) = outputs.split_at_mut(1);
             let (k_output, v_output) = rest.split_at_mut(1);
-            dispatch_selected(LibraryDispatch::QkvProjection {
+            dispatch_metal_library(MetalLibraryDispatch::QkvProjection {
                 library_entry: Some("QkvProjection"),
                 decode_gemv,
                 layout: QkvProjectionLayout::Grouped,
@@ -668,7 +671,7 @@ fn qkv_single_body_selection_parity_receipt_covers_both_rungs_and_uniforms() {
                     expected
                 );
                 eprintln!(
-                    "M4-U2b parity receipt: rung={} entry=Some(QkvProjection) decode_gemv={} max_ulp={} max_relative_error={:.3e} rows={} qkv=single-body",
+                    "M4-U2b parity receipt: runtime=metal-library rung={} entry=Some(QkvProjection) decode_gemv={} max_ulp={} max_relative_error={:.3e} rows={} qkv=single-body",
                     rung.name,
                     decode_gemv,
                     max_ulp,
@@ -682,7 +685,7 @@ fn qkv_single_body_selection_parity_receipt_covers_both_rungs_and_uniforms() {
 }
 
 fn select_qkv_projection_for_test_drift() -> Result<(), KernelBodyError> {
-    dispatch_selected(LibraryDispatch::QkvProjection {
+    dispatch_metal_library(MetalLibraryDispatch::QkvProjection {
         library_entry: Some("QkvProjection"),
         decode_gemv: 2,
         layout: QkvProjectionLayout::Grouped,
@@ -809,20 +812,18 @@ fn residual_rms_norm_selection_parity_receipt_covers_both_rungs_and_bind_paths()
             )
             .expect("composed RMS baseline");
 
-            let selected = select_residual_rms_norm(Some("ResidualRmsNorm"), bind.layout)
-                .expect("ResidualRmsNorm selection")
-                .expect("ResidualRmsNorm body selected");
             let mut actual = vec![f32::NAN; fixture.rows * fixture.stride];
-            dispatch_residual_rms_norm(
-                selected,
-                &bind,
-                &fixture.residual,
-                &fixture.skip,
-                &fixture.gamma,
-                &mut actual,
-                1e-5,
-            )
-            .expect("selected ResidualRmsNorm body");
+            dispatch_metal_library(MetalLibraryDispatch::ResidualRmsNorm {
+                library_entry: Some("ResidualRmsNorm"),
+                layout: bind.layout,
+                bind: &bind,
+                residual: &fixture.residual,
+                skip: &fixture.skip,
+                gamma: &fixture.gamma,
+                output: &mut actual,
+                epsilon: 1e-5,
+            })
+            .expect("runtime ResidualRmsNorm body");
 
             let last_row = PREFIX_BEFORE;
             let actual_last =
@@ -845,7 +846,7 @@ fn residual_rms_norm_selection_parity_receipt_covers_both_rungs_and_bind_paths()
             assert!(actual_last.iter().all(|value| value.is_finite()));
             assert!(baseline_last.iter().all(|value| value.is_finite()));
             eprintln!(
-                "M4-U2b parity receipt: rung={} entry=Some(ResidualRmsNorm) layout={} last_row={:?} baseline={:?} residuals={:?} max_ulp={} rms=1 launch/layer",
+                "M4-U2b parity receipt: runtime=metal-library rung={} entry=Some(ResidualRmsNorm) layout={} last_row={:?} baseline={:?} residuals={:?} max_ulp={} rms=1 launch/layer",
                 rung.name,
                 if strided { "strided" } else { "row_major" },
                 actual_last,
@@ -857,4 +858,238 @@ fn residual_rms_norm_selection_parity_receipt_covers_both_rungs_and_bind_paths()
     }
     assert!(select_residual_rms_norm(Some("ResidualRmsNorm"), BindLayout::Flat).is_err());
     assert!(select_residual_rms_norm(Some("rms"), BindLayout::RowMajor).is_err());
+}
+
+#[test]
+fn fused_library_runtime_reaches_real_metal_entries() {
+    // The host package builds on non-macOS for CUDA lanes.  A missing Metal
+    // device is an environmental skip, not a green claim about device work.
+    let Ok(mut session) = MetalHostSession::try_open() else {
+        return;
+    };
+
+    let facts = LibraryFamilyMslFacts {
+        rows: 2,
+        hidden: 8,
+        kv_heads: 1,
+        q_per_kv: 2,
+        head_dim: 4,
+        epsilon: 1.0e-5,
+    };
+    let module_image = library_family_msl(&facts).expect("mint fused library Metal module");
+    let module = session
+        .load_module(module_image.as_bytes())
+        .expect("load fused library Metal module");
+
+    let activation: Vec<f32> = (0..(facts.rows * facts.hidden) as usize)
+        .map(|index| 0.125 + index as f32 * 0.007)
+        .collect();
+    let q_width = facts.q_width() as usize;
+    let kv_width = facts.kv_width() as usize;
+    let q_weight: Vec<f32> = (0..q_width * facts.hidden as usize)
+        .map(|index| 0.01 + (index % 13) as f32 * 0.002)
+        .collect();
+    let k_weight: Vec<f32> = (0..kv_width * facts.hidden as usize)
+        .map(|index| 0.02 + (index % 11) as f32 * 0.003)
+        .collect();
+    let v_weight: Vec<f32> = (0..kv_width * facts.hidden as usize)
+        .map(|index| 0.03 + (index % 7) as f32 * 0.004)
+        .collect();
+    let q_bind = QkvProjectionBind::grouped(
+        facts.rows,
+        facts.hidden,
+        facts.kv_heads,
+        facts.q_per_kv,
+        facts.head_dim,
+        [q_width as u32 * facts.rows as u32, 1, 1],
+    );
+    let mut expected_q = vec![f32::NAN; facts.rows as usize * q_width];
+    let mut expected_k = vec![f32::NAN; facts.rows as usize * kv_width];
+    let mut expected_v = vec![f32::NAN; facts.rows as usize * kv_width];
+    dispatch_metal_library(MetalLibraryDispatch::QkvProjection {
+        library_entry: Some("QkvProjection"),
+        decode_gemv: 0,
+        layout: QkvProjectionLayout::Grouped,
+        bind: &q_bind,
+        activation: &activation,
+        weights: [
+            QkvProjectionWeight::Dense(&q_weight),
+            QkvProjectionWeight::Dense(&k_weight),
+            QkvProjectionWeight::Dense(&v_weight),
+        ],
+        biases: [None, None, None],
+        rope: None,
+        outputs: [&mut expected_q, &mut expected_k, &mut expected_v],
+    })
+    .expect("CPU runtime bridge QKV parity");
+
+    let activation_buffer = session
+        .alloc_bytes(activation.len() * std::mem::size_of::<f32>())
+        .expect("allocate activation");
+    let q_weight_buffer = session
+        .alloc_bytes(q_weight.len() * std::mem::size_of::<f32>())
+        .expect("allocate Q weight");
+    let k_weight_buffer = session
+        .alloc_bytes(k_weight.len() * std::mem::size_of::<f32>())
+        .expect("allocate K weight");
+    let v_weight_buffer = session
+        .alloc_bytes(v_weight.len() * std::mem::size_of::<f32>())
+        .expect("allocate V weight");
+    let q_output_buffer = session
+        .alloc_bytes(expected_q.len() * std::mem::size_of::<f32>())
+        .expect("allocate Q output");
+    let k_output_buffer = session
+        .alloc_bytes(expected_k.len() * std::mem::size_of::<f32>())
+        .expect("allocate K output");
+    let v_output_buffer = session
+        .alloc_bytes(expected_v.len() * std::mem::size_of::<f32>())
+        .expect("allocate V output");
+    session
+        .copy_in_f32(activation_buffer, &activation)
+        .expect("upload activation");
+    session
+        .copy_in_f32(q_weight_buffer, &q_weight)
+        .expect("upload Q weight");
+    session
+        .copy_in_f32(k_weight_buffer, &k_weight)
+        .expect("upload K weight");
+    session
+        .copy_in_f32(v_weight_buffer, &v_weight)
+        .expect("upload V weight");
+    session
+        .launch_kernel_3d(
+            module,
+            "QkvProjection",
+            &[
+                activation_buffer,
+                q_weight_buffer,
+                k_weight_buffer,
+                v_weight_buffer,
+                q_output_buffer,
+                k_output_buffer,
+                v_output_buffer,
+            ],
+            q_width as u32 * facts.rows as u32,
+            1,
+            1,
+            1,
+            1,
+            1,
+        )
+        .expect("encode QkvProjection runtime entry");
+    session.sync().expect("submit QkvProjection runtime entry");
+    let actual_q = session
+        .readback_f32(q_output_buffer)
+        .expect("read Q output");
+    let actual_k = session
+        .readback_f32(k_output_buffer)
+        .expect("read K output");
+    let actual_v = session
+        .readback_f32(v_output_buffer)
+        .expect("read V output");
+    assert_close("QkvProjection Q", &actual_q, &expected_q);
+    assert_close("QkvProjection K", &actual_k, &expected_k);
+    assert_close("QkvProjection V", &actual_v, &expected_v);
+
+    let residual: Vec<f32> = activation.iter().map(|value| value + 0.5).collect();
+    let skip: Vec<f32> = activation.iter().map(|value| value * 0.25).collect();
+    let gamma: Vec<f32> = (0..facts.hidden as usize)
+        .map(|index| 0.75 + index as f32 * 0.01)
+        .collect();
+    let rms_bind =
+        BindDescriptor::row_major(vec![facts.rows, facts.hidden], [facts.hidden as u32, 1, 1]);
+    let mut expected_rms = vec![f32::NAN; residual.len()];
+    dispatch_metal_library(MetalLibraryDispatch::ResidualRmsNorm {
+        library_entry: Some("ResidualRmsNorm"),
+        layout: BindLayout::RowMajor,
+        bind: &rms_bind,
+        residual: &residual,
+        skip: &skip,
+        gamma: &gamma,
+        output: &mut expected_rms,
+        epsilon: facts.epsilon,
+    })
+    .expect("CPU runtime bridge ResidualRmsNorm parity");
+    let residual_buffer = session
+        .alloc_bytes(residual.len() * std::mem::size_of::<f32>())
+        .expect("allocate residual");
+    let skip_buffer = session
+        .alloc_bytes(skip.len() * std::mem::size_of::<f32>())
+        .expect("allocate skip");
+    let gamma_buffer = session
+        .alloc_bytes(gamma.len() * std::mem::size_of::<f32>())
+        .expect("allocate gamma");
+    let rms_output_buffer = session
+        .alloc_bytes(expected_rms.len() * std::mem::size_of::<f32>())
+        .expect("allocate RMS output");
+    session
+        .copy_in_f32(residual_buffer, &residual)
+        .expect("upload residual");
+    session
+        .copy_in_f32(skip_buffer, &skip)
+        .expect("upload skip");
+    session
+        .copy_in_f32(gamma_buffer, &gamma)
+        .expect("upload gamma");
+    session
+        .launch_kernel_3d(
+            module,
+            "ResidualRmsNorm",
+            &[
+                residual_buffer,
+                skip_buffer,
+                gamma_buffer,
+                rms_output_buffer,
+            ],
+            facts.rows as u32 * facts.hidden as u32,
+            1,
+            1,
+            1,
+            1,
+            1,
+        )
+        .expect("encode ResidualRmsNorm runtime entry");
+    session
+        .sync()
+        .expect("submit ResidualRmsNorm runtime entry");
+    let actual_rms = session
+        .readback_f32(rms_output_buffer)
+        .expect("read RMS output");
+    assert_close("ResidualRmsNorm", &actual_rms, &expected_rms);
+    eprintln!(
+        "PB-4a runtime parity receipt: entries=[QkvProjection,ResidualRmsNorm] rows={} hidden={} q_width={} kv_width={} real_metal=true",
+        facts.rows, facts.hidden, q_width, kv_width
+    );
+
+    for handle in [
+        activation_buffer,
+        q_weight_buffer,
+        k_weight_buffer,
+        v_weight_buffer,
+        q_output_buffer,
+        k_output_buffer,
+        v_output_buffer,
+        residual_buffer,
+        skip_buffer,
+        gamma_buffer,
+        rms_output_buffer,
+        module,
+    ] {
+        session
+            .release(handle)
+            .expect("release fused runtime handle");
+    }
+}
+
+fn assert_close(label: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "{label} length");
+    let max_abs = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs <= 2.0e-5,
+        "{label} runtime mismatch: max_abs={max_abs} actual={actual:?} expected={expected:?}"
+    );
 }
