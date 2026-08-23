@@ -1042,16 +1042,41 @@ fn fused_cursor_position(
     buffers: &BTreeMap<BufferKey, DeviceHandle>,
     cursor: FusedQkvSlot,
 ) -> HostResult<u64> {
+    // The cursor is a descriptor-declared f32 input: the producer uploads
+    // the four fields as f32 values and the carrier kernels read them as
+    // floats. The position is the first f32 VALUE, never its raw word
+    // reinterpreted as u32 (f32 1.0 bits read as u32 is 0x3F800000).
+    if cursor.dtype != DeviceDataType::F32 {
+        return Err(HostError::invalid_args(format!(
+            "fused library cursor must be f32, got {}",
+            cursor.dtype.spelling()
+        )));
+    }
     let handle = buffers
         .get(&cursor.key)
         .ok_or_else(|| HostError::internal("fused library cursor disappeared during launch"))?;
-    let bytes = runtime.readback_bytes(handle, DeviceDataType::U8)?;
-    let first = bytes
-        .get(..4)
+    let values = runtime.readback_f32(handle)?;
+    fused_cursor_position_from_words(&values)
+}
+
+/// Decode the append position from the cursor's f32 word values, failing
+/// closed on anything that is not one non-negative integer-valued f32.
+fn fused_cursor_position_from_words(values: &[f32]) -> HostResult<u64> {
+    let position = values
+        .first()
         .ok_or_else(|| HostError::invalid_args("fused library cursor is shorter than position"))?;
-    Ok(u64::from(u32::from_le_bytes([
-        first[0], first[1], first[2], first[3],
-    ])))
+    if !position.is_finite() || *position < 0.0 || position.fract() != 0.0 {
+        return Err(HostError::invalid_args(format!(
+            "fused library cursor position {position} is not a non-negative integer f32"
+        )));
+    }
+    let decoded = *position as u64;
+    if decoded as f32 != *position {
+        return Err(HostError::invalid_args(format!(
+            "fused library cursor position {position} overflows the u64 cursor surface"
+        )));
+    }
+    Ok(decoded)
 }
 
 fn dispatch_fused_qkv_plan(
@@ -3765,6 +3790,50 @@ mod fused_qkv_plan_tests {
         )
         .expect("plan builds; resolution is a dispatch-time fact");
         assert!(finalize_fused_bind(&plan, &BTreeMap::new()).is_err());
+    }
+
+    /// The cursor position is the first f32 VALUE of the descriptor-declared
+    /// cursor input, never its raw word reinterpreted as u32. f32 1.0 read
+    /// as u32 is 0x3F800000 = 1_065_353_216, which multiplied the k=3
+    /// append offset into a ~272 GB view end against a 10 MiB K arena
+    /// (SV-E5 binding-8 defect; same class as the PB-4d word/extent
+    /// confusion).
+    #[test]
+    fn cursor_position_decodes_f32_value_not_raw_word() {
+        let k3 = [1.0_f32, 4.0, 3.0, 1.0];
+        assert_eq!(
+            fused_cursor_position_from_words(&k3).expect("k=3 cursor decodes"),
+            1,
+            "f32 1.0 must decode to position 1, not 0x3F800000"
+        );
+        assert_eq!(
+            fused_cursor_position_from_words(&[0.0, 9.0, 9.0, 0.0]).expect("prefill cursor"),
+            0
+        );
+        assert_eq!(
+            fused_cursor_position_from_words(&[8192.0, 8192.0, 1.0, 1.0]).expect("deep position"),
+            8192
+        );
+    }
+
+    /// Cursor positions that are not one non-negative integer-valued f32
+    /// fail closed instead of truncating into an append offset.
+    #[test]
+    fn cursor_position_fails_closed_on_non_integer_words() {
+        for bad in [
+            Vec::new(),
+            vec![-1.0_f32, 0.0, 1.0, 0.0],
+            vec![1.5_f32, 4.0, 3.0, 1.0],
+            vec![f32::NAN, 4.0, 3.0, 1.0],
+            vec![f32::INFINITY, 4.0, 3.0, 1.0],
+            vec![-0.5_f32, 4.0, 3.0, 1.0],
+            vec![f32::MAX, 0.0, 0.0, 0.0],
+        ] {
+            assert!(
+                fused_cursor_position_from_words(&bad).is_err(),
+                "cursor {bad:?} must fail closed"
+            );
+        }
     }
 }
 
