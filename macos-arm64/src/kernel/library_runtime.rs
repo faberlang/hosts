@@ -584,6 +584,13 @@ pub struct FusedResidualRmsDeviceDispatch<'a> {
 /// stream rides the launch as an extra read resource the carrier kernel never
 /// touches.  This bridge runs the fused body that consumes both streams and
 /// uploads the destination, so the written bytes prove the residual add ran.
+///
+/// PB-8: the bridge also writes the accumulated stream (`residual + skip`)
+/// back into the residual buffer.  The carrier's layer-end residual add
+/// composes against the residual view it was bound with, so without this
+/// write-back the attention output is normalized but never joins the
+/// residual stream and every layer loses one attention projection
+/// (`h_next = h + down` instead of the reference `h + o + down`).
 pub fn dispatch_fused_residual_rms_device(
     runtime: &mut DeviceRuntime,
     request: FusedResidualRmsDeviceDispatch<'_>,
@@ -603,8 +610,16 @@ pub fn dispatch_fused_residual_rms_device(
             "fused residual/RMS dispatch has a zero dimension",
         ));
     }
-    let residual = dense_view(runtime, request.residual, "residual")?;
+    let (mut residual_buffer, residual_start, residual_end) =
+        dense_storage(runtime, request.residual, "residual")?;
+    let residual_len = residual_end - residual_start;
     let skip = dense_view(runtime, request.skip, "skip")?;
+    if skip.len() != residual_len {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused residual/RMS dispatch stream widths disagree: residual {residual_len}, skip {}",
+            skip.len()
+        )));
+    }
     let gamma = dense_view(runtime, request.gamma, "gamma")?;
     let (mut output, out_start, out_end) = dense_storage(runtime, request.output, "output")?;
     let bind = BindDescriptor::row_major([request.rows, request.hidden], [1, 1, 1]);
@@ -612,7 +627,7 @@ pub fn dispatch_fused_residual_rms_device(
         library_entry: Some(request.library_entry),
         layout: BindLayout::RowMajor,
         bind: &bind,
-        residual: &residual,
+        residual: &residual_buffer[residual_start..residual_end],
         skip: &skip,
         gamma: &gamma,
         output: &mut output[out_start..out_end],
@@ -620,6 +635,17 @@ pub fn dispatch_fused_residual_rms_device(
     })
     .map_err(|error| crate::kernel::HostError::invalid_args(error.to_string()))?;
     runtime.copy_in_f32(request.output.handle, &output)?;
+    // PB-8: fold the skip into the residual stream so the carrier's layer-end
+    // residual add composes h + o + down. The write covers the whole device
+    // buffer with the view span updated in place, preserving any bytes
+    // outside the view.
+    for (slot, add) in residual_buffer[residual_start..residual_end]
+        .iter_mut()
+        .zip(&skip)
+    {
+        *slot += *add;
+    }
+    runtime.copy_in_f32(request.residual.handle, &residual_buffer)?;
     Ok(())
 }
 
@@ -909,6 +935,92 @@ mod tests {
         };
         let with_skip = expected[0] / gamma[0];
         assert!((with_skip - bare).abs() > 1.0e-3);
+        // PB-8: the residual stream must carry the skip so the layer-end
+        // residual add composes h + o + down.
+        let written_residual = runtime
+            .readback_f32(&residual_handle)
+            .expect("read residual buffer");
+        for (actual, want) in written_residual
+            .iter()
+            .zip(residual.iter().zip(&skip).map(|(a, b)| a + b))
+        {
+            assert!(
+                (actual - want).abs() <= 1.0e-6 * want.abs().max(1.0),
+                "expected accumulated {want}, wrote {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_rms_bridge_writeback_splices_a_view_span_not_the_whole_buffer() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                .expect("fake Metal admission"),
+        );
+        // One pooled buffer holding two spans; the residual view is the
+        // second span, so a whole-buffer overwrite would corrupt the first.
+        let pooled = [9.0f32, 9.0, 9.0, 9.0, 1.0, -2.0, 3.0, -4.0];
+        let skip = [0.25f32, 0.25, -0.25, -0.25];
+        let gamma = [1.0f32, 0.5, 2.0, 1.5];
+        let alloc = |runtime: &mut DeviceRuntime, values: &[f32]| {
+            let handle = runtime
+                .alloc_bytes(values.len() * 4)
+                .expect("allocate bridge buffer");
+            runtime
+                .copy_in_f32(&handle, values)
+                .expect("initialize bridge buffer");
+            handle
+        };
+        let pooled_handle = alloc(&mut runtime, &pooled);
+        let skip_handle = alloc(&mut runtime, &skip);
+        let gamma_handle = alloc(&mut runtime, &gamma);
+        let output_handle = alloc(&mut runtime, &vec![0.0f32; 4]);
+        fn view<'a>(
+            handle: &'a host_coordinator::DeviceHandle,
+            count: u64,
+            offset: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: offset,
+                view_span: count * 4,
+                binding_index: binding,
+                packed_format: None,
+            }
+        }
+        dispatch_fused_residual_rms_device(
+            &mut runtime,
+            FusedResidualRmsDeviceDispatch {
+                library_entry: "ResidualRmsNorm",
+                rows: 1,
+                hidden: 4,
+                epsilon: 1.0e-6,
+                residual: view(&pooled_handle, 4, 16, 0),
+                skip: view(&skip_handle, 4, 0, 1),
+                gamma: view(&gamma_handle, 4, 0, 2),
+                output: view(&output_handle, 4, 0, 3),
+            },
+        )
+        .expect("fused residual/RMS body executes");
+        let pooled_after = runtime
+            .readback_f32(&pooled_handle)
+            .expect("read pooled buffer");
+        for (actual, want) in pooled_after.iter().zip(
+            pooled
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value + skip.get(index.wrapping_sub(4)).copied().unwrap_or(0.0)),
+        ) {
+            assert!(
+                (actual - want).abs() <= 1.0e-6 * want.abs().max(1.0),
+                "expected pooled {want}, wrote {actual}"
+            );
+        }
     }
 
     #[test]
