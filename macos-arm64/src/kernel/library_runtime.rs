@@ -334,12 +334,14 @@ fn packed_view(
     view: FusedLibraryDeviceBuffer<'_>,
     label: &'static str,
 ) -> HostResult<Vec<u8>> {
-    if view.dtype != DeviceDataType::U8 {
+    if !matches!(view.dtype, DeviceDataType::F32 | DeviceDataType::U8) {
         return Err(crate::kernel::HostError::invalid_args(format!(
-            "fused library packed {label} requires u8, got {}",
+            "fused library packed {label} requires an f32-word or u8 region, got {}",
             view.dtype.spelling()
         )));
     }
+    // The f32 tag marks a padded word region (byte length / 4 elements);
+    // the view span stays in bytes either way.
     if view.packed_format.is_none() {
         return Err(crate::kernel::HostError::invalid_args(format!(
             "fused library packed {label} has no known GGML format"
@@ -421,17 +423,34 @@ pub fn dispatch_fused_qkv_device(
         .zip(request.weights)
         .zip(["Q weight", "K weight", "V weight"])
     {
-        *storage = match view.dtype {
-            DeviceDataType::F32 => WeightStorage::Dense(dense_view(runtime, view, label)?),
-            DeviceDataType::U8 => WeightStorage::Packed {
+        // A packed region is recognized by its uploaded GGML format fact,
+        // not by its dtype tag: the wire types padded packed regions as f32
+        // words (byte length / 4) while the bytes keep the native layout.
+        *storage = if view.packed_format.is_some() {
+            if !matches!(view.dtype, DeviceDataType::F32 | DeviceDataType::U8) {
+                return Err(crate::kernel::HostError::invalid_args(format!(
+                    "fused library packed {label} requires an f32-word or u8 region, got {}",
+                    view.dtype.spelling()
+                )));
+            }
+            WeightStorage::Packed {
                 values: packed_view(runtime, view, label)?,
                 format: quantized_format(view, label)?,
-            },
-            dtype => {
-                return Err(crate::kernel::HostError::invalid_args(format!(
-                    "fused library {label} requires f32 or packed u8, got {}",
-                    dtype.spelling()
-                )))
+            }
+        } else {
+            match view.dtype {
+                DeviceDataType::F32 => WeightStorage::Dense(dense_view(runtime, view, label)?),
+                DeviceDataType::U8 => {
+                    return Err(crate::kernel::HostError::invalid_args(format!(
+                        "fused library {label} is a u8 region with no known GGML format"
+                    )));
+                }
+                dtype => {
+                    return Err(crate::kernel::HostError::invalid_args(format!(
+                        "fused library {label} requires f32 or packed u8, got {}",
+                        dtype.spelling()
+                    )))
+                }
             }
         };
     }
@@ -842,6 +861,123 @@ mod tests {
             },
         )
         .expect("packed QKV bridge executes");
+
+        let q = runtime.readback_f32(&q_output).expect("read packed Q");
+        let k = runtime.readback_f32(&k_output).expect("read packed K");
+        let v = runtime.readback_f32(&v_output).expect("read packed V");
+        assert!(q.iter().all(|value| *value == 32.0));
+        assert!(k.iter().all(|value| *value == 64.0));
+        assert!(v.iter().all(|value| *value == 96.0));
+        assert_eq!(runtime.backend(), DeviceBackend::Metal);
+    }
+
+    #[test]
+    fn production_bridge_admits_f32_word_tagged_packed_regions() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+        use host_coordinator::{DeviceBackend, DeviceHandle};
+
+        // The wire types a padded packed region as f32 words (byte length/4)
+        // while the bytes keep the native GGML layout; the uploaded format
+        // fact, not the dtype tag, selects the packed path.
+        fn f32_word_view<'a>(
+            handle: &'a DeviceHandle,
+            words: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: 0,
+                view_span: words * 4,
+                binding_index: binding,
+                packed_format: Some(PackedStorageFormat::Q8_0),
+            }
+        }
+
+        fn f32_view<'a>(
+            handle: &'a DeviceHandle,
+            count: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: 0,
+                view_span: count * 4,
+                binding_index: binding,
+                packed_format: None,
+            }
+        }
+
+        fn q8_columns(value: u8, columns: usize) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(columns * 34);
+            for _ in 0..columns {
+                bytes.extend_from_slice(&[0x00, 0x3c]);
+                bytes.extend(std::iter::repeat_n(value, 32));
+            }
+            bytes
+        }
+
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                .expect("fake Metal admission"),
+        );
+        let hidden = 32u64;
+        let alloc_f32 = |runtime: &mut DeviceRuntime, values: &[f32]| {
+            let handle = runtime
+                .alloc_bytes(values.len() * 4)
+                .expect("allocate f32 bridge buffer");
+            runtime
+                .copy_in_f32(&handle, values)
+                .expect("initialize f32 bridge buffer");
+            handle
+        };
+        let alloc_bytes = |runtime: &mut DeviceRuntime, values: &[u8]| {
+            let handle = runtime
+                .alloc_bytes(values.len())
+                .expect("allocate packed bridge buffer");
+            runtime
+                .copy_in_bytes(&handle, values, DeviceDataType::U8)
+                .expect("initialize packed bridge buffer");
+            handle
+        };
+        let activation = alloc_f32(&mut runtime, &[1.0; 32]);
+        let q_weight_bytes = q8_columns(1, 32);
+        let k_weight_bytes = q8_columns(2, 32);
+        let v_weight_bytes = q8_columns(3, 32);
+        // Pad each region to a whole f32 word count, as the wire does.
+        let words = |bytes: &[u8]| -> u64 { bytes.len().div_ceil(4) as u64 };
+        let q_weight = alloc_bytes(&mut runtime, &q_weight_bytes);
+        let k_weight = alloc_bytes(&mut runtime, &k_weight_bytes);
+        let v_weight = alloc_bytes(&mut runtime, &v_weight_bytes);
+        let q_output = alloc_f32(&mut runtime, &[0.0; 32]);
+        let k_output = alloc_f32(&mut runtime, &[0.0; 32]);
+        let v_output = alloc_f32(&mut runtime, &[0.0; 32]);
+
+        dispatch_fused_qkv_device(
+            &mut runtime,
+            FusedQkvDeviceDispatch {
+                library_entry: "QkvProjection",
+                derived_entry: "prefill_blk_0_QkvProjection",
+                decode_gemv: 1,
+                bind: QkvProjectionBind::grouped(1, hidden, 1, 1, 32, [32, 1, 1]),
+                activation: f32_view(&activation, hidden, 0),
+                weights: [
+                    f32_word_view(&q_weight, words(&q_weight_bytes), 1),
+                    f32_word_view(&k_weight, words(&k_weight_bytes), 2),
+                    f32_word_view(&v_weight, words(&v_weight_bytes), 3),
+                ],
+                biases: [None, None, None],
+                rope: None,
+                outputs: [
+                    f32_view(&q_output, hidden, 4),
+                    f32_view(&k_output, hidden, 5),
+                    f32_view(&v_output, hidden, 6),
+                ],
+            },
+        )
+        .expect("f32-word-tagged packed QKV bridge executes");
 
         let q = runtime.readback_f32(&q_output).expect("read packed Q");
         let k = runtime.readback_f32(&k_output).expect("read packed K");

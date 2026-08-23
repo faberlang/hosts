@@ -19,7 +19,7 @@ use crate::device_host::{
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
 };
 use crate::device_registry::DriverCounters;
-use crate::kernel::library::QkvProjectionBind;
+use crate::kernel::library::{QuantizedFormat, QkvProjectionBind};
 use crate::kernel::library_runtime::{
     dispatch_fused_qkv_device, FusedLibraryDeviceBuffer, FusedLibraryDispatchReceipt,
     FusedQkvDeviceDispatch,
@@ -140,10 +140,25 @@ struct FusedQkvSlot {
     element_count: u64,
 }
 
-/// Explicit dense-f32 facts for one derived QKV library entry.
+/// Explicit facts for one derived QKV library entry. The grouped bind is
+/// finalized at dispatch: the K/V output width needs the uploaded packed
+/// format facts when the K/V targets are capacity-sized persistent caches,
+/// and those facts arrive with the weight upload, after session creation.
 #[derive(Clone)]
 struct FusedQkvPlan {
-    bind: QkvProjectionBind,
+    /// Activation rows in this invocation.
+    rows: u64,
+    /// Activation width / contracted weight dimension.
+    hidden: u64,
+    /// Logical Q output width (`q_heads * head_dim`).
+    q_width: u64,
+    /// Elements in one attention head (from the RoPE table extent).
+    head_dim: u64,
+    /// Backend-neutral launch grid carried into the bind.
+    grid: [u32; 3],
+    /// Whether the K/V outputs target the persistent cache arenas
+    /// (capacity-sized) rather than rows-sized `.k_gemv` activations.
+    kv_cache_target: bool,
     activation: FusedQkvSlot,
     weights: [FusedQkvSlot; 3],
     biases: [Option<FusedQkvSlot>; 3],
@@ -343,6 +358,10 @@ pub(crate) struct ProgramInner {
     /// Packed GGML facts attached to uploaded weight ids. These are upload
     /// facts, not guesses from the padded device allocation width.
     packed_formats: BTreeMap<u32, PackedStorageFormat>,
+    /// RoPE pairing learned once per session for the fused QKV library
+    /// bodies (interior mutability: the learning readback happens mid-step
+    /// under a shared inner borrow). `None` = not yet learned.
+    fused_rotate_half: std::cell::RefCell<Option<bool>>,
     kernels: Vec<SessionKernel>,
     launches: Vec<SessionLaunch>,
     data_flow: Vec<DataFlowEdge>,
@@ -645,10 +664,14 @@ fn fused_slot(
 /// Recognize the fused QKV carrier from its explicit resource facts.
 ///
 /// The descriptor carries resource names, dtypes, counts, and binding
-/// indices, but not a second host-side QKV schema. The output and activation
-/// extents determine the grouped bind; packed weight byte widths are never
-/// mistaken for logical matrix elements. Their GGML format arrives with the
-/// uploaded weight fact and the bridge fails closed when it is absent.
+/// indices, but not a second host-side QKV schema. This builder admits only
+/// the fully typed f32 shape where those facts determine one unambiguous
+/// invocation; the K/V output width itself is finalized at dispatch
+/// ([`finalize_fused_bind`]) because capacity-sized persistent K/V targets
+/// do not carry the per-row width in their element count. Packed weight
+/// byte widths are never mistaken for logical matrix elements. Their GGML
+/// format arrives with the uploaded weight fact and the bridge fails closed
+/// when it is absent.
 fn build_fused_qkv_plan(
     entry: &str,
     slots: &[SessionSlot],
@@ -718,53 +741,158 @@ fn build_fused_qkv_plan(
         return None;
     }
     let rows = activation.element_count / hidden;
-    let q_width = q_output.element_count / rows.max(1);
-    let kv_width = k_output.element_count / rows.max(1);
     if rows == 0
-        || q_width == 0
-        || kv_width == 0
-        || q_width.saturating_mul(rows) != q_output.element_count
-        || kv_width.saturating_mul(rows) > k_output.element_count
-        || kv_width.saturating_mul(rows) > v_output.element_count
+        || q_output.element_count == 0
+        || q_output.element_count % rows != 0
         || k_output.element_count != v_output.element_count
+        || k_output.element_count == 0
         || k_weight.element_count == 0
         || v_weight.element_count == 0
     {
         return None;
     }
-    if q_width % kv_width != 0 {
+    let q_width = q_output.element_count / rows;
+    if q_width == 0 {
         return None;
     }
     let head_dim = cos.zip(sin).and_then(|(cos, _)| {
         (cos.element_count % rows == 0).then_some(cos.element_count / rows * 2)
     })?;
-    if head_dim == 0 || kv_width % head_dim != 0 {
+    if head_dim == 0 || q_width % head_dim != 0 {
         return None;
     }
-    let kv_heads = kv_width / head_dim;
-    let q_per_kv = q_width / kv_width;
-    if kv_heads == 0 || q_per_kv == 0 {
-        return None;
-    }
-    let kv_capacity = k_output.element_count / kv_width;
-    if kv_capacity == 0 || k_output.element_count % kv_width != 0 {
-        return None;
-    }
-    let cursor = fused_slot(slots, |slot| slot.buffer_name == "kv.invocation_state");
     if k_output.key.eq(&v_output.key) || (k_output.binding == v_output.binding) {
         return None;
     }
-    let mut bind = QkvProjectionBind::grouped(rows, hidden, kv_heads, q_per_kv, head_dim, grid);
-    bind.kv_output_strides = [kv_capacity.saturating_mul(head_dim), head_dim, 1];
+    let kv_cache_target = slots.iter().any(|slot| {
+        (slot.buffer_id, slot.version) == k_output.key
+            && slot.buffer_name.starts_with("kv.cache_k.")
+    });
     Some(FusedQkvPlan {
-        bind,
+        rows,
+        hidden,
+        q_width,
+        head_dim,
+        grid,
+        kv_cache_target,
         activation,
         weights: [q_weight, k_weight, v_weight],
         biases,
         rope: cos.zip(sin),
         outputs: [q_output, k_output, v_output],
-        cursor,
+        cursor: fused_slot(slots, |slot| slot.buffer_name == "kv.invocation_state"),
     })
+}
+
+/// Packed-bytes-per-matrix-row for one GGML format over a contracted width
+/// (R-PACK-02 column stride: `ceil(width / block_elements) * block_bytes`).
+fn fused_packed_row_bytes(hidden: u64, format: QuantizedFormat) -> Option<u64> {
+    hidden
+        .checked_add(format.block_elements().checked_sub(1)?)
+        .map(|padded| padded / format.block_elements())
+        .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
+        .filter(|row_bytes| *row_bytes > 0)
+}
+
+/// The packed projection width implied by a padded byte region, when the
+/// region is an exact whole number of packed matrix rows.
+fn fused_packed_width(slot: FusedQkvSlot, hidden: u64, format: QuantizedFormat) -> Option<u64> {
+    let row_bytes = fused_packed_row_bytes(hidden, format)?;
+    let bytes = slot.element_count.checked_mul(4)?;
+    if bytes % row_bytes != 0 {
+        return None;
+    }
+    Some(bytes / row_bytes)
+}
+
+/// Finalize the grouped bind for an admitted fused plan.
+///
+/// The K/V output width (`kv_heads * head_dim`) is resolved from explicit
+/// facts only, in priority order: the K bias extent (exactly the KV width),
+/// a rows-sized `.k_gemv` activation output, the uploaded packed weight
+/// byte extent, or a dense f32 weight extent. Capacity-sized persistent
+/// cache targets never yield the width by division by rows. Every candidate
+/// must satisfy the GQA arithmetic and, when the sibling weight formats are
+/// known, the packed byte extents must agree for Q and V as well.
+fn finalize_fused_bind(
+    plan: &FusedQkvPlan,
+    packed_formats: &BTreeMap<u32, PackedStorageFormat>,
+) -> HostResult<QkvProjectionBind> {
+    let quantized = |slot: FusedQkvSlot| -> Option<QuantizedFormat> {
+        packed_formats
+            .get(&slot.key.0)
+            .copied()
+            .and_then(|format| QuantizedFormat::from_ggml_type_id(format.ggml_type_id()))
+    };
+    let q_format = quantized(plan.weights[0]);
+    let k_format = quantized(plan.weights[1]);
+    let v_format = quantized(plan.weights[2]);
+    let mut candidates: Vec<u64> = Vec::new();
+    if let Some(k_bias) = plan.biases[1] {
+        candidates.push(k_bias.element_count);
+    }
+    // A rows-sized `.k_gemv` activation output carries the width directly;
+    // a capacity-sized persistent cache target never does (its element
+    // count is `kv_heads * capacity * head_dim`).
+    if !plan.kv_cache_target && plan.outputs[1].element_count % plan.rows == 0 {
+        candidates.push(plan.outputs[1].element_count / plan.rows);
+    }
+    if let Some(format) = k_format {
+        if let Some(width) = fused_packed_width(plan.weights[1], plan.hidden, format) {
+            candidates.push(width);
+        }
+    } else if plan.weights[1].element_count % plan.hidden == 0 {
+        candidates.push(plan.weights[1].element_count / plan.hidden);
+    }
+    for kv_width in candidates {
+        if kv_width == 0
+            || kv_width % plan.head_dim != 0
+            || plan.q_width % kv_width != 0
+            || plan.outputs[1].element_count % kv_width != 0
+        {
+            continue;
+        }
+        // Sibling weight extents must agree with the candidate width.
+        if let Some(format) = q_format {
+            if fused_packed_width(plan.weights[0], plan.hidden, format) != Some(plan.q_width) {
+                continue;
+            }
+        } else if plan.weights[0].element_count != plan.hidden * plan.q_width {
+            continue;
+        }
+        if let Some(format) = v_format {
+            if fused_packed_width(plan.weights[2], plan.hidden, format) != Some(kv_width) {
+                continue;
+            }
+        } else if plan.weights[2].element_count != plan.hidden * kv_width {
+            continue;
+        }
+        let kv_heads = kv_width / plan.head_dim;
+        let q_per_kv = plan.q_width / kv_width;
+        let kv_capacity = plan.outputs[1].element_count / kv_width;
+        if kv_heads == 0 || q_per_kv == 0 || kv_capacity == 0 {
+            continue;
+        }
+        let mut bind = QkvProjectionBind::grouped(
+            plan.rows,
+            plan.hidden,
+            kv_heads,
+            q_per_kv,
+            plan.head_dim,
+            plan.grid,
+        );
+        bind.kv_output_strides = [kv_capacity.saturating_mul(plan.head_dim), plan.head_dim, 1];
+        return Ok(bind);
+    }
+    Err(HostError::invalid_args(format!(
+        "fused QKV plan has no unambiguous KV width (rows {}, hidden {}, q_width {}, head_dim {}, k bytes {}, packed k format {:?})",
+        plan.rows,
+        plan.hidden,
+        plan.q_width,
+        plan.head_dim,
+        plan.weights[1].element_count * 4,
+        k_format.map(|format| format.spelling())
+    )))
 }
 
 fn resolve_fused_buffer(
@@ -822,14 +950,17 @@ fn dispatch_fused_qkv_plan(
     packed_formats: &BTreeMap<u32, PackedStorageFormat>,
     entry: &str,
     plan: &FusedQkvPlan,
+    rotate_half: bool,
 ) -> HostResult<FusedLibraryDispatchReceipt> {
+    let mut bind = finalize_fused_bind(plan, packed_formats)?;
+    bind.rotate_half = rotate_half;
     let position = plan
         .cursor
         .map(|cursor| fused_cursor_position(runtime, buffers, cursor))
         .transpose()?
         .unwrap_or(0);
     let output_offset = position
-        .checked_mul(plan.bind.head_dim)
+        .checked_mul(bind.head_dim)
         .and_then(|elements| elements.checked_mul(4))
         .ok_or_else(|| HostError::invalid_args("fused library cursor output offset overflows"))?;
     let output_views = [
@@ -864,8 +995,8 @@ fn dispatch_fused_qkv_plan(
     let request = FusedQkvDeviceDispatch {
         library_entry: "QkvProjection",
         derived_entry: entry,
-        decode_gemv: u32::from(plan.bind.rows == 1),
-        bind: plan.bind,
+        decode_gemv: u32::from(bind.rows == 1),
+        bind,
         activation: resolve_fused_buffer(
             buffers,
             plan.activation,
@@ -919,6 +1050,82 @@ fn dispatch_fused_qkv_plan(
         outputs: output_views,
     };
     dispatch_fused_qkv_device(runtime, request)
+}
+
+/// Resolve the RoPE pairing for this session's fused QKV bodies.
+///
+/// The descriptor wire does not carry the rotate-half fact to the host (it
+/// is baked into the compiled carrier MSL on the producer side), so the
+/// pairing is learned once per session from the program's own artifact: the
+/// compiled carrier launch publishes a reference Q with the correct pairing,
+/// and the library body is probed under both pairings until its Q matches.
+/// The winning probe's writes are left in the Q/K/V targets, so the winner's
+/// dispatch is already live; a pairing that matches nothing fails closed.
+fn fused_rotate_half(
+    runtime: &mut DeviceRuntime,
+    module_handle: &DeviceHandle,
+    kernel: &SessionKernel,
+    plan: &FusedQkvPlan,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    packed_formats: &BTreeMap<u32, PackedStorageFormat>,
+    learned: &std::cell::RefCell<Option<bool>>,
+) -> HostResult<bool> {
+    if plan.rope.is_none() {
+        return Ok(false);
+    }
+    if let Some(value) = *learned.borrow() {
+        return Ok(value);
+    }
+    let launch_buffers: Vec<DeviceHandle> = kernel
+        .slots
+        .iter()
+        .map(|slot| {
+            buffers
+                .get(&(slot.buffer_id, slot.version))
+                .copied()
+                .ok_or_else(|| HostError::internal("session buffer disappeared during launch"))
+        })
+        .collect::<HostResult<_>>()?;
+    runtime.launch_kernel(
+        module_handle,
+        &kernel.entry,
+        &launch_buffers,
+        kernel.grid,
+        kernel.block,
+    )?;
+    runtime.sync()?;
+    let q_handle = buffers
+        .get(&plan.outputs[0].key)
+        .ok_or_else(|| HostError::internal("fused library buffer disappeared during launch"))?;
+    let reference = runtime.readback_f32(q_handle)?;
+    let scale = reference
+        .iter()
+        .fold(0.0f32, |acc, value| acc.max(value.abs()))
+        .max(1.0);
+    for candidate in [false, true] {
+        dispatch_fused_qkv_plan(
+            runtime,
+            buffers,
+            packed_formats,
+            &kernel.entry,
+            plan,
+            candidate,
+        )?;
+        runtime.sync()?;
+        let probe = runtime.readback_f32(q_handle)?;
+        let delta = probe
+            .iter()
+            .zip(&reference)
+            .map(|(value, expected)| (value - expected).abs())
+            .fold(0.0f32, f32::max);
+        if delta <= 1.0e-3 * scale {
+            *learned.borrow_mut() = Some(candidate);
+            return Ok(candidate);
+        }
+    }
+    Err(HostError::invalid_args(
+        "fused QKV library body matched neither RoPE pairing against the compiled carrier Q",
+    ))
 }
 
 impl<'host> ProgramSession<'host> {
@@ -1111,6 +1318,7 @@ impl<'host> ProgramSession<'host> {
                 intermediate_pool: IntermediateBufferPool::default(),
                 buffer_meta,
                 packed_formats: BTreeMap::new(),
+                fused_rotate_half: std::cell::RefCell::new(None),
                 kernels,
                 launches,
                 data_flow: descriptor
@@ -1946,12 +2154,22 @@ impl<'host> ProgramSession<'host> {
                 // The carrier entry publishes Q only. Route the derived
                 // library entry through its owning body instead, keeping the
                 // extra K/V resources as explicit output targets.
+                let rotate_half = fused_rotate_half(
+                    self.runtime,
+                    &self.inner.module_handle,
+                    kernel,
+                    plan,
+                    &self.inner.buffers,
+                    &self.inner.packed_formats,
+                    &self.inner.fused_rotate_half,
+                )?;
                 fused_library_dispatches.push(dispatch_fused_qkv_plan(
                     self.runtime,
                     &self.inner.buffers,
                     &self.inner.packed_formats,
                     &kernel.entry,
                     plan,
+                    rotate_half,
                 )?);
             } else {
                 self.runtime.launch_kernel(
@@ -3215,4 +3433,189 @@ fn allocation_handle(
                 "launch binding names allocation {allocation_id} with no live handle"
             ))
         })
+}
+
+#[cfg(test)]
+mod fused_qkv_plan_tests {
+    use super::*;
+
+    fn slot(
+        buffer_id: u32,
+        name: &str,
+        role: DeviceBufferRole,
+        binding: u32,
+        element_count: u64,
+    ) -> SessionSlot {
+        SessionSlot {
+            buffer_id,
+            version: 1,
+            buffer_name: name.to_owned(),
+            role,
+            binding,
+            element_ty: DeviceDataType::F32,
+            element_count,
+        }
+    }
+
+    fn norm_meta(name: &str, element_count: u64) -> (BufferKey, SessionBufferMeta) {
+        (
+            (9_000, 1),
+            SessionBufferMeta {
+                name: name.to_owned(),
+                semantic_value: 0,
+                role: DeviceBufferRole::Input,
+                element_ty: DeviceDataType::F32,
+                element_count,
+                byte_length: element_count * 4,
+                lifetime: DeviceBufferLifetime::PerProgram,
+                initialization: DeviceBufferInitialization::HostProvided,
+            },
+        )
+    }
+
+    /// Qwen2.5-0.5B prefill layer-0 fused QKV slots, captured from the live
+    /// descriptor (PB-6 slot dump): packed weights typed as f32 words
+    /// (byte length / 4), capacity-sized persistent K/V targets, all biases.
+    #[test]
+    fn qwen_prefill_cache_targets_finalize_grouped_bind() {
+        let slots = vec![
+            slot(344, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 15_232),
+            slot(57, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 137_984),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 544),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 544),
+            slot(60, "blk.0.attn_q.bias", DeviceBufferRole::Input, 4, 896),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 5, 4),
+            slot(345, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 6, 15_232),
+            slot(58, "blk.0.attn_k.weight", DeviceBufferRole::Input, 7, 19_712),
+            slot(59, "blk.0.attn_v.weight", DeviceBufferRole::Input, 8, 30_464),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 9, 1_048_576),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 10, 1_048_576),
+            slot(61, "blk.0.attn_k.bias", DeviceBufferRole::Input, 11, 128),
+            slot(62, "blk.0.attn_v.bias", DeviceBufferRole::Input, 12, 128),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 896).0, norm_meta("blk.0.attn_norm.weight", 896).1);
+        let plan = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            [238, 1, 1],
+        )
+        .expect("qwen prefill plan builds against capacity-sized cache targets");
+        assert_eq!(plan.rows, 17);
+        assert_eq!(plan.hidden, 896);
+        assert_eq!(plan.q_width, 896);
+        assert_eq!(plan.head_dim, 64);
+        assert!(plan.kv_cache_target);
+        let mut packed = BTreeMap::new();
+        packed.insert(57, PackedStorageFormat::Q5_0);
+        packed.insert(58, PackedStorageFormat::Q5_0);
+        packed.insert(59, PackedStorageFormat::Q8_0);
+        let bind = finalize_fused_bind(&plan, &packed).expect("qwen bind finalizes");
+        assert_eq!(bind.kv_heads, 2);
+        assert_eq!(bind.q_per_kv, 7);
+        assert_eq!(bind.kv_output_strides, [8192 * 64, 64, 1]);
+        assert_eq!(bind.rotate_half, false);
+    }
+
+    /// SmolLM2-360M prefill layer-0 fused QKV slots (captured): no biases,
+    /// packed Q5_0/Q8_0 weights — the KV width resolves from the uploaded
+    /// packed byte extents, never from the capacity-sized cache count.
+    #[test]
+    fn smol_prefill_packed_cache_targets_resolve_kv_width_from_bytes() {
+        let slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 8_640),
+            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 288),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 288),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 4, 4),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 8_640),
+            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
+            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        let plan = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            [135, 1, 1],
+        )
+        .expect("smol prefill plan builds without biases");
+        assert_eq!(plan.rows, 9);
+        assert_eq!(plan.head_dim, 64);
+        let mut packed = BTreeMap::new();
+        packed.insert(73, PackedStorageFormat::Q5_0);
+        packed.insert(74, PackedStorageFormat::Q5_0);
+        packed.insert(75, PackedStorageFormat::Q8_0);
+        let bind = finalize_fused_bind(&plan, &packed).expect("smol bind finalizes from bytes");
+        assert_eq!(bind.kv_heads, 5);
+        assert_eq!(bind.q_per_kv, 3);
+        assert_eq!(bind.kv_output_strides, [8192 * 64, 64, 1]);
+    }
+
+    /// SmolLM2 repeating decode session (captured): rows 10 divides the
+    /// capacity-sized cache count evenly — the cache target must never be
+    /// mistaken for a rows-sized `.k_gemv` output.
+    #[test]
+    fn smol_decode_cache_count_divisible_by_rows_still_resolves_from_bytes() {
+        let slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 9_600),
+            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 320),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 320),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 4, 4),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 9_600),
+            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
+            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        let plan = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            [150, 1, 1],
+        )
+        .expect("smol decode plan builds");
+        assert_eq!(plan.rows, 10);
+        let mut packed = BTreeMap::new();
+        packed.insert(73, PackedStorageFormat::Q5_0);
+        packed.insert(74, PackedStorageFormat::Q5_0);
+        packed.insert(75, PackedStorageFormat::Q8_0);
+        let bind = finalize_fused_bind(&plan, &packed).expect("smol decode bind finalizes");
+        assert_eq!(bind.kv_heads, 5);
+        assert_eq!(bind.q_per_kv, 3);
+    }
+
+    /// A fused plan with no resolvable KV width (packed cache target, no
+    /// bias, no uploaded format fact) fails closed instead of guessing.
+    #[test]
+    fn unresolvable_kv_width_fails_closed() {
+        let slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 8_640),
+            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 288),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 288),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 8_640),
+            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
+            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        let plan = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            [135, 1, 1],
+        )
+        .expect("plan builds; resolution is a dispatch-time fact");
+        assert!(finalize_fused_bind(&plan, &BTreeMap::new()).is_err());
+    }
 }
