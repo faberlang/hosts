@@ -13,7 +13,7 @@ use crate::device_descriptor::{
     errors as descriptor_errors, fnv1a64, DescriptorAllocation, DescriptorInvocationState,
     DescriptorLaunchBinding, DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization,
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
-    DeviceProgramLifetime, KvCacheDescriptor, E_DEVICE_DESCRIPTOR,
+    DeviceProgramLifetime, KvCacheDescriptor, PackedStorageFormat, E_DEVICE_DESCRIPTOR,
 };
 use crate::device_host::{
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
@@ -192,6 +192,9 @@ pub struct DeviceByteBuffer {
     pub bytes: Vec<u8>,
     /// Dtype tag carried to the neutral device transfer surface.
     pub dtype: DeviceDataType,
+    /// GGML block/pack geometry for a native packed region. `None` is retained
+    /// for generic byte inputs and remains unknown to fused bodies.
+    pub packed_format: Option<PackedStorageFormat>,
 }
 
 /// Per-version metadata captured at session creation for input validation,
@@ -337,6 +340,9 @@ pub(crate) struct ProgramInner {
     buffers: BTreeMap<BufferKey, DeviceHandle>,
     intermediate_pool: IntermediateBufferPool,
     buffer_meta: BTreeMap<BufferKey, SessionBufferMeta>,
+    /// Packed GGML facts attached to uploaded weight ids. These are upload
+    /// facts, not guesses from the padded device allocation width.
+    packed_formats: BTreeMap<u32, PackedStorageFormat>,
     kernels: Vec<SessionKernel>,
     launches: Vec<SessionLaunch>,
     data_flow: Vec<DataFlowEdge>,
@@ -636,14 +642,13 @@ fn fused_slot(
         })
 }
 
-/// Recognize the dense QKV carrier from its explicit resource facts.
+/// Recognize the fused QKV carrier from its explicit resource facts.
 ///
 /// The descriptor carries resource names, dtypes, counts, and binding
-/// indices, but not a second host-side QKV schema. This builder admits only
-/// the fully typed f32 shape where those facts determine one unambiguous
-/// grouped bind. Packed resources remain on their target-owned carrier until
-/// the wire carries their format facts; no packed layout is guessed from a
-/// byte length.
+/// indices, but not a second host-side QKV schema. The output and activation
+/// extents determine the grouped bind; packed weight byte widths are never
+/// mistaken for logical matrix elements. Their GGML format arrives with the
+/// uploaded weight fact and the bridge fails closed when it is absent.
 fn build_fused_qkv_plan(
     entry: &str,
     slots: &[SessionSlot],
@@ -657,13 +662,16 @@ fn build_fused_qkv_plan(
         slot.buffer_name.ends_with(".a") && slot.element_ty == DeviceDataType::F32
     })?;
     let q_weight = fused_slot(slots, |slot| {
-        slot.buffer_name.ends_with(".attn_q.weight") && slot.element_ty == DeviceDataType::F32
+        slot.buffer_name.ends_with(".attn_q.weight")
+            && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
     })?;
     let k_weight = fused_slot(slots, |slot| {
-        slot.buffer_name.ends_with(".attn_k.weight") && slot.element_ty == DeviceDataType::F32
+        slot.buffer_name.ends_with(".attn_k.weight")
+            && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
     })?;
     let v_weight = fused_slot(slots, |slot| {
-        slot.buffer_name.ends_with(".attn_v.weight") && slot.element_ty == DeviceDataType::F32
+        slot.buffer_name.ends_with(".attn_v.weight")
+            && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
     })?;
     let q_output = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".q_gemv") && slot.element_ty == DeviceDataType::F32
@@ -706,30 +714,25 @@ fn build_fused_qkv_plan(
         .find(|meta| meta.name.ends_with(".attn_norm.weight"))
         .filter(|meta| meta.element_ty == DeviceDataType::F32)
         .map(|meta| meta.element_count)?;
-    if hidden == 0
-        || activation.element_count % hidden != 0
-        || q_weight.element_count % hidden != 0
-        || k_weight.element_count % hidden != 0
-        || v_weight.element_count != k_weight.element_count
-    {
+    if hidden == 0 || activation.element_count % hidden != 0 {
         return None;
     }
     let rows = activation.element_count / hidden;
-    let q_width = q_weight.element_count / hidden;
-    let kv_width = k_weight.element_count / hidden;
+    let q_width = q_output.element_count / rows.max(1);
+    let kv_width = k_output.element_count / rows.max(1);
     if rows == 0
         || q_width == 0
         || kv_width == 0
-        || q_output.element_count != rows.saturating_mul(q_width)
-        || q_width % kv_width != 0
-        || q_output
-            .element_count
-            .saturating_mul(q_weight.element_count)
-            != activation
-                .element_count
-                .saturating_mul(q_width)
-                .saturating_mul(q_width)
+        || q_width.saturating_mul(rows) != q_output.element_count
+        || kv_width.saturating_mul(rows) > k_output.element_count
+        || kv_width.saturating_mul(rows) > v_output.element_count
+        || k_output.element_count != v_output.element_count
+        || k_weight.element_count == 0
+        || v_weight.element_count == 0
     {
+        return None;
+    }
+    if q_width % kv_width != 0 {
         return None;
     }
     let head_dim = cos.zip(sin).and_then(|(cos, _)| {
@@ -769,6 +772,7 @@ fn resolve_fused_buffer(
     slot: FusedQkvSlot,
     byte_offset: u64,
     view_span: u64,
+    packed_format: Option<PackedStorageFormat>,
 ) -> HostResult<FusedLibraryDeviceBuffer<'_>> {
     let handle = buffers
         .get(&slot.key)
@@ -791,6 +795,7 @@ fn resolve_fused_buffer(
         byte_offset,
         view_span,
         binding_index: slot.binding,
+        packed_format,
     })
 }
 
@@ -814,6 +819,7 @@ fn fused_cursor_position(
 fn dispatch_fused_qkv_plan(
     runtime: &mut DeviceRuntime,
     buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    packed_formats: &BTreeMap<u32, PackedStorageFormat>,
     entry: &str,
     plan: &FusedQkvPlan,
 ) -> HostResult<FusedLibraryDispatchReceipt> {
@@ -832,6 +838,7 @@ fn dispatch_fused_qkv_plan(
             plan.outputs[0],
             0,
             plan.outputs[0].element_count.saturating_mul(4),
+            None,
         )?,
         resolve_fused_buffer(
             buffers,
@@ -841,6 +848,7 @@ fn dispatch_fused_qkv_plan(
                 .element_count
                 .saturating_mul(4)
                 .saturating_sub(output_offset),
+            None,
         )?,
         resolve_fused_buffer(
             buffers,
@@ -850,6 +858,7 @@ fn dispatch_fused_qkv_plan(
                 .element_count
                 .saturating_mul(4)
                 .saturating_sub(output_offset),
+            None,
         )?,
     ];
     let request = FusedQkvDeviceDispatch {
@@ -862,6 +871,7 @@ fn dispatch_fused_qkv_plan(
             plan.activation,
             0,
             plan.activation.element_count.saturating_mul(4),
+            None,
         )?,
         weights: [
             resolve_fused_buffer(
@@ -869,37 +879,40 @@ fn dispatch_fused_qkv_plan(
                 plan.weights[0],
                 0,
                 plan.weights[0].element_count.saturating_mul(4),
+                packed_formats.get(&plan.weights[0].key.0).copied(),
             )?,
             resolve_fused_buffer(
                 buffers,
                 plan.weights[1],
                 0,
                 plan.weights[1].element_count.saturating_mul(4),
+                packed_formats.get(&plan.weights[1].key.0).copied(),
             )?,
             resolve_fused_buffer(
                 buffers,
                 plan.weights[2],
                 0,
                 plan.weights[2].element_count.saturating_mul(4),
+                packed_formats.get(&plan.weights[2].key.0).copied(),
             )?,
         ],
         biases: [
             plan.biases[0]
-                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4, None))
                 .transpose()?,
             plan.biases[1]
-                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4, None))
                 .transpose()?,
             plan.biases[2]
-                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4))
+                .map(|slot| resolve_fused_buffer(buffers, slot, 0, slot.element_count * 4, None))
                 .transpose()?,
         ],
         rope: plan
             .rope
             .map(|(cos, sin)| {
                 Ok((
-                    resolve_fused_buffer(buffers, cos, 0, cos.element_count * 4)?,
-                    resolve_fused_buffer(buffers, sin, 0, sin.element_count * 4)?,
+                    resolve_fused_buffer(buffers, cos, 0, cos.element_count * 4, None)?,
+                    resolve_fused_buffer(buffers, sin, 0, sin.element_count * 4, None)?,
                 ))
             })
             .transpose()?,
@@ -1097,6 +1110,7 @@ impl<'host> ProgramSession<'host> {
                 buffers,
                 intermediate_pool: IntermediateBufferPool::default(),
                 buffer_meta,
+                packed_formats: BTreeMap::new(),
                 kernels,
                 launches,
                 data_flow: descriptor
@@ -1220,6 +1234,9 @@ impl<'host> ProgramSession<'host> {
         let mut uploaded = BTreeSet::new();
         for (id, input) in weights {
             let key = self.weight_key(*id)?;
+            if let Some(format) = input.packed_format {
+                self.inner.packed_formats.insert(*id, format);
+            }
             if self.inner.shared_keys.contains(&key) {
                 uploaded.insert(*id);
                 continue;
@@ -1932,6 +1949,7 @@ impl<'host> ProgramSession<'host> {
                 fused_library_dispatches.push(dispatch_fused_qkv_plan(
                     self.runtime,
                     &self.inner.buffers,
+                    &self.inner.packed_formats,
                     &kernel.entry,
                     plan,
                 )?);

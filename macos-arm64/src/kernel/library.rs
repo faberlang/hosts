@@ -703,9 +703,8 @@ impl QkvProjectionBind {
         self.kv_heads
             .checked_mul(self.q_per_kv)
             .and_then(|heads| heads.checked_mul(self.head_dim))
-            .filter(|width| *width == self.hidden)
-            .ok_or(KernelBodyError::ShapeMismatch(
-                "QKV hidden width does not equal kv_heads * q_per_kv * head_dim",
+            .ok_or(KernelBodyError::InvalidBind(
+                "QKV output width overflows the element index",
             ))?;
         self.rows
             .checked_sub(1)

@@ -59,7 +59,7 @@ use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
     DescriptorKernel, DescriptorLaunch, DescriptorResult, DeviceBufferInitialization,
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
-    DeviceProgramLifetime,
+    DeviceProgramLifetime, PackedStorageFormat,
 };
 use crate::device_host::DeviceSession;
 use crate::distributed_translate::{
@@ -1528,6 +1528,7 @@ pub fn inputs_from_json(bytes: &[u8]) -> HostResult<WeightInputs> {
                     DeviceByteBuffer {
                         bytes: payload,
                         dtype,
+                        packed_format: None,
                     },
                 );
             }
@@ -1656,6 +1657,7 @@ pub fn inputs_from_gguf(
             DeviceByteBuffer {
                 bytes: slice.to_vec(),
                 dtype: DeviceDataType::U8,
+                packed_format: packed_format_for_range(gguf, range)?,
             },
         );
     }
@@ -1671,6 +1673,100 @@ fn validate_packed_range(id: u32, range: &WeightFileRange) -> HostResult<()> {
         )));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GgufTensorFact {
+    relative_offset: u64,
+    logical_elements: u64,
+    format: PackedStorageFormat,
+}
+
+/// Read the GGUF tensor format fact for one exact mapped region. Raw fixture
+/// files intentionally return `None`; a real GGUF with an unrepresentable
+/// type or a range that does not name one tensor fails closed.
+fn packed_format_for_range(
+    bytes: &[u8],
+    range: &WeightFileRange,
+) -> HostResult<Option<PackedStorageFormat>> {
+    let Some(data_start) = gguf_data_start(bytes)? else {
+        return Ok(None);
+    };
+    if bytes.len() < 24 || &bytes[..4] != b"GGUF" {
+        return Ok(None);
+    }
+    let n_tensors = read_u64_at(bytes, 8, "GGUF tensor count")?;
+    let n_kv = read_u64_at(bytes, 16, "GGUF metadata count")?;
+    if n_tensors == 0 {
+        return Ok(None);
+    }
+    let mut off = 24usize;
+    for _ in 0..n_kv {
+        off = skip_gguf_kv(bytes, off)?;
+    }
+    let mut facts = Vec::with_capacity(usize::try_from(n_tensors).unwrap_or(0));
+    for _ in 0..n_tensors {
+        let after_name = skip_gguf_string(bytes, off)?;
+        let ndims = read_u32_at(bytes, after_name, "GGUF tensor rank")?;
+        let mut next = after_name + 4;
+        let mut logical_elements = 1u64;
+        for _ in 0..ndims {
+            let dim = read_u64_at(bytes, next, "GGUF tensor dimension")?;
+            logical_elements = logical_elements.checked_mul(dim).ok_or_else(|| {
+                HostError::invalid_args("device-execute GGUF tensor element count overflows")
+            })?;
+            next += 8;
+        }
+        let type_id = read_u32_at(bytes, next, "GGUF tensor type")?;
+        next += 4;
+        let relative_offset = read_u64_at(bytes, next, "GGUF tensor offset")?;
+        next += 8;
+        let format = PackedStorageFormat::from_ggml_type_id(type_id).ok_or_else(|| {
+            HostError::invalid_args(format!(
+                "device-execute GGUF tensor type id {type_id} is outside the admitted packed-format surface"
+            ))
+        })?;
+        facts.push(GgufTensorFact {
+            relative_offset,
+            logical_elements,
+            format,
+        });
+        off = next;
+    }
+    for fact in facts {
+        let absolute_offset = data_start
+            .checked_add(fact.relative_offset)
+            .ok_or_else(|| {
+                HostError::invalid_args("device-execute GGUF tensor offset overflows")
+            })?;
+        if absolute_offset != range.offset {
+            continue;
+        }
+        let expected = fact
+            .format
+            .packed_bytes_for_elements(fact.logical_elements)
+            .ok_or_else(|| {
+                HostError::invalid_args(format!(
+                    "device-execute GGUF tensor at offset {} has partial {} block geometry",
+                    range.offset,
+                    fact.format.spelling()
+                ))
+            })?;
+        if expected != range.len {
+            return Err(HostError::invalid_args(format!(
+                "device-execute GGUF range at offset {} has {} bytes, but {} geometry requires {}",
+                range.offset,
+                range.len,
+                fact.format.spelling(),
+                expected
+            )));
+        }
+        return Ok(Some(fact.format));
+    }
+    Err(HostError::invalid_args(format!(
+        "device-execute GGUF weight range at offset {} does not name a tensor",
+        range.offset
+    )))
 }
 
 /// Gradus region table: `data_start` plus the admitted `abs_starts` /
@@ -1727,7 +1823,12 @@ impl WeightInputs {
         self.bytes.insert(id, values);
     }
 
-    fn insert_bytes_aliased(&mut self, id: u32, bytes: &[u8]) {
+    fn insert_bytes_aliased(
+        &mut self,
+        id: u32,
+        bytes: &[u8],
+        packed_format: Option<PackedStorageFormat>,
+    ) {
         let values =
             unsafe { Vec::from_raw_parts(bytes.as_ptr() as *mut u8, bytes.len(), bytes.len()) };
         self.bytes.insert(
@@ -1735,6 +1836,7 @@ impl WeightInputs {
             DeviceByteBuffer {
                 bytes: values,
                 dtype: DeviceDataType::U8,
+                packed_format,
             },
         );
         self.aliased_bytes.insert(id);
@@ -1831,7 +1933,8 @@ pub fn inputs_from_mapped_gguf(
             ))
         })?;
         validate_packed_range(*id, range)?;
-        inputs.insert_bytes_aliased(*id, slice);
+        let packed_format = packed_format_for_range(bytes, range)?;
+        inputs.insert_bytes_aliased(*id, slice, packed_format);
     }
     Ok(inputs)
 }
@@ -2659,6 +2762,35 @@ mod tests {
             launch_gpu_us: Vec::new(),
             launch_gpu_start_us: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gguf_weight_ingress_carries_q8_block_geometry() {
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&1u64.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        gguf.extend_from_slice(&1u64.to_le_bytes());
+        gguf.extend_from_slice(b"q");
+        gguf.extend_from_slice(&1u32.to_le_bytes());
+        gguf.extend_from_slice(&32u64.to_le_bytes());
+        gguf.extend_from_slice(&8u32.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        gguf.resize(64, 0);
+        gguf.extend(std::iter::repeat_n(0u8, 34));
+        let map = BTreeMap::from([(
+            7,
+            WeightFileRange {
+                offset: 64,
+                len: 34,
+                elems: 9,
+            },
+        )]);
+        let inputs = inputs_from_gguf(&gguf, &map).expect("admit GGUF bytes");
+        assert_eq!(
+            inputs.byte_map()[&7].packed_format,
+            Some(PackedStorageFormat::Q8_0)
+        );
     }
 
     #[test]

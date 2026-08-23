@@ -385,6 +385,7 @@ fn prepared_session_accepts_raw_weight_bytes_on_both_fake_backends() {
         DeviceByteBuffer {
             bytes,
             dtype: DeviceDataType::U8,
+            packed_format: None,
         },
     )]);
 

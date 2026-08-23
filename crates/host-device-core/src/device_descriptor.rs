@@ -167,6 +167,137 @@ impl DeviceDataType {
     }
 }
 
+/// GGML storage format carried alongside a native packed weight region.
+///
+/// This mirrors radix's `PackedStorageLayout` geometry at the host boundary.
+/// The type id and block facts are carried rather than inferred from a byte
+/// length, so an unknown or unsupported format remains fail-closed.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PackedStorageFormat {
+    /// Plain f32 storage.
+    F32,
+    /// Native IEEE binary16 storage.
+    F16,
+    /// Native bfloat16 storage.
+    Bf16,
+    /// GGML Q8_0: 32 elements / 34 bytes.
+    Q8_0,
+    /// GGML Q4_K: 256 elements / 144 bytes.
+    Q4_K,
+    /// GGML Q5_K: 256 elements / 176 bytes.
+    Q5_K,
+    /// GGML Q6_K: 256 elements / 210 bytes.
+    Q6_K,
+    /// GGML Q5_0: 32 elements / 22 bytes.
+    Q5_0,
+    /// MXFP4: 32 elements / 17 bytes.
+    MXFP4,
+}
+
+impl PackedStorageFormat {
+    /// GGML type id used on the radix device ABI.
+    #[must_use]
+    pub const fn ggml_type_id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q5_0 => 6,
+            Self::Q8_0 => 8,
+            Self::Q4_K => 12,
+            Self::Q5_K => 13,
+            Self::Q6_K => 14,
+            Self::Bf16 => 30,
+            Self::MXFP4 => 39,
+        }
+    }
+
+    /// Resolve the closed radix GGML type-id set.
+    #[must_use]
+    pub const fn from_ggml_type_id(id: u32) -> Option<Self> {
+        match id {
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
+            6 => Some(Self::Q5_0),
+            8 => Some(Self::Q8_0),
+            12 => Some(Self::Q4_K),
+            13 => Some(Self::Q5_K),
+            14 => Some(Self::Q6_K),
+            30 => Some(Self::Bf16),
+            39 => Some(Self::MXFP4),
+            _ => None,
+        }
+    }
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
+            Self::Q8_0 => "Q8_0",
+            Self::Q4_K => "Q4_K",
+            Self::Q5_K => "Q5_K",
+            Self::Q6_K => "Q6_K",
+            Self::Q5_0 => "Q5_0",
+            Self::MXFP4 => "MXFP4",
+        }
+    }
+
+    /// Parse a stable spelling from the descriptor/weight surface.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "F32" => Some(Self::F32),
+            "F16" => Some(Self::F16),
+            "BF16" => Some(Self::Bf16),
+            "Q8_0" => Some(Self::Q8_0),
+            "Q4_K" => Some(Self::Q4_K),
+            "Q5_K" => Some(Self::Q5_K),
+            "Q6_K" => Some(Self::Q6_K),
+            "Q5_0" => Some(Self::Q5_0),
+            "MXFP4" => Some(Self::MXFP4),
+            _ => None,
+        }
+    }
+
+    /// Logical elements covered by one stored block.
+    #[must_use]
+    pub const fn block_elements(self) -> u32 {
+        match self {
+            Self::F32 | Self::F16 | Self::Bf16 => 1,
+            Self::Q8_0 | Self::Q5_0 | Self::MXFP4 => 32,
+            Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
+        }
+    }
+
+    /// Bytes occupied by one stored block.
+    #[must_use]
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+            Self::Q8_0 => 34,
+            Self::Q4_K => 144,
+            Self::Q5_K => 176,
+            Self::Q6_K => 210,
+            Self::Q5_0 => 22,
+            Self::MXFP4 => 17,
+        }
+    }
+
+    /// Exact packed byte extent, or `None` for a partial block.
+    #[must_use]
+    pub const fn packed_bytes_for_elements(self, logical_elements: u64) -> Option<u64> {
+        let elements = self.block_elements() as u64;
+        if !logical_elements.is_multiple_of(elements) {
+            return None;
+        }
+        (logical_elements / elements).checked_mul(self.block_bytes() as u64)
+    }
+}
+
 /// Slot role of a device buffer at a kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceBufferRole {

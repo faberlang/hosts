@@ -743,6 +743,7 @@ fn synthetic_moe_layer_plan_path_run_on_metal() {
             DeviceByteBuffer {
                 bytes: plan_path_router_packed(),
                 dtype: DeviceDataType::U8,
+                packed_format: None,
             },
         ),
         (
@@ -750,6 +751,7 @@ fn synthetic_moe_layer_plan_path_run_on_metal() {
             DeviceByteBuffer {
                 bytes: plan_path_expert_packed(),
                 dtype: DeviceDataType::U8,
+                packed_format: None,
             },
         ),
     ]);

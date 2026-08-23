@@ -672,6 +672,7 @@ fn synthetic_ssm_layer_prefill_and_decode_plan_path_run_on_metal() {
             DeviceByteBuffer {
                 bytes: kernel_bytes.clone(),
                 dtype: DeviceDataType::F32,
+                packed_format: None,
             },
         )]);
         let mut prepared = PreparedResidentSession::prepare_with_weight_bytes(

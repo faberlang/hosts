@@ -14,13 +14,14 @@
 use host_coordinator::DeviceHandle;
 use serde::{Deserialize, Serialize};
 
-use crate::device_descriptor::DeviceDataType;
+use crate::device_descriptor::{DeviceDataType, PackedStorageFormat};
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::kernel::HostResult;
 
 use super::library::{
     dispatch_selected, BindDescriptor, BindLayout, KernelBodyError, LibraryDispatch,
-    QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight,
+    QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight, QuantizedFormat,
+    QuantizedGemvBind,
 };
 
 /// Concrete dimensions baked into the fused Metal family module.
@@ -52,18 +53,17 @@ impl LibraryFamilyMslFacts {
                 "fused library Metal module has a zero dimension",
             ));
         }
-        let expected_hidden = self
-            .kv_heads
+        self.kv_heads
             .checked_mul(self.q_per_kv)
             .and_then(|heads| heads.checked_mul(self.head_dim))
             .ok_or(KernelBodyError::InvalidBind(
-                "fused library Metal module hidden width overflow",
+                "fused library Metal module Q width overflows",
             ))?;
-        if expected_hidden != self.hidden {
-            return Err(KernelBodyError::ShapeMismatch(
-                "fused library Metal module hidden width does not match GQA facts",
-            ));
-        }
+        self.kv_heads
+            .checked_mul(self.head_dim)
+            .ok_or(KernelBodyError::InvalidBind(
+                "fused library Metal module KV width overflows",
+            ))?;
         if !self.epsilon.is_finite() || self.epsilon <= 0.0 {
             return Err(KernelBodyError::InvalidEpsilon);
         }
@@ -234,6 +234,9 @@ pub struct FusedLibraryDeviceBuffer<'a> {
     pub view_span: u64,
     /// Explicit descriptor binding index.
     pub binding_index: u32,
+    /// GGML block/pack geometry for a packed view. Unknown formats remain
+    /// explicit so the CPU bridge can fail closed before reinterpretation.
+    pub packed_format: Option<PackedStorageFormat>,
 }
 
 /// A producer fact emitted when the owning fused body executes.
@@ -254,10 +257,11 @@ pub struct FusedLibraryDispatchReceipt {
 /// A fully bound CPU bridge for one derived QKV library entry.
 ///
 /// This is the production fallback for Metal modules whose carrier function
-/// only publishes Q.  The bridge reads the typed dense views, executes the
-/// same selected body used by the focused library tests, and uploads all
-/// three destinations.  Packed views are rejected here rather than silently
-/// reinterpreted as f32; their owner remains the target-specific carrier.
+/// only publishes Q. The bridge reads typed dense views and native packed
+/// views, executes the same selected body used by the focused library tests,
+/// and uploads all three destinations. Packed views require an admitted GGML
+/// format fact; absent or unsupported formats fail closed rather than being
+/// reinterpreted as f32.
 pub struct FusedQkvDeviceDispatch<'a> {
     /// Canonical library selection entry.
     pub library_entry: &'a str,
@@ -325,6 +329,64 @@ fn dense_view(
     Ok(values[start..end].to_vec())
 }
 
+fn packed_view(
+    runtime: &mut DeviceRuntime,
+    view: FusedLibraryDeviceBuffer<'_>,
+    label: &'static str,
+) -> HostResult<Vec<u8>> {
+    if view.dtype != DeviceDataType::U8 {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} requires u8, got {}",
+            view.dtype.spelling()
+        )));
+    }
+    if view.packed_format.is_none() {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} has no known GGML format"
+        )));
+    }
+    let values = runtime.readback_bytes(view.handle, DeviceDataType::U8)?;
+    let start = usize::try_from(view.byte_offset).map_err(|_| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} offset overflows host"
+        ))
+    })?;
+    let span = usize::try_from(view.view_span).map_err(|_| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} span overflows host"
+        ))
+    })?;
+    let end = start.checked_add(span).ok_or_else(|| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} view overflows host"
+        ))
+    })?;
+    if end > values.len() {
+        return Err(crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} view [{start}..{end}] exceeds {} bytes",
+            values.len()
+        )));
+    }
+    Ok(values[start..end].to_vec())
+}
+
+fn quantized_format(
+    view: FusedLibraryDeviceBuffer<'_>,
+    label: &'static str,
+) -> HostResult<QuantizedFormat> {
+    let format = view.packed_format.ok_or_else(|| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} has no known GGML format"
+        ))
+    })?;
+    QuantizedFormat::from_ggml_type_id(format.ggml_type_id()).ok_or_else(|| {
+        crate::kernel::HostError::invalid_args(format!(
+            "fused library packed {label} format {} is not servable by the CPU bridge",
+            format.spelling()
+        ))
+    })
+}
+
 /// Execute one fully bound fused QKV library body on the Metal session.
 ///
 /// The call is deliberately below the generic carrier launch: K/V output
@@ -342,10 +404,73 @@ pub fn dispatch_fused_qkv_device(
         ));
     }
     let activation = dense_view(runtime, request.activation, "activation")?;
-    let weights = [
-        dense_view(runtime, request.weights[0], "Q weight")?,
-        dense_view(runtime, request.weights[1], "K weight")?,
-        dense_view(runtime, request.weights[2], "V weight")?,
+    enum WeightStorage {
+        Dense(Vec<f32>),
+        Packed {
+            values: Vec<u8>,
+            format: QuantizedFormat,
+        },
+    }
+    let mut weight_storage = [
+        WeightStorage::Dense(Vec::new()),
+        WeightStorage::Dense(Vec::new()),
+        WeightStorage::Dense(Vec::new()),
+    ];
+    for ((storage, view), label) in weight_storage
+        .iter_mut()
+        .zip(request.weights)
+        .zip(["Q weight", "K weight", "V weight"])
+    {
+        *storage = match view.dtype {
+            DeviceDataType::F32 => WeightStorage::Dense(dense_view(runtime, view, label)?),
+            DeviceDataType::U8 => WeightStorage::Packed {
+                values: packed_view(runtime, view, label)?,
+                format: quantized_format(view, label)?,
+            },
+            dtype => {
+                return Err(crate::kernel::HostError::invalid_args(format!(
+                    "fused library {label} requires f32 or packed u8, got {}",
+                    dtype.spelling()
+                )))
+            }
+        };
+    }
+    let q_width = request
+        .bind
+        .kv_heads
+        .checked_mul(request.bind.q_per_kv)
+        .and_then(|heads| heads.checked_mul(request.bind.head_dim))
+        .ok_or_else(|| crate::kernel::HostError::invalid_args("QKV Q width overflows"))?;
+    let kv_width = request
+        .bind
+        .kv_heads
+        .checked_mul(request.bind.head_dim)
+        .ok_or_else(|| crate::kernel::HostError::invalid_args("QKV KV width overflows"))?;
+    let packed_bind = |n: u64, format: QuantizedFormat| {
+        QuantizedGemvBind::decode(request.bind.hidden, n, format, request.bind.grid)
+    };
+    let weight_refs = [
+        match &weight_storage[0] {
+            WeightStorage::Dense(values) => QkvProjectionWeight::Dense(values),
+            WeightStorage::Packed { values, format } => QkvProjectionWeight::Quantized {
+                bind: packed_bind(q_width, *format),
+                packed: values,
+            },
+        },
+        match &weight_storage[1] {
+            WeightStorage::Dense(values) => QkvProjectionWeight::Dense(values),
+            WeightStorage::Packed { values, format } => QkvProjectionWeight::Quantized {
+                bind: packed_bind(kv_width, *format),
+                packed: values,
+            },
+        },
+        match &weight_storage[2] {
+            WeightStorage::Dense(values) => QkvProjectionWeight::Dense(values),
+            WeightStorage::Packed { values, format } => QkvProjectionWeight::Quantized {
+                bind: packed_bind(kv_width, *format),
+                packed: values,
+            },
+        },
     ];
     let biases = [
         request.biases[0]
@@ -370,11 +495,6 @@ pub fn dispatch_fused_qkv_device(
     let (mut q_output, q_start, q_end) = dense_storage(runtime, request.outputs[0], "Q output")?;
     let (mut k_output, k_start, k_end) = dense_storage(runtime, request.outputs[1], "K output")?;
     let (mut v_output, v_start, v_end) = dense_storage(runtime, request.outputs[2], "V output")?;
-    let weight_refs = [
-        QkvProjectionWeight::Dense(&weights[0]),
-        QkvProjectionWeight::Dense(&weights[1]),
-        QkvProjectionWeight::Dense(&weights[2]),
-    ];
     let bias_refs = [
         biases[0].as_deref(),
         biases[1].as_deref(),
@@ -471,8 +591,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_msl_rejects_gqa_width_drift() {
-        let error = library_family_msl(&LibraryFamilyMslFacts {
+    fn runtime_msl_admits_activation_width_distinct_from_q_width() {
+        let module = library_family_msl(&LibraryFamilyMslFacts {
             rows: 1,
             hidden: 8,
             kv_heads: 1,
@@ -480,11 +600,9 @@ mod tests {
             head_dim: 4,
             epsilon: 1.0e-5,
         })
-        .expect_err("hidden/GQA drift must fail closed");
-        assert!(matches!(
-            error,
-            KernelBodyError::ShapeMismatch(message) if message.contains("hidden width")
-        ));
+        .expect("activation width and Q width are independent facts");
+        assert!(module.contains("constant uint HIDDEN = 8u;"));
+        assert!(module.contains("constant uint Q_WIDTH = 4u;"));
     }
 
     #[test]
@@ -537,6 +655,7 @@ mod tests {
                 byte_offset: 0,
                 view_span: count * 4,
                 binding_index: binding,
+                packed_format: None,
             }
         }
 
@@ -612,5 +731,124 @@ mod tests {
             assert!(v_values.iter().all(|value| *value == hidden as f32 * 3.0));
             assert_eq!(runtime.backend(), DeviceBackend::Metal);
         }
+    }
+
+    #[test]
+    fn production_bridge_consumes_packed_qkv_views_with_explicit_format() {
+        use crate::device_host::DeviceRuntime;
+        use crate::metal_host::{FakeMetalDriver, MetalHostSession};
+        use host_coordinator::{DeviceBackend, DeviceHandle};
+
+        fn f32_view<'a>(
+            handle: &'a DeviceHandle,
+            count: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::F32,
+                byte_offset: 0,
+                view_span: count * 4,
+                binding_index: binding,
+                packed_format: None,
+            }
+        }
+
+        fn packed_view<'a>(
+            handle: &'a DeviceHandle,
+            bytes: u64,
+            binding: u32,
+        ) -> FusedLibraryDeviceBuffer<'a> {
+            FusedLibraryDeviceBuffer {
+                handle,
+                dtype: DeviceDataType::U8,
+                byte_offset: 0,
+                view_span: bytes,
+                binding_index: binding,
+                packed_format: Some(PackedStorageFormat::Q8_0),
+            }
+        }
+
+        fn q8_columns(value: u8, columns: usize) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(columns * 34);
+            for _ in 0..columns {
+                bytes.extend_from_slice(&[0x00, 0x3c]);
+                bytes.extend(std::iter::repeat_n(value, 32));
+            }
+            bytes
+        }
+
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
+                .expect("fake Metal admission"),
+        );
+        let hidden = 32u64;
+        let alloc_f32 = |runtime: &mut DeviceRuntime, values: &[f32]| {
+            let handle = runtime
+                .alloc_bytes(values.len() * 4)
+                .expect("allocate f32 bridge buffer");
+            runtime
+                .copy_in_f32(&handle, values)
+                .expect("initialize f32 bridge buffer");
+            handle
+        };
+        let alloc_bytes = |runtime: &mut DeviceRuntime, values: &[u8]| {
+            let handle = runtime
+                .alloc_bytes(values.len())
+                .expect("allocate packed bridge buffer");
+            runtime
+                .copy_in_bytes(&handle, values, DeviceDataType::U8)
+                .expect("initialize packed bridge buffer");
+            handle
+        };
+        let activation = alloc_f32(&mut runtime, &[1.0; 32]);
+        let q_weight_bytes = q8_columns(1, 32);
+        let k_weight_bytes = q8_columns(2, 32);
+        let v_weight_bytes = q8_columns(3, 32);
+        let q_weight = alloc_bytes(&mut runtime, &q_weight_bytes);
+        let k_weight = alloc_bytes(&mut runtime, &k_weight_bytes);
+        let v_weight = alloc_bytes(&mut runtime, &v_weight_bytes);
+        let q_output = alloc_f32(&mut runtime, &[0.0; 32]);
+        let k_output = alloc_f32(&mut runtime, &[0.0; 32]);
+        let v_output = alloc_f32(&mut runtime, &[0.0; 32]);
+
+        dispatch_fused_qkv_device(
+            &mut runtime,
+            FusedQkvDeviceDispatch {
+                library_entry: "QkvProjection",
+                derived_entry: "prefill_blk_0_QkvProjection",
+                decode_gemv: 1,
+                bind: QkvProjectionBind::grouped(1, hidden, 1, 1, 32, [32, 1, 1]),
+                activation: FusedLibraryDeviceBuffer {
+                    handle: &activation,
+                    dtype: DeviceDataType::F32,
+                    byte_offset: 0,
+                    view_span: hidden * 4,
+                    binding_index: 0,
+                    packed_format: None,
+                },
+                weights: [
+                    packed_view(&q_weight, q_weight_bytes.len() as u64, 1),
+                    packed_view(&k_weight, k_weight_bytes.len() as u64, 2),
+                    packed_view(&v_weight, v_weight_bytes.len() as u64, 3),
+                ],
+                biases: [None, None, None],
+                rope: None,
+                outputs: [
+                    f32_view(&q_output, hidden, 4),
+                    f32_view(&k_output, hidden, 5),
+                    f32_view(&v_output, hidden, 6),
+                ],
+            },
+        )
+        .expect("packed QKV bridge executes");
+
+        let q = runtime.readback_f32(&q_output).expect("read packed Q");
+        let k = runtime.readback_f32(&k_output).expect("read packed K");
+        let v = runtime.readback_f32(&v_output).expect("read packed V");
+        assert!(q.iter().all(|value| *value == 32.0));
+        assert!(k.iter().all(|value| *value == 64.0));
+        assert!(v.iter().all(|value| *value == 96.0));
+        assert_eq!(runtime.backend(), DeviceBackend::Metal);
     }
 }

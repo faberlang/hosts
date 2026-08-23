@@ -761,6 +761,7 @@ fn packed_weight_bytes_reach_session_buffers_on_both_fake_backends() {
         DeviceByteBuffer {
             bytes: packed,
             dtype: DeviceDataType::U8,
+            packed_format: None,
         },
     )]);
     let inputs = BTreeMap::from([(2, vec![0.0; 9])]);
