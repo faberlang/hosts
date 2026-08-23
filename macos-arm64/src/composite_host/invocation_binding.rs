@@ -75,11 +75,12 @@ fn invalid_args(message: impl Into<String>) -> HostError {
 ///
 /// Prefill emits the supplied prompt and the complete prompt-length RoPE
 /// table. Scalar decode emits one token, one RoPE row at the explicit absolute
-/// `position`, and the declared gather-index tables (`decode.q_prefix_ids` /
-/// `decode.kv_prefix_ids`) as `0..element_count`. Those ids address the
-/// GEMV-padded logical Q/K/V span, not the sequence cursor. The supplied
-/// prompt is ignored for decode, so a caller cannot accidentally upload a
-/// full prompt on a scalar step.
+/// `position`, the mandatory K/V gather-index table (`decode.kv_prefix_ids`)
+/// as `0..element_count`, and — only when the selected decode descriptor
+/// declares it — the Q gather-index table (`decode.q_prefix_ids`) the same
+/// way. Those ids address the GEMV-padded logical Q/K/V span, not the
+/// sequence cursor. The supplied prompt is ignored for decode, so a caller
+/// cannot accidentally upload a full prompt on a scalar step.
 ///
 /// # Errors
 /// Returns `E_INVALID_ARGS` for malformed cursor arithmetic, a mode/query-row
@@ -97,13 +98,7 @@ pub fn project_invocation_bindings(
 
     let required = match invocation.mode {
         DeviceExecuteInvocationMode::Prefill => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", ""],
-        DeviceExecuteInvocationMode::ScalarDecode => [
-            PROMPT_TOKENS,
-            ROPE_COS,
-            ROPE_SIN,
-            Q_PREFIX_IDS,
-            KV_PREFIX_IDS,
-        ],
+        DeviceExecuteInvocationMode::ScalarDecode => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", KV_PREFIX_IDS],
     };
     let required = required.into_iter().filter(|name| !name.is_empty());
     let inputs = declared_input_specs(descriptor, required)?;
@@ -156,12 +151,20 @@ pub fn project_invocation_bindings(
     }
 
     if invocation.mode == DeviceExecuteInvocationMode::ScalarDecode {
-        insert_checked(
-            &mut projected,
-            Q_PREFIX_IDS,
-            inputs.get(Q_PREFIX_IDS),
-            prefix_ids_for(inputs.get(Q_PREFIX_IDS), Q_PREFIX_IDS)?,
-        )?;
+        // The fused QKV library body owns the GQA gather through its own
+        // bind (q_per_kv), so the Q gather table is projected only when the
+        // selected decode descriptor still declares it — the emitter-route
+        // carrier reads it, the fused route does not. The K/V gather table
+        // stays mandatory: it is the fail-closed proof (1446b23) that the
+        // decode graph is a cache-append graph.
+        if let Some(q_prefix) = optional_input_spec(descriptor, Q_PREFIX_IDS)? {
+            insert_checked(
+                &mut projected,
+                Q_PREFIX_IDS,
+                Some(&q_prefix),
+                prefix_ids_for(Some(&q_prefix), Q_PREFIX_IDS)?,
+            )?;
+        }
         insert_checked(
             &mut projected,
             KV_PREFIX_IDS,
