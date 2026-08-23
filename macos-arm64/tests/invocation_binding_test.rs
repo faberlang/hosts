@@ -162,6 +162,31 @@ fn decode_prefix_ids_follow_declared_gather_width_not_sequence_len() {
 }
 
 #[test]
+fn decode_without_declared_q_prefix_ids_still_projects_the_fused_route() {
+    // The fused QKV library body owns the GQA gather through its own bind,
+    // so a decode descriptor without a kernel-level `decode.q_prefix_ids`
+    // slot (the fused-route graph) must still project; the K/V gather table
+    // remains mandatory on every decode descriptor.
+    let mut descriptor = descriptor(1, 4, None);
+    descriptor
+        .kernels[0]
+        .buffers
+        .push(input(5, KV_PREFIX_IDS, 4));
+    let invocation = decode_invocation(Some(42), 3, 3, 4);
+    let projected = project_invocation_bindings(&descriptor, &invocation, &[1, 2], ROPE)
+        .expect("fused-route decode projection without q prefix ids");
+    assert_eq!(
+        projected.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3, 5],
+        "no q prefix projection is emitted for an undeclared table"
+    );
+    assert_eq!(
+        bits(projected.get(&5).expect("kv prefix ids")),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[test]
 fn decode_rope_uses_absolute_position_not_step_count() {
     let descriptor = descriptor(1, 4, Some(18));
     let invocation = decode_invocation(Some(42), 17, 17, 18);
