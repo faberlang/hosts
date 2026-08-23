@@ -486,7 +486,10 @@ impl CompositeHost {
                 "composite host has no device session; a device descriptor cannot execute",
             )
         })?;
-        ProgramSession::new(runtime, descriptor, device_name)
+        // No authoritative attention axes on this generic single-program
+        // path: a `_QkvProjection` entry fails closed at plan recognition
+        // rather than degrading to the Q-only carrier (FQ-1).
+        ProgramSession::new(runtime, descriptor, device_name, None)
     }
 
     /// Prepare paired prefill and scalar-decode programs over one runtime and

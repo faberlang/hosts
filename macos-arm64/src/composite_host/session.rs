@@ -19,7 +19,7 @@ use crate::device_host::{
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
 };
 use crate::device_registry::DriverCounters;
-use crate::kernel::library::{QuantizedFormat, QkvProjectionBind};
+use crate::kernel::library::{QkvProjectionBind, QuantizedFormat};
 use crate::kernel::library_runtime::{
     dispatch_fused_qkv_device, dispatch_fused_residual_rms_device, FusedLibraryDeviceBuffer,
     FusedLibraryDispatchReceipt, FusedQkvDeviceDispatch, FusedResidualRmsDeviceDispatch,
@@ -155,7 +155,7 @@ struct FusedQkvPlan {
     hidden: u64,
     /// Logical Q output width (`q_heads * head_dim`).
     q_width: u64,
-    /// Elements in one attention head (from the RoPE table extent).
+    /// Elements in one attention head (the caller's carried producer fact).
     head_dim: u64,
     /// Backend-neutral launch grid carried into the bind.
     grid: [u32; 3],
@@ -683,54 +683,96 @@ fn fused_slot(
         })
 }
 
+/// Attention axes a fused QKV plan must be bound to, carried EXPLICITLY by
+/// the session's owner — the paired executor's validated RoPE facts, whose
+/// head_dim is the width of one row of the producer's own prefill RoPE
+/// table. The producer's declaration wins: the host must never reconstruct
+/// `head_dim` by dividing a RoPE buffer's total element count by the
+/// activation row count, because a persistent decode table is capacity-sized
+/// (8192 rows) while the M=1 activation has one row (FQ-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FusedAttentionAxes {
+    /// Attention head width in elements (from the model's RoPE row width).
+    pub head_dim: u64,
+}
+
 /// Recognize the fused QKV carrier from its explicit resource facts.
 ///
 /// The descriptor carries resource names, dtypes, counts, and binding
 /// indices, but not a second host-side QKV schema. This builder admits only
 /// the fully typed f32 shape where those facts determine one unambiguous
-/// invocation; the K/V output width itself is finalized at dispatch
-/// ([`finalize_fused_bind`]) because capacity-sized persistent K/V targets
-/// do not carry the per-row width in their element count. Packed weight
-/// byte widths are never mistaken for logical matrix elements. Their GGML
-/// format arrives with the uploaded weight fact and the bridge fails closed
-/// when it is absent.
+/// invocation; `head_dim` comes ONLY from the caller's carried
+/// [`FusedAttentionAxes`] (producer declaration wins). The K/V output width
+/// itself is finalized at dispatch ([`finalize_fused_bind`]) because
+/// capacity-sized persistent K/V targets do not carry the per-row width in
+/// their element count. Packed weight byte widths are never mistaken for
+/// logical matrix elements. Their GGML format arrives with the uploaded
+/// weight fact and the bridge fails closed when it is absent.
+///
+/// A `None` return means the entry is not a fused QKV carrier. An `Err`
+/// return is a recognized `_QkvProjection` entry that cannot form its fused
+/// plan: the Q-only carrier fallback would silently drop the K/V writes, so
+/// recognition failure is an ERROR, never a degradation (FQ-1 fail-closed).
 fn build_fused_qkv_plan(
     entry: &str,
     slots: &[SessionSlot],
     buffer_meta: &BTreeMap<BufferKey, SessionBufferMeta>,
+    axes: Option<FusedAttentionAxes>,
     grid: [u32; 3],
-) -> Option<FusedQkvPlan> {
+) -> HostResult<Option<FusedQkvPlan>> {
     if !entry.ends_with("_QkvProjection") {
-        return None;
+        return Ok(None);
+    }
+    let unresolvable = |fact: &str| {
+        HostError::invalid_args(format!(
+            "fused QkvProjection kernel `{entry}` has unresolvable {fact}"
+        ))
+    };
+    let Some(FusedAttentionAxes { head_dim }) = axes else {
+        return Err(HostError::invalid_args(format!(
+            "fused QkvProjection kernel `{entry}` has no authoritative attention axes: the session owner must carry head_dim explicitly; refusing rather than degrading to the Q-only carrier"
+        )));
+    };
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(unresolvable(
+            "attention head width (must be a nonzero even element count)",
+        ));
     }
     let activation = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".a") && slot.element_ty == DeviceDataType::F32
-    })?;
+    })
+    .ok_or_else(|| unresolvable("activation slot"))?;
     let q_weight = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".attn_q.weight")
             && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
-    })?;
+    })
+    .ok_or_else(|| unresolvable("q weight slot"))?;
     let k_weight = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".attn_k.weight")
             && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
-    })?;
+    })
+    .ok_or_else(|| unresolvable("k weight slot"))?;
     let v_weight = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".attn_v.weight")
             && matches!(slot.element_ty, DeviceDataType::F32 | DeviceDataType::U8)
-    })?;
+    })
+    .ok_or_else(|| unresolvable("v weight slot"))?;
     let q_output = fused_slot(slots, |slot| {
         slot.buffer_name.ends_with(".q_gemv") && slot.element_ty == DeviceDataType::F32
-    })?;
+    })
+    .ok_or_else(|| unresolvable("q output slot"))?;
     let k_output = fused_slot(slots, |slot| {
         (slot.buffer_name.starts_with("kv.cache_k.") || slot.buffer_name.ends_with(".k_gemv"))
             && slot.element_ty == DeviceDataType::F32
             && slot.role != DeviceBufferRole::Input
-    })?;
+    })
+    .ok_or_else(|| unresolvable("k output slot"))?;
     let v_output = fused_slot(slots, |slot| {
         (slot.buffer_name.starts_with("kv.cache_v.") || slot.buffer_name.ends_with(".v_gemv"))
             && slot.element_ty == DeviceDataType::F32
             && slot.role != DeviceBufferRole::Input
-    })?;
+    })
+    .ok_or_else(|| unresolvable("v output slot"))?;
     let cos = fused_slot(slots, |slot| {
         slot.buffer_name == "prefill.rope.cos" && slot.element_ty == DeviceDataType::F32
     });
@@ -738,7 +780,17 @@ fn build_fused_qkv_plan(
         slot.buffer_name == "prefill.rope.sin" && slot.element_ty == DeviceDataType::F32
     });
     if cos.is_some() != sin.is_some() {
-        return None;
+        return Err(unresolvable("rope pairing (cos without sin or vice versa)"));
+    }
+    // The RoPE tables are whole rows of head_dim/2 elements each — the row
+    // count is the producer's axis (seq for prefill, capacity for decode),
+    // never the activation row count.
+    if let Some((cos, _)) = cos.zip(sin) {
+        if cos.element_count == 0 || cos.element_count % (head_dim / 2) != 0 {
+            return Err(unresolvable(
+                "rope table shape (element count is not whole head_dim/2 rows)",
+            ));
+        }
     }
     let biases = [
         fused_slot(slots, |slot| {
@@ -752,15 +804,18 @@ fn build_fused_qkv_plan(
         }),
     ];
     if biases.iter().any(Option::is_some) && biases.iter().any(Option::is_none) {
-        return None;
+        return Err(unresolvable("bias set (some present, some absent)"));
     }
     let hidden = buffer_meta
         .values()
         .find(|meta| meta.name.ends_with(".attn_norm.weight"))
         .filter(|meta| meta.element_ty == DeviceDataType::F32)
-        .map(|meta| meta.element_count)?;
+        .map(|meta| meta.element_count)
+        .ok_or_else(|| unresolvable("hidden width (no attn_norm weight fact)"))?;
     if hidden == 0 || activation.element_count % hidden != 0 {
-        return None;
+        return Err(unresolvable(
+            "activation geometry (not whole hidden-width rows)",
+        ));
     }
     let rows = activation.element_count / hidden;
     if rows == 0
@@ -771,26 +826,22 @@ fn build_fused_qkv_plan(
         || k_weight.element_count == 0
         || v_weight.element_count == 0
     {
-        return None;
+        return Err(unresolvable("row/output geometry"));
     }
     let q_width = q_output.element_count / rows;
-    if q_width == 0 {
-        return None;
-    }
-    let head_dim = cos.zip(sin).and_then(|(cos, _)| {
-        (cos.element_count % rows == 0).then_some(cos.element_count / rows * 2)
-    })?;
-    if head_dim == 0 || q_width % head_dim != 0 {
-        return None;
+    if q_width == 0 || q_width % head_dim != 0 {
+        return Err(unresolvable(&format!(
+            "q width grouping (q_width {q_width} is not a whole multiple of head_dim {head_dim})"
+        )));
     }
     if k_output.key.eq(&v_output.key) || (k_output.binding == v_output.binding) {
-        return None;
+        return Err(unresolvable("k/v output separation"));
     }
     let kv_cache_target = slots.iter().any(|slot| {
         (slot.buffer_id, slot.version) == k_output.key
             && slot.buffer_name.starts_with("kv.cache_k.")
     });
-    Some(FusedQkvPlan {
+    Ok(Some(FusedQkvPlan {
         rows,
         hidden,
         q_width,
@@ -803,7 +854,7 @@ fn build_fused_qkv_plan(
         rope: cos.zip(sin),
         outputs: [q_output, k_output, v_output],
         cursor: fused_slot(slots, |slot| slot.buffer_name == "kv.invocation_state"),
-    })
+    }))
 }
 
 /// Parse the RMS epsilon from one compiled carrier kernel's MSL source.
@@ -857,8 +908,10 @@ fn build_fused_residual_rms_plan(
         ))
     };
     let f32_slot = |predicate: &dyn Fn(&SessionSlot) -> bool, label: &str| {
-        fused_slot(slots, |slot| predicate(slot) && slot.element_ty == DeviceDataType::F32)
-            .ok_or_else(|| unresolvable(label))
+        fused_slot(slots, |slot| {
+            predicate(slot) && slot.element_ty == DeviceDataType::F32
+        })
+        .ok_or_else(|| unresolvable(label))
     };
     let residual = f32_slot(&|slot| slot.buffer_name.ends_with(".h"), "residual slot")?;
     let skip = f32_slot(&|slot| slot.buffer_name.ends_with(".o"), "skip slot")?;
@@ -876,8 +929,8 @@ fn build_fused_residual_rms_plan(
         || skip.element_count != rows * hidden
         || output.element_count != rows * hidden
         || gamma.key.eq(&residual.key)
-            || gamma.key.eq(&skip.key)
-            || gamma.key.eq(&output.key)
+        || gamma.key.eq(&skip.key)
+        || gamma.key.eq(&output.key)
     {
         return Err(unresolvable("slot geometry"));
     }
@@ -1308,8 +1361,9 @@ impl<'host> ProgramSession<'host> {
         runtime: &'host mut DeviceRuntime,
         descriptor: &DeviceDescriptor,
         device_name: String,
+        attention_axes: Option<FusedAttentionAxes>,
     ) -> HostResult<Self> {
-        Self::new_with_share(runtime, descriptor, device_name, None)
+        Self::new_with_share(runtime, descriptor, device_name, None, attention_axes)
     }
 
     /// Prepare one program, optionally binding PerProgram weights/cache and
@@ -1319,6 +1373,7 @@ impl<'host> ProgramSession<'host> {
         descriptor: &DeviceDescriptor,
         device_name: String,
         share: Option<&SharedProgramOffer>,
+        attention_axes: Option<FusedAttentionAxes>,
     ) -> HostResult<Self> {
         if runtime.backend() != descriptor.backend {
             return Err(HostError {
@@ -1434,8 +1489,13 @@ impl<'host> ProgramSession<'host> {
                         element_count: slot.element_count,
                     });
                 }
-                let fused_qkv =
-                    build_fused_qkv_plan(&kernel.entry, &slots, &buffer_meta, kernel.grid);
+                let fused_qkv = build_fused_qkv_plan(
+                    &kernel.entry,
+                    &slots,
+                    &buffer_meta,
+                    attention_axes,
+                    kernel.grid,
+                )?;
                 let fused_residual_rms =
                     build_fused_residual_rms_plan(&kernel.entry, &slots, &descriptor.module_image)?;
                 kernels.push(SessionKernel {
@@ -2342,11 +2402,17 @@ impl<'host> ProgramSession<'host> {
                 // The carrier entry normalizes the residual stream only.
                 // Route the derived library entry through the fused body
                 // with the skip stream bound, or the residual add is lost.
-                dispatch_fused_residual_rms_plan(
-                    self.runtime,
-                    &self.inner.buffers,
-                    plan,
-                )?;
+                dispatch_fused_residual_rms_plan(self.runtime, &self.inner.buffers, plan)?;
+            } else if kernel.entry.ends_with("_QkvProjection") {
+                // Fail closed (FQ-1): an entry selected as the fused QKV
+                // carrier can NEVER degrade to the Q-only carrier launch —
+                // the carrier publishes Q only, so the current K/V row
+                // would never be written. Session creation refuses
+                // unbindable plans; this seam asserts the invariant.
+                return Err(HostError::internal(format!(
+                    "fused QkvProjection kernel `{}` reached the carrier-only launch seam without a fused plan",
+                    kernel.entry
+                )));
             } else {
                 self.runtime.launch_kernel(
                     &self.inner.module_handle,
@@ -3008,7 +3074,7 @@ impl<'host> PreparedResidentSession<'host> {
         // all. The adapter still admits them: reset_prompt becomes a
         // deliberate no-op, while the PerProgram + HostProvided weights keep
         // the same once-init residency contract.
-        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
+        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone(), None)?;
         session.init_params(weights)?;
         let counters = session.driver_counters();
         Ok(Self {
@@ -3067,7 +3133,7 @@ impl<'host> PreparedResidentSession<'host> {
                 "a prepared resident session requires once-init weights: at least one PerProgram + HostProvided buffer",
             ));
         }
-        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone())?;
+        let mut session = ProgramSession::new(runtime, descriptor, device_name.clone(), None)?;
         session.init_params_with_weight_bytes(weights, byte_weights)?;
         let counters = session.driver_counters();
         Ok(Self {
@@ -3649,6 +3715,12 @@ mod fused_qkv_plan_tests {
         )
     }
 
+    /// The validated attention axes both model families carry (head_dim 64
+    /// — the producer's own RoPE row width).
+    fn axes64() -> Option<FusedAttentionAxes> {
+        Some(FusedAttentionAxes { head_dim: 64 })
+    }
+
     /// Qwen2.5-0.5B prefill layer-0 fused QKV slots, captured from the live
     /// descriptor (PB-6 slot dump): packed weights typed as f32 words
     /// (byte length / 4), capacity-sized persistent K/V targets, all biases.
@@ -3656,28 +3728,57 @@ mod fused_qkv_plan_tests {
     fn qwen_prefill_cache_targets_finalize_grouped_bind() {
         let slots = vec![
             slot(344, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 15_232),
-            slot(57, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 137_984),
+            slot(
+                57,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                137_984,
+            ),
             slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 544),
             slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 544),
             slot(60, "blk.0.attn_q.bias", DeviceBufferRole::Input, 4, 896),
             slot(6, "kv.invocation_state", DeviceBufferRole::Input, 5, 4),
-            slot(345, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 6, 15_232),
-            slot(58, "blk.0.attn_k.weight", DeviceBufferRole::Input, 7, 19_712),
-            slot(59, "blk.0.attn_v.weight", DeviceBufferRole::Input, 8, 30_464),
+            slot(
+                345,
+                "prefill.blk0.q_gemv",
+                DeviceBufferRole::InOut,
+                6,
+                15_232,
+            ),
+            slot(
+                58,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                7,
+                19_712,
+            ),
+            slot(
+                59,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                8,
+                30_464,
+            ),
             slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 9, 1_048_576),
             slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 10, 1_048_576),
             slot(61, "blk.0.attn_k.bias", DeviceBufferRole::Input, 11, 128),
             slot(62, "blk.0.attn_v.bias", DeviceBufferRole::Input, 12, 128),
         ];
         let mut buffer_meta = BTreeMap::new();
-        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 896).0, norm_meta("blk.0.attn_norm.weight", 896).1);
+        buffer_meta.insert(
+            norm_meta("blk.0.attn_norm.weight", 896).0,
+            norm_meta("blk.0.attn_norm.weight", 896).1,
+        );
         let plan = build_fused_qkv_plan(
             "prefill_blk_0_QkvProjection",
             &slots,
             &buffer_meta,
+            axes64(),
             [238, 1, 1],
         )
-        .expect("qwen prefill plan builds against capacity-sized cache targets");
+        .expect("qwen prefill plan builds against capacity-sized cache targets")
+        .expect("entry matched");
         assert_eq!(plan.rows, 17);
         assert_eq!(plan.hidden, 896);
         assert_eq!(plan.q_width, 896);
@@ -3701,25 +3802,54 @@ mod fused_qkv_plan_tests {
     fn smol_prefill_packed_cache_targets_resolve_kv_width_from_bytes() {
         let slots = vec![
             slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 8_640),
-            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
             slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 288),
             slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 288),
             slot(6, "kv.invocation_state", DeviceBufferRole::Input, 4, 4),
-            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 8_640),
-            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
-            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(
+                361,
+                "prefill.blk0.q_gemv",
+                DeviceBufferRole::InOut,
+                5,
+                8_640,
+            ),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
             slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
             slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
         ];
         let mut buffer_meta = BTreeMap::new();
-        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        buffer_meta.insert(
+            norm_meta("blk.0.attn_norm.weight", 960).0,
+            norm_meta("blk.0.attn_norm.weight", 960).1,
+        );
         let plan = build_fused_qkv_plan(
             "prefill_blk_0_QkvProjection",
             &slots,
             &buffer_meta,
+            axes64(),
             [135, 1, 1],
         )
-        .expect("smol prefill plan builds without biases");
+        .expect("smol prefill plan builds without biases")
+        .expect("entry matched");
         assert_eq!(plan.rows, 9);
         assert_eq!(plan.head_dim, 64);
         let mut packed = BTreeMap::new();
@@ -3739,25 +3869,54 @@ mod fused_qkv_plan_tests {
     fn smol_decode_cache_count_divisible_by_rows_still_resolves_from_bytes() {
         let slots = vec![
             slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 9_600),
-            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
             slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 320),
             slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 320),
             slot(6, "kv.invocation_state", DeviceBufferRole::Input, 4, 4),
-            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 9_600),
-            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
-            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(
+                361,
+                "prefill.blk0.q_gemv",
+                DeviceBufferRole::InOut,
+                5,
+                9_600,
+            ),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
             slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
             slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
         ];
         let mut buffer_meta = BTreeMap::new();
-        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        buffer_meta.insert(
+            norm_meta("blk.0.attn_norm.weight", 960).0,
+            norm_meta("blk.0.attn_norm.weight", 960).1,
+        );
         let plan = build_fused_qkv_plan(
             "prefill_blk_0_QkvProjection",
             &slots,
             &buffer_meta,
+            axes64(),
             [150, 1, 1],
         )
-        .expect("smol decode plan builds");
+        .expect("smol decode plan builds")
+        .expect("entry matched");
         assert_eq!(plan.rows, 10);
         let mut packed = BTreeMap::new();
         packed.insert(73, PackedStorageFormat::Q5_0);
@@ -3774,25 +3933,288 @@ mod fused_qkv_plan_tests {
     fn unresolvable_kv_width_fails_closed() {
         let slots = vec![
             slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 8_640),
-            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 158_400),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
             slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 288),
             slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 288),
-            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 8_640),
-            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 6, 52_800),
-            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 7, 81_600),
+            slot(
+                361,
+                "prefill.blk0.q_gemv",
+                DeviceBufferRole::InOut,
+                5,
+                8_640,
+            ),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
             slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
             slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
         ];
         let mut buffer_meta = BTreeMap::new();
-        buffer_meta.insert(norm_meta("blk.0.attn_norm.weight", 960).0, norm_meta("blk.0.attn_norm.weight", 960).1);
+        buffer_meta.insert(
+            norm_meta("blk.0.attn_norm.weight", 960).0,
+            norm_meta("blk.0.attn_norm.weight", 960).1,
+        );
         let plan = build_fused_qkv_plan(
             "prefill_blk_0_QkvProjection",
             &slots,
             &buffer_meta,
+            axes64(),
             [135, 1, 1],
         )
-        .expect("plan builds; resolution is a dispatch-time fact");
+        .expect("plan builds; resolution is a dispatch-time fact")
+        .expect("entry matched");
         assert!(finalize_fused_bind(&plan, &BTreeMap::new()).is_err());
+    }
+
+    /// FQ-1 (pb4 findings P1): the actual frozen M=1 decode descriptor
+    /// shape — one activation row, capacity-sized RoPE tables
+    /// (8192 * 64/2 = 262144 elements), persistent K/V cache targets — for
+    /// BOTH model Q widths (SmolLM2 960, Qwen2.5 896). Recognition must
+    /// resolve rows == 1 and head_dim == 64. Dividing the RoPE table's
+    /// total element count by activation rows invents 524288, fails
+    /// divisibility, and silently degrades to the Q-only carrier, which
+    /// never appends the current K/V row.
+    #[test]
+    fn m1_decode_capacity_rope_tables_resolve_rows_one_head_dim_64() {
+        let smol_slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 960),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 262_144),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 262_144),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 4, 4),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 960),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut smol_meta = BTreeMap::new();
+        let smol_norm = norm_meta("blk.0.attn_norm.weight", 960);
+        smol_meta.insert(smol_norm.0, smol_norm.1);
+        let smol = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &smol_slots,
+            &smol_meta,
+            axes64(),
+            [150, 1, 1],
+        )
+        .expect("SmolLM2 M=1 decode plan must resolve, never fall back to the Q-only carrier")
+        .expect("entry matched");
+        assert_eq!(smol.rows, 1, "one activation row is the M=1 decode row");
+        assert_eq!(smol.hidden, 960);
+        assert_eq!(smol.q_width, 960);
+        assert_eq!(
+            smol.head_dim, 64,
+            "head_dim comes from the model, not the capacity table"
+        );
+        assert!(smol.kv_cache_target);
+        let mut smol_packed = BTreeMap::new();
+        smol_packed.insert(73, PackedStorageFormat::Q5_0);
+        smol_packed.insert(74, PackedStorageFormat::Q5_0);
+        smol_packed.insert(75, PackedStorageFormat::Q8_0);
+        let smol_bind =
+            finalize_fused_bind(&smol, &smol_packed).expect("SmolLM2 M=1 bind finalizes");
+        assert_eq!(smol_bind.kv_heads, 5);
+        assert_eq!(smol_bind.q_per_kv, 3);
+        assert_eq!(smol_bind.kv_output_strides, [8192 * 64, 64, 1]);
+
+        let qwen_slots = vec![
+            slot(344, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 896),
+            slot(
+                57,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                137_984,
+            ),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 262_144),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 262_144),
+            slot(60, "blk.0.attn_q.bias", DeviceBufferRole::Input, 4, 896),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 5, 4),
+            slot(345, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 6, 896),
+            slot(
+                58,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                7,
+                19_712,
+            ),
+            slot(
+                59,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                8,
+                30_464,
+            ),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 9, 1_048_576),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 10, 1_048_576),
+            slot(61, "blk.0.attn_k.bias", DeviceBufferRole::Input, 11, 128),
+            slot(62, "blk.0.attn_v.bias", DeviceBufferRole::Input, 12, 128),
+        ];
+        let mut qwen_meta = BTreeMap::new();
+        let qwen_norm = norm_meta("blk.0.attn_norm.weight", 896);
+        qwen_meta.insert(qwen_norm.0, qwen_norm.1);
+        let qwen = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &qwen_slots,
+            &qwen_meta,
+            axes64(),
+            [238, 1, 1],
+        )
+        .expect("Qwen2.5 M=1 decode plan must resolve, never fall back to the Q-only carrier")
+        .expect("entry matched");
+        assert_eq!(qwen.rows, 1);
+        assert_eq!(qwen.hidden, 896);
+        assert_eq!(qwen.q_width, 896);
+        assert_eq!(qwen.head_dim, 64);
+        assert!(qwen.kv_cache_target);
+        let mut qwen_packed = BTreeMap::new();
+        qwen_packed.insert(57, PackedStorageFormat::Q5_0);
+        qwen_packed.insert(58, PackedStorageFormat::Q5_0);
+        qwen_packed.insert(59, PackedStorageFormat::Q8_0);
+        let qwen_bind =
+            finalize_fused_bind(&qwen, &qwen_packed).expect("Qwen2.5 M=1 bind finalizes");
+        assert_eq!(qwen_bind.kv_heads, 2);
+        assert_eq!(qwen_bind.q_per_kv, 7);
+        assert_eq!(qwen_bind.kv_output_strides, [8192 * 64, 64, 1]);
+    }
+
+    /// A `_QkvProjection` entry with no authoritative attention axes is a
+    /// recognition ERROR, never a silent Q-only carrier fallback (FQ-1
+    /// fail-closed).
+    #[test]
+    fn qkv_entry_without_axes_fails_closed() {
+        let slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 960),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 2, 262_144),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 3, 262_144),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 960),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        let norm = norm_meta("blk.0.attn_norm.weight", 960);
+        buffer_meta.insert(norm.0, norm.1);
+        let error = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            None,
+            [150, 1, 1],
+        )
+        .err()
+        .expect("a QkvProjection entry without carried axes must fail the session");
+        assert!(
+            error.message.contains("attention axes"),
+            "error names the missing fact: {}",
+            error.message
+        );
+    }
+
+    /// A carried head_dim that contradicts the descriptor facts (q_width is
+    /// not a whole multiple of it) is a recognition error, not a guess.
+    #[test]
+    fn qkv_entry_with_contradicting_axes_fails_closed() {
+        let slots = vec![
+            slot(360, "prefill.blk0.a", DeviceBufferRole::InOut, 0, 960),
+            slot(
+                73,
+                "blk.0.attn_q.weight",
+                DeviceBufferRole::Input,
+                1,
+                158_400,
+            ),
+            slot(361, "prefill.blk0.q_gemv", DeviceBufferRole::InOut, 5, 960),
+            slot(
+                74,
+                "blk.0.attn_k.weight",
+                DeviceBufferRole::Input,
+                6,
+                52_800,
+            ),
+            slot(
+                75,
+                "blk.0.attn_v.weight",
+                DeviceBufferRole::Input,
+                7,
+                81_600,
+            ),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 2_621_440),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 2_621_440),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        let norm = norm_meta("blk.0.attn_norm.weight", 960);
+        buffer_meta.insert(norm.0, norm.1);
+        let error = build_fused_qkv_plan(
+            "prefill_blk_0_QkvProjection",
+            &slots,
+            &buffer_meta,
+            Some(FusedAttentionAxes { head_dim: 128 }),
+            [150, 1, 1],
+        )
+        .err()
+        .expect("a head_dim that does not divide q_width must fail the session");
+        assert!(
+            error.message.contains("q width grouping"),
+            "error names the contradicted fact: {}",
+            error.message
+        );
     }
 
     /// The cursor position is the first f32 VALUE of the descriptor-declared
@@ -3868,20 +4290,18 @@ mod fused_residual_rms_plan_tests {
     /// carrier kernel while the neighboring attn_norm uses 1e-5 — the parse
     /// must bind the ResidualRmsNorm body's own literal.
     fn qwen_module_image() -> Vec<u8> {
-        format!(
-            concat!(
-                "kernel void prefill_blk_0_attn_norm(float) {{\n",
-                "    float scale = 1.0 / sqrt(mean + 0.00001f);\n",
-                "}}\n",
-                "kernel void prefill_blk_0_ResidualRmsNorm(float) {{\n",
-                "    float mean = sumsq / float(896u);\n",
-                "    float scale = 1.0 / sqrt(mean + 0.000001f);\n",
-                "}}\n",
-                "kernel void prefill_blk_0_ffn_gate(float) {{\n",
-                "    return;\n",
-                "}}\n",
-            )
-        )
+        format!(concat!(
+            "kernel void prefill_blk_0_attn_norm(float) {{\n",
+            "    float scale = 1.0 / sqrt(mean + 0.00001f);\n",
+            "}}\n",
+            "kernel void prefill_blk_0_ResidualRmsNorm(float) {{\n",
+            "    float mean = sumsq / float(896u);\n",
+            "    float scale = 1.0 / sqrt(mean + 0.000001f);\n",
+            "}}\n",
+            "kernel void prefill_blk_0_ffn_gate(float) {{\n",
+            "    return;\n",
+            "}}\n",
+        ))
         .into_bytes()
     }
 
@@ -3946,13 +4366,9 @@ mod fused_residual_rms_plan_tests {
             slot(402, "prefill.blk0.o", DeviceBufferRole::InOut, 3, 15_232),
         ];
         let image = b"kernel void prefill_blk_0_ResidualRmsNorm(float) {\n return;\n}\n";
-        let error = build_fused_residual_rms_plan(
-            "prefill_blk_0_ResidualRmsNorm",
-            &slots,
-            image,
-        )
-        .err()
-        .expect("an unparseable carrier epsilon must fail the session");
+        let error = build_fused_residual_rms_plan("prefill_blk_0_ResidualRmsNorm", &slots, image)
+            .err()
+            .expect("an unparseable carrier epsilon must fail the session");
         assert!(error.message.contains("RMS epsilon"));
     }
 
