@@ -7,8 +7,7 @@ use host_kernel::{
 };
 use std::fs::File;
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_BYTES: usize = 1024 * 1024;
@@ -132,6 +131,10 @@ impl Prng {
 fn random_bytes_route(opener: &Valor) -> HostResult<ProviderReply> {
     let n = i64_arg(opener, 0, "n")?;
     let len = bounded_non_negative_len(n, MAX_RANDOM_BYTES, "aleator:octetos", "n")?;
+    Ok(ProviderReply::byte(random_bytes(len)?))
+}
+
+fn random_bytes(len: usize) -> HostResult<Vec<u8>> {
     let mut bytes = vec![0_u8; len];
     if len > 0 {
         File::open("/dev/urandom")
@@ -140,7 +143,7 @@ fn random_bytes_route(opener: &Valor) -> HostResult<ProviderReply> {
                 HostError::internal(format!("aleator random bytes failed: {error}"))
             })?;
     }
-    Ok(ProviderReply::byte(bytes))
+    Ok(bytes)
 }
 
 fn bounded_non_negative_len(value: i64, max: usize, route: &str, name: &str) -> HostResult<usize> {
@@ -158,10 +161,7 @@ fn bounded_non_negative_len(value: i64, max: usize, route: &str, name: &str) -> 
 }
 
 fn uuid_route() -> HostResult<ProviderReply> {
-    let mut bytes = vec![0_u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|error| HostError::internal(format!("aleator random bytes failed: {error}")))?;
+    let mut bytes = random_bytes(16)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(ProviderReply::item(Valor::Textus(format_uuid(&bytes))))
