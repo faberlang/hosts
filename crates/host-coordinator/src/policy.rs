@@ -511,14 +511,14 @@ pub fn evaluate(request: &PolicyRequest) -> PolicyOutcome {
     match gate_health_epoch_selection(request) {
         Ok(set) => {
             let mut passers = Vec::new();
-            for (idx, plan) in request.plans.iter().enumerate() {
+            for plan in request.plans {
                 let mut violations = Vec::new();
                 violations.extend(gate_membership(plan, &set));
                 violations.extend(gate_compatibility(plan, request.discovery));
                 violations.extend(gate_memory(plan, request.constraints));
                 violations.extend(gate_topology(plan, &request.constraints.topology));
                 if violations.is_empty() {
-                    passers.push((idx, plan));
+                    passers.push(plan);
                 } else {
                     rejected.push(PlanRejection {
                         plan: plan.name.clone(),
@@ -918,7 +918,7 @@ fn gate_topology(plan: &CandidatePlan, topology: &DeviceTopologySnapshot) -> Vec
 /// Pass 2: rank only the gate-passing plans by the declared objectives in
 /// order, then by stable [`PhysicalDeviceId`] — never ordinal.
 fn rank_plans(
-    passers: Vec<(usize, &CandidatePlan)>,
+    passers: Vec<&CandidatePlan>,
     objectives: &[Objective],
     constraints: &DeclaredConstraints,
 ) -> Vec<RankedPlan> {
@@ -926,13 +926,9 @@ fn rank_plans(
         return Vec::new();
     }
 
-    let mut scored: Vec<(
-        (usize, &CandidatePlan),
-        Vec<u64>,
-        BTreeSet<PhysicalDeviceId>,
-    )> = passers
+    let mut scored: Vec<(&CandidatePlan, Vec<u64>, BTreeSet<PhysicalDeviceId>)> = passers
         .into_iter()
-        .map(|(idx, plan)| {
+        .map(|plan| {
             let values: Vec<u64> = objectives
                 .iter()
                 .map(|objective| objective_value(plan, *objective, constraints))
@@ -942,7 +938,7 @@ fn rank_plans(
                 .iter()
                 .map(|assignment| assignment.device.clone())
                 .collect();
-            ((idx, plan), values, devices)
+            (plan, values, devices)
         })
         .collect();
 
@@ -965,7 +961,7 @@ fn rank_plans(
     scored
         .into_iter()
         .enumerate()
-        .map(|(rank, ((_idx, plan), values, devices))| {
+        .map(|(rank, (plan, values, devices))| {
             let objective_scores = objectives
                 .iter()
                 .zip(&values)
