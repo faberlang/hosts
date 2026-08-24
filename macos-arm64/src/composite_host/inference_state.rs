@@ -6,10 +6,8 @@
 //! transaction and the O(1) reset receipt; rollback is not proven, so a
 //! possible partial device mutation poisons.
 //!
-//! Parent registration is a private `mod inference_state` in
-//! `composite_host.rs`; this unit cannot re-export it.
-
-#![allow(dead_code)]
+//! Registered as `pub mod inference_state` by `composite_host.rs`, which
+//! re-exports this unit's public surface.
 
 use std::fmt;
 
