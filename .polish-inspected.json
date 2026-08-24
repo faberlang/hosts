@@ -1,5 +1,10 @@
 {
+  "crates/host-coordinator/src/bound_plan.rs": "2026-08-24T13:47:33.594715+00:00",
+  "crates/host-coordinator/src/device_set.rs": "2026-08-24T13:47:41.300976+00:00",
+  "crates/host-coordinator/src/discovery.rs": "2026-08-24T13:47:47.455881+00:00",
+  "crates/host-coordinator/src/execution_transaction/mirror.rs": "2026-08-24T13:47:55.433995+00:00",
   "crates/host-coordinator/src/transport.rs": "2026-08-24T13:13:45.040185+00:00",
+  "crates/host-kernel/src/lib.rs": "2026-08-24T13:48:04.046925+00:00",
   "crates/http/src/lib.rs": "2026-08-24T13:13:45.040185+00:00",
   "crates/solum/src/lib.rs": "2026-08-24T13:13:45.040185+00:00",
   "llvm/src/cli.rs": "2026-08-24T13:14:04.081824+00:00",
