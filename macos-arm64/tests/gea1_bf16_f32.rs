@@ -31,7 +31,8 @@ const OUTPUT_ELEMENTS: usize = 320;
 const INPUT_ELEMENTS: usize = 960;
 const WEIGHT_ELEMENTS: usize = OUTPUT_ELEMENTS * INPUT_ELEMENTS;
 const DISPATCH: [u32; 3] = [320, 1, 1];
-const BLOCK: [u32; 3] = [1, 1, 1];
+// The tiled GEMV artifact uses one 8x8 threadgroup per output row.
+const BLOCK: [u32; 3] = [8, 8, 1];
 const MEASUREMENT_FIELDS: [&str; 20] = [
     "admission_us",
     "admission_bytes",
@@ -218,15 +219,8 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn f32_to_bf16_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    assert_eq!(bytes.len() % 2, 0, "BF16 output is not halfword aligned");
+    assert_eq!(bytes.len() % 2, 0, "BF16 values are not halfword aligned");
     bytes
         .chunks_exact(2)
         .map(|chunk| {
@@ -234,6 +228,21 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
             f32::from_bits(bits << 16)
         })
         .collect()
+}
+
+/// Mirror the U5 scalar F32 GEMV oracle over the admitted logical matrix.
+fn reference_gemv(weights: &[f32], input: &[f32]) -> Vec<f32> {
+    assert_eq!(weights.len(), WEIGHT_ELEMENTS);
+    assert_eq!(input.len(), INPUT_ELEMENTS);
+    let mut output = Vec::with_capacity(OUTPUT_ELEMENTS);
+    for row in weights.chunks_exact(INPUT_ELEMENTS) {
+        let mut sum = 0.0_f32;
+        for (&weight, &value) in row.iter().zip(input) {
+            sum += weight * value;
+        }
+        output.push(sum);
+    }
+    output
 }
 
 fn measured(value: impl serde::Serialize) -> Value {
@@ -308,8 +317,8 @@ fn host_descriptor(dtype: DeviceDataType, entry: &str, module_image: &[u8]) -> D
                 DeviceBufferLifetime::PerProgram,
                 DeviceBufferInitialization::HostProvided,
                 1,
-                dtype,
-                OUTPUT_ELEMENTS as u64,
+                DeviceDataType::F32,
+                INPUT_ELEMENTS as u64,
             ),
             descriptor_slot(
                 3,
@@ -318,7 +327,7 @@ fn host_descriptor(dtype: DeviceDataType, entry: &str, module_image: &[u8]) -> D
                 DeviceBufferLifetime::ObservationPoint,
                 DeviceBufferInitialization::KernelInitialized,
                 2,
-                dtype,
+                DeviceDataType::F32,
                 OUTPUT_ELEMENTS as u64,
             ),
         ],
@@ -356,8 +365,8 @@ fn host_descriptor(dtype: DeviceDataType, entry: &str, module_image: &[u8]) -> D
     }
 }
 
-fn fake_bytes(dtype: DeviceDataType) -> Vec<u8> {
-    vec![0; OUTPUT_ELEMENTS * dtype.byte_width()]
+fn fake_bytes(dtype: DeviceDataType, elements: usize) -> Vec<u8> {
+    vec![0; elements * dtype.byte_width()]
 }
 
 fn artifact_root() -> PathBuf {
@@ -517,14 +526,24 @@ fn gea1_descriptor_admission() {
         f32.kernels[0].buffers[0].element_count,
         WEIGHT_ELEMENTS as u64
     );
-    assert_eq!(
-        bf16.kernels[0].buffers[2].element_count,
-        OUTPUT_ELEMENTS as u64
-    );
-    assert_eq!(
-        f32.kernels[0].buffers[2].element_count,
-        OUTPUT_ELEMENTS as u64
-    );
+    for descriptor in [&bf16, &f32] {
+        assert_eq!(
+            descriptor.kernels[0].buffers[1].element_ty,
+            DeviceDataType::F32
+        );
+        assert_eq!(
+            descriptor.kernels[0].buffers[1].element_count,
+            INPUT_ELEMENTS as u64
+        );
+        assert_eq!(
+            descriptor.kernels[0].buffers[2].element_ty,
+            DeviceDataType::F32
+        );
+        assert_eq!(
+            descriptor.kernels[0].buffers[2].element_count,
+            OUTPUT_ELEMENTS as u64
+        );
+    }
 }
 
 #[test]
@@ -544,7 +563,9 @@ fn gea1_fake_sequence_has_no_cpu_substitute() {
         let module = session
             .load_module(descriptor.module_image.as_slice())
             .expect("fake module load");
-        let bytes = fake_bytes(dtype);
+        // FakeMetalDriver's generic three-buffer simulation requires equal
+        // spans; dimensional admission is proved separately above.
+        let bytes = fake_bytes(DeviceDataType::F32, OUTPUT_ELEMENTS);
         let weight = session.alloc_bytes(bytes.len()).expect("resident weight");
         let input = session.alloc_bytes(bytes.len()).expect("resident input");
         let output = session.alloc_bytes(bytes.len()).expect("resident output");
@@ -553,10 +574,10 @@ fn gea1_fake_sequence_has_no_cpu_substitute() {
             .expect("weight upload");
         session.record_weight_upload();
         session
-            .copy_in_bytes(input, &bytes, dtype)
+            .copy_in_bytes(input, &bytes, DeviceDataType::F32)
             .expect("input upload");
         session
-            .copy_in_bytes(output, &bytes, dtype)
+            .copy_in_bytes(output, &bytes, DeviceDataType::F32)
             .expect("output initialization");
         let bindings = [
             MetalLaunchBinding {
@@ -583,9 +604,12 @@ fn gea1_fake_sequence_has_no_cpu_substitute() {
             .expect("fake GEA1 launch");
         session.sync().expect("fake GEA1 synchronization");
         let output_bytes = session
-            .readback_bytes(output, dtype)
+            .readback_bytes(output, DeviceDataType::F32)
             .expect("fake declared output readback");
-        assert_eq!(output_bytes.len(), bytes.len());
+        assert_eq!(
+            output_bytes.len(),
+            OUTPUT_ELEMENTS * DeviceDataType::F32.byte_width()
+        );
         launch_order.push(entry);
     }
     assert_eq!(launch_order, [BF16_ENTRY, F32_ENTRY]);
@@ -684,7 +708,10 @@ fn gea1_fake_failure_modes_fail_closed() {
 
 fn numerical_rows(expected: &[f32], observed: &[f32]) -> Vec<Value> {
     assert_eq!(expected.len(), OUTPUT_ELEMENTS);
-    assert_eq!(observed, expected, "GEA1 copy artifact output differs");
+    assert_eq!(
+        observed, expected,
+        "GEA1 GEMV output differs from the scalar oracle"
+    );
     (0..8)
         .map(|index| {
             json!({
@@ -730,7 +757,7 @@ fn output_receipt(run: &KernelRun, e2e_us: u64) -> Value {
             "elements": OUTPUT_ELEMENTS,
             "logical_dtype": "F32",
             "logical_bytes": OUTPUT_ELEMENTS * 4,
-            "physical_dtype": run.physical_dtype,
+            "physical_dtype": "F32",
             "physical_bytes": physical_output_bytes,
         },
         "output_hashes": {
@@ -744,11 +771,7 @@ fn output_receipt(run: &KernelRun, e2e_us: u64) -> Value {
             "tensor_range_read_us": measured(run.tensor_range_read_us),
             "tensor_range_read_bytes": measured(run.weight_bytes),
             "bf16_to_f32_us": measured(run.bf16_to_f32_us),
-            "bf16_to_f32_bytes": measured(if run.dtype == DeviceDataType::BF16 {
-                OUTPUT_ELEMENTS * 4
-            } else {
-                0
-            }),
+            "bf16_to_f32_bytes": measured(0),
             "allocation_us": measured(run.allocation_us),
             "upload_us": measured(run.upload_us),
             "upload_bytes": measured(run.weight_bytes),
@@ -832,13 +855,8 @@ fn gea1_real_metal_receipt() {
         assert_eq!(weight_bytes.len(), expected_weight_bytes);
         assert_eq!(weight_bytes.len(), WEIGHT_ELEMENTS * dtype.byte_width());
 
-        let input_values = &activation_values[..OUTPUT_ELEMENTS];
-        let input_bytes = if dtype == DeviceDataType::BF16 {
-            f32_to_bf16_bytes(input_values)
-        } else {
-            f32_bytes(input_values)
-        };
-        let output_bytes = vec![0; input_bytes.len()];
+        let input_bytes = f32_bytes(&activation_values);
+        let output_bytes = vec![0; OUTPUT_ELEMENTS * DeviceDataType::F32.byte_width()];
         let allocation_start = Instant::now();
         let weight_handle = session
             .alloc_bytes(weight_bytes.len())
@@ -858,10 +876,10 @@ fn gea1_real_metal_receipt() {
         session.record_weight_upload();
         let upload_us = upload_start.elapsed().as_micros() as u64;
         session
-            .copy_in_bytes(input_handle, &input_bytes, dtype)
+            .copy_in_bytes(input_handle, &input_bytes, DeviceDataType::F32)
             .expect("upload activation input");
         session
-            .copy_in_bytes(output_handle, &output_bytes, dtype)
+            .copy_in_bytes(output_handle, &output_bytes, DeviceDataType::F32)
             .expect("initialize output allocation");
 
         let pipeline_start = Instant::now();
@@ -912,22 +930,18 @@ fn gea1_real_metal_receipt() {
 
         let readback_start = Instant::now();
         let output_raw = session
-            .readback_bytes(output_handle, dtype)
+            .readback_bytes(output_handle, DeviceDataType::F32)
             .expect("read only the declared 320-element output allocation");
         let readback_us = readback_start.elapsed().as_micros() as u64;
         assert_eq!(output_raw.len(), output_bytes.len());
-        let expand_start = Instant::now();
-        let output_f32 = if dtype == DeviceDataType::BF16 {
-            bf16_to_f32(&output_raw)
+        let output_f32 = decode_f32_le(&output_raw);
+        let bf16_to_f32_us = 0;
+        let weight_values = if dtype == DeviceDataType::BF16 {
+            bf16_to_f32(&weight_bytes)
         } else {
-            decode_f32_le(&output_raw)
+            decode_f32_le(&weight_bytes)
         };
-        let bf16_to_f32_us = expand_start.elapsed().as_micros() as u64;
-        let expected_f32 = if dtype == DeviceDataType::BF16 {
-            bf16_to_f32(&input_bytes)
-        } else {
-            input_values.to_vec()
-        };
+        let expected_f32 = reference_gemv(&weight_values, &activation_values);
         let numerical_rows = numerical_rows(&expected_f32, &output_f32);
         runs.push(KernelRun {
             prepared: prepared_entry,
@@ -960,8 +974,22 @@ fn gea1_real_metal_receipt() {
     assert_eq!(runs[1].prepared.descriptor.entry, F32_ENTRY);
     assert_eq!(runs[0].dtype, DeviceDataType::BF16);
     assert_eq!(runs[1].dtype, DeviceDataType::F32);
-    assert_eq!(runs[0].input_bytes, OUTPUT_ELEMENTS * 2);
-    assert_eq!(runs[1].input_bytes, OUTPUT_ELEMENTS * 4);
+    assert_eq!(
+        runs[0].input_bytes,
+        INPUT_ELEMENTS * DeviceDataType::F32.byte_width()
+    );
+    assert_eq!(
+        runs[1].input_bytes,
+        INPUT_ELEMENTS * DeviceDataType::F32.byte_width()
+    );
+    assert_eq!(
+        runs[0].output_bytes,
+        OUTPUT_ELEMENTS * DeviceDataType::F32.byte_width()
+    );
+    assert_eq!(
+        runs[1].output_bytes,
+        OUTPUT_ELEMENTS * DeviceDataType::F32.byte_width()
+    );
     assert_eq!(session.driver_counters().uploads, 2);
 
     let allocations: Vec<Value> = runs
