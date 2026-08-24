@@ -18,8 +18,8 @@ fn f16_bf16_round_trip_spelling_and_byte_width() {
 }
 
 #[test]
-fn placement_discriminant_maps_to_device_data_type() {
-    // MirScalarLayout declaration-order discriminants (F2 owner).
+fn gea1_bf16_has_stable_placement_discriminant() {
+    // MirScalarLayout declaration-order discriminants, including the U3 BF16 row.
     assert_eq!(
         DeviceDataType::from_placement_discriminant(3),
         Some(DeviceDataType::I32)
@@ -38,10 +38,14 @@ fn placement_discriminant_maps_to_device_data_type() {
     );
     assert_eq!(
         DeviceDataType::from_placement_discriminant(11),
-        Some(DeviceDataType::F32)
+        Some(DeviceDataType::BF16)
     );
     assert_eq!(
         DeviceDataType::from_placement_discriminant(12),
+        Some(DeviceDataType::F32)
+    );
+    assert_eq!(
+        DeviceDataType::from_placement_discriminant(13),
         Some(DeviceDataType::F64)
     );
     assert_eq!(DeviceDataType::from_placement_discriminant(0), None);
@@ -51,9 +55,9 @@ fn placement_discriminant_maps_to_device_data_type() {
     assert_eq!(DeviceDataType::I64.placement_discriminant(), Some(4));
     assert_eq!(DeviceDataType::U8.placement_discriminant(), Some(6));
     assert_eq!(DeviceDataType::F16.placement_discriminant(), Some(10));
-    assert_eq!(DeviceDataType::F32.placement_discriminant(), Some(11));
-    assert_eq!(DeviceDataType::F64.placement_discriminant(), Some(12));
-    assert_eq!(DeviceDataType::BF16.placement_discriminant(), None);
+    assert_eq!(DeviceDataType::BF16.placement_discriminant(), Some(11));
+    assert_eq!(DeviceDataType::F32.placement_discriminant(), Some(12));
+    assert_eq!(DeviceDataType::F64.placement_discriminant(), Some(13));
 }
 
 #[test]

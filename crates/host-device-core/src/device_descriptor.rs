@@ -59,10 +59,10 @@ pub const E_NO_DEVICE_PROGRAM: &str = "E_NO_DEVICE_PROGRAM";
 /// element type from module text (A3).
 ///
 /// Placement-ABI `dtype: u32` (`__faber_gpu_v1_copy_in`) is the
-/// `MirScalarLayout` discriminant. Radix `placement-debt-audit` F2 owns that
-/// integer; this enum coordinates the host names onto it and does not assign
-/// a second numbering. F2 has not yet given `MirScalarLayout` `#[repr(u32)]`,
-/// so the numbers below are that enum's declaration-order discriminants:
+/// `MirScalarLayout` discriminant. Radix owns that integer; this enum
+/// coordinates the host names onto it and does not assign a second numbering.
+/// `MirScalarLayout` has no `#[repr(u32)]`, so the numbers below are its
+/// declaration-order discriminants:
 ///
 /// | `dtype` | `MirScalarLayout` | [`DeviceDataType`] |
 /// | ------- | ----------------- | ------------------ |
@@ -70,10 +70,13 @@ pub const E_NO_DEVICE_PROGRAM: &str = "E_NO_DEVICE_PROGRAM";
 /// | 4       | `I64`             | [`Self::I64`]      |
 /// | 6       | `U8`              | [`Self::U8`]       |
 /// | 10      | `F16`             | [`Self::F16`]      |
-/// | 11      | `F32`             | [`Self::F32`]      |
-/// | 12      | `F64`             | [`Self::F64`]      |
+/// | 11      | `Bf16`            | [`Self::BF16`]     |
+/// | 12      | `F32`             | [`Self::F32`]      |
+/// | 13      | `F64`             | [`Self::F64`]      |
 ///
-/// [`Self::BF16`] has no F2 slot yet (`MirScalarLayout` has no BF16 variant).
+/// The discriminants are declaration-order values from Radix's
+/// `MirScalarLayout`; BF16 is intentionally admitted as the U3 device-view
+/// element and shifts the later floating-point rows.
 /// Decode via [`Self::from_placement_discriminant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceDataType {
@@ -136,7 +139,7 @@ impl DeviceDataType {
 
     /// Decode a placement-ABI `dtype: u32` (`MirScalarLayout` discriminant).
     ///
-    /// Radix `placement-debt-audit` F2 owns the integer. Unmapped
+    /// Radix's `MirScalarLayout` declaration order owns the integer. Unmapped
     /// discriminants (Bool/I8/I16/I128/U16/U32/U64, and any future slot)
     /// return `None`.
     #[must_use]
@@ -146,13 +149,19 @@ impl DeviceDataType {
             4 => Some(Self::I64),
             6 => Some(Self::U8),
             10 => Some(Self::F16),
-            11 => Some(Self::F32),
-            12 => Some(Self::F64),
+            11 => Some(Self::BF16),
+            12 => Some(Self::F32),
+            13 => Some(Self::F64),
             _ => None,
         }
     }
 
-    /// Placement-ABI `dtype: u32` for this host type, when F2 names one.
+    /// Placement-ABI `dtype: u32` for this host type.
+    ///
+    /// The value mirrors the declaration-order discriminant in Radix's
+    /// `MirScalarLayout`; this is the sole host-side mapping for the wire
+    /// placement dtype.
+
     #[must_use]
     pub fn placement_discriminant(self) -> Option<u32> {
         match self {
@@ -160,9 +169,9 @@ impl DeviceDataType {
             Self::I64 => Some(4),
             Self::U8 => Some(6),
             Self::F16 => Some(10),
-            Self::F32 => Some(11),
-            Self::F64 => Some(12),
-            Self::BF16 => None,
+            Self::BF16 => Some(11),
+            Self::F32 => Some(12),
+            Self::F64 => Some(13),
         }
     }
 }
