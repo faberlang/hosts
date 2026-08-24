@@ -116,32 +116,18 @@ fn http_request(
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<Replicatio, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
-    let mut request = agent.request(method, url);
-    for (name, value) in headers {
-        request = request.set(name, value);
-    }
-
-    let result = if body.is_empty() {
-        request.call()
-    } else {
-        request.send_bytes(body)
-    };
-    match result {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => response_to_replicatio(response),
-        Err(error) => Err(format!("http request failed: {error}")),
-    }
+    let header_pairs = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let agent = build_agent(DEFAULT_AGENT_TIMEOUT);
+    let response = send_request(&agent, method, url, &header_pairs, body)?;
+    response_to_replicatio(response)
 }
 
 fn response_to_replicatio(response: ureq::Response) -> Result<Replicatio, String> {
     let status = i64::from(response.status());
-    let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| response.header(&name).map(|value| (name, value.to_owned())))
-        .collect::<HashMap<_, _>>();
+    let headers = collect_response_headers(&response).into_iter().collect();
     let mut body = Vec::new();
     response
         .into_reader()
@@ -482,20 +468,31 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()
 }
 
-fn call_ureq(agent: &ureq::Agent, args: &RequestArgs) -> HostResult<ureq::Response> {
-    let mut request = agent.request(&args.method, &args.url);
-    for (name, value) in &args.headers {
+fn send_request(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<ureq::Response, String> {
+    let mut request = agent.request(method, url);
+    for (name, value) in headers {
         request = request.set(name, value);
     }
-    let result = if args.body.is_empty() {
+    let result = if body.is_empty() {
         request.call()
     } else {
-        request.send_bytes(&args.body)
+        request.send_bytes(body)
     };
     match result {
         Ok(response) | Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(error) => Err(HostError::internal(format!("http request failed: {error}"))),
+        Err(error) => Err(format!("http request failed: {error}")),
     }
+}
+
+fn call_ureq(agent: &ureq::Agent, args: &RequestArgs) -> HostResult<ureq::Response> {
+    send_request(agent, &args.method, &args.url, &args.headers, &args.body)
+        .map_err(HostError::internal)
 }
 
 fn collect_response_headers(response: &ureq::Response) -> Vec<(String, String)> {
