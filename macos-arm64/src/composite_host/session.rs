@@ -1112,24 +1112,98 @@ fn fused_cursor_position(
     fused_cursor_position_from_words(&values)
 }
 
-/// Decode the append position from the cursor's f32 word values, failing
-/// closed on anything that is not one non-negative integer-valued f32.
-fn fused_cursor_position_from_words(values: &[f32]) -> HostResult<u64> {
-    let position = values
-        .first()
-        .ok_or_else(|| HostError::invalid_args("fused library cursor is shorter than position"))?;
-    if !position.is_finite() || *position < 0.0 || position.fract() != 0.0 {
+/// Decode one invocation-state field from the cursor's f32 word values,
+/// failing closed on anything that is not one non-negative integer-valued
+/// f32. `field` names the guard fact in the error.
+fn fused_cursor_field_from_words(values: &[f32], index: usize, field: &str) -> HostResult<u64> {
+    let Some(value) = values.get(index) else {
         return Err(HostError::invalid_args(format!(
-            "fused library cursor position {position} is not a non-negative integer f32"
+            "fused library cursor is shorter than {field}"
+        )));
+    };
+    if !value.is_finite() || *value < 0.0 || value.fract() != 0.0 {
+        return Err(HostError::invalid_args(format!(
+            "fused library cursor {field} {value} is not a non-negative integer f32"
         )));
     }
-    let decoded = *position as u64;
-    if decoded as f32 != *position {
+    let decoded = *value as u64;
+    if decoded as f32 != *value {
         return Err(HostError::invalid_args(format!(
-            "fused library cursor position {position} overflows the u64 cursor surface"
+            "fused library cursor {field} {value} overflows the u64 cursor surface"
         )));
     }
     Ok(decoded)
+}
+
+/// Decode the append position from the cursor's f32 word values.
+fn fused_cursor_position_from_words(values: &[f32]) -> HostResult<u64> {
+    fused_cursor_field_from_words(values, 0, "position")
+}
+
+/// The cursor facts the compiled carrier's fail-early guard checks (radix
+/// `emit_cache_guard`, projection.rs): a decode whose facts disagree with
+/// the baked constants is rejected with `DECODE_STATUS_INVALID_CURSOR` and
+/// writes NO Q.
+struct FusedCursorFacts {
+    position: u64,
+    valid_len_after: u64,
+    query_rows: u64,
+}
+
+/// Establish the authoritative cursor facts BEFORE the pairing probe's
+/// direct carrier launch (R3-HOSTS). The probe bypasses the normal invoke
+/// plumbing, so it must verify for itself that the invocation-state buffer
+/// carries the paired executor's facts — a blind launch whose guard rejects
+/// leaves the Q buffer unwritten and the probe comparing a stale reference
+/// under both pairings ("matched neither pairing"). Every unavailable or
+/// disagreeing fact fails closed naming the fact.
+fn fused_probe_cursor_facts(
+    runtime: &mut DeviceRuntime,
+    buffers: &BTreeMap<BufferKey, DeviceHandle>,
+    plan: &FusedQkvPlan,
+    packed_formats: &BTreeMap<u32, PackedStorageFormat>,
+) -> HostResult<FusedCursorFacts> {
+    let Some(cursor) = plan.cursor else {
+        return Err(HostError::invalid_args(
+            "fused QKV cursor facts are unavailable: the plan binds RoPE but declares no `kv.invocation_state` slot, so the carrier's position/valid_len_after/query_rows cannot be established; refusing to probe against a possibly stale carrier Q",
+        ));
+    };
+    let handle = buffers
+        .get(&cursor.key)
+        .ok_or_else(|| HostError::internal("fused library cursor disappeared during launch"))?;
+    let values = runtime.readback_f32(handle)?;
+    let position = fused_cursor_field_from_words(&values, 0, "position")?;
+    let valid_len_after = fused_cursor_field_from_words(&values, 1, "valid_len_after")?;
+    let query_rows = fused_cursor_field_from_words(&values, 2, "query_rows")?;
+    if query_rows != plan.rows {
+        return Err(HostError::invalid_args(format!(
+            "fused QKV cursor fact `query_rows` = {query_rows} disagrees with the fused plan's {} activation rows: the compiled carrier's fail-early guard rejects the launch and writes no Q, so the probe would compare a stale reference",
+            plan.rows
+        )));
+    }
+    let expected_after = position
+        .checked_add(plan.rows)
+        .ok_or_else(|| HostError::invalid_args("fused QKV cursor position + rows overflows"))?;
+    if valid_len_after != expected_after {
+        return Err(HostError::invalid_args(format!(
+            "fused QKV cursor fact `valid_len_after` = {valid_len_after} disagrees with `position` {position} + {query_rows} query rows: the compiled carrier's fail-early guard rejects the launch and writes no Q, so the probe would compare a stale reference"
+        )));
+    }
+    // Capacity guard: the append must fit the K/V arena (the carrier's
+    // `DECODE_STATUS_CAPACITY` rejection also writes no Q).
+    let bind = finalize_fused_bind(plan, packed_formats)?;
+    let kv_width = bind.kv_heads.saturating_mul(bind.head_dim);
+    let capacity = plan.outputs[1].element_count / kv_width;
+    if position > capacity || capacity - position < plan.rows {
+        return Err(HostError::invalid_args(format!(
+            "fused QKV cursor fact `capacity` = {capacity} cannot hold `position` {position} + {query_rows} query rows: the compiled carrier's fail-early guard rejects the launch and writes no Q, so the probe would compare a stale reference"
+        )));
+    }
+    Ok(FusedCursorFacts {
+        position,
+        valid_len_after,
+        query_rows,
+    })
 }
 
 fn dispatch_fused_qkv_plan(
@@ -1278,6 +1352,13 @@ fn dispatch_fused_residual_rms_plan(
 /// and the library body is probed under both pairings until its Q matches.
 /// The winning probe's writes are left in the Q/K/V targets, so the winner's
 /// dispatch is already live; a pairing that matches nothing fails closed.
+///
+/// The probe's direct carrier launch bypasses the normal invoke plumbing, so
+/// it owns its cursor facts (R3-HOSTS): the invocation-state facts are
+/// validated against the plan BEFORE the launch, and the Q reference is
+/// poison-filled so a rejected decode (the carrier's fail-early cursor
+/// guard writes no Q) is detected instead of silently compared as a stale
+/// reference.
 fn fused_rotate_half(
     runtime: &mut DeviceRuntime,
     module_handle: &DeviceHandle,
@@ -1293,6 +1374,7 @@ fn fused_rotate_half(
     if let Some(value) = *learned.borrow() {
         return Ok(value);
     }
+    let facts = fused_probe_cursor_facts(runtime, buffers, plan, packed_formats)?;
     let launch_buffers: Vec<DeviceHandle> = kernel
         .slots
         .iter()
@@ -1303,6 +1385,14 @@ fn fused_rotate_half(
                 .ok_or_else(|| HostError::internal("session buffer disappeared during launch"))
         })
         .collect::<HostResult<_>>()?;
+    let q_handle = buffers
+        .get(&plan.outputs[0].key)
+        .ok_or_else(|| HostError::internal("fused library buffer disappeared during launch"))?;
+    // Poison the Q target so an unwritten reference is detectable: the
+    // carrier publishes Q only when its cursor guard admits the decode.
+    let q_elements = usize::try_from(plan.outputs[0].element_count)
+        .map_err(|_| HostError::internal("fused QKV Q element count overflows host"))?;
+    runtime.copy_in_f32(q_handle, &vec![f32::NAN; q_elements])?;
     runtime.launch_kernel(
         module_handle,
         &kernel.entry,
@@ -1311,14 +1401,29 @@ fn fused_rotate_half(
         kernel.block,
     )?;
     runtime.sync()?;
-    let q_handle = buffers
-        .get(&plan.outputs[0].key)
-        .ok_or_else(|| HostError::internal("fused library buffer disappeared during launch"))?;
     let reference = runtime.readback_f32(q_handle)?;
+    let stale: Vec<usize> = reference
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.is_nan().then_some(index))
+        .collect();
+    if !stale.is_empty() {
+        return Err(HostError::invalid_args(format!(
+            "fused QKV pairing probe: the compiled carrier published no Q — {}/{} Q elements still hold the pre-launch poison (first at index {}): the carrier's fail-early cursor guard rejected the launch even though the host-validated facts were position {}, valid_len_after {}, query_rows {}, so the baked carrier facts disagree with the fused plan's and the Q reference is STALE",
+            stale.len(),
+            reference.len(),
+            stale[0],
+            facts.position,
+            facts.valid_len_after,
+            facts.query_rows
+        )));
+    }
     let scale = reference
         .iter()
         .fold(0.0f32, |acc, value| acc.max(value.abs()))
         .max(1.0);
+    let tolerance = 1.0e-3 * scale;
+    let mut deltas: Vec<(bool, f32)> = Vec::with_capacity(2);
     for candidate in [false, true] {
         dispatch_fused_qkv_plan(
             runtime,
@@ -1335,14 +1440,24 @@ fn fused_rotate_half(
             .zip(&reference)
             .map(|(value, expected)| (value - expected).abs())
             .fold(0.0f32, f32::max);
-        if delta <= 1.0e-3 * scale {
+        deltas.push((candidate, delta));
+        if delta <= tolerance {
             *learned.borrow_mut() = Some(candidate);
             return Ok(candidate);
         }
     }
-    Err(HostError::invalid_args(
-        "fused QKV library body matched neither RoPE pairing against the compiled carrier Q",
-    ))
+    // deltas was pushed in [false, true] candidate order.
+    let delta_pair = deltas[0].1;
+    let delta_half = deltas[1].1;
+    let rows = plan.rows;
+    let head_dim = plan.head_dim;
+    let q_width = plan.q_width;
+    let position = facts.position;
+    let valid_len_after = facts.valid_len_after;
+    let query_rows = facts.query_rows;
+    Err(HostError::invalid_args(format!(
+        "fused QKV RoPE pairing probe matched neither candidate against the compiled carrier Q: probe inputs rows={rows}, head_dim={head_dim}, q_width={q_width}, rope position={position} (cursor facts position {position}, valid_len_after {valid_len_after}, query_rows {query_rows}); candidate rotate_half=false max_delta={delta_pair:.3e}, candidate rotate_half=true max_delta={delta_half:.3e}, tolerance={tolerance:.3e} (reference scale {scale}); if both deltas are large the carrier Q reference itself is suspect — stale content or a RoPE position disagreement with the cursor facts — inspect the carrier's cursor guard facts before re-probing"
+    )))
 }
 
 impl<'host> ProgramSession<'host> {
@@ -4257,6 +4372,334 @@ mod fused_qkv_plan_tests {
             assert!(
                 fused_cursor_position_from_words(&bad).is_err(),
                 "cursor {bad:?} must fail closed"
+            );
+        }
+    }
+}
+
+/// R3-HOSTS: the RoPE-pairing probe's direct carrier launch under real M=1
+/// decode facts. The fake driver's `FakeQkvCarrierSim` mirrors the compiled
+/// carrier's observable contract — the fail-early cursor guard (radix
+/// projection.rs `emit_cache_guard`) writes a status word and NO Q on
+/// rejection; an admitted decode publishes a dense-f32 Q through the
+/// library body under the baked pairing.
+#[cfg(test)]
+mod fused_rotate_half_probe_tests {
+    use super::*;
+    use crate::metal_host::{FakeMetalDriver, FakeQkvCarrierSim, MetalHostSession};
+
+    const ENTRY: &str = "decode_blk_0_QkvProjection";
+
+    /// Dense-f32 M=1 decode geometry: head_dim 8, hidden 16, kv_heads 2,
+    /// q_per_kv 3 (q_width 48), K/V arenas of 8 rows (kv_width 16, 128
+    /// elements), capacity-sized RoPE tables of 8 rows (32 elements).
+    fn carrier_sim(rotate_half: bool, baked_query_rows: u32, skew: f32) -> FakeQkvCarrierSim {
+        FakeQkvCarrierSim {
+            entry: ENTRY.to_owned(),
+            activation: 0,
+            q_weight: 1,
+            k_weight: 2,
+            v_weight: 3,
+            q_bias: None,
+            cos: 4,
+            sin: 5,
+            cursor: 6,
+            q_out: 7,
+            baked_query_rows,
+            rows: 1,
+            hidden: 16,
+            kv_heads: 2,
+            q_per_kv: 3,
+            head_dim: 8,
+            rotate_half,
+            skew,
+        }
+    }
+
+    struct ProbeFixture {
+        runtime: DeviceRuntime,
+        module: DeviceHandle,
+        kernel: SessionKernel,
+        plan: FusedQkvPlan,
+        buffers: BTreeMap<BufferKey, DeviceHandle>,
+    }
+
+    fn probe_fixture(sim: FakeQkvCarrierSim, cursor: [f32; 4]) -> ProbeFixture {
+        let mut runtime = DeviceRuntime::Metal(
+            MetalHostSession::with_driver(Box::new(
+                FakeMetalDriver::default()
+                    .with_known_entry(ENTRY)
+                    .with_qkv_carrier_sim(sim),
+            ))
+            .expect("fake metal admit"),
+        );
+        let slot = |buffer_id: u32,
+                    name: &str,
+                    role: DeviceBufferRole,
+                    binding: u32,
+                    element_count: u64| SessionSlot {
+            buffer_id,
+            version: 1,
+            buffer_name: name.to_owned(),
+            role,
+            binding,
+            element_ty: DeviceDataType::F32,
+            element_count,
+        };
+        let slots = vec![
+            slot(360, "decode.blk0.a", DeviceBufferRole::InOut, 0, 16),
+            slot(73, "blk.0.attn_q.weight", DeviceBufferRole::Input, 1, 768),
+            slot(74, "blk.0.attn_k.weight", DeviceBufferRole::Input, 2, 256),
+            slot(75, "blk.0.attn_v.weight", DeviceBufferRole::Input, 3, 256),
+            slot(3, "prefill.rope.cos", DeviceBufferRole::Input, 4, 32),
+            slot(4, "prefill.rope.sin", DeviceBufferRole::Input, 5, 32),
+            slot(6, "kv.invocation_state", DeviceBufferRole::Input, 6, 4),
+            slot(361, "decode.blk0.q_gemv", DeviceBufferRole::InOut, 7, 48),
+            slot(7, "kv.cache_k.0", DeviceBufferRole::InOut, 8, 128),
+            slot(8, "kv.cache_v.0", DeviceBufferRole::InOut, 9, 128),
+        ];
+        let mut buffer_meta = BTreeMap::new();
+        buffer_meta.insert(
+            (9_000, 1),
+            SessionBufferMeta {
+                name: "blk.0.attn_norm.weight".to_owned(),
+                semantic_value: 0,
+                role: DeviceBufferRole::Input,
+                element_ty: DeviceDataType::F32,
+                element_count: 16,
+                byte_length: 64,
+                lifetime: DeviceBufferLifetime::PerProgram,
+                initialization: DeviceBufferInitialization::HostProvided,
+            },
+        );
+        let plan = build_fused_qkv_plan(
+            ENTRY,
+            &slots,
+            &buffer_meta,
+            Some(FusedAttentionAxes { head_dim: 8 }),
+            [1, 1, 1],
+        )
+        .expect("the M=1 decode plan builds from the frozen slot facts")
+        .expect("entry matched");
+        assert_eq!(plan.rows, 1);
+        let module = runtime
+            .load_module(b"qkv-probe-module")
+            .expect("module loads");
+        let mut buffers = BTreeMap::new();
+        let mut seed = |runtime: &mut DeviceRuntime,
+                        buffers: &mut BTreeMap<BufferKey, DeviceHandle>,
+                        id: u32,
+                        values: &[f32]| {
+            let handle = runtime
+                .alloc_bytes(values.len() * 4)
+                .expect("probe buffer allocates");
+            runtime
+                .copy_in_f32(&handle, values)
+                .expect("probe input copies");
+            buffers.insert((id, 1), handle);
+        };
+        seed(
+            &mut runtime,
+            &mut buffers,
+            360,
+            &(0..16).map(|i| i as f32 * 0.25 - 1.75).collect::<Vec<_>>(),
+        );
+        seed(
+            &mut runtime,
+            &mut buffers,
+            73,
+            &(0..768)
+                .map(|i| (i % 13) as f32 * 0.07 - 0.42)
+                .collect::<Vec<_>>(),
+        );
+        seed(
+            &mut runtime,
+            &mut buffers,
+            74,
+            &(0..256)
+                .map(|i| (i % 11) as f32 * 0.06 - 0.3)
+                .collect::<Vec<_>>(),
+        );
+        seed(
+            &mut runtime,
+            &mut buffers,
+            75,
+            &(0..256)
+                .map(|i| (i % 9) as f32 * 0.05 - 0.2)
+                .collect::<Vec<_>>(),
+        );
+        seed(
+            &mut runtime,
+            &mut buffers,
+            3,
+            &(0..32).map(|i| (i % 7) as f32 * 0.11).collect::<Vec<_>>(),
+        );
+        seed(
+            &mut runtime,
+            &mut buffers,
+            4,
+            &(0..32)
+                .map(|i| 0.02 + (i % 5) as f32 * 0.09)
+                .collect::<Vec<_>>(),
+        );
+        seed(&mut runtime, &mut buffers, 6, &cursor);
+        seed(&mut runtime, &mut buffers, 361, &vec![0.0f32; 48]);
+        seed(&mut runtime, &mut buffers, 7, &vec![0.0f32; 128]);
+        seed(&mut runtime, &mut buffers, 8, &vec![0.0f32; 128]);
+        let kernel = SessionKernel {
+            entry: ENTRY.to_owned(),
+            slots,
+            fused_qkv: None,
+            fused_residual_rms: None,
+            grid: [1, 1, 1],
+            block: [32, 1, 1],
+        };
+        ProbeFixture {
+            runtime,
+            module,
+            kernel,
+            plan,
+            buffers,
+        }
+    }
+
+    /// Real M=1 decode facts (position 5, valid_len_after 6, query_rows 1)
+    /// pass the carrier's guard: the carrier publishes Q, the reference is
+    /// non-stale, and the probe learns the carrier's baked rotate-half
+    /// pairing (the Qwen RED case).
+    #[test]
+    fn probe_learns_carrier_pairing_under_real_m1_facts() {
+        let mut fixture = probe_fixture(carrier_sim(true, 1, 0.0), [5.0, 6.0, 1.0, 0.0]);
+        let learned = std::cell::RefCell::new(None);
+        let pairing = fused_rotate_half(
+            &mut fixture.runtime,
+            &fixture.module,
+            &fixture.kernel,
+            &fixture.plan,
+            &fixture.buffers,
+            &BTreeMap::new(),
+            &learned,
+        )
+        .expect("the probe resolves the carrier's baked rotate-half pairing");
+        assert!(pairing, "the carrier baked rotate_half=true");
+        assert_eq!(*learned.borrow(), Some(true));
+    }
+
+    /// The consecutive-pair carrier (SmolLM2 class) is learned the same way.
+    #[test]
+    fn probe_learns_pair_rotate_under_real_m1_facts() {
+        let mut fixture = probe_fixture(carrier_sim(false, 1, 0.0), [5.0, 6.0, 1.0, 0.0]);
+        let learned = std::cell::RefCell::new(None);
+        let pairing = fused_rotate_half(
+            &mut fixture.runtime,
+            &fixture.module,
+            &fixture.kernel,
+            &fixture.plan,
+            &fixture.buffers,
+            &BTreeMap::new(),
+            &learned,
+        )
+        .expect("the probe resolves the carrier's baked pair-rotate pairing");
+        assert!(!pairing, "the carrier baked rotate_half=false");
+    }
+
+    /// The M1-NUM zeroed-cursor case: stale cursor facts fail closed BEFORE
+    /// the carrier launch, naming the unavailable fact — never a blind
+    /// launch that compares the Q buffer's stale contents.
+    #[test]
+    fn zeroed_cursor_fails_closed_naming_the_fact() {
+        let mut fixture = probe_fixture(carrier_sim(true, 1, 0.0), [0.0, 0.0, 0.0, 0.0]);
+        let learned = std::cell::RefCell::new(None);
+        let error = fused_rotate_half(
+            &mut fixture.runtime,
+            &fixture.module,
+            &fixture.kernel,
+            &fixture.plan,
+            &fixture.buffers,
+            &BTreeMap::new(),
+            &learned,
+        )
+        .err()
+        .expect("a zeroed cursor must fail closed before the carrier launch");
+        assert!(
+            error.message.contains("query_rows"),
+            "the error names the unavailable fact: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("stale reference"),
+            "the error names the stale-reference consequence: {}",
+            error.message
+        );
+    }
+
+    /// Kimi's surviving mechanism, reproduced: the host-side facts validate
+    /// against the plan, but the compiled carrier's BAKED query-row constant
+    /// disagrees — the carrier's fail-early guard rejects the decode and
+    /// writes no Q. The poison-fill assertion catches the stale reference
+    /// instead of comparing it under both pairings.
+    #[test]
+    fn guard_trip_despite_valid_host_facts_is_detected_as_stale() {
+        let mut fixture = probe_fixture(carrier_sim(true, 2, 0.0), [5.0, 6.0, 1.0, 0.0]);
+        let learned = std::cell::RefCell::new(None);
+        let error = fused_rotate_half(
+            &mut fixture.runtime,
+            &fixture.module,
+            &fixture.kernel,
+            &fixture.plan,
+            &fixture.buffers,
+            &BTreeMap::new(),
+            &learned,
+        )
+        .err()
+        .expect("a carrier that publishes no Q must fail the probe closed");
+        assert!(
+            error.message.contains("published no Q"),
+            "the error states the carrier wrote nothing: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("47/48"),
+            "the error reports the surviving poison count: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("STALE"),
+            "the error names the stale reference: {}",
+            error.message
+        );
+    }
+
+    /// Repair law 4: a both-candidates mismatch reports per-candidate
+    /// deltas and the probe inputs instead of "matched neither pairing".
+    #[test]
+    fn no_match_error_reports_candidate_deltas_and_inputs() {
+        let mut fixture = probe_fixture(carrier_sim(true, 1, 1.0), [5.0, 6.0, 1.0, 0.0]);
+        let learned = std::cell::RefCell::new(None);
+        let error = fused_rotate_half(
+            &mut fixture.runtime,
+            &fixture.module,
+            &fixture.kernel,
+            &fixture.plan,
+            &fixture.buffers,
+            &BTreeMap::new(),
+            &learned,
+        )
+        .err()
+        .expect("a skewed carrier Q matches neither candidate");
+        for fragment in [
+            "rotate_half=false max_delta=",
+            "rotate_half=true max_delta=",
+            "rows=1",
+            "head_dim=8",
+            "position 5",
+            "tolerance=",
+            "stale",
+        ] {
+            assert!(
+                error.message.contains(fragment),
+                "diagnostic missing `{fragment}`: {}",
+                error.message
             );
         }
     }
