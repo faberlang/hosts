@@ -36,8 +36,6 @@ pub struct PairedProgramSession<'host> {
     decode_descriptor: DeviceDescriptor,
     prompt_tokens: Vec<u32>,
     rope: RopeConfig,
-    model_identity: String,
-    session_identity: String,
     state: InferenceSessionState,
     reuses: usize,
     resets: usize,
@@ -140,8 +138,6 @@ impl<'host> PairedProgramSession<'host> {
             decode_descriptor,
             prompt_tokens,
             rope,
-            model_identity,
-            session_identity,
             state,
             reuses: 0,
             resets: 0,
@@ -310,39 +306,6 @@ impl<'host> PairedProgramSession<'host> {
         );
         self.prefill = Some(session.into_inner());
         Ok(identity)
-    }
-
-    /// The explicitly carried model identity.
-    #[must_use]
-    pub fn model_identity(&self) -> &str {
-        &self.model_identity
-    }
-
-    /// The explicitly carried sequence/session identity.
-    #[must_use]
-    pub fn session_identity(&self) -> &str {
-        &self.session_identity
-    }
-
-    /// Number of declared physical kernels in both static programs.
-    #[must_use]
-    pub fn kernel_count(&self) -> usize {
-        self.prefill_descriptor.kernels.len() + self.decode_descriptor.kernels.len()
-    }
-
-    /// Program graph identities in the stable control-receipt spelling.
-    #[must_use]
-    pub fn program_identities(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                "prefill".to_owned(),
-                self.prefill_descriptor.program_graph_hash(),
-            ),
-            (
-                "scalar_decode".to_owned(),
-                self.decode_descriptor.program_graph_hash(),
-            ),
-        ])
     }
 
     /// Live handles owned by the pair's runtime, including the shared model
