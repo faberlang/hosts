@@ -4906,12 +4906,6 @@ fn abi_roundtrip_perf_measurement() {
     }
     eprintln!("array push+get {N} f32: {:?}", started.elapsed());
 
-    let runtime_array = unsafe { &*array.value.cast::<RuntimeArray>() };
-    eprintln!(
-        "f32 array {N} payload bytes: {}",
-        runtime_array.values.payload_bytes()
-    );
-
     let source = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
     let target = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
     for index in 0..10_000 {

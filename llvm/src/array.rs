@@ -151,23 +151,6 @@ impl RuntimeCells {
         self.len() == 0
     }
 
-    pub(super) fn payload_bytes(&self) -> usize {
-        match self {
-            Self::I1(values) | Self::U8(values) => values.len(),
-            Self::I8(values) => values.len(),
-            Self::I16(values) => values.len() * 2,
-            Self::U16(values) => values.len() * 2,
-            Self::F16(values) => values.len() * 2,
-            Self::I32(values) => values.len() * 4,
-            Self::U32(values) => values.len() * 4,
-            Self::F32(values) => values.len() * 4,
-            Self::I64(values) => values.len() * 8,
-            Self::U64(values) => values.len() * 8,
-            Self::F64(values) => values.len() * 8,
-            Self::Ptr(values) => values.len() * std::mem::size_of::<*mut c_void>(),
-        }
-    }
-
     pub(super) fn reserve(&mut self, additional: usize) {
         match self {
             Self::I1(values) | Self::U8(values) => values.reserve(additional),
