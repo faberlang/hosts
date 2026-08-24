@@ -53,7 +53,7 @@ use crate::composite_host::invocation_binding::RopeConfig;
 use crate::composite_host::{
     admitted_backends, resolve_device_selection, CompositeHost, CompositeHostConfig,
     DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection, KvCacheTimingReceipt,
-    PairedProgramSession, PreparedResidentSession,
+    PairedProgramSession, PreparedResidentSession, PreparedSessionReceipt,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -1304,16 +1304,7 @@ pub fn run_device_execute_control(args: &DeviceExecuteArgs) -> HostResult<()> {
                     DeviceExecuteControlReceipt {
                         operation: "release".to_owned(),
                         protocol: args.protocol.version(),
-                        lifecycle: DeviceExecuteLifecycle {
-                            prepares: lifecycle.counters.prepares,
-                            reuses: lifecycle.counters.reuses,
-                            resets: lifecycle.counters.resets,
-                            releases: lifecycle.counters.releases,
-                            module_reloads: lifecycle.module_reloads,
-                            per_program_reallocs: lifecycle.per_program_reallocs,
-                            weight_uploads: lifecycle.timing.lifecycle.weight_uploads as usize,
-                            live_handles: lifecycle.live_handles,
-                        },
+                        lifecycle: control_lifecycle(&lifecycle),
                         kernel_count: descriptor.kernels.len(),
                         reset_cleared: 0,
                         receipt: None,
@@ -1358,16 +1349,7 @@ fn control_receipt(
     DeviceExecuteControlReceipt {
         operation: operation.to_owned(),
         protocol: DeviceExecuteProtocol::V1.version(),
-        lifecycle: DeviceExecuteLifecycle {
-            prepares: lifecycle.counters.prepares,
-            reuses: lifecycle.counters.reuses,
-            resets: lifecycle.counters.resets,
-            releases: lifecycle.counters.releases,
-            module_reloads: lifecycle.module_reloads,
-            per_program_reallocs: lifecycle.per_program_reallocs,
-            weight_uploads: lifecycle.timing.lifecycle.weight_uploads as usize,
-            live_handles: lifecycle.live_handles,
-        },
+        lifecycle: control_lifecycle(&lifecycle),
         kernel_count,
         reset_cleared,
         receipt,
@@ -1377,6 +1359,20 @@ fn control_receipt(
         mmap: MappedWeightPaging::default(),
         mmap_data_start: 0,
         mmap_regions: 0,
+    }
+}
+
+/// Project one prepared-session receipt onto the control-wire lifecycle.
+fn control_lifecycle(lifecycle: &PreparedSessionReceipt) -> DeviceExecuteLifecycle {
+    DeviceExecuteLifecycle {
+        prepares: lifecycle.counters.prepares,
+        reuses: lifecycle.counters.reuses,
+        resets: lifecycle.counters.resets,
+        releases: lifecycle.counters.releases,
+        module_reloads: lifecycle.module_reloads,
+        per_program_reallocs: lifecycle.per_program_reallocs,
+        weight_uploads: lifecycle.timing.lifecycle.weight_uploads as usize,
+        live_handles: lifecycle.live_handles,
     }
 }
 
