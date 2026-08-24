@@ -16,8 +16,7 @@ use crate::abi::{
 };
 use faber::tensor::{
     tensor_flat_offset, tensor_shape_element_count, tensor_shape_has_element_count,
-    ERR_INDEX_OUT_OF_BOUNDS, ERR_INVALID_SLICE_RANGE, ERR_NEGATIVE_DIM, ERR_NEGATIVE_INDEX,
-    ERR_NEGATIVE_SLICE,
+    ERR_INDEX_OUT_OF_BOUNDS, ERR_NEGATIVE_DIM, ERR_NEGATIVE_INDEX,
 };
 use faber::Tensor;
 use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_I64};
@@ -467,11 +466,9 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_slice(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         if start < 0 || end < 0 {
-            let _ = ERR_NEGATIVE_SLICE;
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
         if end < start {
-            let _ = ERR_INVALID_SLICE_RANGE;
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
         if tensor.shape.is_empty() {
@@ -852,7 +849,7 @@ fn cast_runtime_value(
     from_kind: FaberRtValueKindV1,
     to_kind: FaberRtValueKindV1,
 ) -> Option<RuntimeValue> {
-    // Mirror Rust `as` for numeric lattice cells used by tensor conversio.
+    // Mirror Rust `as` for numeric lattice cells used by tensor conversion.
     if matches!(
         to_kind,
         radix_host_abi::VALUE_KIND_F32
