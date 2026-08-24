@@ -131,11 +131,11 @@ pub fn bind_policy_for_declared_count(
     if bind_count == 1 {
         return Ok(BindPolicy::ColocateOnSnapshot);
     }
-    let bind = bind_count as usize;
-    if bind == partition_count {
+    let count = bind_count as usize;
+    if count == partition_count {
         return Ok(BindPolicy::OnePhysicalPerPartition);
     }
-    if bind < partition_count && partition_count.is_multiple_of(bind) {
+    if count < partition_count && partition_count.is_multiple_of(count) {
         return Ok(BindPolicy::SplitAcrossMembership { bind_count });
     }
     Err(TranslateError::Unsupported(format!(
