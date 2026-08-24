@@ -55,13 +55,9 @@ impl BindDescriptor {
     #[must_use]
     pub fn row_major(dims: impl Into<Vec<u64>>, grid: [u32; 3]) -> Self {
         let dims = dims.into();
-        let mut strides = vec![1u64; dims.len()];
-        for axis in (0..dims.len()).rev().skip(1) {
-            strides[axis] = strides[axis + 1].saturating_mul(dims[axis + 1]);
-        }
         Self {
+            strides: row_major_strides(&dims),
             dims,
-            strides,
             layout: BindLayout::RowMajor,
             grid,
         }
