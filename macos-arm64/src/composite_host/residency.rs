@@ -9,6 +9,8 @@
 //! Parent registration is a private `mod residency` in `composite_host.rs`;
 //! this unit cannot re-export it.
 
+// Load-bearing: the #[path]-included residency tests consume the surface
+// the lib build would otherwise flag.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,13 +44,6 @@ fn invalid_args(message: impl Into<String>) -> SessionError {
 /// from [`DescriptorAllocation::capacity_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AllocationIdentity(u64);
-
-impl AllocationIdentity {
-    #[must_use]
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-}
 
 /// One resident allocation: a B3 descriptor plus a minted object identity.
 /// Programs resolve this object, not a copy sized the same way.
@@ -171,11 +166,6 @@ impl ModelIdentity {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    #[must_use]
-    pub fn epoch(&self) -> u32 {
-        self.epoch
     }
 }
 
