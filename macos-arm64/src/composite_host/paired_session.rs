@@ -24,7 +24,7 @@ use super::inference_state::{
     FailureStage, InferenceSessionState, InvocationMode, InvocationTransaction, ResetReceipt,
     SequencePhase, SessionError, E_KV_STALE,
 };
-use super::session::{ProgramInner, ProgramSession};
+use super::session::{FusedAttentionAxes, ProgramInner, ProgramSession};
 use super::{DeviceExecutionReceipt, KvCacheTimingReceipt};
 
 /// One prepared prefill/scalar-decode pair over one runtime and model owner.
@@ -86,25 +86,39 @@ impl<'host> PairedProgramSession<'host> {
         }
         rope.validate_for_pair()?;
         validate_pair_descriptors(prefill, decode)?;
+        // FQ-1: the pair's validated RoPE facts ARE the authoritative
+        // attention axes — head_dim is the width of one row of the
+        // producer's own prefill RoPE table. Carry them into both fused
+        // QKV plan recognitions; the host never divides a capacity-sized
+        // decode table by the activation row count.
+        let attention_axes = FusedAttentionAxes {
+            head_dim: u64::from(rope.head_dim),
+        };
         let prefill_descriptor = prefill.clone();
         let decode_descriptor = decode.clone();
         let uploads_at_prepare = runtime.driver_counters().uploads;
 
-        let mut prefill_session = ProgramSession::new(runtime, prefill, device_name.clone())?;
+        let mut prefill_session =
+            ProgramSession::new(runtime, prefill, device_name.clone(), Some(attention_axes))?;
         if let Err(error) = prefill_session.init_params_with_weight_bytes(weights, byte_weights) {
             return Err(error);
         }
         let offer = prefill_session.shared_offer();
         let prefill = prefill_session.into_inner();
 
-        let mut decode_session =
-            match ProgramSession::new_with_share(runtime, decode, device_name, Some(&offer)) {
-                Ok(session) => session,
-                Err(error) => {
-                    release_inner(runtime, prefill);
-                    return Err(error);
-                }
-            };
+        let mut decode_session = match ProgramSession::new_with_share(
+            runtime,
+            decode,
+            device_name,
+            Some(&offer),
+            Some(attention_axes),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                release_inner(runtime, prefill);
+                return Err(error);
+            }
+        };
         if let Err(error) = decode_session.init_params_with_weight_bytes(weights, byte_weights) {
             let decode = decode_session.into_inner();
             release_inner(runtime, decode);

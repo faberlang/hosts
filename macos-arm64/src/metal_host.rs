@@ -1161,6 +1161,53 @@ pub struct FakeMetalDriver {
     blocking_waits: usize,
     /// Times `copy_in` took the retained-mmap wrap branch.
     mmap_wraps: usize,
+    /// Optional simulated fused QKV carrier launch (RoPE-pairing probe
+    /// tests): mirrors the compiled carrier's observable decode contract.
+    qkv_carrier: Option<FakeQkvCarrierSim>,
+}
+
+/// Simulated fused QKV carrier (`*_QkvProjection`) for the hosts-side
+/// RoPE-pairing probe tests. This mirrors the compiled carrier's observable
+/// contract — NOT its numerics: the fail-early cursor guard runs first (the
+/// `DECODE_STATUS_INVALID_CURSOR` status word lands in Q[0] and NO Q is
+/// written on rejection), and an admitted decode publishes a dense-f32 Q
+/// through the library body under the baked rotate-half pairing. Binding
+/// indices address the launch's buffer list in slot order.
+#[derive(Debug, Clone)]
+pub struct FakeQkvCarrierSim {
+    /// Entry name this simulation serves.
+    pub entry: String,
+    /// Launch-buffer index of the activation input.
+    pub activation: usize,
+    /// Launch-buffer index of the dense column-major Q weight.
+    pub q_weight: usize,
+    /// Launch-buffer indices of the dense K/V weights (unused for Q).
+    pub k_weight: usize,
+    pub v_weight: usize,
+    /// Launch-buffer index of the optional Q/K/V bias (all-or-none).
+    pub q_bias: Option<usize>,
+    /// Launch-buffer indices of the RoPE cosine/sine tables.
+    pub cos: usize,
+    pub sin: usize,
+    /// Launch-buffer index of the four-field invocation-state cursor.
+    pub cursor: usize,
+    /// Launch-buffer index of the Q output.
+    pub q_out: usize,
+    /// The carrier's baked query-row constant — what its guard compares the
+    /// cursor's `query_rows` against (a value other than the cursor's
+    /// exercises the guard-trip / stale-reference path).
+    pub baked_query_rows: u32,
+    /// Bind geometry (rows, hidden, kv_heads, q_per_kv, head_dim).
+    pub rows: u64,
+    pub hidden: u64,
+    pub kv_heads: u64,
+    pub q_per_kv: u64,
+    pub head_dim: u64,
+    /// The baked rotate-half pairing the probe is meant to discover.
+    pub rotate_half: bool,
+    /// Constant added to every published Q element (forces a both-candidates
+    /// mismatch to exercise the diagnostic error message).
+    pub skew: f32,
 }
 
 impl FakeMetalDriver {
@@ -1182,6 +1229,14 @@ impl FakeMetalDriver {
     /// is 1-based; an absent entry means the stage never fails.
     pub fn with_failure_at(mut self, stage: FakeFailureStage, call: u32) -> Self {
         self.fail_at.insert(stage, call);
+        self
+    }
+
+    /// Install a simulated fused QKV carrier launch (RoPE-pairing probe
+    /// tests). The entry must also be declared via
+    /// [`FakeMetalDriver::with_known_entry`].
+    pub fn with_qkv_carrier_sim(mut self, sim: FakeQkvCarrierSim) -> Self {
+        self.qkv_carrier = Some(sim);
         self
     }
 
@@ -1328,6 +1383,145 @@ impl FakeMetalDriver {
         out_view.copy_from_slice(&src_bytes[..out_view.len()]);
         Ok(())
     }
+
+    /// Read one launch binding's whole slot as f32 values.
+    fn read_slot_f32(&self, token: u64, what: &str) -> HostResult<Vec<f32>> {
+        let bytes = self.view_from(token, 0, what)?;
+        if bytes.len() % 4 != 0 {
+            return Err(HostError::invalid_args(format!(
+                "fake {what} is not f32 aligned"
+            )));
+        }
+        Ok((0..bytes.len() / 4)
+            .map(|index| read_f32_at(bytes, index))
+            .collect())
+    }
+
+    /// Overwrite one launch binding's whole slot with f32 values.
+    fn write_slot_f32(&mut self, token: u64, values: &[f32], what: &str) -> HostResult<()> {
+        let start = {
+            let slot = self.slot(token, what)?;
+            compose_bind_offset(slot.region_offset, 0, 0, slot.bytes.len() as u64)? as usize
+        };
+        let end = start
+            .checked_add(values.len() * 4)
+            .ok_or_else(|| HostError::invalid_args("fake write overflows"))?;
+        let buffer = self
+            .buffers
+            .get_mut(&token)
+            .ok_or_else(|| HostError::internal(format!("fake {what} missing buffer")))?;
+        if end > buffer.bytes.len() {
+            return Err(HostError::invalid_args(format!(
+                "fake {what} write of {} f32 values exceeds the slot",
+                values.len()
+            )));
+        }
+        for (index, value) in values.iter().enumerate() {
+            write_f32_at(&mut buffer.bytes[start..], index, *value);
+        }
+        Ok(())
+    }
+
+    /// Simulate the fused QKV carrier launch: the observable decode contract
+    /// of the compiled `*_QkvProjection` entry. The fail-early cursor guard
+    /// runs first — on rejection the `DECODE_STATUS_INVALID_CURSOR` status
+    /// word lands in Q[0] and NO Q is written (the stale-reference path the
+    /// pairing probe must detect); an admitted decode publishes a dense-f32
+    /// Q through the library body under the baked rotate-half pairing.
+    fn simulate_qkv_carrier(
+        &mut self,
+        module: u64,
+        buffers: &[u64],
+        sim: &FakeQkvCarrierSim,
+    ) -> HostResult<()> {
+        use crate::kernel::library::{qkv_projection, QkvProjectionBind, QkvProjectionWeight};
+
+        if !self.modules.contains_key(&module) {
+            return Err(HostError::internal("fake launch missing module"));
+        }
+        let binding = |index: usize, what: &str| {
+            buffers.get(index).copied().ok_or_else(|| {
+                HostError::invalid_args(format!(
+                    "fake QKV carrier launch has no binding {index} for {what}"
+                ))
+            })
+        };
+        let cursor = self.read_slot_f32(binding(sim.cursor, "carrier cursor")?, "cursor")?;
+        let position = cursor.first().copied().unwrap_or(f32::NAN);
+        let valid_len_after = cursor.get(1).copied().unwrap_or(f32::NAN);
+        let query_rows = cursor.get(2).copied().unwrap_or(f32::NAN);
+        if query_rows != sim.baked_query_rows as f32 || valid_len_after != position + query_rows {
+            // Status word only: the rejected decode writes no Q.
+            let q_out = binding(sim.q_out, "carrier Q output")?;
+            let mut status = self.read_slot_f32(q_out, "carrier Q output")?;
+            status[0] = f32::from_bits(1u32);
+            return self.write_slot_f32(q_out, &status, "carrier Q output");
+        }
+        let activation =
+            self.read_slot_f32(binding(sim.activation, "carrier activation")?, "activation")?;
+        let q_weight =
+            self.read_slot_f32(binding(sim.q_weight, "carrier Q weight")?, "Q weight")?;
+        let k_weight =
+            self.read_slot_f32(binding(sim.k_weight, "carrier K weight")?, "K weight")?;
+        let v_weight =
+            self.read_slot_f32(binding(sim.v_weight, "carrier V weight")?, "V weight")?;
+        let bias = match sim.q_bias {
+            Some(index) => Some(self.read_slot_f32(binding(index, "carrier bias")?, "bias")?),
+            None => None,
+        };
+        let cos = self.read_slot_f32(binding(sim.cos, "carrier cos table")?, "cos table")?;
+        let sin = self.read_slot_f32(binding(sim.sin, "carrier sin table")?, "sin table")?;
+        let mut bind = QkvProjectionBind::grouped(
+            sim.rows,
+            sim.hidden,
+            sim.kv_heads,
+            sim.q_per_kv,
+            sim.head_dim,
+            [1, 1, 1],
+        );
+        bind.rotate_half = sim.rotate_half;
+        bind.rope_position = position as u64;
+        let q_width = sim
+            .kv_heads
+            .saturating_mul(sim.q_per_kv)
+            .saturating_mul(sim.head_dim) as usize;
+        let kv_span = sim
+            .kv_heads
+            .saturating_mul(sim.rows)
+            .saturating_mul(sim.head_dim) as usize;
+        let mut q_values = vec![0.0f32; q_width];
+        let mut k_values = vec![0.0f32; kv_span];
+        let mut v_values = vec![0.0f32; kv_span];
+        let bias_ref = bias.as_deref();
+        qkv_projection(
+            &bind,
+            &activation,
+            QkvProjectionWeight::Dense(&q_weight),
+            QkvProjectionWeight::Dense(&k_weight),
+            QkvProjectionWeight::Dense(&v_weight),
+            bias_ref,
+            bias_ref,
+            bias_ref,
+            Some(&cos),
+            Some(&sin),
+            &mut q_values,
+            &mut k_values,
+            &mut v_values,
+        )
+        .map_err(|error| {
+            HostError::invalid_args(format!("fake QKV carrier simulation failed: {error}"))
+        })?;
+        if sim.skew != 0.0 {
+            for value in &mut q_values {
+                *value += sim.skew;
+            }
+        }
+        self.write_slot_f32(
+            binding(sim.q_out, "carrier Q output")?,
+            &q_values,
+            "carrier Q output",
+        )
+    }
 }
 
 impl MetalDriver for FakeMetalDriver {
@@ -1467,6 +1661,18 @@ impl MetalDriver for FakeMetalDriver {
                 .any(|entry_name| entry_name.as_bytes() == entry)
         {
             return Err(metal_entry_mismatch(&String::from_utf8_lossy(entry)));
+        }
+        // The simulated fused QKV carrier serves its declared entry with the
+        // compiled carrier's observable decode contract (cursor guard +
+        // dense Q publish) for the RoPE-pairing probe tests.
+        let carrier = match &self.qkv_carrier {
+            Some(sim) if sim.entry.as_bytes() == entry => Some(sim.clone()),
+            _ => None,
+        };
+        if let Some(sim) = carrier {
+            self.simulate_qkv_carrier(module, buffers, &sim)?;
+            self.pending_encodes += 1;
+            return Ok(());
         }
         // The simulated elementwise-add kernel takes exactly three buffers
         // (a, b, out); the simulated accumulate kernel takes two (a, acc)
