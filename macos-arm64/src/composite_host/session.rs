@@ -469,14 +469,6 @@ impl ProgramInner {
         }
     }
 
-    pub(crate) fn program_graph_hash(&self) -> &str {
-        &self.program_graph_hash
-    }
-
-    pub(crate) fn module_hash(&self) -> u64 {
-        self.module_hash
-    }
-
     pub(crate) fn kv_cache_timing(&self) -> KvCacheTimingReceipt {
         self.kv_cache_timing
     }
@@ -3121,9 +3113,6 @@ impl PreparedSessionReceipt {
 /// retains allocation.
 pub struct PreparedResidentSession<'host> {
     session: ProgramSession<'host>,
-    backend: DeviceBackend,
-    device_name: String,
-    program_graph_hash: String,
     counters: PreparedSessionCounters,
     /// Driver-counter baselines at prepare (module loads / buffer allocs)
     /// for the reload/realloc derivation in [`PreparedResidentSession::receipt`].
@@ -3134,9 +3123,6 @@ pub struct PreparedResidentSession<'host> {
     per_execution_alloc_count: usize,
     /// HostProvided weights copied exactly once during preparation.
     weight_uploads_at_prepare: usize,
-    /// Closed after an error-path release (S2-3): every handle is gone and
-    /// no further reuse/reset is possible.
-    closed: bool,
 }
 
 impl<'host> PreparedResidentSession<'host> {
@@ -3193,9 +3179,6 @@ impl<'host> PreparedResidentSession<'host> {
         session.init_params(weights)?;
         let counters = session.driver_counters();
         Ok(Self {
-            program_graph_hash: descriptor.program_graph_hash(),
-            backend: descriptor.backend,
-            device_name,
             session,
             counters: PreparedSessionCounters {
                 prepares: 1,
@@ -3205,7 +3188,6 @@ impl<'host> PreparedResidentSession<'host> {
             buffer_allocs_at_prepare: counters.buffer_allocs,
             per_execution_alloc_count: classes.per_execution_alloc_count,
             weight_uploads_at_prepare: classes.host_provided_weights,
-            closed: false,
         })
     }
 
@@ -3252,9 +3234,6 @@ impl<'host> PreparedResidentSession<'host> {
         session.init_params_with_weight_bytes(weights, byte_weights)?;
         let counters = session.driver_counters();
         Ok(Self {
-            program_graph_hash: descriptor.program_graph_hash(),
-            backend: descriptor.backend,
-            device_name,
             session,
             counters: PreparedSessionCounters {
                 prepares: 1,
@@ -3264,7 +3243,6 @@ impl<'host> PreparedResidentSession<'host> {
             buffer_allocs_at_prepare: counters.buffer_allocs,
             per_execution_alloc_count: classes.per_execution_alloc_count,
             weight_uploads_at_prepare: classes.host_provided_weights,
-            closed: false,
         })
     }
 
