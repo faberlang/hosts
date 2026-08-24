@@ -130,14 +130,14 @@ fn run_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| HostError::internal(format!("{operation} failed: {error}")))?;
-    let Some(pipe) = child.stdout.take() else {
-        return Err(pipe_unavailable(&mut child, operation, "stdout"));
-    };
-    let stdout = pipe;
-    let Some(pipe) = child.stderr.take() else {
-        return Err(pipe_unavailable(&mut child, operation, "stderr"));
-    };
-    let stderr = pipe;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| pipe_unavailable(&mut child, operation, "stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| pipe_unavailable(&mut child, operation, "stderr"))?;
     let stdout_reader = thread::spawn(move || read_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_pipe(stderr));
 
@@ -226,9 +226,7 @@ fn abort_command(
 
 fn terminate_child(child: &mut Child) -> HostResult<()> {
     let group_termination = terminate_process_group(child);
-    let direct_termination = if matches!(&group_termination, Ok(true)) {
-        Ok(())
-    } else {
+    if !matches!(&group_termination, Ok(true)) {
         match child.kill() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -238,13 +236,11 @@ fn terminate_child(child: &mut Child) -> HostResult<()> {
                 )));
             }
         }
-        Ok(())
-    };
+    }
     let reap = child
         .wait()
         .map(|_| ())
         .map_err(|error| HostError::internal(format!("failed to reap child: {error}")));
-    direct_termination?;
     reap?;
     group_termination.map(|_| ())
 }
