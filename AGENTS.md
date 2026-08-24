@@ -22,6 +22,15 @@ asked. Container law: [`../AGENTS.md`](../AGENTS.md).
 Path deps expect sibling `faberlang/{faber,radix}` for library/product work.
 Public generated-Rust carriers live under `faber/runtime/rust`.
 
+GPU architecture follows the canonical public
+[GPU Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/gpu-execution-architecture.md).
+Gradus owns ML semantics, logical placement and sharding intent, and all ML
+kernel source in Faber. Radix compiles target artifacts and explicit execution
+facts. Hosts owns physical discovery, virtual-partition admission, binding,
+residency, launch, synchronization, and readback. Do not add an ML kernel body,
+recover missing model facts from resource extents, or silently run a CPU
+implementation on a declared GPU path.
+
 ## Invariants
 
 1. Hosts are **execution** products and libraries. Compiler-only Radix builds do
