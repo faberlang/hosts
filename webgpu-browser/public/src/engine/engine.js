@@ -92,12 +92,12 @@ function greyboxDrawManifest(indexCount) {
  * two levels up).
  *
  * NOTE — placeholder artifact state: hosts public/generated/triga-lit.* are
- * byte-identical copies of the pre-radix kernel.wgsl + reflection.json (old
- * reflection format) until the radix regeneration lands (gated on 80 Stage
- * 4–5 graphics-MIR completeness). loadFaberGraphicsPipeline requires
- * schema_version / target / launch.webgpu_adapter, so the placeholder
- * reflection is REJECTED by admission with a typed FaberKernelContractError
- * and no draw happens. That is the documented gated state, not a defect.
+ * still the old pre-radix reflection format until the radix regeneration
+ * lands (gated on 80 Stage 4–5 graphics-MIR completeness).
+ * loadFaberGraphicsPipeline requires schema_version / target /
+ * launch.webgpu_adapter, so the placeholder reflection is REJECTED by
+ * admission with a typed FaberKernelContractError and no draw happens. That
+ * is the documented gated state, not a defect.
  *
  * @param {GPUDevice} device
  * @returns {Promise<{ descriptor: object, wgsl: string, reflection: object }>}
@@ -638,7 +638,6 @@ export function createEngineSession({
   let started = false;
   let destroyed = false;
   let sessionError = null;
-  let frameCount = 0;
   let lastTransform = null;
   const transformSequence = [];
   const drawCountHistory = [];
@@ -709,7 +708,6 @@ export function createEngineSession({
   function renderSceneFrame(transform) {
     if (!sceneResources) return;
     const result = renderGreyboxSceneFrame(sceneResources, transform, { clearValue });
-    frameCount += 1;
     drawCountHistory.push({
       frame: result.frame_index,
       draw_count: result.draw_count,
@@ -759,7 +757,6 @@ export function createEngineSession({
         if (floats) recordTransform(floats);
         return floats ?? lastTransform;
       },
-      onSceneFirstRender: () => {},
       onResize: (w, h) => {
         if (renderState.scene) {
           resizeGreyboxRenderer(renderState.scene, w, h);
