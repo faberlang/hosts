@@ -226,7 +226,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_ne_2_ptr_ptr_to_i1(
     compare_instans(lhs, rhs, |lhs, rhs| lhs != rhs)
 }
 
-/// Current wall-clock instant as an `instans<ns>` handle (`norma:tempus.nunc`).
+/// Current wall-clock instant as an `instans<ns>` handle (`norma:time.nunc`).
 #[no_mangle]
 pub unsafe extern "C" fn __faber_rt_v1_tempus_nunc(
     context: *mut FaberRtContextV1,

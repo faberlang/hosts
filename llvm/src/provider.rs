@@ -1,7 +1,7 @@
 //! Versioned `norma:*` provider carriers for the LLVM host.
 //!
-//! The LLVM emitter routes named providers (`norma:tempus.nunc`,
-//! `norma:toml.solve`, `norma:valor.cape`, `norma:json.{pange,solve,tempta}`)
+//! The LLVM emitter routes named providers (`norma:time.nunc`,
+//! `norma:toml.parse`, `norma:value.get`, `norma:json.{stringify,parse,try_parse}`)
 //! to these versioned v1 symbols. Each implementation either provides the
 //! provider semantics or fails closed with a stable unsupported status that
 //! the emitted program latches honestly (Stage 5 owns the semantic surface).

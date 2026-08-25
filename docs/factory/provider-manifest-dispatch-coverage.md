@@ -49,7 +49,7 @@ These are intentionally not support claims from this repository:
   coverage packet until their manifests, dispatch, and run evidence land.
 - No provider manifest exists here for deferred families such as `arca`,
   `caelum`, `crypta`, `http`, `nuncius`, `pressura`, `thesaurus`, `codex`,
-  `toml`, `yaml`, or deferred `chorda` wire/mechanical routes.
+  `toml`, `yaml`, or deferred `text` wire/mechanical routes.
 - `tempus` does not claim recurring timer cursor support; this workspace only
   manifests one-shot `tempus:dormiet` plus scalar clock routes.
 - This packet does not export provider manifests into public contracts and does

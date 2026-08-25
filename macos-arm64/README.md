@@ -108,7 +108,7 @@ prefix routing, structured `E_` errors, `host:echo`, and manifest output.
 
 ## First Host Migration Candidate
 
-`norma:consolum` is the first recorded host migration candidate. Console I/O
+`norma:console` is the first recorded host migration candidate. Console I/O
 is outside-world behavior, and the current route proof makes it a good next
 surface to move toward host-owned frame syscalls.
 

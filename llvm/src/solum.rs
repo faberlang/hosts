@@ -1,4 +1,4 @@
-//! Filesystem boundaries used by LLVM-host `norma:solum` providers.
+//! Filesystem boundaries used by LLVM-host `norma:fs` providers.
 
 use super::array::{store_array, RuntimeValue};
 use super::format::{store_text, text_value};
