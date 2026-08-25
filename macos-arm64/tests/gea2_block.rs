@@ -1811,48 +1811,123 @@ fn oracle_softmax_causal(scores: &[f32], row: usize) -> Vec<f32> {
 /// The independent scalar mirror of the §2 block forward at T=8: returns
 /// the [8,960] block output.
 fn oracle_scalar_block(inputs: &Gea2ScalarBlockInputs) -> Vec<f32> {
+    oracle_scalar_block_rows(inputs).block_output
+}
+
+/// A head window `[rows, width]` carved from a packed `[rows, heads*width]`
+/// projection (the plan's per-head windowed entries write exactly these).
+fn oracle_head_window(packed: &[f32], rows: usize, head: usize, heads: usize, width: usize) -> Vec<f32> {
+    let mut window = vec![0.0_f32; rows * width];
+    for row in 0..rows {
+        for d in 0..width {
+            window[row * width + d] = packed[row * heads * width + head * width + d];
+        }
+    }
+    window
+}
+
+/// Every §2 policy-row intermediate of the block forward at T=8, produced by
+/// the scalar mirror (the instrumented diagnostic's reference rows; the
+/// plan's per-head window buffers carry slices of the packed projections and
+/// attention rows).
+struct Gea2ScalarBlockRows {
+    ln1: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    rope_q: Vec<f32>,
+    rope_k: Vec<f32>,
+    q_head: Vec<Vec<f32>>,
+    k_head: Vec<Vec<f32>>,
+    v_head: Vec<Vec<f32>>,
+    scores: Vec<Vec<f32>>,
+    probabilities: Vec<Vec<f32>>,
+    contexts: Vec<Vec<f32>>,
+    o_projection: Vec<f32>,
+    residual1: Vec<f32>,
+    ln2: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    swiglu: Vec<f32>,
+    down: Vec<f32>,
+    block_output: Vec<f32>,
+}
+
+fn oracle_scalar_block_rows(inputs: &Gea2ScalarBlockInputs) -> Gea2ScalarBlockRows {
     let ln1 = oracle_rmsnorm(&inputs.x, &inputs.attn_norm, GEA2_T, GEA2_D);
-    let qb = oracle_gemm(&ln1, &inputs.q, GEA2_T, GEA2_D, GEA2_D);
-    let kb = oracle_gemm(&ln1, &inputs.k, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
-    let vb = oracle_gemm(&ln1, &inputs.v, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
-    let rq = oracle_rope_packed(&qb, GEA2_D, &inputs.rope);
-    let rk = oracle_rope_packed(&kb, GEA2_KV * GEA2_HD, &inputs.rope);
+    let q = oracle_gemm(&ln1, &inputs.q, GEA2_T, GEA2_D, GEA2_D);
+    let k = oracle_gemm(&ln1, &inputs.k, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
+    let v = oracle_gemm(&ln1, &inputs.v, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
+    let rope_q = oracle_rope_packed(&q, GEA2_D, &inputs.rope);
+    let rope_k = oracle_rope_packed(&k, GEA2_KV * GEA2_HD, &inputs.rope);
+
+    let q_head = (0..GEA2_H)
+        .map(|head| oracle_head_window(&rope_q, GEA2_T, head, GEA2_H, GEA2_HD))
+        .collect();
+    let k_head = (0..GEA2_KV)
+        .map(|head| oracle_head_window(&rope_k, GEA2_T, head, GEA2_KV, GEA2_HD))
+        .collect();
+    let v_head = (0..GEA2_KV)
+        .map(|head| oracle_head_window(&v, GEA2_T, head, GEA2_KV, GEA2_HD))
+        .collect();
 
     // Attention: 15 query heads over 5 KV heads (GQA ratio 3, head h → h/3).
+    // The device score_gemm writes the FULL 8×8 product scaled by
+    // GEA2_SCALE (the causal mask lives in causal_softmax, which zeroes the
+    // upper triangle), so the reference score row is the full product.
     let mut ctx = vec![0.0_f32; GEA2_T * GEA2_D];
+    let mut scores = Vec::with_capacity(GEA2_H);
+    let mut probabilities = Vec::with_capacity(GEA2_H);
+    let mut contexts = Vec::with_capacity(GEA2_H);
     for h in 0..GEA2_H {
         let kv = h / 3;
-        let mut scores = vec![0.0_f32; GEA2_T * GEA2_T];
+        let mut score = vec![0.0_f32; GEA2_T * GEA2_T];
         for row in 0..GEA2_T {
-            for col in 0..=row {
+            for col in 0..GEA2_T {
                 let mut acc = 0.0_f32;
                 for d in 0..GEA2_HD {
-                    acc += rq[row * GEA2_D + h * GEA2_HD + d]
-                        * rk[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
+                    acc += rope_q[row * GEA2_D + h * GEA2_HD + d]
+                        * rope_k[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
                 }
-                scores[row * GEA2_T + col] = acc * GEA2_SCALE;
+                score[row * GEA2_T + col] = acc * GEA2_SCALE;
             }
         }
+        let mut prob = vec![0.0_f32; GEA2_T * GEA2_T];
         for row in 0..GEA2_T {
-            let probabilities = oracle_softmax_causal(&scores, row);
+            let window = oracle_softmax_causal(&score, row);
+            prob[row * GEA2_T..row * GEA2_T + row + 1].copy_from_slice(&window);
+        }
+        let mut context = vec![0.0_f32; GEA2_T * GEA2_HD];
+        for row in 0..GEA2_T {
             for d in 0..GEA2_HD {
                 let mut acc = 0.0_f32;
-                for (col, weight) in probabilities.iter().enumerate() {
-                    acc += weight * vb[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
+                for col in 0..GEA2_T {
+                    acc += prob[row * GEA2_T + col]
+                        * v[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
                 }
-                ctx[row * GEA2_D + h * GEA2_HD + d] = acc;
+                context[row * GEA2_HD + d] = acc;
+            }
+        }
+        scores.push(score);
+        probabilities.push(prob);
+        contexts.push(context);
+    }
+    for h in 0..GEA2_H {
+        for row in 0..GEA2_T {
+            for d in 0..GEA2_HD {
+                ctx[row * GEA2_D + h * GEA2_HD + d] = contexts[h][row * GEA2_HD + d];
             }
         }
     }
 
-    let attn_out = oracle_gemm(&ctx, &inputs.o, GEA2_T, GEA2_D, GEA2_D);
-    let r1: Vec<f32> = inputs
+    let o_projection = oracle_gemm(&ctx, &inputs.o, GEA2_T, GEA2_D, GEA2_D);
+    let residual1: Vec<f32> = inputs
         .x
         .iter()
-        .zip(&attn_out)
+        .zip(&o_projection)
         .map(|(left, right)| left + right)
         .collect();
-    let ln2 = oracle_rmsnorm(&r1, &inputs.ffn_norm, GEA2_T, GEA2_D);
+    let ln2 = oracle_rmsnorm(&residual1, &inputs.ffn_norm, GEA2_T, GEA2_D);
     let gate = oracle_gemm(&ln2, &inputs.gate, GEA2_T, GEA2_D, GEA2_F);
     let up = oracle_gemm(&ln2, &inputs.up, GEA2_T, GEA2_D, GEA2_F);
     let swiglu: Vec<f32> = gate
@@ -1860,11 +1935,34 @@ fn oracle_scalar_block(inputs: &Gea2ScalarBlockInputs) -> Vec<f32> {
         .zip(&up)
         .map(|(&g, &u)| (g / ((-g).exp() + 1.0)) * u)
         .collect();
-    let ffn_out = oracle_gemm(&swiglu, &inputs.down, GEA2_T, GEA2_F, GEA2_D);
-    r1.iter()
-        .zip(&ffn_out)
+    let down = oracle_gemm(&swiglu, &inputs.down, GEA2_T, GEA2_F, GEA2_D);
+    let block_output: Vec<f32> = residual1
+        .iter()
+        .zip(&down)
         .map(|(left, right)| left + right)
-        .collect()
+        .collect();
+    Gea2ScalarBlockRows {
+        ln1,
+        q,
+        k,
+        v,
+        rope_q,
+        rope_k,
+        q_head,
+        k_head,
+        v_head,
+        scores,
+        probabilities,
+        contexts,
+        o_projection,
+        residual1,
+        ln2,
+        gate,
+        up,
+        swiglu,
+        down,
+        block_output,
+    }
 }
 
 // --- frozen-policy comparison (mirrors the U1 `compare_f32` semantics) ---
@@ -2256,7 +2354,11 @@ fn gea2_real_metal_block_receipt() {
             })
         })
         .collect();
-    assert_eq!(intermediate_allocations.len(), 84);
+    assert_eq!(
+        intermediate_allocations.len(),
+        89,
+        "101 version-keyed buffers minus the 12 host uploads (the U5g windowed v-projection grew the plan by five v_head windows)"
+    );
 
     let hostname = Command::new("hostname")
         .output()
@@ -2384,4 +2486,300 @@ block_output policy: max_abs={max_abs:.3e} (≤5e-4), max_rel={max_rel:.3e} (≤
 max_ulp={max_ulp} (≤1024), first_largest_error_index={first_index}; receipt at {}",
         receipt_path.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// GEA2-U6b instrumented localization (the U5g successor's diagnostic): one
+// real-Metal execution reclassifies every policy-row intermediate as an
+// ObservationPoint result at its producing launch (the descriptor ABI's own
+// lifetime/cadence surface; no wire or schema change) and reads them all
+// back in the same run, comparing each against the scalar oracle's reference
+// row to name the first launch whose output diverges (the CTO ruling's
+// method — the bounded executor residual localizes at the diverging launch).
+// The five transpose launches carry no policy row and are not observed.
+// ---------------------------------------------------------------------------
+
+/// The diagnostic descriptor: every kernel-produced buffer of the 59
+/// policy-row launches observed at its producing launch — 84 buffers
+/// including the per-head windows (a superset of U6b's 59 policy rows; the
+/// windowed entries' fan-out is exactly where the U5g layout truth lives).
+/// The five transpose launches carry no policy row and are not observed.
+fn gea2_diagnostic_descriptor() -> DeviceDescriptor {
+    let artifact_dir = gea2_artifact_dir();
+    let envelope = load_gea2_plan(&artifact_dir);
+    let mut descriptor = gea2_sequence_descriptor();
+    // The observed set comes from the wire's access facts (the descriptor
+    // slot model carries the buffer's storage role, not the per-slot access).
+    let mut observed: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+    for (index, kernel) in envelope.program.kernels.iter().enumerate() {
+        let launch_id = u32::try_from(index + 1).expect("launch id fits u32");
+        if kernel.entry == "transpose" {
+            continue;
+        }
+        for resource in &kernel.resources {
+            if matches!(resource.access, Gea2ResourceAccess::Write | Gea2ResourceAccess::ReadWrite)
+            {
+                observed.insert(resource.buffer.id, (resource.version.version, launch_id));
+            }
+        }
+    }
+    // One lifetime per buffer across every slot that references it (the
+    // descriptor's lifetime rule), so consumers of an observed intermediate
+    // see the same observation-point class as its producer.
+    for kernel in descriptor.kernels.iter_mut() {
+        for slot in kernel.buffers.iter_mut() {
+            if observed.contains_key(&slot.buffer_id) {
+                slot.lifetime = DeviceBufferLifetime::ObservationPoint;
+            }
+        }
+    }
+    descriptor.results = observed
+        .iter()
+        .map(|(&buffer_id, &(version, launch_id))| DescriptorResult {
+            buffer_id,
+            version,
+            produced_by: launch_id,
+            at_launch: launch_id,
+        })
+        .collect();
+    descriptor
+        .validate()
+        .expect("the diagnostic descriptor validates (84 observed rows)");
+    descriptor
+}
+
+/// The reference row for every observed buffer, keyed by buffer name
+/// (resolved through the descriptor so the plan's buffer ids stay the wire's
+/// facts, never hardcoded here).
+fn gea2_diagnostic_reference_rows(
+    descriptor: &DeviceDescriptor,
+    inputs: &Gea2ScalarBlockInputs,
+) -> BTreeMap<u32, Vec<f32>> {
+    let rows = oracle_scalar_block_rows(inputs);
+    let mut named: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    named.insert("ln1".to_owned(), rows.ln1);
+    named.insert("q".to_owned(), rows.q);
+    named.insert("k".to_owned(), rows.k);
+    named.insert("v".to_owned(), rows.v);
+    named.insert("rope_q".to_owned(), rows.rope_q);
+    named.insert("rope_k".to_owned(), rows.rope_k);
+    named.insert("o_projection".to_owned(), rows.o_projection);
+    named.insert("residual1".to_owned(), rows.residual1);
+    named.insert("ln2".to_owned(), rows.ln2);
+    named.insert("gate".to_owned(), rows.gate);
+    named.insert("up".to_owned(), rows.up);
+    named.insert("swiglu".to_owned(), rows.swiglu);
+    named.insert("down".to_owned(), rows.down);
+    named.insert("block_output".to_owned(), rows.block_output);
+    for (head, row) in rows.q_head.iter().enumerate() {
+        named.insert(format!("q_head_{head}"), row.clone());
+    }
+    for (head, row) in rows.k_head.iter().enumerate() {
+        named.insert(format!("k_head_{head}"), row.clone());
+    }
+    for (head, row) in rows.v_head.iter().enumerate() {
+        named.insert(format!("v_head_{head}"), row.clone());
+    }
+    for (head, row) in rows.scores.iter().enumerate() {
+        named.insert(format!("score_{head}"), row.clone());
+    }
+    for (head, row) in rows.probabilities.iter().enumerate() {
+        named.insert(format!("probabilities_{head}"), row.clone());
+    }
+    for (head, row) in rows.contexts.iter().enumerate() {
+        named.insert(format!("context_{head}"), row.clone());
+    }
+
+    let mut reference = BTreeMap::new();
+    for result in &descriptor.results {
+        let name = descriptor
+            .kernels
+            .iter()
+            .flat_map(|kernel| kernel.buffers.iter())
+            .find(|slot| slot.buffer_id == result.buffer_id && slot.version == result.version)
+            .map(|slot| slot.buffer_name.as_str())
+            .expect("observed buffer has a name");
+        let row = named
+            .get(name)
+            .unwrap_or_else(|| panic!("no oracle reference row for `{name}`"));
+        assert_eq!(
+            row.len(),
+            descriptor
+                .buffer_versions
+                .iter()
+                .find(|version| {
+                    version.buffer_id == result.buffer_id && version.version == result.version
+                })
+                .expect("observed buffer has version metadata")
+                .element_count as usize,
+            "reference row `{name}` has the declared element count"
+        );
+        reference.insert(result.buffer_id, row.clone());
+    }
+    reference
+}
+
+fn gea2_row_metrics(expected: &[f32], observed: &[f32]) -> (f32, f32, u32) {
+    assert_eq!(expected.len(), observed.len());
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    let mut max_ulp = 0_u32;
+    for (&want, &got) in expected.iter().zip(observed) {
+        let absolute = (got - want).abs();
+        max_abs = max_abs.max(absolute);
+        let denominator = want.abs().max(got.abs()).max(f32::MIN_POSITIVE);
+        max_rel = max_rel.max(absolute / denominator);
+        max_ulp = max_ulp.max(ulp_distance(want, got));
+    }
+    (max_abs, max_rel, max_ulp)
+}
+
+/// The instrumented physical localization run: reads back every policy-row
+/// intermediate at its producing launch in one real-Metal execution and
+/// writes the raw device-rows artifact (schema `gea2-device-rows-v1`: F32 LE
+/// values + launch id + entry name — the device side never sees the policy)
+/// under the artifact dir via `GEA2_DEVICE_ROWS` (uncommitted; Mind
+/// integrates). The comparison against the scalar mirror's reference rows
+/// names the first diverging launch.
+#[test]
+#[ignore = "physical Metal gate; run only with GEA2_ARTIFACT_DIR + GEA2_DEVICE_ROWS set"]
+fn gea2_real_metal_diagnostic_rows() {
+    let workspace = workspace_root();
+    let manifest_path = workspace.join(
+        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
+    )
+    .expect("valid GEA2 U1 input manifest");
+    let (inputs, _, _) = gea2_scalar_block_inputs(&manifest);
+
+    let descriptor = gea2_diagnostic_descriptor();
+    assert_eq!(
+        descriptor.results.len(),
+        84,
+        "84 kernel-produced buffers observed across the 59 policy-row launches (58 intermediates + the block output + 25 per-head windows)"
+    );
+    let reference = gea2_diagnostic_reference_rows(&descriptor, &inputs);
+    assert_eq!(reference.len(), 84, "every observed row has a reference");
+
+    let runtime =
+        DeviceRuntime::Metal(MetalHostSession::try_open().expect("physical Metal admission"));
+    let mut host = CompositeHost::with_device(runtime, "metal-device")
+        .expect("real-metal composite");
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("diagnostic GEA2 program session");
+    let uploads = gea2_real_host_inputs(&descriptor, &inputs);
+    let receipt = session
+        .execute_with_weight_bytes(&BTreeMap::new(), &uploads)
+        .expect("the 64-launch GEA2 block executes on physical Metal");
+    session.teardown().expect("ordered diagnostic teardown");
+    assert_eq!(
+        receipt.outputs.len(),
+        84,
+        "every observed row is read back"
+    );
+
+    // Per-launch comparison in launch order; the first launch whose output
+    // diverges beyond the diagnostic threshold is the localization.
+    let mut rows_out: Vec<Value> = Vec::new();
+    let mut first_divergent: Option<(u32, String, f32, f32)> = None;
+    for result in &descriptor.results {
+        let launch = descriptor
+            .launches
+            .iter()
+            .find(|launch| launch.id == result.produced_by)
+            .expect("observed result names its producing launch");
+        let kernel = &descriptor.kernels[launch.kernel_index as usize];
+        let slot = descriptor
+            .kernels
+            .iter()
+            .flat_map(|kernel| kernel.buffers.iter())
+            .find(|slot| {
+                slot.buffer_id == result.buffer_id && slot.version == result.version
+            })
+            .expect("observed buffer has a descriptor slot");
+        let expected = &reference[&result.buffer_id];
+        let observed = &receipt.outputs[&result.buffer_id];
+        let (max_abs, max_rel, max_ulp) = gea2_row_metrics(expected, observed);
+        let diverged = max_abs > 1e-2 || max_rel > 1e-3;
+        rows_out.push(json!({
+            "launch_id": launch.id,
+            "entry": kernel.entry,
+            "buffer": slot.buffer_name,
+            "buffer_id": slot.buffer_id,
+            "elements": slot.element_count,
+            "max_absolute_error": max_abs,
+            "max_relative_error": max_rel,
+            "max_ulp_distance": max_ulp,
+            "diverged": diverged,
+        }));
+        if diverged && first_divergent.is_none() {
+            first_divergent = Some((
+                launch.id,
+                format!("{} ({})", kernel.entry, slot.buffer_name),
+                max_abs,
+                max_rel,
+            ));
+        }
+    }
+    assert!(
+        rows_out.len() == 84,
+        "all 84 observed rows were compared (got {})",
+        rows_out.len()
+    );
+
+    let artifact_path = match std::env::var_os("GEA2_DEVICE_ROWS") {
+        Some(path) => PathBuf::from(path),
+        None => gea2_artifact_dir().join("gea2-device-rows.json"),
+    };
+    let artifact = json!({
+        "schema": "gea2-device-rows-v1",
+        "delivery": "GEA2-U6b",
+        "backend": "Metal",
+        "revisions": {
+            "gradus": git_revision(&workspace.join("gradus")),
+            "radix": git_revision(&workspace.join("radix")),
+            "hosts": git_revision(&workspace.join("hosts")),
+        },
+        "launches": rows_out,
+    });
+    let parent = artifact_path.parent().expect("artifact parent");
+    fs::create_dir_all(parent).expect("create artifact parent");
+    fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&artifact).expect("serialize device rows"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", artifact_path.display()));
+    eprintln!("GEA2 device rows: {}", artifact_path.display());
+
+    match first_divergent {
+        Some((launch_id, entry, max_abs, max_rel)) => panic!(
+            "localization: launch {launch_id} ({entry}) diverges from the scalar oracle — \
+max_abs={max_abs:.3e}, max_rel={max_rel:.3e}; device rows at {}",
+            artifact_path.display()
+        ),
+        None => {
+            let worst = rows_out
+                .iter()
+                .max_by(|a, b| {
+                    a["max_absolute_error"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .partial_cmp(&b["max_absolute_error"].as_f64().unwrap_or(0.0))
+                        .expect("comparable")
+                })
+                .expect("non-empty rows");
+            assert!(
+                worst["max_absolute_error"].as_f64().unwrap_or(1.0) <= 1e-2,
+                "every intermediate matched the oracle within the diagnostic slack"
+            );
+            eprintln!(
+                "GEA2 diagnostic: no launch diverges (worst row {} max_abs={})",
+                worst["entry"], worst["max_absolute_error"]
+            );
+        }
+    }
 }
