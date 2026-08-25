@@ -2499,11 +2499,11 @@ max_ulp={max_ulp} (≤1024), first_largest_error_index={first_index}; receipt at
 // The five transpose launches carry no policy row and are not observed.
 // ---------------------------------------------------------------------------
 
-/// The diagnostic descriptor: every kernel-produced buffer of the 59
-/// policy-row launches observed at its producing launch — 84 buffers
-/// including the per-head windows (a superset of U6b's 59 policy rows; the
-/// windowed entries' fan-out is exactly where the U5g layout truth lives).
-/// The five transpose launches carry no policy row and are not observed.
+/// The diagnostic descriptor: every kernel-produced buffer of all 64
+/// launches observed at its producing launch — 89 buffers including the
+/// per-head windows and the five transpose outputs (a superset of U6b's 59
+/// policy rows; the windowed entries' fan-out and the key transpose are
+/// exactly where the U5h layout truth lives).
 fn gea2_diagnostic_descriptor() -> DeviceDescriptor {
     let artifact_dir = gea2_artifact_dir();
     let envelope = load_gea2_plan(&artifact_dir);
@@ -2513,9 +2513,6 @@ fn gea2_diagnostic_descriptor() -> DeviceDescriptor {
     let mut observed: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     for (index, kernel) in envelope.program.kernels.iter().enumerate() {
         let launch_id = u32::try_from(index + 1).expect("launch id fits u32");
-        if kernel.entry == "transpose" {
-            continue;
-        }
         for resource in &kernel.resources {
             if matches!(resource.access, Gea2ResourceAccess::Write | Gea2ResourceAccess::ReadWrite)
             {
@@ -2579,6 +2576,12 @@ fn gea2_diagnostic_reference_rows(
     }
     for (head, row) in rows.v_head.iter().enumerate() {
         named.insert(format!("v_head_{head}"), row.clone());
+    }
+    // The transpose entries copy their input head window (the score_gemm
+    // read `key_transposed_in[col * k + d]` wants the key at position `col`
+    // — the window itself; the transpose's identity move is the contract).
+    for (head, row) in rows.k_head.iter().enumerate() {
+        named.insert(format!("key_transpose_{head}"), row.clone());
     }
     for (head, row) in rows.scores.iter().enumerate() {
         named.insert(format!("score_{head}"), row.clone());
@@ -2658,11 +2661,11 @@ fn gea2_real_metal_diagnostic_rows() {
     let descriptor = gea2_diagnostic_descriptor();
     assert_eq!(
         descriptor.results.len(),
-        84,
-        "84 kernel-produced buffers observed across the 59 policy-row launches (58 intermediates + the block output + 25 per-head windows)"
+        89,
+        "89 kernel-produced buffers observed across all 64 launches (58 policy intermediates + the block output + 25 per-head windows + 5 transpose outputs)"
     );
     let reference = gea2_diagnostic_reference_rows(&descriptor, &inputs);
-    assert_eq!(reference.len(), 84, "every observed row has a reference");
+    assert_eq!(reference.len(), 89, "every observed row has a reference");
 
     let runtime =
         DeviceRuntime::Metal(MetalHostSession::try_open().expect("physical Metal admission"));
@@ -2678,7 +2681,7 @@ fn gea2_real_metal_diagnostic_rows() {
     session.teardown().expect("ordered diagnostic teardown");
     assert_eq!(
         receipt.outputs.len(),
-        84,
+        89,
         "every observed row is read back"
     );
 
@@ -2715,6 +2718,8 @@ fn gea2_real_metal_diagnostic_rows() {
             "max_relative_error": max_rel,
             "max_ulp_distance": max_ulp,
             "diverged": diverged,
+            "observed_f32": observed,
+            "expected_f32": expected,
         }));
         if diverged && first_divergent.is_none() {
             first_divergent = Some((
@@ -2726,8 +2731,8 @@ fn gea2_real_metal_diagnostic_rows() {
         }
     }
     assert!(
-        rows_out.len() == 84,
-        "all 84 observed rows were compared (got {})",
+        rows_out.len() == 89,
+        "all 89 observed rows were compared (got {})",
         rows_out.len()
     );
 
