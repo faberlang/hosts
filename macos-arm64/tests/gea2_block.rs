@@ -3,12 +3,13 @@
 //!
 //! The bundle's `gea2-program-plan.json` member (envelope schema
 //! `gea2-program-plan-v1`) carries the radix `WireDeviceProgram` in its native
-//! serde JSON form, instance-expanded (64 kernels/launches, 63 dependency
+//! serde JSON form, instance-expanded (64 kernels/launches, 78 dependency
 //! edges, roots `[1]`). Hosts owns the consumption half of that ABI: these
 //! mirror structs parse the envelope (unknown/missing fields fail closed),
 //! [`map_envelope_to_descriptor`] resolves the wire's per-slot bound shapes
-//! onto the host descriptor's version-keyed shape table while carrying
-//! role/lifetime/initialization verbatim, and
+//! onto the host descriptor's version-keyed shape table — failing closed on
+//! any slot that binds fewer elements than its buffer's full shape — while
+//! carrying role/lifetime/initialization verbatim, and
 //! [`DeviceDescriptor::validate`] runs before any launch. Neither side infers
 //! the other's facts (GEA2 seam-lowering transport decision).
 #![allow(dead_code)] // the mirror fields are the fail-closed decode contract; serde reads the full wire shape while the mapper consumes the mapped subset
@@ -38,14 +39,16 @@ const PLAN_MEMBER: &str = "gea2-program-plan.json";
 const MODULE_IMAGE_RULE: &str =
     "module_image is the concatenation of module_members in listed order";
 
-/// The 14-entry block kernel table and its instance counts (GEA2 §5 / U5a
+/// The 15-entry block kernel table and its instance counts (GEA2 §5 / U5a
 /// admission facts, mirrored here for consumption admission; the gathered
-/// o-projection is its own entry since radix `6a0e3780a`).
-const GEA2_ENTRY_TABLE: [(&str, usize); 14] = [
+/// o-projection is its own entry since radix `6a0e3780a`, and the windowed
+/// v-projection since GEA2-U5g).
+const GEA2_ENTRY_TABLE: [(&str, usize); 15] = [
     ("rmsnorm", 2),
     ("gemm_qo", 1),
     ("gemm_qo_gathered", 1),
-    ("gemm_kv", 2),
+    ("gemm_kv", 1),
+    ("gemm_kv_windows", 1),
     ("gemm_gate_up", 2),
     ("gemm_down", 1),
     ("rope_q", 1),
@@ -473,9 +476,9 @@ fn map_envelope_to_descriptor(
             program.launches.len()
         ));
     }
-    if program.dependencies.len() != 63 {
+    if program.dependencies.len() != 78 {
         return Err(format!(
-            "missing dependency edge: {} present, 63 expected",
+            "missing dependency edge: {} present, 78 expected",
             program.dependencies.len()
         ));
     }
@@ -491,12 +494,15 @@ fn map_envelope_to_descriptor(
     }
     check_entry_table(&program.kernels)?;
 
-    // The wire carries per-slot bound shapes: a kernel may bind a window of a
-    // buffer (score_gemm binds a 512-element window of the 7680-element
-    // rope_q). The host descriptor's keyed metadata carries ONE shape per
-    // (buffer_id, version), so the mapper resolves each key to the buffer's
-    // full shape (the largest bound count) and admits window reads
-    // fail-closed as views of that shape.
+    // The wire carries per-slot bound shapes. The host descriptor's keyed
+    // metadata carries ONE shape per (buffer_id, version), so the mapper
+    // resolves each key to the buffer's full shape (the largest bound
+    // count) — and a slot that binds FEWER elements than that full shape
+    // fails closed (GEA2-U5g): the descriptor ABI carries no projection
+    // fact, so an undeclared sub-window read would silently widen to a
+    // mis-strided prefix of the packed buffer. A window a launch means to
+    // consume must be declared as its own full-shape buffer (the per-head
+    // q/k/v windows), never a slice of a packed one.
     let mut shapes: BTreeMap<(u32, u32), (DeviceDataType, u64)> = BTreeMap::new();
     for kernel in &program.kernels {
         for resource in &kernel.resources {
@@ -587,6 +593,16 @@ fn map_envelope_to_descriptor(
             {
                 return Err(format!(
                     "buffer `{}` (id {}) version {} is written as {} elements, not the buffer's declared {}; a write must define the full shape",
+                    resource.buffer.name,
+                    resource.buffer.id,
+                    resource.version.version,
+                    bound_count,
+                    full_count
+                ));
+            }
+            if bound_count < full_count {
+                return Err(format!(
+                    "buffer `{}` (id {}) version {} is read as {} elements of the buffer's declared {}; an undeclared sub-window read is not a carried ABI fact — declare the window as its own full-shape buffer",
                     resource.buffer.name,
                     resource.buffer.id,
                     resource.version.version,
@@ -726,8 +742,9 @@ fn check_entry_table(kernels: &[Gea2KernelUnit]) -> Result<(), String> {
     }
     if counts.len() != GEA2_ENTRY_TABLE.len() {
         return Err(format!(
-            "GEA2 plan carries {} distinct entries; the 14-entry block table expects {}",
+            "GEA2 plan carries {} distinct entries; the {}-entry block table expects {}",
             counts.len(),
+            GEA2_ENTRY_TABLE.len(),
             GEA2_ENTRY_TABLE.len()
         ));
     }
@@ -739,8 +756,8 @@ fn check_entry_table(kernels: &[Gea2KernelUnit]) -> Result<(), String> {
 fn check_entry_recipe(entry: &str, plan: &Gea2Plan) -> Result<(), String> {
     let admitted = match entry {
         "rmsnorm" => matches!(plan, Gea2Plan::RmsNormalization(_)),
-        "gemm_qo" | "gemm_qo_gathered" | "gemm_kv" | "gemm_gate_up" | "gemm_down"
-        | "score_gemm" | "context_gemm" => {
+        "gemm_qo" | "gemm_qo_gathered" | "gemm_kv" | "gemm_kv_windows" | "gemm_gate_up"
+        | "gemm_down" | "score_gemm" | "context_gemm" => {
             matches!(plan, Gea2Plan::TiledMatMul(_))
         }
         "rope_q" | "rope_k" => matches!(plan, Gea2Plan::Rope(_)),
@@ -841,9 +858,9 @@ fn gea2_descriptor_admission() {
     assert_eq!(descriptor.backend, DeviceBackend::Metal);
     assert_eq!(descriptor.kernels.len(), 64);
     assert_eq!(descriptor.launches.len(), 64);
-    assert_eq!(descriptor.data_flow.len(), 63);
+    assert_eq!(descriptor.data_flow.len(), 78);
     assert_eq!(descriptor.roots, vec![1]);
-    assert_eq!(descriptor.buffer_versions.len(), 96, "96 distinct buffer version keys");
+    assert_eq!(descriptor.buffer_versions.len(), 101, "101 distinct buffer version keys");
     assert_eq!(descriptor.results.len(), 1);
     assert_eq!(descriptor.end_of_run_results.len(), 0);
     assert!(!descriptor.module_image.is_empty());
@@ -962,44 +979,46 @@ fn gea2_descriptor_admission() {
         .filter(|resource| {
             resource.buffer.name.starts_with("q_head_")
                 || resource.buffer.name.starts_with("k_head_")
+                || resource.buffer.name.starts_with("v_head_")
         })
         .map(|resource| (resource.buffer.id, resource.version.element_count))
         .collect();
     assert_eq!(
         window_extents.len(),
-        20,
-        "15 q_head + 5 k_head windows, each a distinct full-shape buffer"
+        25,
+        "15 q_head + 5 k_head + 5 v_head windows, each a distinct full-shape buffer"
     );
     assert!(
         window_extents.iter().all(|&(_, extent)| extent == 512),
         "every per-head window is the full [8,64] shape: {window_extents:?}"
     );
 
-    // The context_gemm VALUE window is a declared shared fact (plan producer
-    // truth): all 15 instances bind the SAME read-only 512-element window of
-    // the 2560-element `v` buffer. Read-only reuse of one value window is
-    // admitted by the mapper (a read may bind a view of the full shape), and
-    // the plan declares exactly this sharing — pinned here so drift in
-    // either direction (a per-instance v window, or a different shared
-    // extent) fails this gate closed rather than passing silently.
-    let value_windows: std::collections::BTreeSet<(u32, u64)> = envelope
-        .program
-        .kernels
-        .iter()
-        .filter(|kernel| kernel.entry == "context_gemm")
-        .flat_map(|kernel| &kernel.resources)
-        .filter(|resource| resource.buffer.name == "v")
-        .map(|resource| (resource.buffer.id, resource.version.element_count))
-        .collect();
+    // GEA2-U5g layout truth: every context_gemm consumes ITS OWN KV head's
+    // value window (§2: head h → v_head_{h/3}), declared as a distinct
+    // full-shape [8,64] buffer produced by the windowed v-projection launch
+    // — never a sub-window read of the packed [8,320] `v` (the pre-U5g
+    // defect bound the packed buffer at element_count 512 into all 15
+    // instances, ignoring the GQA kv-head; the mapper now rejects that
+    // shape outright). Pinned here so drift in either direction — a shared
+    // window, a wrong kv-head mapping, or a sub-window read — fails this
+    // gate closed rather than passing silently.
+    let mut value_windows = Vec::new();
+    for kernel in &descriptor.kernels {
+        if kernel.entry == "context_gemm" {
+            value_windows.push(kernel.buffers[1].buffer_name.clone());
+        }
+    }
+    assert_eq!(value_windows.len(), 15);
+    for (position, name) in value_windows.iter().enumerate() {
+        assert_eq!(
+            name, &format!("v_head_{}", position / 3),
+            "context_gemm {position} must bind its GQA kv-head value window"
+        );
+    }
     assert_eq!(
-        value_windows.len(),
-        1,
-        "the plan shares one v window across all 15 context_gemm instances: {value_windows:?}"
-    );
-    assert_eq!(
-        value_windows.iter().next().copied().map(|(_, extent)| extent),
-        Some(512),
-        "the shared value window is the declared 512-element extent"
+        value_windows.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        5,
+        "the 15 context_gemm instances resolve to the 5 distinct per-KV-head v windows"
     );
 }
 
@@ -1100,10 +1119,42 @@ fn gea2_mirror_parse_rejects_malformed_plans() {
         .expect("dependencies array")
         .pop();
     let parsed: Gea2ProgramPlanEnvelope =
-        serde_json::from_value(missing_edge).expect("62-edge plan still mirrors");
+        serde_json::from_value(missing_edge).expect("77-edge plan still mirrors");
     let error = map_envelope_to_descriptor(&parsed, &artifact_dir)
-        .expect_err("a 62-edge plan must fail closed");
-    assert!(error.contains("63"), "edge count must fail closed: {error}");
+        .expect_err("a 77-edge plan must fail closed");
+    assert!(error.contains("78"), "edge count must fail closed: {error}");
+
+    // GEA2-U5g rejection proof: an UNDECLARED sub-window read — a
+    // context_gemm binding the packed 2560-element `v` at 512 elements
+    // with no projection (the pre-U5g defect shape) — fails the mapping
+    // closed instead of silently widening to a mis-strided prefix.
+    let packed_v = value["program"]["kernels"]
+        .as_array()
+        .expect("kernels")
+        .iter()
+        .find(|kernel| kernel["entry"] == "gemm_kv_windows")
+        .and_then(|kernel| kernel["resources"].as_array())
+        .and_then(|resources| resources.get(2))
+        .and_then(|resource| resource.get("buffer"))
+        .expect("the windowed v-projection's packed v write")
+        .clone();
+    let context_index = value["program"]["kernels"]
+        .as_array()
+        .expect("kernels")
+        .iter()
+        .position(|kernel| kernel["entry"] == "context_gemm")
+        .expect("a context_gemm kernel");
+    let mut subwindow_read = value.clone();
+    subwindow_read["program"]["kernels"][context_index]["resources"][1]["buffer"] = packed_v;
+    // element_count stays 512 — smaller than the bound buffer's 2560.
+    let parsed: Gea2ProgramPlanEnvelope =
+        serde_json::from_value(subwindow_read).expect("the sub-window plan still mirrors");
+    let error = map_envelope_to_descriptor(&parsed, &artifact_dir)
+        .expect_err("an undeclared sub-window read must fail the mapping closed");
+    assert!(
+        error.contains("sub-window read"),
+        "the rejection must name the sub-window rule: {error}"
+    );
 
     // A module member absent from the bundle fails the assembly closed.
     let mut missing_member = value.clone();
@@ -1210,7 +1261,7 @@ fn gea2_descriptor_validate_rejects_plan_shape_violations() {
 // ---------------------------------------------------------------------------
 // The fake sequence ladder (U5c + U5d): the 64-launch block program executes
 // on the FakeMetalDriver through the composite program session. The driver's
-// declared-function table carries the 14-entry block ABI, so every launch
+// declared-function table carries the 15-entry block ABI, so every launch
 // takes the structural, encode-only GEA2 dispatch — no kernel-library body
 // and no CPU oracle is ever consulted (the values are never evidence).
 // ---------------------------------------------------------------------------
@@ -1334,8 +1385,8 @@ fn gea2_fake_sequence_has_no_cpu_substitute() {
     assert!(receipt.fused_library_dispatches.is_empty());
     assert_eq!(
         receipt.allocated_buffer_versions.len(),
-        96,
-        "the plan's 96 version-keyed buffers are the whole allocation set"
+        101,
+        "the plan's 101 version-keyed buffers are the whole allocation set"
     );
     assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
     assert_eq!(receipt.outputs.len(), 1);
@@ -1698,8 +1749,11 @@ fn oracle_rmsnorm(x: &[f32], gamma: &[f32], rows: usize, width: usize) -> Vec<f3
     out
 }
 
-/// `a [rows, k] · W` where `w_raw` is the GGUF's in-major layout `[k, n]`
-/// (the exact layout every exported gemm kernel indexes).
+/// `a [rows, k] · W` where `w_raw` is the GGUF's `[out][in]` row-major
+/// weight layout: out-row `col` holds the `k` input weights for output
+/// `col` (`w_raw[col * k + i]`). This is the container's one weight
+/// contract — the U1/GEA3 oracle `matmul` and every exported gemm kernel
+/// index the same layout (GEA2-U5g layout-truth ruling).
 fn oracle_gemm(a: &[f32], w_raw: &[f32], rows: usize, k: usize, n: usize) -> Vec<f32> {
     assert_eq!(a.len(), rows * k);
     assert_eq!(w_raw.len(), k * n);
@@ -1708,7 +1762,7 @@ fn oracle_gemm(a: &[f32], w_raw: &[f32], rows: usize, k: usize, n: usize) -> Vec
         for col in 0..n {
             let mut acc = 0.0_f32;
             for i in 0..k {
-                acc += a[row * k + i] * w_raw[i * n + col];
+                acc += a[row * k + i] * w_raw[col * k + i];
             }
             out[row * n + col] = acc;
         }
@@ -1831,6 +1885,43 @@ fn ulp_distance(left: f32, right: f32) -> u32 {
 
 /// The frozen `block_output` policy row: abs ≤ 5e-4, rel ≤ 2e-5 (denominator
 /// `max(|expected|, |observed|, MIN_POSITIVE)`), ULP ≤ 1024.
+/// GEA2-U5g layout-truth pin: the scalar mirror oracle reads the GGUF
+/// weights in the container's `[out][in]` row-major layout — the same
+/// contract the U1/GEA3 oracles and every exported gemm kernel index. The
+/// pre-U5g oracle read `[k][n]` and reproduced the retired receipt's
+/// −5.8359156 row 0 (to 1.8e-6); the correct row-0 class is −1.0494539
+/// (digest-verified bytes, llama-cli-exact semantics). No device — the
+/// ignored marker is the frozen F32 GGUF's local model-cache identity.
+#[test]
+#[ignore = "reads the frozen F32 GGUF from the local model cache (the §6 fixture identity)"]
+fn gea2_scalar_block_oracle_pins_row_zero_under_out_in_weights() {
+    let workspace = workspace_root();
+    let manifest_path = workspace.join(
+        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
+    )
+    .expect("valid GEA2 U1 input manifest");
+    let (inputs, _range_read_us, _range_read_bytes) = gea2_scalar_block_inputs(&manifest);
+    let expected = oracle_scalar_block(&inputs);
+    assert!(
+        expected.iter().all(|value| value.is_finite()),
+        "the scalar block oracle produces finite F32 throughout"
+    );
+    // The digest-verified reference value is −1.0494539 (GEA3-U1 oracle
+    // bytes); this mirror is an independent F32 implementation (std `exp`,
+    // its own accumulation order), so the pin admits cross-implementation
+    // ulp slack — while staying six orders of magnitude from the wrong
+    // transposed class (−5.8359156).
+    assert!(
+        (expected[0] - (-1.049_453_9_f32)).abs() <= 2e-6,
+        "row 0 must be the [out][in]-weighted block output class −1.0494539, got {}",
+        expected[0]
+    );
+}
+
 fn gea2_compare_block_output(expected: &[f32], observed: &[f32]) -> (f32, f32, u32, usize) {
     assert_eq!(expected.len(), observed.len());
     assert!(
@@ -2024,8 +2115,8 @@ fn gea2_real_metal_block_receipt() {
     assert_eq!(receipt.launch_entries, declared_entries);
     assert_eq!(receipt.fused_library_dispatches.len(), 0, "zero CPU substitutes");
     assert!(
-        receipt.allocated_buffer_versions.len() == 96,
-        "the plan's 96 version-keyed buffers are the whole allocation set"
+        receipt.allocated_buffer_versions.len() == 101,
+        "the plan's 101 version-keyed buffers are the whole allocation set"
     );
     let counters = host.device().expect("device present").driver_counters();
     assert_eq!(counters.uploads, 12, "each declared host tensor uploads exactly once");
@@ -2046,8 +2137,8 @@ fn gea2_real_metal_block_receipt() {
     assert_eq!(observed.len(), GEA2_T * GEA2_D, "the declared [8,960] output in full");
     assert!(observed.iter().all(|value| value.is_finite()), "finite physical output");
 
-    // Dependency-edge satisfaction: 63 declared edges, producer before consumer.
-    assert_eq!(descriptor.data_flow.len(), 63);
+    // Dependency-edge satisfaction: 78 declared edges, producer before consumer.
+    assert_eq!(descriptor.data_flow.len(), 78);
     let edge_rows: Vec<Value> = descriptor
         .data_flow
         .iter()

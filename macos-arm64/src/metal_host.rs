@@ -1212,16 +1212,18 @@ pub struct FakeQkvCarrierSim {
 
 impl FakeMetalDriver {
     /// Emitted GEA2 entries and their declared device-buffer arities. The
-    /// table mirrors the 14-entry bundle ABI: transpose and causal_softmax
+    /// table mirrors the 15-entry bundle ABI: transpose and causal_softmax
     /// consume two buffers, score_gemm consumes four, and the remaining
-    /// entries consume three — except the two variant rows: the gathered
+    /// entries consume three — except the three variant rows: the gathered
     /// o-projection is its own entry `gemm_qo_gathered` (the block's launch
     /// 57, radix `6a0e3780a`) binding 17 (15 context reads + o_weight +
-    /// o_projection), and the rope launches, whose per-instance window
+    /// o_projection); the rope launches, whose per-instance window
     /// repair (radix `5f96ed340`)
     /// declares the packed output plus every per-head window as a write:
     /// `rope_q` binds 18 (input + table + packed output + 15 `q_head_<h>`)
-    /// and `rope_k` binds 8 (input + table + packed output + 5 `k_head_<g>`).
+    /// and `rope_k` binds 8 (input + table + packed output + 5 `k_head_<g>`);
+    /// and the windowed v-projection `gemm_kv_windows` (GEA2-U5g) binds 8
+    /// (input + weight + the packed [8,320] output + 5 `v_head_<kv>`).
     /// Each entry admits exactly its declared binding shapes, never a
     /// blanket range; any other arity fails closed. These launches are
     /// structural only; they do not pretend to simulate the kernel numerics.
@@ -1230,6 +1232,7 @@ impl FakeMetalDriver {
         ("gemm_qo", &[3]),
         ("gemm_qo_gathered", &[17]),
         ("gemm_kv", &[3]),
+        ("gemm_kv_windows", &[8]),
         ("gemm_gate_up", &[3]),
         ("gemm_down", &[3]),
         ("rope_q", &[18]),
