@@ -14,8 +14,11 @@
 #![allow(dead_code)] // the mirror fields are the fail-closed decode contract; serde reads the full wire shape while the mapper consumes the mapped subset
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 
 use faber_host_macos_arm64::composite_host::{CompositeHost, DeviceByteBuffer};
 use faber_host_macos_arm64::device_descriptor::{
@@ -25,7 +28,7 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
-use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
+use faber_host_macos_arm64::{enumerate_metal_physical_devices, FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1329,5 +1332,868 @@ fn gea2_fake_sequence_rejects_intermediate_readback() {
         error.message.contains("no kernel slot allocates"),
         "diagnostic names the unknown buffer: {}",
         error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GEA2-U5e: the physical Metal block receipt. The ignored test executes the
+// exported 64-launch block program on the real Metal driver with the frozen
+// U1 inputs — nine GGUF tensor ranges SHA-checked against the U1 manifest,
+// the activation fixture, and the Gradus rope table — reads back only the
+// declared [8,960] output after one step-boundary sync, and compares the
+// physical values against the scalar block oracle authored below from the
+// §2 block arithmetic (the GEA1 `reference_gemv` mirror pattern: no gradus,
+// radix, or host-helper calls). Per-kernel rows and seam classification are
+// U6's; the receipt lands at `GEA2_METAL_RECEIPT`.
+// ---------------------------------------------------------------------------
+
+/// Frozen block geometry (gea2-delivery §2 / U1 manifest facts).
+const GEA2_T: usize = 8;
+const GEA2_D: usize = 960;
+const GEA2_H: usize = 15;
+const GEA2_KV: usize = 5;
+const GEA2_HD: usize = 64;
+const GEA2_F: usize = 2560;
+const GEA2_EPS: f32 = 1e-5;
+const GEA2_SCALE: f32 = 0.125;
+
+/// The U1 manifest's nine frozen tensors: GGUF name → logical element count.
+const GEA2_FROZEN_TENSORS: [(&str, usize); 9] = [
+    ("blk.0.attn_norm.weight", 960),
+    ("blk.0.attn_q.weight", 921_600),
+    ("blk.0.attn_k.weight", 307_200),
+    ("blk.0.attn_v.weight", 307_200),
+    ("blk.0.attn_output.weight", 921_600),
+    ("blk.0.ffn_norm.weight", 960),
+    ("blk.0.ffn_gate.weight", 2_457_600),
+    ("blk.0.ffn_up.weight", 2_457_600),
+    ("blk.0.ffn_down.weight", 2_457_600),
+];
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("faberlang workspace root")
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut child = Command::new("shasum")
+        .args(["-a", "256"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn shasum for bytes");
+    child
+        .stdin
+        .take()
+        .expect("shasum stdin")
+        .write_all(bytes)
+        .expect("write bytes to shasum");
+    let output = child.wait_with_output().expect("wait for shasum");
+    assert!(
+        output.status.success(),
+        "shasum stdin failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .expect("shasum digest")
+        .to_owned()
+}
+
+fn sha256_file(path: &Path) -> String {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|error| panic!("run shasum for {}: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "shasum failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn git_revision(path: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap_or_else(|error| panic!("git revision {}: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "git revision failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn read_range(path: &Path, range: [u64; 2]) -> Vec<u8> {
+    assert!(range[1] > range[0], "empty range in {}", path.display());
+    let length = usize::try_from(range[1] - range[0]).expect("range fits host usize");
+    let mut file =
+        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    file.seek(SeekFrom::Start(range[0]))
+        .unwrap_or_else(|error| panic!("seek {}: {error}", path.display()));
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    bytes
+}
+
+fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
+    assert_eq!(bytes.len() % 4, 0, "F32 payload is not word aligned");
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn measured(value: impl serde::Serialize) -> Value {
+    json!({"value": value, "status": "measured"})
+}
+
+fn derived(value: impl serde::Serialize, formula: &str) -> Value {
+    json!({"value": value, "status": "derived", "formula": formula})
+}
+
+fn unmeasured(reason: &str) -> Value {
+    json!({"value": Value::Null, "status": "unmeasured", "reason": reason})
+}
+
+/// The frozen U1 input set for the scalar block oracle: the activation row
+/// block, the nine decoded GGUF tensors, and the rope table.
+struct Gea2ScalarBlockInputs {
+    x: Vec<f32>,
+    attn_norm: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    o: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    rope: Vec<f32>,
+}
+
+fn gea2_f32_gguf_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("GEA2_F32_GGUF") {
+        return PathBuf::from(path);
+    }
+    // The U1 manifest freezes the identity by digest, not path; the derived
+    // model cache location is the frozen run's default (GEA1 §7 precedent).
+    PathBuf::from(
+        "/Users/ianzepp/ai/models/derived/HuggingFaceTB/SmolLM2-360M-Instruct/\
+a10cc1512eabd3dde888204e902eca88bddb4951/SmolLM2-360M-Instruct-f32.gguf",
+    )
+}
+
+/// Range-read and SHA-check the nine frozen tensors plus the activation and
+/// rope fixtures against the U1 manifest. Any drift is a stop, not a new
+/// fixture.
+fn gea2_scalar_block_inputs(manifest: &Value) -> (Gea2ScalarBlockInputs, u64, usize) {
+    let workspace = workspace_root();
+    let gguf_path = gea2_f32_gguf_path();
+    assert!(gguf_path.is_file(), "missing F32 GGUF {}", gguf_path.display());
+    assert_eq!(
+        sha256_file(&gguf_path),
+        manifest["model"]["derived_f32_gguf"]["sha256"]
+            .as_str()
+            .expect("manifest gguf digest"),
+        "the F32 GGUF no longer matches the frozen U1 identity"
+    );
+
+    let tensors = manifest["tensors"].as_array().expect("manifest tensors");
+    assert_eq!(tensors.len(), GEA2_FROZEN_TENSORS.len());
+    let mut range_read_us = 0_u64;
+    let mut range_read_bytes = 0_usize;
+    let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(tensors.len());
+    for (row, (gguf_name, elements)) in GEA2_FROZEN_TENSORS.iter().enumerate() {
+        let tensor = &tensors[row];
+        assert_eq!(
+            tensor["name"].as_str().expect("tensor name"),
+            *gguf_name,
+            "U1 manifest tensor order drifted at row {row}"
+        );
+        assert_eq!(tensor["values"].as_u64().expect("values") as usize, *elements);
+        let range = [
+            tensor["absolute_range"][0].as_u64().expect("range start"),
+            tensor["absolute_range"][1].as_u64().expect("range end"),
+        ];
+        let started = Instant::now();
+        let bytes = read_range(&gguf_path, range);
+        range_read_us += started.elapsed().as_micros() as u64;
+        range_read_bytes += bytes.len();
+        assert_eq!(
+            bytes.len(),
+            *elements * DeviceDataType::F32.byte_width(),
+            "tensor {gguf_name} range length disagrees with the frozen element count"
+        );
+        assert_eq!(
+            sha256_bytes(&bytes),
+            tensor["tensor_sha256"].as_str().expect("tensor digest"),
+            "tensor {gguf_name} drifted against the U1 manifest digest"
+        );
+        decoded.push(decode_f32_le(&bytes));
+    }
+
+    let activation_path = workspace.join("gradus/fixtures/activations/gea2-block-input.bin");
+    let activation = fs::read(&activation_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", activation_path.display()));
+    assert_eq!(activation.len(), GEA2_T * GEA2_D * 4);
+    assert_eq!(
+        sha256_bytes(&activation),
+        manifest["activation"]["sha256"].as_str().expect("activation digest"),
+        "activation fixture drifted against the U1 manifest"
+    );
+    let rope_path = workspace.join("gradus/fixtures/rope/gea2-rope-table.f32");
+    let rope_bytes = fs::read(&rope_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", rope_path.display()));
+    assert_eq!(rope_bytes.len(), GEA2_T * 32 * 3 * 4);
+    assert_eq!(
+        sha256_bytes(&rope_bytes),
+        manifest["rope_table"]["sha256"].as_str().expect("rope digest"),
+        "rope table drifted against the U1 manifest"
+    );
+
+    let inputs = Gea2ScalarBlockInputs {
+        x: decode_f32_le(&activation),
+        attn_norm: decoded[0].clone(),
+        q: decoded[1].clone(),
+        k: decoded[2].clone(),
+        v: decoded[3].clone(),
+        o: decoded[4].clone(),
+        ffn_norm: decoded[5].clone(),
+        gate: decoded[6].clone(),
+        up: decoded[7].clone(),
+        down: decoded[8].clone(),
+        rope: decode_f32_le(&rope_bytes),
+    };
+    (inputs, range_read_us, range_read_bytes)
+}
+
+// --- the mirrored scalar block oracle (§2 arithmetic, independent of every
+// gradus/radix/host body; F32 left-to-right accumulation throughout) ---
+
+fn oracle_rmsnorm(x: &[f32], gamma: &[f32], rows: usize, width: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; rows * width];
+    for row in 0..rows {
+        let mut sumsq = 0.0_f32;
+        for j in 0..width {
+            let value = x[row * width + j];
+            sumsq += value * value;
+        }
+        let mean = sumsq / width as f32;
+        let scale = 1.0 / (mean + GEA2_EPS).sqrt();
+        for col in 0..width {
+            out[row * width + col] = x[row * width + col] * scale * gamma[col];
+        }
+    }
+    out
+}
+
+/// `a [rows, k] · W` where `w_raw` is the GGUF's in-major layout `[k, n]`
+/// (the exact layout every exported gemm kernel indexes).
+fn oracle_gemm(a: &[f32], w_raw: &[f32], rows: usize, k: usize, n: usize) -> Vec<f32> {
+    assert_eq!(a.len(), rows * k);
+    assert_eq!(w_raw.len(), k * n);
+    let mut out = vec![0.0_f32; rows * n];
+    for row in 0..rows {
+        for col in 0..n {
+            let mut acc = 0.0_f32;
+            for i in 0..k {
+                acc += a[row * k + i] * w_raw[i * n + col];
+            }
+            out[row * n + col] = acc;
+        }
+    }
+    out
+}
+
+/// Apply consecutive-pair RoPE to every head dimension of a packed
+/// `[T, heads*64]` projection. Row `t` carries position `t` (positions
+/// 0..7); the table row is `[pos, pair, {angle, cos, sin}]`.
+fn oracle_rope_packed(packed: &[f32], width: usize, rope: &[f32]) -> Vec<f32> {
+    let mut out = packed.to_vec();
+    for row in 0..GEA2_T {
+        for col in 0..width {
+            let within = col % GEA2_HD;
+            let pair = within / 2;
+            let cos_t = rope[(row * 32 + pair) * 3 + 1];
+            let sin_t = rope[(row * 32 + pair) * 3 + 2];
+            let base = row * width + col - within;
+            if within % 2 == 0 {
+                let next = packed[base + within + 1];
+                out[base + within] = packed[base + within] * cos_t - next * sin_t;
+            } else {
+                let prev = packed[base + within - 1];
+                out[base + within] = prev * sin_t + packed[base + within] * cos_t;
+            }
+        }
+    }
+    out
+}
+
+fn oracle_softmax_causal(scores: &[f32], row: usize) -> Vec<f32> {
+    let mut row_max = scores[row * GEA2_T];
+    for j in 1..=row {
+        row_max = row_max.max(scores[row * GEA2_T + j]);
+    }
+    let mut row_sum = 0.0_f32;
+    for j in 0..=row {
+        row_sum += (scores[row * GEA2_T + j] - row_max).exp();
+    }
+    (0..=row)
+        .map(|j| (scores[row * GEA2_T + j] - row_max).exp() / row_sum)
+        .collect()
+}
+
+/// The independent scalar mirror of the §2 block forward at T=8: returns
+/// the [8,960] block output.
+fn oracle_scalar_block(inputs: &Gea2ScalarBlockInputs) -> Vec<f32> {
+    let ln1 = oracle_rmsnorm(&inputs.x, &inputs.attn_norm, GEA2_T, GEA2_D);
+    let qb = oracle_gemm(&ln1, &inputs.q, GEA2_T, GEA2_D, GEA2_D);
+    let kb = oracle_gemm(&ln1, &inputs.k, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
+    let vb = oracle_gemm(&ln1, &inputs.v, GEA2_T, GEA2_D, GEA2_KV * GEA2_HD);
+    let rq = oracle_rope_packed(&qb, GEA2_D, &inputs.rope);
+    let rk = oracle_rope_packed(&kb, GEA2_KV * GEA2_HD, &inputs.rope);
+
+    // Attention: 15 query heads over 5 KV heads (GQA ratio 3, head h → h/3).
+    let mut ctx = vec![0.0_f32; GEA2_T * GEA2_D];
+    for h in 0..GEA2_H {
+        let kv = h / 3;
+        let mut scores = vec![0.0_f32; GEA2_T * GEA2_T];
+        for row in 0..GEA2_T {
+            for col in 0..=row {
+                let mut acc = 0.0_f32;
+                for d in 0..GEA2_HD {
+                    acc += rq[row * GEA2_D + h * GEA2_HD + d]
+                        * rk[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
+                }
+                scores[row * GEA2_T + col] = acc * GEA2_SCALE;
+            }
+        }
+        for row in 0..GEA2_T {
+            let probabilities = oracle_softmax_causal(&scores, row);
+            for d in 0..GEA2_HD {
+                let mut acc = 0.0_f32;
+                for (col, weight) in probabilities.iter().enumerate() {
+                    acc += weight * vb[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
+                }
+                ctx[row * GEA2_D + h * GEA2_HD + d] = acc;
+            }
+        }
+    }
+
+    let attn_out = oracle_gemm(&ctx, &inputs.o, GEA2_T, GEA2_D, GEA2_D);
+    let r1: Vec<f32> = inputs
+        .x
+        .iter()
+        .zip(&attn_out)
+        .map(|(left, right)| left + right)
+        .collect();
+    let ln2 = oracle_rmsnorm(&r1, &inputs.ffn_norm, GEA2_T, GEA2_D);
+    let gate = oracle_gemm(&ln2, &inputs.gate, GEA2_T, GEA2_D, GEA2_F);
+    let up = oracle_gemm(&ln2, &inputs.up, GEA2_T, GEA2_D, GEA2_F);
+    let swiglu: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| (g / ((-g).exp() + 1.0)) * u)
+        .collect();
+    let ffn_out = oracle_gemm(&swiglu, &inputs.down, GEA2_T, GEA2_F, GEA2_D);
+    r1.iter()
+        .zip(&ffn_out)
+        .map(|(left, right)| left + right)
+        .collect()
+}
+
+// --- frozen-policy comparison (mirrors the U1 `compare_f32` semantics) ---
+
+fn ulp_distance(left: f32, right: f32) -> u32 {
+    if left.to_bits() == right.to_bits() || left == right {
+        return 0;
+    }
+    fn ordered_bits(bits: u32) -> u32 {
+        if bits & 0x8000_0000 != 0 {
+            0x8000_0000_u32 - (bits & 0x7fff_ffff)
+        } else {
+            0x8000_0000_u32 + bits
+        }
+    }
+    ordered_bits(left.to_bits()).abs_diff(ordered_bits(right.to_bits()))
+}
+
+/// The frozen `block_output` policy row: abs ≤ 5e-4, rel ≤ 2e-5 (denominator
+/// `max(|expected|, |observed|, MIN_POSITIVE)`), ULP ≤ 1024.
+fn gea2_compare_block_output(expected: &[f32], observed: &[f32]) -> (f32, f32, u32, usize) {
+    assert_eq!(expected.len(), observed.len());
+    assert!(
+        expected.iter().chain(observed).all(|value| value.is_finite()),
+        "the block comparison rejects non-finite values"
+    );
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    let mut max_ulp = 0_u32;
+    let mut first_index = 0;
+    for (index, (&want, &got)) in expected.iter().zip(observed).enumerate() {
+        let absolute = (got - want).abs();
+        if absolute > max_abs {
+            max_abs = absolute;
+            first_index = index;
+        }
+        let denominator = want.abs().max(got.abs()).max(f32::MIN_POSITIVE);
+        max_rel = max_rel.max(absolute / denominator);
+        max_ulp = max_ulp.max(ulp_distance(want, got));
+    }
+    (max_abs, max_rel, max_ulp, first_index)
+}
+
+/// Build the real 11-tensor HostProvided upload set: every declared
+/// HostProvided PerProgram slot resolved by name to its frozen U1 bytes.
+fn gea2_real_host_inputs(
+    descriptor: &DeviceDescriptor,
+    inputs: &Gea2ScalarBlockInputs,
+) -> BTreeMap<u32, DeviceByteBuffer> {
+    let mut uploads = BTreeMap::new();
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            if slot.lifetime != DeviceBufferLifetime::PerProgram
+                || slot.initialization != DeviceBufferInitialization::HostProvided
+                || uploads.contains_key(&slot.buffer_id)
+            {
+                continue;
+            }
+            let values: Vec<f32> = match slot.buffer_name.as_str() {
+                "activation_x" => inputs.x.clone(),
+                "attn_norm_weight" => inputs.attn_norm.clone(),
+                "q_weight" => inputs.q.clone(),
+                "k_weight" => inputs.k.clone(),
+                "v_weight" => inputs.v.clone(),
+                "o_weight" => inputs.o.clone(),
+                "ffn_norm_weight" => inputs.ffn_norm.clone(),
+                "gate_weight" => inputs.gate.clone(),
+                "up_weight" => inputs.up.clone(),
+                "down_weight" => inputs.down.clone(),
+                "rope_table" => inputs.rope.clone(),
+                other => panic!("unknown HostProvided GEA2 tensor `{other}`"),
+            };
+            assert_eq!(
+                values.len() as u64, slot.element_count,
+                "tensor `{}` byte length disagrees with the plan's declared shape",
+                slot.buffer_name
+            );
+            uploads.insert(
+                slot.buffer_id,
+                DeviceByteBuffer {
+                    bytes: f32_le_bytes(&values),
+                    dtype: DeviceDataType::F32,
+                    packed_format: None,
+                },
+            );
+        }
+    }
+    assert_eq!(uploads.len(), 11, "the frozen upload set is eleven tensors");
+    uploads
+}
+
+#[test]
+#[ignore = "physical Metal gate; run only with the exact §6 command pair"]
+fn gea2_real_metal_block_receipt() {
+    let e2e_start = Instant::now();
+    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    let workspace = workspace_root();
+    let receipt_path = PathBuf::from(
+        std::env::var_os("GEA2_METAL_RECEIPT")
+            .expect("GEA2_METAL_RECEIPT must identify the receipt output"),
+    );
+
+    // Frozen identities: the U1 manifest gates every input byte.
+    let manifest_path = workspace.join(
+        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
+    )
+    .expect("valid GEA2 U1 input manifest");
+    assert_eq!(manifest["schema"], "gea2-input-manifest-v1");
+    assert_eq!(manifest["delivery"], "GEA2-U1");
+    assert_eq!(manifest["geometry"]["token_rows"].as_u64(), Some(GEA2_T as u64));
+    assert_eq!(manifest["geometry"]["hidden_dim"].as_u64(), Some(GEA2_D as u64));
+    assert_eq!(manifest["geometry"]["query_heads"].as_u64(), Some(GEA2_H as u64));
+    assert_eq!(manifest["geometry"]["kv_heads"].as_u64(), Some(GEA2_KV as u64));
+    assert_eq!(manifest["geometry"]["intermediate_dim"].as_u64(), Some(GEA2_F as u64));
+    let (inputs, tensor_range_read_us, tensor_range_read_bytes) =
+        gea2_scalar_block_inputs(&manifest);
+
+    // Entry identities: the exported bundle's thirteen members, hash-verified.
+    let artifact_dir = gea2_artifact_dir();
+    let bundle_path = artifact_dir.join("gea2-artifact-bundle-manifest.json");
+    let bundle: Value = serde_json::from_slice(
+        &fs::read(&bundle_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", bundle_path.display())),
+    )
+    .expect("valid GEA2 artifact bundle manifest");
+    assert_eq!(bundle["delivery"], "GEA2-U5a");
+    let entries = bundle["entries"].as_array().expect("bundle entries");
+    assert_eq!(entries.len(), GEA2_ENTRY_TABLE.len());
+    let entry_identities: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let artifact = artifact_dir.join(entry["artifact"].as_str().expect("artifact member"));
+            let bytes = fs::read(&artifact)
+                .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
+            assert_eq!(
+                sha256_bytes(&bytes),
+                entry["artifact_sha256"].as_str().expect("artifact digest"),
+                "bundle member {} drifted",
+                artifact.display()
+            );
+            json!({
+                "entry": entry["entry"],
+                "provenance": entry["provenance"],
+                "artifact": entry["artifact"],
+                "artifact_sha256": entry["artifact_sha256"],
+                "artifact_bytes": bytes.len(),
+                "descriptor_sha256": entry["descriptor_sha256"],
+                "source": entry["source"],
+                "source_sha256": entry["source_sha256"],
+            })
+        })
+        .collect();
+    let plan_bytes = fs::read(artifact_dir.join(PLAN_MEMBER))
+        .unwrap_or_else(|error| panic!("read plan member: {error}"));
+    let plan_sha256 = sha256_bytes(&plan_bytes);
+
+    // Revisions and physical device identity.
+    let gradus_revision = git_revision(&workspace.join("gradus"));
+    let radix_revision = git_revision(&workspace.join("radix"));
+    let hosts_revision = git_revision(&workspace.join("hosts"));
+    let devices = enumerate_metal_physical_devices().expect("Metal device enumeration");
+    assert!(
+        !devices.is_empty(),
+        "Metal selected but no physical device identity exists"
+    );
+    let device = &devices[0];
+    assert!(!device.registry_id.is_empty(), "registry identity required");
+    assert!(device.api_total_bytes > 0, "memory capability required");
+
+    // The plan, mapped and admitted exactly as the fake ladder admits it.
+    let descriptor = gea2_sequence_descriptor();
+
+    // The real session: physical Metal, one module compile, one execution.
+    let runtime =
+        DeviceRuntime::Metal(MetalHostSession::try_open().expect("physical Metal admission"));
+    let mut host = CompositeHost::with_device(runtime, "metal-device")
+        .expect("real-metal composite");
+    let mut session = host
+        .create_program_session(&descriptor)
+        .expect("real GEA2 program session");
+    let module_hash = session.module_hash();
+    let program_graph_hash = session.program_graph_hash().to_owned();
+    let module_compile_us = unmeasured("session module-compile timing is crate-private");
+    let per_program_alloc_us = unmeasured("session per-program allocation timing is crate-private");
+    let uploads = gea2_real_host_inputs(&descriptor, &inputs);
+    let weight_bytes_total: usize = uploads.values().map(|buffer| buffer.bytes.len()).sum();
+    let receipt = session
+        .execute_with_weight_bytes(&BTreeMap::new(), &uploads)
+        .expect("the 64-launch GEA2 block executes on physical Metal");
+    session.teardown().expect("ordered GEA2 session teardown");
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0,
+        "teardown released every handle"
+    );
+
+    // Structural facts: the §6 sequence contract, on the real driver.
+    assert_eq!(receipt.launch_ids, (1..=64).collect::<Vec<u32>>());
+    let declared_entries: Vec<String> = descriptor
+        .launches
+        .iter()
+        .map(|launch| descriptor.kernels[launch.kernel_index as usize].entry.clone())
+        .collect();
+    assert_eq!(receipt.launch_entries, declared_entries);
+    assert_eq!(receipt.fused_library_dispatches.len(), 0, "zero CPU substitutes");
+    assert!(
+        receipt.allocated_buffer_versions.len() == 75,
+        "the plan's 75 version-keyed buffers are the whole allocation set"
+    );
+    let counters = host.device().expect("device present").driver_counters();
+    assert_eq!(counters.uploads, 11, "each declared host tensor uploads exactly once");
+    assert_eq!(counters.module_loads, 1, "one module compile and load");
+    assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
+    assert_eq!(receipt.outputs.len(), 1);
+    assert_eq!(receipt.transfers, 1, "one step-boundary transfer: the declared readback");
+    assert_eq!(receipt.syncs, 1, "one step-boundary sync after the last launch");
+    let output_id = descriptor.results[0].buffer_id;
+    let observed = &receipt.outputs[&output_id];
+    assert_eq!(observed.len(), GEA2_T * GEA2_D, "the declared [8,960] output in full");
+    assert!(observed.iter().all(|value| value.is_finite()), "finite physical output");
+
+    // Dependency-edge satisfaction: 63 declared edges, producer before consumer.
+    assert_eq!(descriptor.data_flow.len(), 63);
+    let edge_rows: Vec<Value> = descriptor
+        .data_flow
+        .iter()
+        .map(|edge| {
+            let satisfied = receipt.launch_ids.contains(&edge.producer)
+                && receipt.launch_ids.contains(&edge.consumer)
+                && edge.producer < edge.consumer;
+            assert!(satisfied, "edge {}→{} unsatisfied", edge.producer, edge.consumer);
+            json!({
+                "producer": edge.producer,
+                "consumer": edge.consumer,
+                "buffer": edge.buffer_id,
+                "version": edge.version,
+            })
+        })
+        .collect();
+
+    // The block numerical row: physical output vs the independent scalar oracle.
+    let expected = oracle_scalar_block(&inputs);
+    let (max_abs, max_rel, max_ulp, first_index) =
+        gea2_compare_block_output(&expected, observed);
+    let policy_pass = max_abs <= 5e-4 && max_rel <= 2e-5 && max_ulp <= 1024;
+    let sample_rows: Vec<Value> = (0..8)
+        .map(|index| {
+            json!({
+                "index": index,
+                "expected_f32": expected[index],
+                "observed_f32": observed[index],
+                "absolute_error": (observed[index] - expected[index]).abs(),
+            })
+        })
+        .collect();
+
+    // Stage split (derived): rmsnorm-attn | attention (rope..o_proj/residual1)
+    // | ffn (post-attention rmsnorm..block_output), by launch position.
+    let entries_flat = &receipt.launch_entries;
+    let attention_start = entries_flat
+        .iter()
+        .position(|entry| entry == "rope_q")
+        .expect("rope_q launch");
+    let ffn_start = (0..entries_flat.len())
+        .find(|&index| index > attention_start && entries_flat[index] == "rmsnorm")
+        .expect("post-attention rmsnorm launch");
+    let stage_of = |index: usize| -> &'static str {
+        if index < attention_start {
+            "rmsnorm_attn"
+        } else if index < ffn_start {
+            "attention"
+        } else {
+            "ffn"
+        }
+    };
+    let launch_rows: Vec<Value> = descriptor
+        .launches
+        .iter()
+        .enumerate()
+        .map(|(order, launch)| {
+            let kernel = &descriptor.kernels[launch.kernel_index as usize];
+            json!({
+                "order": order,
+                "launch_id": launch.id,
+                "entry": kernel.entry,
+                "stage": stage_of(order),
+                "grid": kernel.grid,
+                "block": kernel.block,
+            })
+        })
+        .collect();
+    let gpu_total: u64 = receipt.launch_gpu_us.iter().sum();
+    let per_stage_gpu_us = if receipt.launch_gpu_us.len() == 64 {
+        let mut stages: BTreeMap<&str, u64> = BTreeMap::new();
+        for (index, gpu) in receipt.launch_gpu_us.iter().enumerate() {
+            *stages.entry(stage_of(index)).or_default() += gpu;
+        }
+        derived(
+            stages,
+            "sum of per-encoder GPU timestamps grouped by launch-position stage",
+        )
+    } else {
+        unmeasured("per-encoder GPU timestamps were not sampled")
+    };
+
+    let output_bytes = f32_le_bytes(observed);
+    let weight_allocations: Vec<Value> = uploads
+        .iter()
+        .map(|(buffer_id, buffer)| {
+            let name = descriptor
+                .kernels
+                .iter()
+                .flat_map(|kernel| &kernel.buffers)
+                .find(|slot| slot.buffer_id == *buffer_id)
+                .map(|slot| slot.buffer_name.as_str())
+                .unwrap_or("unknown");
+            json!({
+                "buffer_id": buffer_id,
+                "name": name,
+                "bytes": buffer.bytes.len(),
+                "lifetime": "per-program",
+                "initialization": "host-provided",
+                "upload_count": 1,
+            })
+        })
+        .collect();
+    let intermediate_allocations: Vec<Value> = descriptor
+        .buffer_versions
+        .iter()
+        .filter(|version| !uploads.contains_key(&version.buffer_id))
+        .map(|version| {
+            json!({
+                "buffer_id": version.buffer_id,
+                "version": version.version,
+                "elements": version.element_count,
+                "bytes": version.element_count as usize * DeviceDataType::F32.byte_width(),
+                "initialization": "kernel-initialized",
+            })
+        })
+        .collect();
+    assert_eq!(intermediate_allocations.len(), 64);
+
+    let hostname = Command::new("hostname")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let e2e_us = e2e_start.elapsed().as_micros() as u64;
+    let receipt_json = json!({
+        "schema": "gea2-metal-receipt-v1",
+        "delivery": "GEA2-U5e",
+        "backend": "Metal",
+        "machine": hostname,
+        "identities": {
+            "entries": entry_identities,
+            "program_plan_sha256": plan_sha256,
+            "module_hash_fnv1a": module_hash,
+            "program_graph_sha256": program_graph_hash,
+            "activation_sha256": manifest["activation"]["sha256"],
+            "rope_table_sha256": manifest["rope_table"]["sha256"],
+            "derived_f32_gguf_sha256": manifest["model"]["derived_f32_gguf"]["sha256"],
+        },
+        "revisions": {
+            "source_model": manifest["model"]["revision"],
+            "gradus": gradus_revision,
+            "radix": radix_revision,
+            "hosts": hosts_revision,
+        },
+        "physical_device": {
+            "backend": "Metal",
+            "registry_id": device.registry_id,
+            "model": device.device_model,
+            "api_total_bytes": device.api_total_bytes,
+            "max_threads_per_workgroup": device.max_threads_per_workgroup,
+            "workgroup_shared_memory_min_bytes": device.workgroup_shared_memory_min_bytes,
+            "workgroup_shared_memory_max_bytes": device.workgroup_shared_memory_max_bytes,
+            "collective_width": device.collective_width,
+            "unified_memory": device.unified_memory,
+        },
+        "allocations": {
+            "host_tensors": weight_allocations,
+            "intermediates": intermediate_allocations,
+        },
+        "launch_sequence": launch_rows,
+        "dependency_edges": edge_rows,
+        "zero_cpu_attestation": {
+            "cpu_substitute_count": 0,
+            "cpu_bridge_count": 0,
+            "fused_library_dispatches": receipt.fused_library_dispatches.len(),
+            "execution_session": "MetalHostSession::try_open",
+            "fake_driver_used": false,
+            "uploads": counters.uploads,
+            "module_loads": counters.module_loads,
+            "intermediate_readbacks": 0,
+            "step_boundary_syncs": receipt.syncs,
+            "completion_boundary": receipt.completion_boundary.spelling(),
+        },
+        "declared_output": {
+            "buffer_id": output_id,
+            "elements": GEA2_T * GEA2_D,
+            "dtype": "F32",
+            "bytes": output_bytes.len(),
+            "sha256": sha256_bytes(&output_bytes),
+        },
+        "block_output_comparison": {
+            "oracle": "independent scalar F32 mirror of gea2-delivery §2 authored in this test (no gradus/radix/host-helper calls)",
+            "policy": {"max_absolute_error": 5e-4, "max_relative_error": 2e-5, "max_ulp_distance": 1024},
+            "max_absolute_error": max_abs,
+            "max_relative_error": max_rel,
+            "max_ulp_distance": max_ulp,
+            "first_largest_error_index": first_index,
+            "policy_pass": policy_pass,
+            "sample_rows": sample_rows,
+        },
+        "measurements": {
+            "tensor_range_read_us": measured(tensor_range_read_us),
+            "tensor_range_read_bytes": measured(tensor_range_read_bytes),
+            "weight_residency_us": measured(receipt.copy_in_us),
+            "weight_bytes": measured(weight_bytes_total),
+            "module_compile_us": module_compile_us,
+            "per_program_alloc_us": per_program_alloc_us,
+            "intermediate_alloc_us": unmeasured(
+                "intermediate pool checkout is not separately timed by the session; count and per_program_alloc_us recorded",
+            ),
+            "intermediate_count": measured(64),
+            "launch_sequence_us": derived(
+                receipt.gpu_encode_submit_wait_us.saturating_sub(gpu_total),
+                "encode+submit+wait wall minus summed per-encoder GPU timestamps",
+            ),
+            "gpu_body_us": measured(gpu_total),
+            "per_stage_gpu_us": per_stage_gpu_us,
+            "block_steady_state_us": unmeasured(
+                "single cold evidence run; warm steady-state sampling is deferred with U6",
+            ),
+            "sync_wait_count": measured(receipt.syncs),
+            "sync_wait_us": unmeasured(
+                "not separately timed inside the single step-boundary wait",
+            ),
+            "readback_us": measured(receipt.readback_us),
+            "readback_bytes": measured(output_bytes.len()),
+            "warmups": measured(0),
+            "repetitions": measured(1),
+            "effective_bandwidth_bytes_per_s": if gpu_total == 0 {
+                unmeasured("GPU timestamps rounded to zero")
+            } else {
+                derived(
+                    weight_bytes_total as f64 * 1_000_000.0 / gpu_total as f64,
+                    "declared resident weight bytes / summed gpu_body_us * 1_000_000",
+                )
+            },
+            "e2e_us": measured(e2e_us),
+        },
+    });
+    let parent = receipt_path.parent().expect("receipt parent");
+    fs::create_dir_all(parent).expect("create receipt parent");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec_pretty(&receipt_json).expect("serialize receipt"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", receipt_path.display()));
+    eprintln!("GEA2 real Metal block receipt: {}", receipt_path.display());
+
+    assert!(
+        policy_pass,
+        "physical [8,960] block output disagrees with the scalar oracle beyond the frozen \
+block_output policy: max_abs={max_abs:.3e} (≤5e-4), max_rel={max_rel:.3e} (≤2e-5), \
+max_ulp={max_ulp} (≤1024), first_largest_error_index={first_index}; receipt at {}",
+        receipt_path.display()
     );
 }
