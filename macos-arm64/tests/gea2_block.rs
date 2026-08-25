@@ -121,12 +121,23 @@ struct Gea2MatMulPlan {
     n: u64,
     left_layout: Gea2MatMulLayout,
     right_layout: Gea2MatMulLayout,
+    right_operand_layout: Gea2RightOperandLayout,
     tile: u32,
     workgroup_x: u32,
     workgroup_y: u32,
     shared_memory: Gea2MatMulSharedMemory,
     barriers: Vec<Gea2BarrierPoint>,
     oob_padding: Gea2OobPaddingPolicy,
+}
+
+/// The tiled matmul right operand's declared physical memory layout
+/// (GEA2-U5i): GGUF `[out][in]` out-major weights vs the natural row-major
+/// `[k][n]` tensor the transpose entry produces.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Gea2RightOperandLayout {
+    OutIn,
+    RowMajor,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -2577,11 +2588,17 @@ fn gea2_diagnostic_reference_rows(
     for (head, row) in rows.v_head.iter().enumerate() {
         named.insert(format!("v_head_{head}"), row.clone());
     }
-    // The transpose entries copy their input head window (the score_gemm
-    // read `key_transposed_in[col * k + d]` wants the key at position `col`
-    // — the window itself; the transpose's identity move is the contract).
+    // The transpose entries produce the real [8,64]→[64,8] key transpose
+    // (GEA2-U5i layout truth — the explicit device transpose, decision 4):
+    // output flat `k` (row `j = k/8`, col `i = k%8`) holds `k_head[i*64+j]`.
     for (head, row) in rows.k_head.iter().enumerate() {
-        named.insert(format!("key_transpose_{head}"), row.clone());
+        let mut transposed = vec![0.0_f32; row.len()];
+        for (k, value) in transposed.iter_mut().enumerate() {
+            let i = k % 8;
+            let j = k / 8;
+            *value = row[i * 64 + j];
+        }
+        named.insert(format!("key_transpose_{head}"), transposed);
     }
     for (head, row) in rows.scores.iter().enumerate() {
         named.insert(format!("score_{head}"), row.clone());
