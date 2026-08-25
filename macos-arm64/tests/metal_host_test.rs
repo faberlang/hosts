@@ -165,6 +165,88 @@ fn fake_driver_sequences_generalized_launch_kernel() {
     session.sync().expect("session sync barrier");
 }
 
+#[test]
+fn fake_driver_accepts_all_gea2_entry_arities_from_declared_table() {
+    const GEA2_ENTRIES: [(&str, usize); 13] = [
+        ("rmsnorm", 3),
+        ("gemm_qo", 3),
+        ("gemm_kv", 3),
+        ("gemm_gate_up", 3),
+        ("gemm_down", 3),
+        ("rope_q", 3),
+        ("rope_k", 3),
+        ("transpose", 2),
+        ("score_gemm", 4),
+        ("causal_softmax", 2),
+        ("context_gemm", 3),
+        ("swiglu", 3),
+        ("residual_add", 3),
+    ];
+
+    let mut driver = FakeMetalDriver::default();
+    for (entry, _) in GEA2_ENTRIES {
+        driver = driver.with_known_entry(entry);
+    }
+    let mut session = MetalHostSession::with_driver(Box::new(driver)).expect("fake admit");
+    let module = session.load_module(b"gea2 fake module").expect("load");
+
+    for (entry, arity) in GEA2_ENTRIES {
+        let mut buffers = Vec::with_capacity(arity);
+        for _ in 0..arity {
+            buffers.push(session.alloc_bytes(4).expect("alloc launch binding"));
+        }
+        session
+            .launch_kernel(module, entry, &buffers, 1, 1)
+            .unwrap_or_else(|error| panic!("GEA2 entry {entry} with arity {arity}: {error}"));
+    }
+
+    assert_eq!(
+        session.command_submit_count(),
+        0,
+        "fake GEA2 launches stay encode-only until sync"
+    );
+    assert_eq!(session.blocking_wait_count(), 0);
+    session.sync().expect("fake GEA2 sync");
+    assert_eq!(session.command_submit_count(), 1);
+    assert_eq!(session.blocking_wait_count(), 1);
+}
+
+#[test]
+fn fake_driver_rejects_unknown_entry_against_declared_gea2_table() {
+    let mut driver = FakeMetalDriver::default();
+    for entry in [
+        "rmsnorm",
+        "gemm_qo",
+        "gemm_kv",
+        "gemm_gate_up",
+        "gemm_down",
+        "rope_q",
+        "rope_k",
+        "transpose",
+        "score_gemm",
+        "causal_softmax",
+        "context_gemm",
+        "swiglu",
+        "residual_add",
+    ] {
+        driver = driver.with_known_entry(entry);
+    }
+    let mut session = MetalHostSession::with_driver(Box::new(driver)).expect("fake admit");
+    let module = session.load_module(b"gea2 fake module").expect("load");
+    let buffers = [
+        session.alloc_bytes(4).expect("alloc input a"),
+        session.alloc_bytes(4).expect("alloc input b"),
+        session.alloc_bytes(4).expect("alloc output"),
+    ];
+
+    let error = session
+        .launch_kernel(module, "not_a_gea2_entry", &buffers, 1, 1)
+        .expect_err("unknown declared-module entry must fail closed");
+    assert_eq!(error.code, E_DEVICE_ENTRY_MISMATCH);
+    assert_eq!(session.command_submit_count(), 0);
+    assert_eq!(session.blocking_wait_count(), 0);
+}
+
 /// W8-U1: several kernel encodes stay encode-only until `sync`, which is
 /// one command-buffer submit and one blocking wait. Readback after that
 /// flush does not add another wait (coalesced).
