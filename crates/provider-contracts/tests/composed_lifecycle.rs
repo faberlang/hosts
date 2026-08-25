@@ -153,8 +153,8 @@ const SOLUM_ROUTES: &[&str] = &[
     "solum:vincula",
     "solum:dele",
     "solum:delet",
-    "solum:exscribe",
-    "solum:exscribet",
+    "solum:copy",
+    "solum:copy_async",
     "solum:renomina",
     "solum:renominabit",
     "solum:tange",
@@ -382,7 +382,7 @@ fn public_fixture(route: &str, workspace: &mut TestWorkspace) -> DispatchFixture
         "solum:dele" | "solum:delet" => {
             DispatchFixture::new(Valor::Textus(workspace.file("delete.txt", "delete")))
         }
-        "solum:exscribe" | "solum:exscribet" => DispatchFixture::new(Valor::Lista(vec![
+        "solum:copy" | "solum:copy_async" => DispatchFixture::new(Valor::Lista(vec![
             Valor::Textus(workspace.file("copy-source.txt", "copy")),
             Valor::Textus(workspace.path("copy-dest.txt")),
         ])),

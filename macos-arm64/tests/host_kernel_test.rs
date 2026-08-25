@@ -249,7 +249,7 @@ fn manifest_lists_current_stdlib_sync_routes() {
         "solum:modum",
         "solum:vincula",
         "solum:dele",
-        "solum:exscribe",
+        "solum:copy",
         "solum:renomina",
         "solum:crea",
         "solum:enumera",
@@ -552,13 +552,13 @@ fn solum_vinculumne_detects_symlink() {
 }
 
 #[test]
-fn solum_exscribe_copies_file() {
+fn solum_copy_copies_file() {
     let kernel = HostKernel::new();
-    let (dir, file, _) = solum_fixture("exscribe");
+    let (dir, file, _) = solum_fixture("copy");
     let copy = dir.path().join("copy.txt");
 
     let copy_resp = kernel.route(&Frame::request_with(
-        "solum:exscribe",
+        "solum:copy",
         Valor::Lista(vec![
             Valor::Textus(file.to_string_lossy().into_owned()),
             Valor::Textus(copy.to_string_lossy().into_owned()),

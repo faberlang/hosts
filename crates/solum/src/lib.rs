@@ -77,7 +77,7 @@ impl Provider for Solum {
             "solum:modus" => file_mode(&request.opener),
             "solum:vincula" => create_symlink(&request.opener),
             "solum:dele" | "solum:delet" => delete_file(&request.opener),
-            "solum:exscribe" | "solum:exscribet" => copy_file(&request.opener),
+            "solum:copy" | "solum:copy_async" => copy_file(&request.opener),
             "solum:renomina" | "solum:renominabit" => rename_file(&request.opener),
             "solum:tange" | "solum:tanget" => touch(&request.opener),
             "solum:sequere" | "solum:sequetur" => follow_symlink(&request.opener),
@@ -343,7 +343,7 @@ fn copy_file(opener: &Valor) -> HostResult<ProviderReply> {
     let source = string_arg(opener, 0, "fons")?;
     let destination = string_arg(opener, 1, "destinatio")?;
     fs::copy(&source, &destination)
-        .map_err(|error| HostError::internal(format!("solum:exscribe failed: {error}")))?;
+        .map_err(|error| HostError::internal(format!("solum:copy failed: {error}")))?;
     Ok(ProviderReply::vacuum())
 }
 
