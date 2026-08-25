@@ -38,11 +38,13 @@ const PLAN_MEMBER: &str = "gea2-program-plan.json";
 const MODULE_IMAGE_RULE: &str =
     "module_image is the concatenation of module_members in listed order";
 
-/// The 13-entry block kernel table and its instance counts (GEA2 §5 / U5a
-/// admission facts, mirrored here for consumption admission).
-const GEA2_ENTRY_TABLE: [(&str, usize); 13] = [
+/// The 14-entry block kernel table and its instance counts (GEA2 §5 / U5a
+/// admission facts, mirrored here for consumption admission; the gathered
+/// o-projection is its own entry since radix `6a0e3780a`).
+const GEA2_ENTRY_TABLE: [(&str, usize); 14] = [
     ("rmsnorm", 2),
-    ("gemm_qo", 2),
+    ("gemm_qo", 1),
+    ("gemm_qo_gathered", 1),
     ("gemm_kv", 2),
     ("gemm_gate_up", 2),
     ("gemm_down", 1),
@@ -724,7 +726,7 @@ fn check_entry_table(kernels: &[Gea2KernelUnit]) -> Result<(), String> {
     }
     if counts.len() != GEA2_ENTRY_TABLE.len() {
         return Err(format!(
-            "GEA2 plan carries {} distinct entries; the 13-entry block table expects {}",
+            "GEA2 plan carries {} distinct entries; the 14-entry block table expects {}",
             counts.len(),
             GEA2_ENTRY_TABLE.len()
         ));
@@ -737,7 +739,8 @@ fn check_entry_table(kernels: &[Gea2KernelUnit]) -> Result<(), String> {
 fn check_entry_recipe(entry: &str, plan: &Gea2Plan) -> Result<(), String> {
     let admitted = match entry {
         "rmsnorm" => matches!(plan, Gea2Plan::RmsNormalization(_)),
-        "gemm_qo" | "gemm_kv" | "gemm_gate_up" | "gemm_down" | "score_gemm" | "context_gemm" => {
+        "gemm_qo" | "gemm_qo_gathered" | "gemm_kv" | "gemm_gate_up" | "gemm_down"
+        | "score_gemm" | "context_gemm" => {
             matches!(plan, Gea2Plan::TiledMatMul(_))
         }
         "rope_q" | "rope_k" => matches!(plan, Gea2Plan::Rope(_)),
@@ -1207,7 +1210,7 @@ fn gea2_descriptor_validate_rejects_plan_shape_violations() {
 // ---------------------------------------------------------------------------
 // The fake sequence ladder (U5c + U5d): the 64-launch block program executes
 // on the FakeMetalDriver through the composite program session. The driver's
-// declared-function table carries the 13-entry block ABI, so every launch
+// declared-function table carries the 14-entry block ABI, so every launch
 // takes the structural, encode-only GEA2 dispatch — no kernel-library body
 // and no CPU oracle is ever consulted (the values are never evidence).
 // ---------------------------------------------------------------------------
@@ -1932,7 +1935,7 @@ fn gea2_real_metal_block_receipt() {
     let (inputs, tensor_range_read_us, tensor_range_read_bytes) =
         gea2_scalar_block_inputs(&manifest);
 
-    // Entry identities: the exported bundle's thirteen members, hash-verified.
+    // Entry identities: the exported bundle's fourteen members, hash-verified.
     let artifact_dir = gea2_artifact_dir();
     let bundle_path = artifact_dir.join("gea2-artifact-bundle-manifest.json");
     let bundle: Value = serde_json::from_slice(

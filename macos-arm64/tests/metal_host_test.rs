@@ -167,9 +167,13 @@ fn fake_driver_sequences_generalized_launch_kernel() {
 
 #[test]
 fn fake_driver_accepts_all_gea2_entry_arities_from_declared_table() {
-    const GEA2_ENTRIES: [(&str, usize); 13] = [
+    const GEA2_ENTRIES: [(&str, usize); 14] = [
         ("rmsnorm", 3),
         ("gemm_qo", 3),
+        // The gathered o-projection is its own 17-binding entry (15 context
+        // reads + o_weight + o_projection) since radix `6a0e3780a` made
+        // emission launch-binding-faithful.
+        ("gemm_qo_gathered", 17),
         ("gemm_kv", 3),
         ("gemm_gate_up", 3),
         ("gemm_down", 3),
@@ -220,6 +224,7 @@ fn fake_driver_rejects_unknown_entry_against_declared_gea2_table() {
     for entry in [
         "rmsnorm",
         "gemm_qo",
+        "gemm_qo_gathered",
         "gemm_kv",
         "gemm_gate_up",
         "gemm_down",
