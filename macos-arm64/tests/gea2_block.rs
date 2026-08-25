@@ -2265,11 +2265,23 @@ fn gea2_real_metal_block_receipt() {
         })
         .collect();
 
-    // The block numerical row: physical output vs the independent scalar oracle.
+    // The block numerical row: physical output vs the independent scalar
+    // oracle. GEA2-U5j pre-timing amendment (CTO ruling f51387e4): the
+    // verdict is the element-wise disjunction `abs(e) <= atol OR (rel(e) <=
+    // rtol AND ulp(e) <= ulp_row)` — every frozen constant unchanged (abs
+    // 5e-4 / rel 2e-5 / ulp 1024); only the composition changes from the
+    // aggregate-conjunction-of-maxima form. The aggregate metrics remain in
+    // the receipt for the record.
     let expected = oracle_scalar_block(&inputs);
     let (max_abs, max_rel, max_ulp, first_index) =
         gea2_compare_block_output(&expected, observed);
-    let policy_pass = max_abs <= 5e-4 && max_rel <= 2e-5 && max_ulp <= 1024;
+    let (policy_pass, failing_elements) =
+        gea2_element_wise_passes(&expected, observed, 5e-4, 2e-5, 1024);
+    assert_eq!(
+        failing_elements,
+        0,
+        "the amended element-wise gate must pass every block element"
+    );
     let sample_rows: Vec<Value> = (0..8)
         .map(|index| {
             json!({
@@ -2435,12 +2447,40 @@ fn gea2_real_metal_block_receipt() {
         "block_output_comparison": {
             "oracle": "independent scalar F32 mirror of gea2-delivery §2 authored in this test (no gradus/radix/host-helper calls)",
             "policy": {"max_absolute_error": 5e-4, "max_relative_error": 2e-5, "max_ulp_distance": 1024},
+            "composition": "element-wise disjunction (GEA2-U5j pre-timing amendment, CTO ruling f51387e4): abs(e) <= atol OR (rel(e) <= rtol AND ulp(e) <= ulp_row); every frozen constant unchanged",
             "max_absolute_error": max_abs,
             "max_relative_error": max_rel,
             "max_ulp_distance": max_ulp,
             "first_largest_error_index": first_index,
+            "failing_elements": failing_elements,
             "policy_pass": policy_pass,
             "sample_rows": sample_rows,
+            "v5_comparison_verbatim": {
+                "commit": "65c952196",
+                "max_absolute_error": 4.9591064453125e-05,
+                "max_relative_error": 1.133144460618496e-2,
+                "max_ulp_distance": 131072,
+                "first_largest_error_index": 1047,
+            },
+        },
+        "amendment": {
+            "id": "GEA2-U5j",
+            "ruling": "head-cto task f51387e4, mail cd41bea1",
+            "record": "radix/docs/factory/gpu-execution-architecture/evidence/gea2-tolerance-amendment.md",
+            "pre_timing": "warmups=0, repetitions=1, block_steady_state unmeasured — the amendment lands before any timing (delivery §5: no tolerance widening after observation; a pre-timing numerical amendment only)",
+            "mechanism": "deterministic tiled-vs-serial F32 accumulation-order difference (8x8-tile partial-sum order vs the scalar oracle's left-to-right serial dot); the U6b diagnostic run reproduced receipt v5's block metrics bit-identically",
+            "v5_retained": "receipt v5 (commit 65c952196) stays in git history as the red justification; v5's block comparison row is carried verbatim above",
+            "prose_corrections": [
+                "all 89 observed rows are sub-5e-5 abs (not 89 sub-1e-5): 87 rows are sub-1e-5; gemm_down and block_output sit at 4.959e-5",
+                "the 8 block_output elements >= 1e-5 are the same 8 elements as the gemm_down row's (the add is exact; the error is inherited)",
+                "the U6b diagnostic's earlier diverged heuristic (abs>1e-2 || rel>1e-3) has small-magnitude blindness and tripped on noise-class rows — the amended element-wise gate replaces it"
+            ],
+            "watch_items": [
+                "gemm_down is the amplitude leader (K=2560): single-block abs margin 10.1x; multi-block or larger-K evidence must re-derive the bound, not inherit it",
+                "swiglu is the tightest family (3.815e-6 vs atol 5e-6 = 1.31x margin): deterministic, but any sigmoid/SiLU emitter change re-tests it immediately",
+                "the residual zero-rows compare the add on device operands (block_output == residual1 + down, residual1 == activation_x + o_projection — bit-exact), not the end-to-end mirror reading",
+                "transpose/window rows carry their producer family's bounds via the declared family mapping"
+            ],
         },
         "measurements": {
             "tensor_range_read_us": measured(tensor_range_read_us),
@@ -2452,7 +2492,7 @@ fn gea2_real_metal_block_receipt() {
             "intermediate_alloc_us": unmeasured(
                 "intermediate pool checkout is not separately timed by the session; count and per_program_alloc_us recorded",
             ),
-            "intermediate_count": measured(84),
+            "intermediate_count": measured(89),
             "launch_sequence_us": derived(
                 receipt.gpu_encode_submit_wait_us.saturating_sub(gpu_total),
                 "encode+submit+wait wall minus summed per-encoder GPU timestamps",
@@ -2654,6 +2694,163 @@ fn gea2_row_metrics(expected: &[f32], observed: &[f32]) -> (f32, f32, u32) {
     (max_abs, max_rel, max_ulp)
 }
 
+/// One frozen per-family tolerance (the U1-frozen table, mirror of the
+/// radix oracle's `FROZEN_TOLERANCES`; constants byte-identical).
+#[derive(Debug, Clone, Copy)]
+struct Gea2FrozenTolerance {
+    family: &'static str,
+    atol: f32,
+    rtol: f32,
+    ulp: u32,
+}
+
+/// GEA2-U5j: the 18-row frozen family table — constants unchanged, only the
+/// composition changes (aggregate-conjunction-of-maxima → element-wise
+/// disjunction, CTO ruling f51387e4).
+const GEA2_FROZEN_TOLERANCES: [Gea2FrozenTolerance; 18] = [
+    Gea2FrozenTolerance { family: "rmsnorm_pre_attention", atol: 2.0e-5, rtol: 2.0e-5, ulp: 256 },
+    Gea2FrozenTolerance { family: "q_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "k_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "v_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "rope_q", atol: 2.0e-6, rtol: 2.0e-6, ulp: 64 },
+    Gea2FrozenTolerance { family: "rope_k", atol: 2.0e-6, rtol: 2.0e-6, ulp: 64 },
+    Gea2FrozenTolerance { family: "score_gemm", atol: 2.0e-5, rtol: 1.0e-5, ulp: 256 },
+    Gea2FrozenTolerance { family: "causal_softmax", atol: 2.0e-6, rtol: 2.0e-6, ulp: 128 },
+    Gea2FrozenTolerance { family: "context_gemm", atol: 2.0e-5, rtol: 1.0e-5, ulp: 256 },
+    Gea2FrozenTolerance { family: "o_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "residual_1", atol: 0.0, rtol: 0.0, ulp: 0 },
+    Gea2FrozenTolerance { family: "rmsnorm_post_attention", atol: 2.0e-5, rtol: 2.0e-5, ulp: 256 },
+    Gea2FrozenTolerance { family: "gate_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "up_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "swiglu", atol: 5.0e-6, rtol: 5.0e-6, ulp: 128 },
+    Gea2FrozenTolerance { family: "down_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
+    Gea2FrozenTolerance { family: "residual_2", atol: 0.0, rtol: 0.0, ulp: 0 },
+    Gea2FrozenTolerance { family: "block_output", atol: 5.0e-4, rtol: 2.0e-5, ulp: 1024 },
+];
+
+fn gea2_frozen_tolerance(family: &str) -> Gea2FrozenTolerance {
+    GEA2_FROZEN_TOLERANCES
+        .iter()
+        .copied()
+        .find(|tolerance| tolerance.family == family)
+        .unwrap_or_else(|| panic!("no frozen GEA2 family `{family}`"))
+}
+
+/// GEA2-U5j companion (ii): the declared family mapping for every observed
+/// buffer. Per-head windows inherit their producer family's bounds; the
+/// transpose outputs are a declared permutation (geometry move) of the
+/// rope_k head window and carry the rope_k family's bounds. The residual
+/// buffers are compared on device operands, not end-to-end (companion (i)).
+fn gea2_diagnostic_family(buffer_name: &str) -> &'static str {
+    if buffer_name.starts_with("key_transpose_") {
+        "rope_k" // declared transpose permutation class (geometry move)
+    } else if buffer_name.starts_with("q_head_") {
+        "rope_q"
+    } else if buffer_name.starts_with("k_head_") {
+        "rope_k"
+    } else if buffer_name.starts_with("v_head_") {
+        "v_projection_gemm"
+    } else if buffer_name.starts_with("score_") {
+        "score_gemm"
+    } else if buffer_name.starts_with("probabilities_") {
+        "causal_softmax"
+    } else if buffer_name.starts_with("context_") {
+        "context_gemm"
+    } else {
+        match buffer_name {
+            "ln1" => "rmsnorm_pre_attention",
+            "q" => "q_projection_gemm",
+            "k" => "k_projection_gemm",
+            "v" => "v_projection_gemm",
+            "rope_q" => "rope_q",
+            "rope_k" => "rope_k",
+            "o_projection" => "o_projection_gemm",
+            "residual1" => "residual_1",
+            "ln2" => "rmsnorm_post_attention",
+            "gate" => "gate_projection_gemm",
+            "up" => "up_projection_gemm",
+            "swiglu" => "swiglu",
+            "down" => "down_projection_gemm",
+            "block_output" => "block_output",
+            other => panic!("no declared GEA2 family for `{other}`"),
+        }
+    }
+}
+
+/// GEA2-U5j element-wise frozen-policy verdict (CTO ruling f51387e4): a row
+/// passes iff EVERY element satisfies `abs(e) <= atol OR (rel(e) <= rtol
+/// AND ulp(e) <= ulp_row)`. Every frozen constant is unchanged; only the
+/// composition changes from the aggregate-conjunction-of-maxima form. The
+/// ulp bound stays scoped to the rel branch (load-binding for rmsnorm).
+/// Returns `(pass, failing_elements)`.
+fn gea2_element_wise_passes(
+    expected: &[f32],
+    observed: &[f32],
+    atol: f32,
+    rtol: f32,
+    ulp_row: u32,
+) -> (bool, usize) {
+    assert_eq!(expected.len(), observed.len());
+    let mut failing = 0usize;
+    for (&want, &got) in expected.iter().zip(observed) {
+        let absolute = (got - want).abs();
+        let denominator = want.abs().max(got.abs()).max(f32::MIN_POSITIVE);
+        let relative = absolute / denominator;
+        let ulps = ulp_distance(want, got);
+        let passes = absolute <= atol || (relative <= rtol && ulps <= ulp_row);
+        if !passes {
+            failing += 1;
+        }
+    }
+    (failing == 0, failing)
+}
+
+/// GEA2-U5j red-green proof (hosts side of the amendment record): the
+/// element-wise disjunction passes the deterministic v5 accumulation-order
+/// noise class (a 2.1e-5-magnitude element at abs 2.4e-7, and the
+/// amplitude leader at |expected| 62.71 at abs 4.959e-5 — receipt v5's
+/// exact block metrics) while still failing a semantic-scale error and the
+/// historical transposed-weight class. The aggregate conjunction this
+/// amendment replaces failed the same green case (max_rel 1.13e-2,
+/// max_ulp 131072).
+#[test]
+fn gea2_amended_block_gate_passes_v5_noise_and_fails_semantic_errors() {
+    let expected = [
+        -1.049_453_3_f32,
+        2.104_044_0e-5_f32,
+        -62.708_534_f32,
+        1.0_f32,
+        -0.5_f32,
+    ];
+    let v5_noise = [
+        -1.049_453_3_f32,
+        2.080_202_0e-5_f32,  // abs 2.384e-7 on a 2.1e-5 element
+        -62.708_584_f32,     // abs 4.959e-5 on a 62.7 element
+        1.0_f32,
+        -0.5_f32,
+    ];
+    let (passes, failing) = gea2_element_wise_passes(&expected, &v5_noise, 5e-4, 2e-5, 1024);
+    assert!(passes, "the v5 noise class must pass the amended block gate");
+    assert_eq!(failing, 0);
+    // The old aggregate conjunction fails the same row (max_rel > rtol).
+    let (max_abs, max_rel, max_ulp) = gea2_row_metrics(&expected, &v5_noise);
+    assert!(max_abs <= 5e-4, "the abs channel governs the noise class");
+    assert!(max_rel > 2e-5 && max_ulp > 1024, "the rel/ulp channels are the old failures");
+    // Semantic-scale errors fail.
+    let mut semantic = expected;
+    semantic[0] += 0.5;
+    assert!(
+        !gea2_element_wise_passes(&expected, &semantic, 5e-4, 2e-5, 1024).0,
+        "a ~5e-1-scale element error must fail the amended gate"
+    );
+    let mut transposed_class = expected;
+    transposed_class[0] = -5.835_915_6_f32;
+    assert!(
+        !gea2_element_wise_passes(&expected, &transposed_class, 5e-4, 2e-5, 1024).0,
+        "the pre-U5g transposed-weight class must fail the amended gate"
+    );
+}
+
 /// The instrumented physical localization run: reads back every policy-row
 /// intermediate at its producing launch in one real-Metal execution and
 /// writes the raw device-rows artifact (schema `gea2-device-rows-v1`: F32 LE
@@ -2702,10 +2899,18 @@ fn gea2_real_metal_diagnostic_rows() {
         "every observed row is read back"
     );
 
-    // Per-launch comparison in launch order; the first launch whose output
-    // diverges beyond the diagnostic threshold is the localization.
+    // Per-launch comparison in launch order under the GEA2-U5j amended
+    // gate: each observed buffer maps to its declared frozen family (the
+    // per-head windows and the transpose outputs carry their producer
+    // family's bounds — companion (ii)), and every element must satisfy
+    // `abs(e) <= atol OR (rel(e) <= rtol AND ulp(e) <= ulp_row)`. The
+    // residual_1 buffer is compared on device operands, not end-to-end
+    // (companion (i) — the end-to-end reading is a false gate for a correct
+    // device once producers carry accumulation-order noise). The first
+    // launch with a failing element is the localization.
     let mut rows_out: Vec<Value> = Vec::new();
     let mut first_divergent: Option<(u32, String, f32, f32)> = None;
+    let mut total_failing = 0usize;
     for result in &descriptor.results {
         let launch = descriptor
             .launches
@@ -2721,24 +2926,58 @@ fn gea2_real_metal_diagnostic_rows() {
                 slot.buffer_id == result.buffer_id && slot.version == result.version
             })
             .expect("observed buffer has a descriptor slot");
+        let family = gea2_diagnostic_family(&slot.buffer_name);
         let expected = &reference[&result.buffer_id];
         let observed = &receipt.outputs[&result.buffer_id];
         let (max_abs, max_rel, max_ulp) = gea2_row_metrics(expected, observed);
-        let diverged = max_abs > 1e-2 || max_rel > 1e-3;
+        if family == "residual_1" {
+            // Companion (i): the residual add is verified bit-exact on the
+            // device operands below; the end-to-end reading of the 0/0/0
+            // residual family is the false gate the U5j amendment replaces.
+            rows_out.push(json!({
+                "launch_id": launch.id,
+                "entry": kernel.entry,
+                "buffer": slot.buffer_name,
+                "buffer_id": slot.buffer_id,
+                "elements": slot.element_count,
+                "family": family,
+                "comparison": "device-operand-add",
+                "max_absolute_error": max_abs,
+                "max_relative_error": max_rel,
+                "max_ulp_distance": max_ulp,
+                "failing_elements": 0,
+                "diverged": false,
+                "observed_f32": observed,
+                "expected_f32": expected,
+            }));
+            continue;
+        }
+        let tolerance = gea2_frozen_tolerance(family);
+        let (passes, failing) = gea2_element_wise_passes(
+            expected,
+            observed,
+            tolerance.atol,
+            tolerance.rtol,
+            tolerance.ulp,
+        );
+        total_failing += failing;
         rows_out.push(json!({
             "launch_id": launch.id,
             "entry": kernel.entry,
             "buffer": slot.buffer_name,
             "buffer_id": slot.buffer_id,
             "elements": slot.element_count,
+            "family": family,
+            "comparison": "end-to-end-element-wise",
             "max_absolute_error": max_abs,
             "max_relative_error": max_rel,
             "max_ulp_distance": max_ulp,
-            "diverged": diverged,
+            "failing_elements": failing,
+            "diverged": !passes,
             "observed_f32": observed,
             "expected_f32": expected,
         }));
-        if diverged && first_divergent.is_none() {
+        if !passes && first_divergent.is_none() {
             first_divergent = Some((
                 launch.id,
                 format!("{} ({})", kernel.entry, slot.buffer_name),
@@ -2753,6 +2992,63 @@ fn gea2_real_metal_diagnostic_rows() {
         rows_out.len()
     );
 
+    // Companion (i) — the residual zero-rows compare the ADD on device
+    // operands (device_out == F32(device_in_a + device_in_b), bitwise).
+    // Launch 64: block_output == residual1 + down; launch 58: residual1 ==
+    // F32(activation_x + o_projection) — activation_x is the host-provided
+    // input, so the pairing is the frozen `inputs.x` + device o_projection.
+    let buffer_by_name = |name: &str| -> u32 {
+        descriptor
+            .kernels
+            .iter()
+            .flat_map(|kernel| kernel.buffers.iter())
+            .find(|slot| slot.buffer_name == name)
+            .unwrap_or_else(|| panic!("no descriptor slot named `{name}`"))
+            .buffer_id
+    };
+    let block_output = &receipt.outputs[&buffer_by_name("block_output")];
+    let residual1 = &receipt.outputs[&buffer_by_name("residual1")];
+    let down = &receipt.outputs[&buffer_by_name("down")];
+    let o_projection = &receipt.outputs[&buffer_by_name("o_projection")];
+    let add64_exact = block_output
+        .iter()
+        .zip(residual1.iter().zip(down.iter()))
+        .all(|(&out, (&a, &b))| out == a + b);
+    assert!(
+        add64_exact,
+        "launch 64 block_output must equal F32(residual1 + down) bitwise on device operands"
+    );
+    let add58_exact = residual1
+        .iter()
+        .zip(inputs.x.iter().zip(o_projection.iter()))
+        .all(|(&out, (&a, &b))| out == a + b);
+    assert!(
+        add58_exact,
+        "launch 58 residual1 must equal F32(activation_x + o_projection) bitwise on device operands"
+    );
+    let residual_rows = json!([
+        {
+            "launch_id": 58,
+            "entry": "residual_add",
+            "buffer": "residual1",
+            "elements": 7680,
+            "family": "residual_1",
+            "comparison": "device-operand-add",
+            "bit_exact": add58_exact,
+            "operands": ["activation_x", "o_projection"],
+        },
+        {
+            "launch_id": 64,
+            "entry": "residual_add",
+            "buffer": "block_output",
+            "elements": 7680,
+            "family": "residual_2",
+            "comparison": "device-operand-add",
+            "bit_exact": add64_exact,
+            "operands": ["residual1", "down"],
+        },
+    ]);
+
     let artifact_path = match std::env::var_os("GEA2_DEVICE_ROWS") {
         Some(path) => PathBuf::from(path),
         None => gea2_artifact_dir().join("gea2-device-rows.json"),
@@ -2766,6 +3062,12 @@ fn gea2_real_metal_diagnostic_rows() {
             "radix": git_revision(&workspace.join("radix")),
             "hosts": git_revision(&workspace.join("hosts")),
         },
+        "policy": {
+            "composition": "element-wise disjunction (GEA2-U5j, CTO ruling f51387e4): abs(e) <= atol OR (rel(e) <= rtol AND ulp(e) <= ulp_row); every frozen constant unchanged",
+            "family_bounds": "the 18-row frozen table; per-head windows and the transpose outputs map to their producer family (declared mapping, companion ii)",
+        },
+        "failing_elements_total": total_failing,
+        "residual_device_add": residual_rows,
         "launches": rows_out,
     });
     let parent = artifact_path.parent().expect("artifact parent");
@@ -2779,8 +3081,8 @@ fn gea2_real_metal_diagnostic_rows() {
 
     match first_divergent {
         Some((launch_id, entry, max_abs, max_rel)) => panic!(
-            "localization: launch {launch_id} ({entry}) diverges from the scalar oracle — \
-max_abs={max_abs:.3e}, max_rel={max_rel:.3e}; device rows at {}",
+            "localization: launch {launch_id} ({entry}) diverges from the scalar oracle under \
+the amended element-wise gate — max_abs={max_abs:.3e}, max_rel={max_rel:.3e}; device rows at {}",
             artifact_path.display()
         ),
         None => {
@@ -2795,11 +3097,15 @@ max_abs={max_abs:.3e}, max_rel={max_rel:.3e}; device rows at {}",
                 })
                 .expect("non-empty rows");
             assert!(
-                worst["max_absolute_error"].as_f64().unwrap_or(1.0) <= 1e-2,
-                "every intermediate matched the oracle within the diagnostic slack"
+                total_failing == 0,
+                "the amended element-wise gate must pass every element (got {total_failing} failing)"
+            );
+            assert!(
+                add64_exact && add58_exact,
+                "the residual device-operand adds must be bit-exact"
             );
             eprintln!(
-                "GEA2 diagnostic: no launch diverges (worst row {} max_abs={})",
+                "GEA2 diagnostic: no launch diverges under the amended gate (worst row {} max_abs={})",
                 worst["entry"], worst["max_absolute_error"]
             );
         }
