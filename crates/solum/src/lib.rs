@@ -100,10 +100,13 @@ impl Provider for Solum {
     }
 }
 
+/// Read file for `solum:carpe`.
+///
 /// One Item per line — shape for `try_sermo_materialize_lista` through `solum:carpe`.
-fn read_file_lines(path: &str, err_label: &str) -> HostResult<ProviderReply> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| HostError::internal(format!("{err_label}: {error}")))?;
+fn read_lines(opener: &Valor) -> HostResult<ProviderReply> {
+    let path = string_arg(opener, 0, "via")?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| HostError::internal(format!("solum:carpe failed: {error}")))?;
     Ok(ProviderReply::list(
         text.lines().map(|line| Valor::Textus(line.to_owned())),
     ))
@@ -172,14 +175,7 @@ fn read_byte_range(opener: &Valor) -> HostResult<ProviderReply> {
     let path = string_arg(opener, 0, "via")?;
     let start = non_negative_offset(i64_arg(opener, 1, "initium")?, "initium")?;
     let length = bounded_range_length(i64_arg(opener, 2, "longitudo")?, "solum:partem")?;
-    let mut file = File::open(&path)
-        .map_err(|error| HostError::internal(format!("solum:partem open failed: {error}")))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| HostError::internal(format!("solum:partem seek failed: {error}")))?;
-    let mut bytes = Vec::with_capacity(length);
-    file.take(length as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| HostError::internal(format!("solum:partem read failed: {error}")))?;
+    let bytes = read_range(&path, start, length, "solum:partem")?;
     Ok(ProviderReply::byte(bytes))
 }
 
@@ -188,17 +184,11 @@ fn find_text_range(opener: &Valor) -> HostResult<ProviderReply> {
     let pattern = string_arg(opener, 1, "exemplar")?;
     let start = non_negative_offset(i64_arg(opener, 2, "initium")?, "initium")?;
     let length = bounded_range_length(i64_arg(opener, 3, "longitudo")?, "solum:inveni")?;
-    let mut file = File::open(&path)
-        .map_err(|error| HostError::internal(format!("solum:inveni open failed: {error}")))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| HostError::internal(format!("solum:inveni seek failed: {error}")))?;
-    let mut bytes = Vec::with_capacity(length);
-    file.take(length as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| HostError::internal(format!("solum:inveni read failed: {error}")))?;
+    let bytes = read_range(&path, start, length, "solum:inveni")?;
     let needle = pattern.as_bytes();
+    let base = i64::try_from(start).unwrap_or(i64::MAX);
     let offset = if needle.is_empty() {
-        i64::try_from(start).unwrap_or(i64::MAX)
+        base
     } else {
         bytes
             .windows(needle.len())
@@ -208,17 +198,23 @@ fn find_text_range(opener: &Valor) -> HostResult<ProviderReply> {
                 // which fits in `i64`.
                 #[allow(clippy::cast_possible_wrap)]
                 let position = position as i64;
-                i64::try_from(start)
-                    .unwrap_or(i64::MAX)
-                    .saturating_add(position)
+                base.saturating_add(position)
             })
     };
     Ok(ProviderReply::item(Valor::Numerus(offset)))
 }
 
-fn read_lines(opener: &Valor) -> HostResult<ProviderReply> {
-    let path = string_arg(opener, 0, "via")?;
-    read_file_lines(&path, "solum:carpe failed")
+/// Read a bounded byte range, labeling failures with the calling route.
+fn read_range(path: &str, start: u64, length: usize, route: &str) -> HostResult<Vec<u8>> {
+    let mut file = File::open(path)
+        .map_err(|error| HostError::internal(format!("{route} open failed: {error}")))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| HostError::internal(format!("{route} seek failed: {error}")))?;
+    let mut bytes = Vec::with_capacity(length);
+    file.take(length as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| HostError::internal(format!("{route} read failed: {error}")))?;
+    Ok(bytes)
 }
 
 fn write_text(opener: &Valor) -> HostResult<ProviderReply> {
@@ -394,25 +390,18 @@ fn create_dir(opener: &Valor) -> HostResult<ProviderReply> {
 
 fn list_dir(opener: &Valor) -> HostResult<ProviderReply> {
     let path = string_arg(opener, 0, "via")?;
-    let mut entries = fs::read_dir(&path)
+    let mut names = fs::read_dir(&path)
         .map_err(|error| HostError::internal(format!("solum:enumera failed: {error}")))?
         .map(|entry| {
             entry
-                .map(|entry| Valor::Textus(entry.file_name().to_string_lossy().into_owned()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .map_err(|error| {
                     HostError::internal(format!("solum:enumera entry failed: {error}"))
                 })
         })
         .collect::<HostResult<Vec<_>>>()?;
-    entries.sort_by(|left, right| left_string(left).cmp(left_string(right)));
-    Ok(ProviderReply::list(entries))
-}
-
-fn left_string(value: &Valor) -> &str {
-    match value {
-        Valor::Textus(text) => text,
-        _ => "",
-    }
+    names.sort();
+    Ok(ProviderReply::list(names.into_iter().map(Valor::Textus)))
 }
 
 fn remove_dir(opener: &Valor) -> HostResult<ProviderReply> {
