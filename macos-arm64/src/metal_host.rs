@@ -1214,28 +1214,31 @@ impl FakeMetalDriver {
     /// Emitted GEA2 entries and their declared device-buffer arities. The
     /// table mirrors the 13-entry bundle ABI: transpose and causal_softmax
     /// consume two buffers, score_gemm consumes four, and the remaining
-    /// entries consume three. These launches are structural only; they do not
-    /// pretend to simulate the kernel numerics.
-    const GEA2_ENTRY_ARITIES: &[(&str, usize)] = &[
-        ("rmsnorm", 3),
-        ("gemm_qo", 3),
-        ("gemm_kv", 3),
-        ("gemm_gate_up", 3),
-        ("gemm_down", 3),
-        ("rope_q", 3),
-        ("rope_k", 3),
-        ("transpose", 2),
-        ("score_gemm", 4),
-        ("causal_softmax", 2),
-        ("context_gemm", 3),
-        ("swiglu", 3),
-        ("residual_add", 3),
+    /// entries consume three — except `gemm_qo`, whose gathered
+    /// multi-context variant (the block's launch 57) binds 17. Each entry
+    /// admits exactly its declared binding shapes, never a blanket range;
+    /// any other arity fails closed. These launches are structural only;
+    /// they do not pretend to simulate the kernel numerics.
+    const GEA2_ENTRY_ARITIES: &[(&str, &[usize])] = &[
+        ("rmsnorm", &[3]),
+        ("gemm_qo", &[3, 17]),
+        ("gemm_kv", &[3]),
+        ("gemm_gate_up", &[3]),
+        ("gemm_down", &[3]),
+        ("rope_q", &[3]),
+        ("rope_k", &[3]),
+        ("transpose", &[2]),
+        ("score_gemm", &[4]),
+        ("causal_softmax", &[2]),
+        ("context_gemm", &[3]),
+        ("swiglu", &[3]),
+        ("residual_add", &[3]),
     ];
 
-    fn gea2_entry_arity(entry: &[u8]) -> Option<usize> {
+    fn gea2_entry_arities(entry: &[u8]) -> Option<&'static [usize]> {
         Self::GEA2_ENTRY_ARITIES
             .iter()
-            .find_map(|(name, arity)| (name.as_bytes() == entry).then_some(*arity))
+            .find_map(|(name, arities)| (name.as_bytes() == entry).then_some(*arities))
     }
 
     pub fn unavailable() -> Self {
@@ -1707,8 +1710,12 @@ impl MetalDriver for FakeMetalDriver {
         // written here. Keep this behind the declared-function-table path so
         // the legacy unnamed-module 3-buffer fake remains unchanged.
         if !self.known_entries.is_empty() {
-            if let Some(arity) = Self::gea2_entry_arity(entry) {
-                expect_fake_arity(buffers, arity, "declared GEA2 entry")?;
+            if let Some(arities) = Self::gea2_entry_arities(entry) {
+                if !arities.contains(&buffers.len()) {
+                    return Err(HostError::invalid_args(
+                        "fake launch_kernel declared GEA2 entry".to_owned(),
+                    ));
+                }
                 self.pending_encodes += 1;
                 return Ok(());
             }

@@ -17,12 +17,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use faber_host_macos_arm64::composite_host::{CompositeHost, DeviceByteBuffer};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
     DescriptorKernel, DescriptorLaunch, DescriptorResult, DeviceBufferInitialization,
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
+use faber_host_macos_arm64::device_host::DeviceRuntime;
+use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1111,6 +1114,219 @@ fn gea2_descriptor_validate_rejects_plan_shape_violations() {
     assert_eq!(error.code, E_DEVICE_DESCRIPTOR);
     assert!(
         error.message.contains("unknown buffer"),
+        "diagnostic names the unknown buffer: {}",
+        error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The fake sequence ladder (U5c + U5d): the 64-launch block program executes
+// on the FakeMetalDriver through the composite program session. The driver's
+// declared-function table carries the 13-entry block ABI, so every launch
+// takes the structural, encode-only GEA2 dispatch — no kernel-library body
+// and no CPU oracle is ever consulted (the values are never evidence).
+// ---------------------------------------------------------------------------
+
+/// The fake-metal composite whose module declares every GEA2 block entry, so
+/// each of the 64 launches takes the driver's declared-entry GEA2 dispatch.
+fn gea2_fake_host() -> CompositeHost {
+    let mut driver = FakeMetalDriver::default();
+    for (entry, _) in GEA2_ENTRY_TABLE {
+        driver = driver.with_known_entry(entry);
+    }
+    let runtime = DeviceRuntime::Metal(
+        MetalHostSession::with_driver(Box::new(driver)).expect("fake Metal admission"),
+    );
+    CompositeHost::with_device(runtime, "fake-metal-device").expect("fake-metal composite")
+}
+
+/// The real exported bundle's plan, mapped onto a validated descriptor.
+fn gea2_sequence_descriptor() -> DeviceDescriptor {
+    let artifact_dir = gea2_artifact_dir();
+    let envelope = load_gea2_plan(&artifact_dir);
+    let descriptor = map_envelope_to_descriptor(&envelope, &artifact_dir)
+        .unwrap_or_else(|error| panic!("GEA2 plan → DeviceDescriptor mapping failed: {error}"));
+    descriptor.validate().unwrap_or_else(|error| {
+        panic!(
+            "mapped GEA2 descriptor must validate: {} ({})",
+            error.message, error.code
+        )
+    });
+    descriptor
+}
+
+/// The declared HostProvided PerProgram tensors as zero-valued F32 byte
+/// payloads. The sequence ladder is structural: the bytes only satisfy the
+/// declared shapes; no value is read or interpreted.
+fn gea2_host_input_bytes(
+    descriptor: &DeviceDescriptor,
+) -> std::collections::BTreeMap<u32, DeviceByteBuffer> {
+    let mut uploads = Vec::new();
+    for kernel in &descriptor.kernels {
+        for slot in &kernel.buffers {
+            if slot.lifetime == DeviceBufferLifetime::PerProgram
+                && slot.initialization == DeviceBufferInitialization::HostProvided
+                && !uploads.contains(&slot.buffer_id)
+            {
+                uploads.push(slot.buffer_id);
+            }
+        }
+    }
+    uploads
+        .into_iter()
+        .map(|buffer_id| {
+            let version = descriptor
+                .buffer_versions
+                .iter()
+                .find(|version| version.buffer_id == buffer_id)
+                .unwrap_or_else(|| panic!("host input buffer {buffer_id} has no keyed version"));
+            let byte_len = usize::try_from(version.element_count)
+                .expect("element count fits usize")
+                * DeviceDataType::F32.byte_width();
+            (
+                buffer_id,
+                DeviceByteBuffer {
+                    bytes: vec![0; byte_len],
+                    dtype: DeviceDataType::F32,
+                    packed_format: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// One structural execution of the 64-launch block sequence on the fake
+/// driver, returning the receipt after an ordered teardown.
+fn gea2_execute_fake_sequence(
+    host: &mut CompositeHost,
+    descriptor: &DeviceDescriptor,
+) -> faber_host_macos_arm64::composite_host::DeviceExecutionReceipt {
+    let mut session = host
+        .create_program_session(descriptor)
+        .expect("fake GEA2 program session");
+    let inputs = gea2_host_input_bytes(descriptor);
+    let receipt = session
+        .execute_with_weight_bytes(&BTreeMap::new(), &inputs)
+        .expect("the 64-launch fake GEA2 sequence executes");
+    session.teardown().expect("ordered GEA2 session teardown");
+    receipt
+}
+
+#[test]
+fn gea2_fake_sequence_has_no_cpu_substitute() {
+    let descriptor = gea2_sequence_descriptor();
+    let mut host = gea2_fake_host();
+    let receipt = gea2_execute_fake_sequence(&mut host, &descriptor);
+
+    // 64 launches, in the declared instance-expanded order.
+    assert_eq!(receipt.launch_ids, (1..=64).collect::<Vec<u32>>());
+    let declared_entries: Vec<String> = descriptor
+        .launches
+        .iter()
+        .map(|launch| descriptor.kernels[launch.kernel_index as usize].entry.clone())
+        .collect();
+    assert_eq!(receipt.launch_entries, declared_entries);
+
+    // Uploads exactly once: the eleven declared HostProvided PerProgram
+    // tensors (nine weights + activation + rope table; the plan carries no
+    // separate positions buffer — positions are rope-recipe facts).
+    let device = host.device().expect("device present");
+    assert_eq!(
+        device.driver_counters().uploads,
+        11,
+        "each declared host tensor uploads exactly once, at the once-upload site"
+    );
+    assert_eq!(device.driver_counters().module_loads, 1, "one module load");
+
+    // Zero CPU substitutes: every launch took the driver's declared-entry
+    // structural GEA2 dispatch; no fused-library body or CPU oracle ran and
+    // no kernel values were produced or interpreted.
+    assert!(receipt.fused_library_dispatches.is_empty());
+    assert_eq!(
+        receipt.allocated_buffer_versions.len(),
+        75,
+        "the plan's 75 version-keyed buffers are the whole allocation set"
+    );
+    assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
+    assert_eq!(receipt.outputs.len(), 1);
+    let output_id = descriptor.results[0].buffer_id;
+    let output = &receipt.outputs[&output_id];
+    assert_eq!(
+        output.len(),
+        7680,
+        "the declared [8,960] F32 block output is read back in full"
+    );
+    assert!(
+        output.iter().all(|value| value.is_finite()),
+        "structural launches produce no garbage bytes"
+    );
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0,
+        "teardown released every handle"
+    );
+}
+
+#[test]
+fn gea2_fake_sequence_rejects_intermediate_readback() {
+    let descriptor = gea2_sequence_descriptor();
+    let mut host = gea2_fake_host();
+    let receipt = gea2_execute_fake_sequence(&mut host, &descriptor);
+
+    // Zero intermediate readbacks on the green path: the only device→host
+    // transfer is the declared output at its declared observation point.
+    let output_id = descriptor.results[0].buffer_id;
+    assert_eq!(receipt.readbacks, 1);
+    assert_eq!(receipt.outputs.len(), 1);
+    assert!(receipt.outputs.contains_key(&output_id));
+    // The eleven uploads are once-init at session creation (driver upload
+    // counter, asserted above); the step-boundary transfer set is exactly
+    // the one declared readback.
+    let device = host.device().expect("device present");
+    assert_eq!(device.driver_counters().uploads, 11, "eleven declared host tensors upload once");
+    assert_eq!(receipt.transfers, 1, "one declared readback is the only step-boundary transfer");
+
+    // A readback attempted outside the declared output fails closed before
+    // any launch: declaring the PerStep intermediate ln1 (buffer 100,
+    // produced by launch 1) as a result is an undeclared readback.
+    let mut intermediate_result = descriptor.clone();
+    intermediate_result.results = vec![DescriptorResult {
+        buffer_id: 100,
+        version: 1,
+        produced_by: 1,
+        at_launch: 1,
+    }];
+    let error = match host.create_program_session(&intermediate_result) {
+        Ok(_) => panic!("reading back a PerStep intermediate must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        error.message.contains("observation-point"),
+        "diagnostic names the observation-point rule: {}",
+        error.message
+    );
+    assert_eq!(
+        host.device().expect("device present").live_handle_count(),
+        0,
+        "the rejected readback leaves no handles behind"
+    );
+
+    // A result naming a buffer the plan does not carry fails closed at
+    // descriptor validation, before a session exists.
+    let mut undeclared_result = descriptor.clone();
+    undeclared_result.results = vec![DescriptorResult {
+        buffer_id: u32::MAX,
+        version: 1,
+        produced_by: 64,
+        at_launch: 64,
+    }];
+    let error = undeclared_result
+        .validate()
+        .expect_err("a result naming an undeclared buffer must fail closed");
+    assert_eq!(error.code, E_DEVICE_DESCRIPTOR);
+    assert!(
+        error.message.contains("no kernel slot allocates"),
         "diagnostic names the unknown buffer: {}",
         error.message
     );
