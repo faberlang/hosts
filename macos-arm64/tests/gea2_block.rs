@@ -840,7 +840,7 @@ fn gea2_descriptor_admission() {
     assert_eq!(descriptor.launches.len(), 64);
     assert_eq!(descriptor.data_flow.len(), 63);
     assert_eq!(descriptor.roots, vec![1]);
-    assert_eq!(descriptor.buffer_versions.len(), 75, "75 distinct buffer version keys");
+    assert_eq!(descriptor.buffer_versions.len(), 96, "96 distinct buffer version keys");
     assert_eq!(descriptor.results.len(), 1);
     assert_eq!(descriptor.end_of_run_results.len(), 0);
     assert!(!descriptor.module_image.is_empty());
@@ -874,7 +874,7 @@ fn gea2_descriptor_admission() {
             }
         }
     }
-    assert_eq!(weight_ids.len(), 11, "eleven block tensors are per-program inputs");
+    assert_eq!(weight_ids.len(), 12, "twelve block tensors are per-program inputs");
     for weight in weight_ids {
         let slots = descriptor
             .kernels
@@ -916,6 +916,88 @@ fn gea2_descriptor_admission() {
     assert_eq!(result.version, 1);
     assert_eq!(result.produced_by, 64);
     assert_eq!(result.at_launch, 64);
+
+    // Per-instance attention windows (GEA2-U5e repair, radix 5f96ed340):
+    // the plan declares a DISTINCT `q_head_<h>` buffer per score_gemm
+    // instance and a DISTINCT `k_head_<g>` buffer per transpose instance —
+    // produced by the rope launches as full-shape 512-element writes, never
+    // a shared window of the packed rope outputs. The consumption side
+    // mirrors the plan admission: the windows stay distinct through the
+    // mapping, and the plan carries no shared query/key window.
+    let mut score_query_windows = Vec::new();
+    let mut transpose_key_windows = Vec::new();
+    for kernel in &descriptor.kernels {
+        match kernel.entry.as_str() {
+            "score_gemm" => score_query_windows.push(kernel.buffers[0].buffer_id),
+            "transpose" => transpose_key_windows.push(kernel.buffers[0].buffer_id),
+            _ => {}
+        }
+    }
+    assert_eq!(score_query_windows.len(), 15);
+    assert_eq!(
+        score_query_windows
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        15,
+        "every score_gemm instance binds its own q_head window"
+    );
+    assert_eq!(transpose_key_windows.len(), 5);
+    assert_eq!(
+        transpose_key_windows
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        5,
+        "every transpose instance binds its own k_head window"
+    );
+    let window_extents: std::collections::BTreeSet<(u32, u64)> = envelope
+        .program
+        .kernels
+        .iter()
+        .flat_map(|kernel| &kernel.resources)
+        .filter(|resource| {
+            resource.buffer.name.starts_with("q_head_")
+                || resource.buffer.name.starts_with("k_head_")
+        })
+        .map(|resource| (resource.buffer.id, resource.version.element_count))
+        .collect();
+    assert_eq!(
+        window_extents.len(),
+        20,
+        "15 q_head + 5 k_head windows, each a distinct full-shape buffer"
+    );
+    assert!(
+        window_extents.iter().all(|&(_, extent)| extent == 512),
+        "every per-head window is the full [8,64] shape: {window_extents:?}"
+    );
+
+    // The context_gemm VALUE window is a declared shared fact (plan producer
+    // truth): all 15 instances bind the SAME read-only 512-element window of
+    // the 2560-element `v` buffer. Read-only reuse of one value window is
+    // admitted by the mapper (a read may bind a view of the full shape), and
+    // the plan declares exactly this sharing — pinned here so drift in
+    // either direction (a per-instance v window, or a different shared
+    // extent) fails this gate closed rather than passing silently.
+    let value_windows: std::collections::BTreeSet<(u32, u64)> = envelope
+        .program
+        .kernels
+        .iter()
+        .filter(|kernel| kernel.entry == "context_gemm")
+        .flat_map(|kernel| &kernel.resources)
+        .filter(|resource| resource.buffer.name == "v")
+        .map(|resource| (resource.buffer.id, resource.version.element_count))
+        .collect();
+    assert_eq!(
+        value_windows.len(),
+        1,
+        "the plan shares one v window across all 15 context_gemm instances: {value_windows:?}"
+    );
+    assert_eq!(
+        value_windows.iter().next().copied().map(|(_, extent)| extent),
+        Some(512),
+        "the shared value window is the declared 512-element extent"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,13 +1312,15 @@ fn gea2_fake_sequence_has_no_cpu_substitute() {
         .collect();
     assert_eq!(receipt.launch_entries, declared_entries);
 
-    // Uploads exactly once: the eleven declared HostProvided PerProgram
-    // tensors (nine weights + activation + rope table; the plan carries no
-    // separate positions buffer — positions are rope-recipe facts).
+    // Uploads exactly once: the twelve declared HostProvided PerProgram
+    // tensors (nine weights + activation + rope table + attention_scale —
+    // the [8,8] scale resource the emitter repair 5f96ed340 added; the plan
+    // carries no separate positions buffer — positions are rope-recipe
+    // facts).
     let device = host.device().expect("device present");
     assert_eq!(
         device.driver_counters().uploads,
-        11,
+        12,
         "each declared host tensor uploads exactly once, at the once-upload site"
     );
     assert_eq!(device.driver_counters().module_loads, 1, "one module load");
@@ -1247,8 +1331,8 @@ fn gea2_fake_sequence_has_no_cpu_substitute() {
     assert!(receipt.fused_library_dispatches.is_empty());
     assert_eq!(
         receipt.allocated_buffer_versions.len(),
-        75,
-        "the plan's 75 version-keyed buffers are the whole allocation set"
+        96,
+        "the plan's 96 version-keyed buffers are the whole allocation set"
     );
     assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
     assert_eq!(receipt.outputs.len(), 1);
@@ -1282,11 +1366,11 @@ fn gea2_fake_sequence_rejects_intermediate_readback() {
     assert_eq!(receipt.readbacks, 1);
     assert_eq!(receipt.outputs.len(), 1);
     assert!(receipt.outputs.contains_key(&output_id));
-    // The eleven uploads are once-init at session creation (driver upload
+    // The twelve uploads are once-init at session creation (driver upload
     // counter, asserted above); the step-boundary transfer set is exactly
     // the one declared readback.
     let device = host.device().expect("device present");
-    assert_eq!(device.driver_counters().uploads, 11, "eleven declared host tensors upload once");
+    assert_eq!(device.driver_counters().uploads, 12, "twelve declared host tensors upload once");
     assert_eq!(receipt.transfers, 1, "one declared readback is the only step-boundary transfer");
 
     // A readback attempted outside the declared output fails closed before
@@ -1767,8 +1851,10 @@ fn gea2_compare_block_output(expected: &[f32], observed: &[f32]) -> (f32, f32, u
     (max_abs, max_rel, max_ulp, first_index)
 }
 
-/// Build the real 11-tensor HostProvided upload set: every declared
-/// HostProvided PerProgram slot resolved by name to its frozen U1 bytes.
+/// Build the real 12-tensor HostProvided upload set: every declared
+/// HostProvided PerProgram slot resolved by name to its frozen U1 bytes (the
+/// attention_scale resource added by the emitter repair 5f96ed340 carries
+/// the §2 frozen 0.125 constant).
 fn gea2_real_host_inputs(
     descriptor: &DeviceDescriptor,
     inputs: &Gea2ScalarBlockInputs,
@@ -1794,6 +1880,7 @@ fn gea2_real_host_inputs(
                 "up_weight" => inputs.up.clone(),
                 "down_weight" => inputs.down.clone(),
                 "rope_table" => inputs.rope.clone(),
+                "attention_scale" => vec![GEA2_SCALE; 64],
                 other => panic!("unknown HostProvided GEA2 tensor `{other}`"),
             };
             assert_eq!(
@@ -1811,7 +1898,7 @@ fn gea2_real_host_inputs(
             );
         }
     }
-    assert_eq!(uploads.len(), 11, "the frozen upload set is eleven tensors");
+    assert_eq!(uploads.len(), 12, "the frozen upload set is twelve tensors");
     uploads
 }
 
@@ -1934,12 +2021,19 @@ fn gea2_real_metal_block_receipt() {
     assert_eq!(receipt.launch_entries, declared_entries);
     assert_eq!(receipt.fused_library_dispatches.len(), 0, "zero CPU substitutes");
     assert!(
-        receipt.allocated_buffer_versions.len() == 75,
-        "the plan's 75 version-keyed buffers are the whole allocation set"
+        receipt.allocated_buffer_versions.len() == 96,
+        "the plan's 96 version-keyed buffers are the whole allocation set"
     );
     let counters = host.device().expect("device present").driver_counters();
-    assert_eq!(counters.uploads, 11, "each declared host tensor uploads exactly once");
-    assert_eq!(counters.module_loads, 1, "one module compile and load");
+    assert_eq!(counters.uploads, 12, "each declared host tensor uploads exactly once");
+    // S2-8 real-device counter contract: the system driver reports module
+    // lifecycle counters as zero (only the fake drivers count them); the
+    // single module compile is proven by the 64 launches executing against
+    // the session's compiled pipeline and recorded as `module_hash_fnv1a`.
+    assert_eq!(
+        counters.module_loads, 0,
+        "system driver reports module counters as zero (S2-8 real-device gate)"
+    );
     assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
     assert_eq!(receipt.outputs.len(), 1);
     assert_eq!(receipt.transfers, 1, "one step-boundary transfer: the declared readback");
@@ -2068,7 +2162,7 @@ fn gea2_real_metal_block_receipt() {
             })
         })
         .collect();
-    assert_eq!(intermediate_allocations.len(), 64);
+    assert_eq!(intermediate_allocations.len(), 84);
 
     let hostname = Command::new("hostname")
         .output()
@@ -2151,7 +2245,7 @@ fn gea2_real_metal_block_receipt() {
             "intermediate_alloc_us": unmeasured(
                 "intermediate pool checkout is not separately timed by the session; count and per_program_alloc_us recorded",
             ),
-            "intermediate_count": measured(64),
+            "intermediate_count": measured(84),
             "launch_sequence_us": derived(
                 receipt.gpu_encode_submit_wait_us.saturating_sub(gpu_total),
                 "encode+submit+wait wall minus summed per-encoder GPU timestamps",

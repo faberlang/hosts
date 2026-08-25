@@ -173,8 +173,11 @@ fn fake_driver_accepts_all_gea2_entry_arities_from_declared_table() {
         ("gemm_kv", 3),
         ("gemm_gate_up", 3),
         ("gemm_down", 3),
-        ("rope_q", 3),
-        ("rope_k", 3),
+        // The rope launches bind the packed output plus every per-head
+        // window write (15 q_head / 5 k_head) declared by the GEA2-U5e
+        // per-instance window repair (radix 5f96ed340).
+        ("rope_q", 18),
+        ("rope_k", 8),
         ("transpose", 2),
         ("score_gemm", 4),
         ("causal_softmax", 2),

@@ -1215,18 +1215,22 @@ impl FakeMetalDriver {
     /// table mirrors the 13-entry bundle ABI: transpose and causal_softmax
     /// consume two buffers, score_gemm consumes four, and the remaining
     /// entries consume three — except `gemm_qo`, whose gathered
-    /// multi-context variant (the block's launch 57) binds 17. Each entry
-    /// admits exactly its declared binding shapes, never a blanket range;
-    /// any other arity fails closed. These launches are structural only;
-    /// they do not pretend to simulate the kernel numerics.
+    /// multi-context variant (the block's launch 57) binds 17, and the rope
+    /// launches, whose per-instance window repair (radix `5f96ed340`)
+    /// declares the packed output plus every per-head window as a write:
+    /// `rope_q` binds 18 (input + table + packed output + 15 `q_head_<h>`)
+    /// and `rope_k` binds 8 (input + table + packed output + 5 `k_head_<g>`).
+    /// Each entry admits exactly its declared binding shapes, never a
+    /// blanket range; any other arity fails closed. These launches are
+    /// structural only; they do not pretend to simulate the kernel numerics.
     const GEA2_ENTRY_ARITIES: &[(&str, &[usize])] = &[
         ("rmsnorm", &[3]),
         ("gemm_qo", &[3, 17]),
         ("gemm_kv", &[3]),
         ("gemm_gate_up", &[3]),
         ("gemm_down", &[3]),
-        ("rope_q", &[3]),
-        ("rope_k", &[3]),
+        ("rope_q", &[18]),
+        ("rope_k", &[8]),
         ("transpose", &[2]),
         ("score_gemm", &[4]),
         ("causal_softmax", &[2]),
