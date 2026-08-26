@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -18,7 +20,7 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime,
 };
-use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
+use faber_host_macos_arm64::{enumerate_metal_physical_devices, FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1376,4 +1378,246 @@ fn gea3_fake_multi_step_structural_loop() {
     );
     assert!(assert_declared_logits_only(&prefill, prefill.end_of_run_results[0].buffer_id).is_ok());
     assert!(assert_declared_logits_only(&decode, decode.end_of_run_results[0].buffer_id).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Physical U5b preflight.  This intentionally stops before Metal dispatch when
+// the exported producer facts cannot carry the declared KV state or when the
+// emitted module's buffer ABI disagrees with those facts.  A fake launch cannot
+// discharge either red, and this test must never turn either one into a CPU
+// substitute or an unmeasured physical receipt.
+// ---------------------------------------------------------------------------
+
+fn gea3_unmeasured(reason: &str) -> Value {
+    json!({"value": Value::Null, "status": "unmeasured", "reason": reason})
+}
+
+fn gea3_git_revision(path: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap_or_else(|error| panic!("read Git revision for {}: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "Git revision failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn gea3_emitted_buffer_arity(module_image: &[u8], entry: &str) -> Option<usize> {
+    let source = std::str::from_utf8(module_image).ok()?;
+    let marker = format!("kernel void {entry}(");
+    let start = source.find(&marker)?;
+    let function_header = &source[start..];
+    let end = function_header.find(") {")?;
+    Some(function_header[..end].matches("[[buffer(").count())
+}
+
+fn gea3_physical_plan_reds(
+    envelope: &Gea3ProgramPlanEnvelope,
+    prefill: &DeviceDescriptor,
+    decode: &DeviceDescriptor,
+) -> Vec<String> {
+    let mut reds = Vec::new();
+    for (program_name, program, descriptor) in [
+        ("prefill", &envelope.programs.prefill, prefill),
+        ("decode-step", &envelope.programs.decode_step, decode),
+    ] {
+        let mut checked_entries = BTreeSet::new();
+        for kernel in &program.kernels {
+            if !checked_entries.insert(kernel.entry.clone()) {
+                continue;
+            }
+            let Some(emitted) = gea3_emitted_buffer_arity(&descriptor.module_image, &kernel.entry)
+            else {
+                reds.push(format!(
+                    "{program_name} entry `{}` is absent from the emitted Metal module",
+                    kernel.entry
+                ));
+                continue;
+            };
+            if emitted != kernel.resources.len() {
+                reds.push(format!(
+                    "{program_name} entry `{}` carries {} plan resources but emitted MSL declares {emitted} buffer arguments",
+                    kernel.entry,
+                    kernel.resources.len()
+                ));
+            }
+        }
+    }
+
+    let decode_resource_names: BTreeSet<&str> = envelope
+        .programs
+        .decode_step
+        .kernels
+        .iter()
+        .flat_map(|kernel| kernel.resources.iter())
+        .map(|resource| resource.buffer.name.as_str())
+        .collect();
+    let missing_kv: Vec<String> = envelope
+        .programs
+        .decode_step
+        .state_buffers
+        .iter()
+        .filter_map(|state| state.name.as_deref())
+        .filter(|name| name.contains(".kv_"))
+        .filter(|name| !decode_resource_names.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !missing_kv.is_empty() {
+        reds.push(format!(
+            "decode-step declares {} fixed-capacity KV state buffers, but none are carried as launch resources (first missing: {})",
+            missing_kv.len(),
+            missing_kv.first().expect("non-empty missing KV row")
+        ));
+    }
+    reds
+}
+
+#[test]
+#[ignore = "physical Metal gate; run only with the exact §6 command"]
+fn gea3_real_metal_decode_receipt() {
+    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("faberlang workspace root");
+    let artifact_dir = gea3_artifact_dir();
+    let receipt_path = PathBuf::from(
+        std::env::var_os("GEA3_METAL_RECEIPT")
+            .expect("GEA3_METAL_RECEIPT must identify the receipt output"),
+    );
+    let model_path = PathBuf::from(
+        std::env::var_os("GEA3_F32_GGUF").expect("GEA3_F32_GGUF must identify the frozen F32 GGUF"),
+    );
+    assert!(
+        model_path.is_file(),
+        "missing GEA3 F32 GGUF {}",
+        model_path.display()
+    );
+
+    let plan_start = Instant::now();
+    let envelope = load_gea3_plan(&artifact_dir);
+    let (prefill, decode) = map_both(&envelope, &artifact_dir)
+        .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
+    let plan_admission_us = plan_start.elapsed().as_micros() as u64;
+    let production_reds = gea3_physical_plan_reds(&envelope, &prefill, &decode);
+
+    let devices = enumerate_metal_physical_devices().expect("Metal device enumeration");
+    assert!(
+        !devices.is_empty(),
+        "Metal selected but no physical device identity exists"
+    );
+    let device = &devices[0];
+    let session_start = Instant::now();
+    let session_admitted = MetalHostSession::try_open().is_ok();
+    let session_admission_us = session_start.elapsed().as_micros() as u64;
+
+    let bundle_manifest_path = artifact_dir.join("gea3-artifact-bundle-manifest.json");
+    let bundle_manifest: Value = serde_json::from_slice(
+        &fs::read(&bundle_manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", bundle_manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("parse {}: {error}", bundle_manifest_path.display()));
+    let input_manifest_path = workspace
+        .join("radix/docs/factory/gpu-execution-architecture/evidence/gea3-input-manifest.json");
+    let input_manifest: Value = serde_json::from_slice(
+        &fs::read(&input_manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", input_manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("parse {}: {error}", input_manifest_path.display()));
+
+    let status = if production_reds.is_empty() && session_admitted {
+        "ready-for-physical-run"
+    } else {
+        "blocked"
+    };
+    let receipt = json!({
+        "schema": "gea3-metal-receipt-v1",
+        "delivery": "GEA3-U5b",
+        "status": status,
+        "machine": Command::new("hostname").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+        "identities": {
+            "model": input_manifest["model"],
+            "plan_schema": envelope.schema,
+            "source": envelope.source,
+            "module_members": bundle_manifest["entries"],
+            "module_image_rule": envelope.module_image_rule,
+        },
+        "revisions": {
+            "gradus": gea3_git_revision(&workspace.join("gradus")),
+            "radix": gea3_git_revision(&workspace.join("radix")),
+            "hosts": gea3_git_revision(&workspace.join("hosts")),
+        },
+        "physical_device": {
+            "backend": "Metal",
+            "ordinal": device.ordinal,
+            "registry_id": device.registry_id,
+            "model": device.device_model,
+            "api_total_bytes": device.api_total_bytes,
+            "max_threads_per_workgroup": device.max_threads_per_workgroup,
+            "workgroup_shared_memory_min_bytes": device.workgroup_shared_memory_min_bytes,
+            "workgroup_shared_memory_max_bytes": device.workgroup_shared_memory_max_bytes,
+            "collective_width": device.collective_width,
+            "unified_memory": device.unified_memory,
+        },
+        "shapes": {
+            "prefill_logits": envelope.declared_outputs.prefill_logits,
+            "decode_logits": envelope.declared_outputs.decode_logits,
+            "kv_capacity": envelope.kv_geometry.capacity,
+            "kv_dtype": envelope.kv_geometry.dtype,
+        },
+        "preflight": {
+            "plan_admission_us": {"value": plan_admission_us, "status": "measured"},
+            "session_admitted": {"value": session_admitted, "status": "measured"},
+            "session_admission_us": {"value": session_admission_us, "status": "measured"},
+            "production_reds": production_reds,
+        },
+        "residency": {
+            "weight_allocations": gea3_unmeasured("physical run stopped before residency after the production preflight red"),
+            "weight_bytes": gea3_unmeasured("physical run stopped before residency"),
+            "weight_upload_count": gea3_unmeasured("physical run stopped before residency"),
+            "kv_allocations": gea3_unmeasured("physical run stopped because KV state is not carried to launches"),
+            "kv_bytes": gea3_unmeasured("physical run stopped because KV state is not carried to launches"),
+            "zero_cpu_substitutes": {"value": 0, "status": "measured", "basis": "no fake or CPU execution was attempted"},
+            "zero_cpu_bridges": {"value": 0, "status": "measured", "basis": "no fake or CPU execution was attempted"},
+        },
+        "execution": {
+            "prefill_wall_us": gea3_unmeasured("blocked before dispatch"),
+            "per_step_gpu_body_us": gea3_unmeasured("blocked before dispatch"),
+            "launch_submit_us_per_step": gea3_unmeasured("blocked before dispatch"),
+            "launches_per_step": gea3_unmeasured("blocked before dispatch"),
+            "sync_wait_count": gea3_unmeasured("blocked before dispatch"),
+            "sync_wait_us": gea3_unmeasured("blocked before dispatch"),
+            "logits_readback_bytes_per_step": gea3_unmeasured("blocked before dispatch"),
+            "greedy_token_sequence": gea3_unmeasured("blocked before dispatch"),
+            "intermediate_readbacks": {"value": 0, "status": "measured", "basis": "no dispatch occurred"},
+        },
+        "blocked_reason": production_reds,
+        "measurement_policy": "No unmeasured physical field is promoted; production reds stop-and-amend.",
+    });
+    let parent = receipt_path.parent().expect("receipt parent");
+    fs::create_dir_all(parent).expect("create receipt parent");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec_pretty(&receipt).expect("serialize GEA3 receipt"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", receipt_path.display()));
+    eprintln!(
+        "GEA3 physical Metal preflight receipt: {}",
+        receipt_path.display()
+    );
+
+    if !production_reds.is_empty() {
+        panic!(
+            "GEA3-U5b production red; stop-and-amend before physical dispatch: {}",
+            production_reds.join("; ")
+        );
+    }
+    assert!(session_admitted, "Metal session admission failed");
+    panic!("GEA3-U5b physical runner is not admitted until the preflight receipt is green");
 }
