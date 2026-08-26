@@ -1270,7 +1270,10 @@ impl FakeMetalDriver {
         // seam under the canonical read ABI — the inert chain read is gone.
         ("kv_append_k", &[4]),
         ("kv_append_v", &[4]),
-        ("decode_key_transpose", &[3]),
+        // GEA3-U6 num-3: the key transposes ride the launch-variant seam
+        // (their strided per-head read windows must reach the emitted
+        // body), which drops the inert chain read — 2 canonical bindings.
+        ("decode_key_transpose", &[2]),
         ("decode_score_gemm", &[4]),
         ("decode_masked_softmax", &[4]),
         ("decode_context_gemm", &[3]),
@@ -1283,7 +1286,9 @@ impl FakeMetalDriver {
         ("prefill_gemm_down", &[5]),
         ("prefill_rope_q", &[4]),
         ("prefill_rope_k", &[4]),
-        ("prefill_key_transpose", &[3]),
+        // GEA3-U6 num-3: the key transposes ride the launch-variant seam
+        // (2 canonical bindings; see decode_key_transpose above).
+        ("prefill_key_transpose", &[2]),
         ("prefill_score_gemm", &[4]),
         ("prefill_causal_softmax", &[3]),
         ("prefill_context_gemm", &[3]),
