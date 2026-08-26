@@ -277,6 +277,25 @@ struct Gea3BufferVersion {
     reduced_projection: Option<Gea3ReducedProjection>,
     #[serde(default)]
     sub_window: Option<Gea3SubWindowProjection>,
+    /// GEA3-U6 num-10: the chunked-geometry declaration — a head-major
+    /// producer read whose logical rows are discontiguous `block`-wide
+    /// chunks (the prefill attention concat the o-projection consumes).
+    #[serde(default)]
+    chunked_window: Option<Gea3ChunkedWindow>,
+}
+
+/// The hosts' typed mirror of the GEA3-U6 num-10 chunked-geometry
+/// declaration: `row_count` rows of `block` contiguous elements per
+/// chunk, chunks stacked head-major at `row_count · block` pitch.
+/// Admission mirrors the emitter's operand-pitch law fail-closed:
+/// read-only, never beside a sub-window projection, and the allocation
+/// must be a whole number of chunk cells (a flat read of a chunked truth
+/// is the same defect as a strided write of a flat truth).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gea3ChunkedWindow {
+    block: u64,
+    row_count: u64,
 }
 
 /// The hosts' typed mirror of the GEA3-WIRE-BUFFER-V2 sub-window
@@ -553,6 +572,54 @@ type Gea3WindowBindings = BTreeMap<(u32, u32), (u64, u64)>;
 /// two-truths guard mirrored from the schema authority
 /// `validate_carried_sub_window_projection`).  Returns the window's byte
 /// binding when the resource carries one.
+/// Admit one carried chunked-geometry declaration against the allocation
+/// it reads (the GEA3-U6 num-10 mirror of the emitter's admission law):
+/// read-only, never beside a sub-window projection, never degenerate, and
+/// the allocation must partition into whole `block · row_count` chunk
+/// cells with the carried count spanning every cell.  A flat read of a
+/// head-major truth is not admissible — the consumer must declare the
+/// geometry it addresses through.
+fn admit_chunked_window(
+    resource: &Gea3DeviceResource,
+    chunked: Gea3ChunkedWindow,
+    allocation: u64,
+) -> Result<(), String> {
+    if matches!(resource.access, Gea3ResourceAccess::Write) {
+        return Err(format!(
+            "resource `{}` carries a chunked window on a write slot; chunked reads are read-side operand-pitch facts only (GEA3-U6 num-10)",
+            resource.buffer.name
+        ));
+    }
+    if resource.version.sub_window.is_some() {
+        return Err(format!(
+            "resource `{}` carries both a sub-window and a chunked geometry; one binding carries one read geometry (GEA3-U6 num-10)",
+            resource.buffer.name
+        ));
+    }
+    let chunk_cells = chunked
+        .block
+        .checked_mul(chunked.row_count)
+        .ok_or_else(|| {
+            format!(
+                "resource `{}` carries a chunked window whose block · rows saturates u64",
+                resource.buffer.name
+            )
+        })?;
+    if chunked.block == 0 || chunked.row_count == 0 || resource.version.element_count == 0 {
+        return Err(format!(
+            "resource `{}` carries a degenerate chunked window (block {}, rows {})",
+            resource.buffer.name, chunked.block, chunked.row_count
+        ));
+    }
+    if resource.version.element_count != allocation || allocation % chunk_cells != 0 {
+        return Err(format!(
+            "resource `{}` carries a chunked window (block {} · rows {} = {chunk_cells}) that does not partition its {allocation}-element allocation; the declared geometry must equal the producer's head-major truth (GEA3-U6 num-10)",
+            resource.buffer.name, chunked.block, chunked.row_count
+        ));
+    }
+    Ok(())
+}
+
 fn admit_sub_window(
     resource: &Gea3DeviceResource,
     allocation: u64,
@@ -758,6 +825,9 @@ fn map_envelope_to_descriptor(
                     resource.buffer.name, key.0, key.1
                 )
             })?;
+            if let Some(chunked) = resource.version.chunked_window {
+                admit_chunked_window(resource, chunked, allocation)?;
+            }
             if let Some(binding) = admit_sub_window(resource, allocation)? {
                 if windows
                     .insert(
@@ -969,7 +1039,9 @@ fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
     }
-    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 36 {
+    // GEA3-U6 num-10: 37 members — the chunked o-projection entry
+    // (prefill_gemm_o) joined the module.
+    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 37 {
         return Err("module assembly facts drifted".to_owned());
     }
     if envelope.instance_expansion.layers != LAYERS
@@ -1164,6 +1236,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "decode_score_gemm"
         | "decode_context_gemm"
         | "prefill_gemm_qo"
+        | "prefill_gemm_o"
         | "prefill_gemm_kv"
         | "prefill_gemm_gate_up"
         | "prefill_gemm_down"
@@ -1260,6 +1333,7 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "decode_residual_add",
         "prefill_rmsnorm",
         "prefill_gemm_qo",
+        "prefill_gemm_o",
         "prefill_gemm_kv",
         "prefill_gemm_gate_up",
         "prefill_gemm_down",
@@ -3336,6 +3410,7 @@ fn gea3_run_staged_diagnostic(
             let probe_entries = [
                 "prefill_rmsnorm",
                 "prefill_gemm_qo",
+                "prefill_gemm_o",
                 "prefill_gemm_kv",
                 "prefill_rope_q",
                 "prefill_rope_k",

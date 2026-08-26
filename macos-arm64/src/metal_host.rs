@@ -1281,6 +1281,11 @@ impl FakeMetalDriver {
         ("decode_residual_add", &[4]),
         ("prefill_rmsnorm", &[5]),
         ("prefill_gemm_qo", &[5]),
+        // GEA3-U6 num-10: the chunked o-projection member rides the
+        // launch-variant seam (the inert chain read is dropped) — 4
+        // bindings: chunked concat read, weights, inert weight extra,
+        // output.
+        ("prefill_gemm_o", &[4]),
         ("prefill_gemm_kv", &[5]),
         ("prefill_gemm_gate_up", &[5]),
         ("prefill_gemm_down", &[5]),
