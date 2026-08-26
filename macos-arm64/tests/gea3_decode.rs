@@ -1558,10 +1558,11 @@ fn gea3_negative_rows_fail_closed() {
     assert!(assert_declared_logits_only(&decode, u32::MAX).is_err());
 
     // GEA3-A1 negatives: the sub-window two-truths guard at the mapper.
-    // Launch 8 (kernels[7]) is the first key transpose; its canonical input
-    // carries the strided [76,64] k-cache window.
+    // Launch 10 (kernels[9], after the num-7 append reorder) is the first
+    // key transpose; its canonical input carries the strided [76,64]
+    // k-cache window.
     let mut wrong_derived = original.clone();
-    wrong_derived["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    wrong_derived["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         ["sub_window"]["derived_element_count"] = json!(4_863);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(wrong_derived).expect("mirror parse");
@@ -1578,7 +1579,7 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let mut off_the_end = original.clone();
-    off_the_end["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    off_the_end["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         ["sub_window"]["element_offset"] = json!(5 * 64);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(off_the_end).expect("mirror parse");
@@ -1600,7 +1601,7 @@ fn gea3_negative_rows_fail_closed() {
     // below the 320 pitch and a stride above it are both rejected.
     for (label, lying_stride) in [("below", 76u64), ("above", 640u64)] {
         let mut lying = original.clone();
-        lying["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
             ["sub_window"]["row_stride"] = json!(lying_stride);
         let parsed: Gea3ProgramPlanEnvelope =
             serde_json::from_value(lying).expect("mirror parse");
@@ -1620,10 +1621,10 @@ fn gea3_negative_rows_fail_closed() {
     }
 
     // The attention-output hybrid write window (first context launch,
-    // kernels[42]; its LAST resource is the windowed write) must stay
-    // contiguous.
+    // kernels[44] after the num-7 reorder; its LAST resource is the
+    // windowed write) must stay contiguous.
     let mut scattered_write = original.clone();
-    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][42]
+    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][44]
         ["resources"]
         .as_array_mut()
         .expect("context resources");
@@ -1649,7 +1650,7 @@ fn gea3_negative_rows_fail_closed() {
 
     // A sub-window without its projection fact stays rejected (the V1 law).
     let mut bare_sub_window = original.clone();
-    bare_sub_window["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    bare_sub_window["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         .as_object_mut()
         .expect("version object")
         .remove("sub_window");
