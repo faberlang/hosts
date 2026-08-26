@@ -8,6 +8,13 @@ mod device_descriptor {
     };
 }
 
+#[allow(dead_code)]
+mod kernel {
+    pub mod library_runtime {
+        pub use faber_host_macos_arm64::kernel::library_runtime::FusedLibraryDispatchReceipt;
+    }
+}
+
 #[path = "../src/composite_host/receipt.rs"]
 mod receipt;
 
