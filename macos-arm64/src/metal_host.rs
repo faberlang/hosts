@@ -1263,8 +1263,10 @@ impl FakeMetalDriver {
         ("decode_gemv_down", &[5]),
         ("decode_rope_q", &[4]),
         ("decode_rope_k", &[4]),
-        ("kv_append_k", &[3]),
-        ("kv_append_v", &[3]),
+        // GEA3-U6 num-1: the mutators launch with the expanded-plan ABI
+        // (history, slot/block, row, chain extra, output) — 5 bindings.
+        ("kv_append_k", &[5]),
+        ("kv_append_v", &[5]),
         ("decode_key_transpose", &[3]),
         ("decode_score_gemm", &[5]),
         ("decode_masked_softmax", &[4]),
@@ -1284,8 +1286,8 @@ impl FakeMetalDriver {
         ("prefill_context_gemm", &[4]),
         ("prefill_swiglu", &[4]),
         ("prefill_residual_add", &[4]),
-        ("prefill_kv_write_k", &[3]),
-        ("prefill_kv_write_v", &[3]),
+        ("prefill_kv_write_k", &[5]),
+        ("prefill_kv_write_v", &[5]),
         ("head_rmsnorm", &[5]),
         ("lm_head_gemv", &[5]),
     ];
