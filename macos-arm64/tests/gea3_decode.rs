@@ -947,7 +947,7 @@ fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
     }
-    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 33 {
+    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 36 {
         return Err("module assembly facts drifted".to_owned());
     }
     if envelope.instance_expansion.layers != LAYERS
@@ -1147,8 +1147,10 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "prefill_gemm_down"
         | "prefill_score_gemm"
         | "prefill_context_gemm"
-        | "lm_head_gemv" => matches!(plan, Gea3Plan::TiledMatMul(_)),
-        "head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
+        | "lm_head_gemv"
+        | "prefill_lm_head_gemv"
+        | "prefill_embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        "head_rmsnorm" | "prefill_head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
             matches!(plan, Gea3Plan::RmsNormalization(_))
         }
         "decode_rope_q" | "decode_rope_k" | "prefill_rope_q" | "prefill_rope_k" => {
@@ -1160,7 +1162,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         "decode_masked_softmax" | "prefill_causal_softmax" => {
             matches!(plan, Gea3Plan::CausalMaskedSoftmax(_))
         }
-        "embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        "embedding_gather" | "prefill_embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
         "decode_swiglu" | "decode_residual_add" | "prefill_swiglu" | "prefill_residual_add" => {
             matches!(plan, Gea3Plan::Elementwise)
         }
@@ -1218,6 +1220,7 @@ struct StructuralLoopReceipt {
 fn fake_entry_names() -> impl Iterator<Item = &'static str> {
     [
         "embedding_gather",
+        "prefill_embedding_gather",
         "decode_rmsnorm",
         "decode_gemv_qo",
         "decode_gemv_kv",
@@ -1250,6 +1253,8 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "prefill_kv_write_v",
         "head_rmsnorm",
         "lm_head_gemv",
+        "prefill_head_rmsnorm",
+        "prefill_lm_head_gemv",
     ]
     .into_iter()
 }
@@ -2091,7 +2096,9 @@ fn gea3_update_inputs(
                 .buffers
                 .get(&(slot.buffer_id, slot.version))
                 .ok_or_else(|| "dynamic input handle disappeared".to_owned())?;
-            if kernel.entry == "embedding_gather" && slot.binding == 0 {
+            if (kernel.entry == "embedding_gather" || kernel.entry == "prefill_embedding_gather")
+                && slot.binding == 0
+            {
                 let rows = if prefill { tokens.len() } else { 1 };
                 let expected = rows
                     .checked_mul(VOCAB as usize)
@@ -3071,6 +3078,7 @@ fn gea3_run_staged_diagnostic(
     prefill: (DeviceDescriptor, Gea3WindowBindings),
     decode: (DeviceDescriptor, Gea3WindowBindings),
     decode_plan: &Gea3Program,
+    prefill_plan: &Gea3Program,
     input_manifest: &Value,
     model_path: &Path,
     prompt_tokens: &[u32],
@@ -3176,6 +3184,76 @@ fn gea3_run_staged_diagnostic(
             && arena_summaries
                 .iter()
                 .all(|summary| summary["non_zero"].as_bool().unwrap_or(false));
+        // GEA3-U6 num-2 localization: layer 0's prefill write lands only one
+        // row while layers 1-31 write all 36 rows with byte-identical plan
+        // bindings.  The plan cannot be the delta, so the runtime inputs are:
+        // record the layer-0 vs layer-1 producer chain (embedding gather,
+        // attention rmsnorm, both kv projections, rope_k, residual add) and
+        // the per-row non-zero census of both layers' arenas right after
+        // prefill.
+        let prefill_program = programs.first().expect("prefill program retained");
+        let mut chain_summaries = Vec::new();
+        let probed_entries = [
+            "embedding_gather",
+            "prefill_rmsnorm",
+            "prefill_gemm_kv",
+            "prefill_rope_k",
+            "prefill_residual_add",
+        ];
+        for kernel in &prefill_plan.kernels {
+            if !probed_entries.contains(&kernel.entry.as_str()) {
+                continue;
+            }
+            let layer = kernel.layer;
+            if layer > 1 {
+                continue;
+            }
+            for resource in &kernel.resources {
+                if resource.access != Gea3ResourceAccess::Write
+                    || gea3_diagnostic_resource_is_weight(resource)
+                {
+                    continue;
+                }
+                let handle = prefill_program
+                    .buffers
+                    .get(&(resource.buffer.id, resource.version.version))
+                    .copied()
+                    .ok_or_else(|| "probe handle disappeared".to_owned())?;
+                chain_summaries
+                    .push(gea3_diagnostic_buffer_summary(runtime, &handle, resource)?);
+            }
+        }
+        let mut arena_row_census = Vec::new();
+        for kernel in &decode_plan.kernels {
+            if kernel.entry != "kv_append_k" && kernel.entry != "kv_append_v" {
+                continue;
+            }
+            let layer = kernel.layer;
+            if layer > 1 {
+                continue;
+            }
+            let resource = &kernel.resources[0];
+            let handle = decode_program
+                .buffers
+                .get(&(resource.buffer.id, resource.version.version))
+                .copied()
+                .ok_or_else(|| "arena handle disappeared".to_owned())?;
+            let bytes = runtime
+                .readback_bytes(&handle, DeviceDataType::F32)
+                .map_err(|error| error.message.clone())?;
+            let values = gea3_f32_from_bytes(&bytes)?;
+            let rows: Vec<u64> = values
+                .chunks(KV_WIDTH as usize)
+                .map(|row| row.iter().filter(|value| **value != 0.0).count() as u64)
+                .collect();
+            arena_row_census.push(json!({
+                "name": resource.buffer.name,
+                "entry": kernel.entry,
+                "layer": layer,
+                "non_zero_per_row": rows,
+                "rows_written": rows.iter().filter(|count| **count > 0).count(),
+            }));
+        }
         let prefill_launch_count = programs[0].descriptor.launches.len();
         let program = programs.last().expect("decode program retained");
         let token = *prompt_tokens
@@ -3384,6 +3462,10 @@ fn gea3_run_staged_diagnostic(
                 "arena_count": arena_summaries.len(),
                 "arenas_non_zero": arenas_non_zero,
                 "arena_summaries_after_prefill": arena_summaries,
+                "layer0_localization": {
+                    "chain_summaries": chain_summaries,
+                    "arena_row_census": arena_row_census,
+                },
             },
             "input_uploads": input_uploads,
             "weights": {
@@ -3499,6 +3581,7 @@ fn gea3_real_metal_staged_composition_diagnostic() {
                     prefill,
                     decode,
                     &envelope.programs.decode_step,
+                    &envelope.programs.prefill,
                     &input_manifest,
                     &model_path,
                     &prompt_tokens,

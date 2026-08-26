@@ -1256,6 +1256,7 @@ impl FakeMetalDriver {
     /// not read values or simulate any GEA3 kernel body.
     const GEA3_ENTRY_ARITIES: &[(&str, &[usize])] = &[
         ("embedding_gather", &[4]),
+        ("prefill_embedding_gather", &[4]),
         ("decode_rmsnorm", &[5]),
         ("decode_gemv_qo", &[5]),
         ("decode_gemv_kv", &[5]),
@@ -1265,12 +1266,14 @@ impl FakeMetalDriver {
         ("decode_rope_k", &[4]),
         // GEA3-U6 num-1: the mutators launch with the expanded-plan ABI
         // (history, slot/block, row, chain extra, output) — 5 bindings.
-        ("kv_append_k", &[5]),
-        ("kv_append_v", &[5]),
+        // GEA3-U6 num-2: the mutators emit through the launch-variant
+        // seam under the canonical read ABI — the inert chain read is gone.
+        ("kv_append_k", &[4]),
+        ("kv_append_v", &[4]),
         ("decode_key_transpose", &[3]),
-        ("decode_score_gemm", &[5]),
+        ("decode_score_gemm", &[4]),
         ("decode_masked_softmax", &[4]),
-        ("decode_context_gemm", &[4]),
+        ("decode_context_gemm", &[3]),
         ("decode_swiglu", &[4]),
         ("decode_residual_add", &[4]),
         ("prefill_rmsnorm", &[5]),
@@ -1281,15 +1284,17 @@ impl FakeMetalDriver {
         ("prefill_rope_q", &[4]),
         ("prefill_rope_k", &[4]),
         ("prefill_key_transpose", &[3]),
-        ("prefill_score_gemm", &[5]),
+        ("prefill_score_gemm", &[4]),
         ("prefill_causal_softmax", &[3]),
-        ("prefill_context_gemm", &[4]),
+        ("prefill_context_gemm", &[3]),
         ("prefill_swiglu", &[4]),
         ("prefill_residual_add", &[4]),
-        ("prefill_kv_write_k", &[5]),
-        ("prefill_kv_write_v", &[5]),
+        ("prefill_kv_write_k", &[4]),
+        ("prefill_kv_write_v", &[4]),
         ("head_rmsnorm", &[5]),
         ("lm_head_gemv", &[5]),
+        ("prefill_head_rmsnorm", &[5]),
+        ("prefill_lm_head_gemv", &[5]),
     ];
 
     fn gea3_entry_arities(entry: &[u8]) -> Option<&'static [usize]> {
