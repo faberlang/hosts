@@ -676,12 +676,15 @@ fn admit_sub_window(
     // nesting both count spans, not pitches).  Contiguous windows (stride
     // == width) are dense by construction and skip the law.
     if !matches!(resource.access, Gea3ResourceAccess::Write) && !window.is_contiguous() {
-        let pitch_span = window.row_stride.checked_mul(window.row_count).ok_or_else(|| {
-            format!(
-                "resource `{}` carries a strided read window whose pitch·rows saturates u64",
-                resource.buffer.name
-            )
-        })?;
+        let pitch_span = window
+            .row_stride
+            .checked_mul(window.row_count)
+            .ok_or_else(|| {
+                format!(
+                    "resource `{}` carries a strided read window whose pitch·rows saturates u64",
+                    resource.buffer.name
+                )
+            })?;
         if pitch_span != allocation {
             return Err(format!(
                 "resource `{}` carries a strided read window declaring row_stride {} · row_count {} = {pitch_span} ≠ the producer's {allocation}-element allocation; the declared stride must equal the producer's actual pitch (GEA3-U6 num-3 pitch-truth law)",
@@ -705,15 +708,12 @@ fn admit_sub_window(
             resource.buffer.name, span, window.element_offset
         ));
     }
-    window
-        .byte_binding()
-        .map(Some)
-        .ok_or_else(|| {
-            format!(
-                "resource `{}` carries a sub-window whose byte binding overflows",
-                resource.buffer.name
-            )
-        })
+    window.byte_binding().map(Some).ok_or_else(|| {
+        format!(
+            "resource `{}` carries a sub-window whose byte binding overflows",
+            resource.buffer.name
+        )
+    })
 }
 
 fn map_envelope_to_descriptor(
@@ -782,10 +782,7 @@ fn map_envelope_to_descriptor(
             if resource.version.sub_window.is_none() {
                 if let Some((previous, count)) = shapes.get(&key) {
                     if *previous != dtype {
-                        return Err(format!(
-                            "buffer {} version {} changes dtype",
-                            key.0, key.1
-                        ));
+                        return Err(format!("buffer {} version {} changes dtype", key.0, key.1));
                     }
                     if *count != resource.version.element_count {
                         return Err(format!(
@@ -831,7 +828,10 @@ fn map_envelope_to_descriptor(
             if let Some(binding) = admit_sub_window(resource, allocation)? {
                 if windows
                     .insert(
-                        (u32::try_from(kernel_index).expect("kernel index fits u32"), resource.binding.binding),
+                        (
+                            u32::try_from(kernel_index).expect("kernel index fits u32"),
+                            resource.binding.binding,
+                        ),
                         binding,
                     )
                     .is_some()
@@ -1149,6 +1149,72 @@ fn admit_program(
                 kernel.entry
             ));
         }
+        // GEA4 (a) mirror: the carried launch facts must agree with each
+        // other and with the kernel's own write slot — the threadgroup
+        // requirements themselves are radix-admitted against the emitted
+        // MSL; the hosts own the two carried copies never contradicting.
+        if (
+            kernel.launch.dispatch_size.x,
+            kernel.launch.dispatch_size.y,
+            kernel.launch.dispatch_size.z,
+        ) != (
+            kernel.launch.workgroup_count.x,
+            kernel.launch.workgroup_count.y,
+            kernel.launch.workgroup_count.z,
+        ) {
+            return Err(format!(
+                "{program_name} `{}` launch facts disagree with each other: dispatch_size {:?} != workgroup_count {:?} (GEA4 derived-geometry law)",
+                kernel.entry,
+                (
+                    kernel.launch.dispatch_size.x,
+                    kernel.launch.dispatch_size.y,
+                    kernel.launch.dispatch_size.z
+                ),
+                (
+                    kernel.launch.workgroup_count.x,
+                    kernel.launch.workgroup_count.y,
+                    kernel.launch.workgroup_count.z
+                )
+            ));
+        }
+        if kernel.launch.workgroup.x == 0
+            || kernel.launch.workgroup.y == 0
+            || kernel.launch.workgroup.z == 0
+            || kernel.launch.workgroup_count.x == 0
+            || kernel.launch.workgroup_count.y == 0
+            || kernel.launch.workgroup_count.z == 0
+        {
+            return Err(format!(
+                "{program_name} `{}` launch carries a zero dispatch axis (GEA4 derived-geometry law)",
+                kernel.entry
+            ));
+        }
+        // The declared output count must agree with the kernel's
+        // full-width write slot.  Windowed writes are owned by the
+        // two-truths and scattered-write laws (their carried width is a
+        // projection fact, not the output declaration).
+        let write_width = kernel
+            .resources
+            .iter()
+            .filter(|resource| {
+                matches!(resource.access, Gea3ResourceAccess::Write)
+                    && resource.version.sub_window.is_none()
+            })
+            .map(|resource| resource.version.element_count)
+            .max();
+        match write_width {
+            Some(width) if width == kernel.launch.declared_output_count => {}
+            Some(width) => {
+                return Err(format!(
+                    "{program_name} `{}` declared output count {} disagrees with its write slot width {width} (GEA4 derived-geometry law)",
+                    kernel.entry, kernel.launch.declared_output_count
+                ));
+            }
+            // A kernel whose only writes are windowed projections (the KV
+            // mutators, the attention-concat tiles) declares its output
+            // through the window laws, not a full-width slot.
+            None => {}
+        }
     }
     for edge in &program.dependencies {
         if edge.producer == 0
@@ -1166,6 +1232,50 @@ fn admit_program(
             return Err(format!("{program_name} repeats a dependency edge"));
         }
     }
+    // GEA4 (b) mirror: binding-vs-edge agreement on EVERY edge — the
+    // producer launch must write the edge's (buffer, version) and the
+    // consumer launch must bind it at a read (or read-write) slot.  This
+    // replaces the KV-pair-scoped special case: a mis-binding anywhere in
+    // the ABI (the launch-6 exact-zero class, the seam class num-3/num-10
+    // proved — a flat read of a chunked truth and a strided write of a
+    // flat truth are the same defect) fails closed before any device work.
+    for edge in &program.dependencies {
+        let producer = &program.kernels[(edge.producer - 1) as usize];
+        let consumer = &program.kernels[(edge.consumer - 1) as usize];
+        let producer_writes = producer.resources.iter().any(|resource| {
+            matches!(
+                resource.access,
+                Gea3ResourceAccess::Write | Gea3ResourceAccess::ReadWrite
+            ) && resource.buffer.id == edge.buffer
+                && resource.version.version == edge.version
+        });
+        let consumer_binds = consumer.resources.iter().any(|resource| {
+            matches!(
+                resource.access,
+                Gea3ResourceAccess::Read | Gea3ResourceAccess::ReadWrite
+            ) && resource.buffer.id == edge.buffer
+                && resource.version.version == edge.version
+        });
+        if !producer_writes || !consumer_binds {
+            return Err(format!(
+                "{program_name} binding-vs-edge mismatch at edge {} → {}: edge names buffer {} version {} (producer writes: {}, consumer binds: {})",
+                edge.producer,
+                edge.consumer,
+                edge.buffer,
+                edge.version,
+                producer_writes,
+                consumer_binds
+            ));
+        }
+    }
+    // GEA4 (d) mirror: the staged-composition non-zero-intermediates
+    // readback (b7c1db3) as a per-family structural gate.  Every
+    // kernel-initialized intermediate a launch reads must be covered by
+    // prior writes at the same (buffer, version): full-width and chunked
+    // reads need the whole allocation tiled with no gap; windowed reads
+    // need each row interval inside one prior write span.  Host-provided
+    // and zero-fill buffers are initialized truths — excluded.
+    gea4_intermediate_coverage(program, program_name)?;
     admit_state_buffers(program, program_name)?;
     let expected_output_count = if program_name == "prefill" {
         PREFILL_ROWS * VOCAB
@@ -1188,6 +1298,119 @@ fn admit_program(
         ));
     }
     let _ = envelope;
+    Ok(())
+}
+
+/// GEA4 (d): the zero-intermediate structural gate (hosts mirror of the
+/// harness admission law).  Walks the family's launches in order and
+/// requires every READ of a kernel-initialized buffer to be covered by
+/// prior writes of the same (buffer, version) — an unwritten region reads
+/// the zero-fill, the exact-zero-logits class the device readback had to
+/// discover after execution.  Plan-carried intervals prove coverage; no
+/// symbolic execution.
+fn gea4_intermediate_coverage(program: &Gea3Program, program_name: &str) -> Result<(), String> {
+    let mut full_width: BTreeMap<(u32, u32), u64> = BTreeMap::new();
+    for kernel in &program.kernels {
+        for resource in &kernel.resources {
+            if resource.version.sub_window.is_none() {
+                // First declaration wins; conflicting counts are the
+                // mapper's WIRE-BUFFER-V1 law, not this gate's.
+                full_width
+                    .entry((resource.buffer.id, resource.version.version))
+                    .or_insert(resource.version.element_count);
+            }
+        }
+    }
+    let kernel_initialized: BTreeMap<u32, ()> = program
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            matches!(
+                allocation.initialization,
+                Gea3Initialization::KernelInitialized
+            )
+        })
+        .map(|allocation| (allocation.id, ()))
+        .collect();
+    let mut written: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
+    for (index, kernel) in program.kernels.iter().enumerate() {
+        let launch = index + 1;
+        for resource in &kernel.resources {
+            let key = (resource.buffer.id, resource.version.version);
+            let Some(&allocation) = full_width.get(&key) else {
+                return Err(format!(
+                    "{program_name} `{}` binds buffer {} version {} with no full-width declaration (GEA4 structural readback gate)",
+                    kernel.entry, key.0, key.1
+                ));
+            };
+            let window = resource.version.sub_window;
+            match resource.access {
+                Gea3ResourceAccess::Write | Gea3ResourceAccess::ReadWrite => {
+                    let span = window.map_or(Some((0, allocation)), |window| {
+                        window.covering_span().map(|span| {
+                            (
+                                window.element_offset,
+                                window.element_offset.saturating_add(span),
+                            )
+                        })
+                    });
+                    let Some(span) = span else {
+                        return Err(format!(
+                            "{program_name} `{}` write window overflows (GEA4 structural readback gate)",
+                            kernel.entry
+                        ));
+                    };
+                    written.entry(key).or_default().push(span);
+                }
+                Gea3ResourceAccess::Read => {
+                    if !kernel_initialized.contains_key(&key.0) {
+                        continue;
+                    }
+                    let Some(spans) = written.get(&key) else {
+                        return Err(format!(
+                            "{program_name} zero-intermediate composition: launch {launch} (`{}`) reads kernel-initialized buffer {} version {} that no prior launch wrote (GEA4 structural readback gate)",
+                            kernel.entry, key.0, key.1
+                        ));
+                    };
+                    match window {
+                        // Full-width and chunked reads span the whole
+                        // allocation: prior writes must tile it with no gap.
+                        None => {
+                            let mut ordered = spans.clone();
+                            ordered.sort_unstable();
+                            let mut cursor = 0_u64;
+                            for (start, end) in ordered {
+                                if start > cursor {
+                                    break;
+                                }
+                                cursor = cursor.max(end);
+                            }
+                            if cursor < allocation {
+                                return Err(format!(
+                                    "{program_name} zero-intermediate composition: launch {launch} (`{}`) reads kernel-initialized buffer {} version {} whole, but prior writes cover only [0, {cursor}) of {allocation} — an unwritten gap reads zeros (GEA4 structural readback gate)",
+                                    kernel.entry, key.0, key.1
+                                ));
+                            }
+                        }
+                        Some(window) => {
+                            for row in 0..window.row_count {
+                                let start = window.element_offset + row * window.row_stride;
+                                let end = start + window.row_width;
+                                if !spans.iter().any(|(write_start, write_end)| {
+                                    *write_start <= start && end <= *write_end
+                                }) {
+                                    return Err(format!(
+                                        "{program_name} zero-intermediate composition: launch {launch} (`{}`) reads kernel-initialized buffer {} version {} window row {row} [{start}, {end}) that no prior launch wrote (GEA4 structural readback gate)",
+                                        kernel.entry, key.0, key.1
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1465,9 +1688,8 @@ fn model_weight_names(program: &Gea3Program) -> BTreeSet<String> {
 fn gea3_descriptor_admission() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((prefill, prefill_windows), (decode, decode_windows)) =
-        map_both(&envelope, &artifact_dir)
-            .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
+    let ((prefill, prefill_windows), (decode, decode_windows)) = map_both(&envelope, &artifact_dir)
+        .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     assert_eq!(prefill.kernels.len(), LAUNCHES_PER_PROGRAM);
     assert_eq!(decode.kernels.len(), LAUNCHES_PER_PROGRAM);
@@ -1502,7 +1724,11 @@ fn gea3_descriptor_admission() {
         "prefill window binding count"
     );
     for (byte_offset, view_span) in decode_windows.values().chain(prefill_windows.values()) {
-        assert_eq!(byte_offset % 4, 0, "window byte offsets are element aligned");
+        assert_eq!(
+            byte_offset % 4,
+            0,
+            "window byte offsets are element aligned"
+        );
         assert_eq!(view_span % 4, 0, "window spans are element aligned");
         assert!(*view_span > 0, "a window binds a non-empty span");
     }
@@ -1653,8 +1879,8 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let mut off_the_end = original.clone();
-    off_the_end["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
-        ["sub_window"]["element_offset"] = json!(5 * 64);
+    off_the_end["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]["sub_window"]
+        ["element_offset"] = json!(5 * 64);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(off_the_end).expect("mirror parse");
     let error = map_envelope_to_descriptor(
@@ -1675,10 +1901,9 @@ fn gea3_negative_rows_fail_closed() {
     // below the 320 pitch and a stride above it are both rejected.
     for (label, lying_stride) in [("below", 76u64), ("above", 640u64)] {
         let mut lying = original.clone();
-        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
-            ["sub_window"]["row_stride"] = json!(lying_stride);
-        let parsed: Gea3ProgramPlanEnvelope =
-            serde_json::from_value(lying).expect("mirror parse");
+        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]["sub_window"]
+            ["row_stride"] = json!(lying_stride);
+        let parsed: Gea3ProgramPlanEnvelope = serde_json::from_value(lying).expect("mirror parse");
         let error = map_envelope_to_descriptor(
             &parsed,
             &parsed.programs.decode_step,
@@ -1698,8 +1923,7 @@ fn gea3_negative_rows_fail_closed() {
     // kernels[44] after the num-7 reorder; its LAST resource is the
     // windowed write) must stay contiguous.
     let mut scattered_write = original.clone();
-    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][44]
-        ["resources"]
+    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][44]["resources"]
         .as_array_mut()
         .expect("context resources");
     let write_index = context_resources.len() - 1;
@@ -1757,6 +1981,99 @@ fn gea3_negative_rows_fail_closed() {
     assert!(
         error.contains("wire-buffer ABI"),
         "diagnostic must name the ABI law: {error}"
+    );
+}
+
+/// GEA4 pre-Metal plan-admission pass (hosts mirror): the derived gates
+/// red-green against the exported proven-good bundle — (a) launch-facts
+/// consistency, (b) binding-vs-edge agreement on every edge, (d) the
+/// staged-composition non-zero-intermediates readback (b7c1db3) promoted
+/// to a structural gate.  The count vocabulary (c) is the radix harness
+/// law; the hosts mirror carries no family spec table.
+#[test]
+fn gea4_admission_gates_fail_closed() {
+    let artifact_dir = gea3_artifact_dir();
+    let bytes = fs::read(artifact_dir.join(PLAN_MEMBER)).expect("read exported GEA3 plan");
+    let original: Value = serde_json::from_slice(&bytes).expect("exported plan is JSON");
+
+    // Green control: both family programs admit as exported.
+    let envelope = load_gea3_plan(&artifact_dir);
+    assert!(admit_program(&envelope, &envelope.programs.decode_step, "decode_step").is_ok());
+    assert!(admit_program(&envelope, &envelope.programs.prefill, "prefill").is_ok());
+
+    // (a) red — the two carried copies of the grid disagree with each
+    // other (dispatch_size mutated, workgroup_count left alone).
+    let mut contradictory = original.clone();
+    contradictory["programs"]["decode_step"]["kernels"][1]["launch"]["dispatch_size"]["x"] =
+        json!(480);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(contradictory).expect("mirror parse");
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+        .expect_err("contradictory launch facts must fail closed");
+    assert!(
+        error.contains("launch facts disagree with each other"),
+        "diagnostic must name the carried-facts law: {error}"
+    );
+
+    // (b) red — non-KV binding-vs-edge mismatch on the CONSUMER side:
+    // launch 6 (`decode_rope_q`) rewires its canonical input to the
+    // embedding output while the edge still names the q projection.
+    let mut non_kv_misbinding = original.clone();
+    let embedding_output_id = original["programs"]["decode_step"]["kernels"][0]["resources"]
+        .as_array()
+        .expect("embedding resources")
+        .last()
+        .expect("embedding output")["buffer"]["id"]
+        .clone();
+    non_kv_misbinding["programs"]["decode_step"]["kernels"][5]["resources"][0]["buffer"]["id"] =
+        embedding_output_id;
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(non_kv_misbinding).expect("mirror parse");
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+        .expect_err("a non-KV mis-binding must fail closed");
+    assert!(
+        error.contains("binding-vs-edge mismatch"),
+        "diagnostic must name the every-edge law: {error}"
+    );
+
+    // (b) red — the same law from the PRODUCER side: the rope_q edge
+    // rewired to launch 1, which never writes the edge buffer.
+    let mut producer_mismatch = original.clone();
+    let rope_edge = producer_mismatch["programs"]["decode_step"]["dependencies"]
+        .as_array_mut()
+        .expect("dependencies")
+        .iter_mut()
+        .find(|edge| edge["consumer"] == json!(6))
+        .expect("rope_q edge");
+    rope_edge["producer"] = json!(1);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(producer_mismatch).expect("mirror parse");
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+        .expect_err("a producer that never writes the edge buffer must fail closed");
+    assert!(
+        error.contains("binding-vs-edge mismatch"),
+        "diagnostic must name the every-edge law: {error}"
+    );
+
+    // (d) red — zero-intermediate composition: context tile 5's write
+    // window shifts one head off its slot (still nested, carried count
+    // untouched), leaving [320, 384) of the attention concat unwritten;
+    // the o-projection's full-width read then observes the zero-fill.
+    let mut zero_intermediate = original.clone();
+    let context_write_index = original["programs"]["decode_step"]["kernels"][49]["resources"]
+        .as_array()
+        .expect("context resources")
+        .len()
+        - 1;
+    zero_intermediate["programs"]["decode_step"]["kernels"][49]["resources"][context_write_index]
+        ["version"]["sub_window"]["element_offset"] = json!(6 * 64);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(zero_intermediate).expect("mirror parse");
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+        .expect_err("an unwritten concat gap must fail closed at admission");
+    assert!(
+        error.contains("zero-intermediate composition"),
+        "diagnostic must name the structural readback gate: {error}"
     );
 }
 
@@ -2033,11 +2350,7 @@ fn gea3_launch_binding(
     kernel_index: u32,
     slot: &DescriptorBuffer,
 ) -> Result<DeviceLaunchBinding, String> {
-    match program
-        .windows
-        .get(&(kernel_index, slot.binding))
-        .copied()
-    {
+    match program.windows.get(&(kernel_index, slot.binding)).copied() {
         Some((byte_offset, view_span)) => Ok(DeviceLaunchBinding {
             handle,
             binding_index: slot.binding,
@@ -2676,12 +2989,8 @@ fn gea3_run_physical(
     let mut shared = BTreeMap::new();
     let mut programs = Vec::new();
     let prepare = (|| {
-        let prefill_program = gea3_prepare_physical_program(
-            runtime,
-            prefill.0,
-            prefill.1,
-            &mut shared,
-        )?;
+        let prefill_program =
+            gea3_prepare_physical_program(runtime, prefill.0, prefill.1, &mut shared)?;
         let decode_program =
             gea3_prepare_physical_program(runtime, decode.0, decode.1, &mut shared)?;
         programs.push(prefill_program);
@@ -3362,8 +3671,7 @@ fn gea3_run_staged_diagnostic(
                     .get(&(resource.buffer.id, resource.version.version))
                     .copied()
                     .ok_or_else(|| "probe handle disappeared".to_owned())?;
-                chain_summaries
-                    .push(gea3_diagnostic_buffer_summary(runtime, &handle, resource)?);
+                chain_summaries.push(gea3_diagnostic_buffer_summary(runtime, &handle, resource)?);
             }
         }
         let mut arena_row_census = Vec::new();
@@ -3917,7 +4225,9 @@ fn gea3_real_metal_staged_composition_diagnostic() {
     // inputs' finiteness state — never leave the NaN origin anonymous.
     assert!(
         receipt["execution"]["first_non_finite"].is_null()
-            || receipt["execution"]["first_non_finite"]["launch_id"].as_u64().is_some(),
+            || receipt["execution"]["first_non_finite"]["launch_id"]
+                .as_u64()
+                .is_some(),
         "first non-finite launch must be named with its launch id"
     );
 }
