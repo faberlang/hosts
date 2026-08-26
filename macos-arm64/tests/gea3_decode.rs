@@ -1804,15 +1804,33 @@ fn gea3_diagnostic_buffer_summary(
     let values = gea3_f32_from_bytes(&bytes)?;
     let mut finite = 0usize;
     let mut non_zero = 0usize;
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
+    let mut first_non_finite = None;
     let mut min = None;
     let mut max = None;
     let mut abs_sum = 0.0_f64;
-    for value in values.iter().copied() {
+    for (index, value) in values.iter().copied().enumerate() {
         if value.is_finite() {
             finite += 1;
             min = Some(min.map_or(value, |previous: f32| previous.min(value)));
             max = Some(max.map_or(value, |previous: f32| previous.max(value)));
             abs_sum += f64::from(value.abs());
+        } else {
+            if value.is_nan() {
+                nan_count += 1;
+            } else if value > 0.0 {
+                pos_inf_count += 1;
+            } else {
+                neg_inf_count += 1;
+            }
+            if first_non_finite.is_none() {
+                first_non_finite = Some(json!({
+                    "index": index,
+                    "value": format!("{value:?}"),
+                }));
+            }
         }
         if value != 0.0 {
             non_zero += 1;
@@ -1839,6 +1857,12 @@ fn gea3_diagnostic_buffer_summary(
         "readback_bytes": bytes.len(),
         "sha256": gea3_readback_hash(&values),
         "finite_count": finite,
+        "non_finite_count": nan_count + pos_inf_count + neg_inf_count,
+        "non_finite": nan_count + pos_inf_count + neg_inf_count != 0,
+        "nan_count": nan_count,
+        "pos_inf_count": pos_inf_count,
+        "neg_inf_count": neg_inf_count,
+        "first_non_finite": first_non_finite,
         "non_zero_count": non_zero,
         "non_zero": non_zero != 0,
         "min": min,
@@ -2690,6 +2714,7 @@ fn gea3_run_staged_diagnostic(
         let mut stages = Vec::new();
         let mut previous_output = None;
         let mut first_bad = None;
+        let mut first_non_finite = None;
         for launch in &program.descriptor.launches {
             let descriptor_kernel = &program.descriptor.kernels[launch.kernel_index as usize];
             let plan_kernel = &decode_plan.kernels[launch.kernel_index as usize];
@@ -2765,6 +2790,27 @@ fn gea3_run_staged_diagnostic(
                     })
                 })
                 .collect::<Vec<_>>();
+            // Non-finite localization: any produced output slot carrying a
+            // NaN or +/-inf flags the launch.  The first such launch is named
+            // with every non-weight input slot's finiteness state so the seam
+            // (finite inputs -> non-finite output) is machine-readable.
+            let non_finite_outputs: Vec<Value> = outputs
+                .iter()
+                .filter(|summary| summary["non_finite"].as_bool().unwrap_or(false))
+                .map(|summary| {
+                    json!({
+                        "name": summary["name"],
+                        "buffer_id": summary["buffer_id"],
+                        "element_count": summary["element_count"],
+                        "finite_count": summary["finite_count"],
+                        "non_finite_count": summary["non_finite_count"],
+                        "nan_count": summary["nan_count"],
+                        "pos_inf_count": summary["pos_inf_count"],
+                        "neg_inf_count": summary["neg_inf_count"],
+                        "first_non_finite": summary["first_non_finite"],
+                    })
+                })
+                .collect();
             let stage = json!({
                 "launch_id": launch.id,
                 "kernel_index": launch.kernel_index,
@@ -2780,6 +2826,19 @@ fn gea3_run_staged_diagnostic(
                     "buffer_id": buffer_id,
                 })),
                 "input": primary_input_summary,
+                "inputs_finiteness": inputs
+                    .iter()
+                    .map(|summary| {
+                        json!({
+                            "name": summary["name"],
+                            "buffer_id": summary["buffer_id"],
+                            "element_count": summary["element_count"],
+                            "finite_count": summary["finite_count"],
+                            "non_finite_count": summary["non_finite_count"],
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "non_finite_outputs": non_finite_outputs.clone(),
                 "outputs": outputs,
                 "primary_output": primary_output_summary,
                 "upstream_primary_output": previous_output,
@@ -2804,6 +2863,17 @@ fn gea3_run_staged_diagnostic(
                         "destination_non_zero": output_non_zero,
                         "wiring_mismatch": wiring_mismatch,
                     },
+                }));
+            }
+            if !non_finite_outputs.is_empty() && first_non_finite.is_none() {
+                first_non_finite = Some(json!({
+                    "launch_id": launch.id,
+                    "layer": plan_kernel.layer,
+                    "ordinal": plan_kernel.ordinal,
+                    "entry": plan_kernel.entry,
+                    "outputs": non_finite_outputs,
+                    "inputs_finiteness": stage["inputs_finiteness"].clone(),
+                    "primary_input": stage["input"].clone(),
                 }));
             }
             stages.push(stage);
@@ -2837,6 +2907,7 @@ fn gea3_run_staged_diagnostic(
             "stages_executed": stages.len(),
             "stages": stages,
             "first_bad": first_bad,
+            "first_non_finite": first_non_finite,
             "terminal": terminal,
             "diagnostic_policy": "real Metal, real F32 GGUF weights, dependency-order launches, internal F32 readback after every stage; no CPU model substitute",
         }))
@@ -2984,5 +3055,13 @@ fn gea3_real_metal_staged_composition_diagnostic() {
         receipt["execution"]["first_bad"].is_object()
             || receipt["execution"]["status"] == "composition-through-logits-writeback",
         "diagnostic receipt lacks first-bad evidence or terminal proof"
+    );
+    // GEA3-U6 rerun #6: non-finite localization.  When any launch produced a
+    // non-finite element, the receipt must name that FIRST launch with its
+    // inputs' finiteness state — never leave the NaN origin anonymous.
+    assert!(
+        receipt["execution"]["first_non_finite"].is_null()
+            || receipt["execution"]["first_non_finite"]["launch_id"].as_u64().is_some(),
+        "first non-finite launch must be named with its launch id"
     );
 }
