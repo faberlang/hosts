@@ -1251,6 +1251,51 @@ impl FakeMetalDriver {
             .find_map(|(name, arities)| (name.as_bytes() == entry).then_some(*arities))
     }
 
+    /// GEA3's plan carries the full entry identity and its ordered bindings.
+    /// These arities are structural fake-driver admission only; the fake does
+    /// not read values or simulate any GEA3 kernel body.
+    const GEA3_ENTRY_ARITIES: &[(&str, &[usize])] = &[
+        ("embedding_gather", &[4]),
+        ("decode_rmsnorm", &[5]),
+        ("decode_gemv_qo", &[5]),
+        ("decode_gemv_kv", &[5]),
+        ("decode_gemv_gate_up", &[5]),
+        ("decode_gemv_down", &[5]),
+        ("decode_rope_q", &[4]),
+        ("decode_rope_k", &[4]),
+        ("kv_append_k", &[3]),
+        ("kv_append_v", &[3]),
+        ("decode_key_transpose", &[3]),
+        ("decode_score_gemm", &[5]),
+        ("decode_masked_softmax", &[4]),
+        ("decode_context_gemm", &[4]),
+        ("decode_swiglu", &[4]),
+        ("decode_residual_add", &[4]),
+        ("prefill_rmsnorm", &[5]),
+        ("prefill_gemm_qo", &[5]),
+        ("prefill_gemm_kv", &[5]),
+        ("prefill_gemm_gate_up", &[5]),
+        ("prefill_gemm_down", &[5]),
+        ("prefill_rope_q", &[4]),
+        ("prefill_rope_k", &[4]),
+        ("prefill_key_transpose", &[3]),
+        ("prefill_score_gemm", &[5]),
+        ("prefill_causal_softmax", &[3]),
+        ("prefill_context_gemm", &[4]),
+        ("prefill_swiglu", &[4]),
+        ("prefill_residual_add", &[4]),
+        ("prefill_kv_write_k", &[3]),
+        ("prefill_kv_write_v", &[3]),
+        ("head_rmsnorm", &[5]),
+        ("lm_head_gemv", &[5]),
+    ];
+
+    fn gea3_entry_arities(entry: &[u8]) -> Option<&'static [usize]> {
+        Self::GEA3_ENTRY_ARITIES
+            .iter()
+            .find_map(|(name, arities)| (name.as_bytes() == entry).then_some(*arities))
+    }
+
     pub fn unavailable() -> Self {
         Self {
             force_unavailable: true,
@@ -1720,6 +1765,15 @@ impl MetalDriver for FakeMetalDriver {
         // written here. Keep this behind the declared-function-table path so
         // the legacy unnamed-module 3-buffer fake remains unchanged.
         if !self.known_entries.is_empty() {
+            if let Some(arities) = Self::gea3_entry_arities(entry) {
+                if !arities.contains(&buffers.len()) {
+                    return Err(HostError::invalid_args(
+                        "fake launch_kernel declared GEA3 entry".to_owned(),
+                    ));
+                }
+                self.pending_encodes += 1;
+                return Ok(());
+            }
             if let Some(arities) = Self::gea2_entry_arities(entry) {
                 if !arities.contains(&buffers.len()) {
                     return Err(HostError::invalid_args(
