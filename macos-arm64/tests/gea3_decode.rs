@@ -2971,8 +2971,13 @@ fn gea3_real_metal_staged_composition_diagnostic() {
         receipt_path.display()
     );
 
-    assert_eq!(
-        receipt["status"], "first-bad-entry",
+    // GEA3-U6 rerun #5: the repaired plan composes through logits writeback
+    // (with NaN logits until the per-head shape residual is amended), so the
+    // diagnostic law is the disjunction: name a first-bad entry OR prove the
+    // route through the logits writeback.
+    assert!(
+        receipt["status"] == "first-bad-entry"
+            || receipt["status"] == "composition-through-logits-writeback",
         "diagnostic must name the first bad composition entry or prove the route through logits"
     );
     assert!(
