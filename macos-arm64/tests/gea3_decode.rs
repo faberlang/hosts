@@ -600,6 +600,28 @@ fn admit_sub_window(
             resource.buffer.name
         ));
     }
+    // GEA3-U6 num-3 pitch-truth law (the hosts mirror of the harness
+    // admission): a STRIDED read window's declared row pitch must equal the
+    // producer's actual pitch — the producer's allocation is exactly
+    // `row_stride · row_count` rows of the window — so a consumer can never
+    // address one level off the producer's real row-major layout (a window
+    // that lies about the pitch passes the count laws: carried==derived and
+    // nesting both count spans, not pitches).  Contiguous windows (stride
+    // == width) are dense by construction and skip the law.
+    if !matches!(resource.access, Gea3ResourceAccess::Write) && !window.is_contiguous() {
+        let pitch_span = window.row_stride.checked_mul(window.row_count).ok_or_else(|| {
+            format!(
+                "resource `{}` carries a strided read window whose pitch·rows saturates u64",
+                resource.buffer.name
+            )
+        })?;
+        if pitch_span != allocation {
+            return Err(format!(
+                "resource `{}` carries a strided read window declaring row_stride {} · row_count {} = {pitch_span} ≠ the producer's {allocation}-element allocation; the declared stride must equal the producer's actual pitch (GEA3-U6 num-3 pitch-truth law)",
+                resource.buffer.name, window.row_stride, window.row_count
+            ));
+        }
+    }
     let span = window.covering_span().ok_or_else(|| {
         format!(
             "resource `{}` carries a sub-window whose covering span saturates u64",
@@ -1571,6 +1593,31 @@ fn gea3_negative_rows_fail_closed() {
         error.contains("nest inside its producer buffer"),
         "diagnostic must name the nesting law: {error}"
     );
+
+    // GEA3-U6 num-3 pitch-truth negatives (the hosts mirror): a strided
+    // read window whose declared stride lies about the producer's actual
+    // pitch fails the mapper even though both count laws pass — a stride
+    // below the 320 pitch and a stride above it are both rejected.
+    for (label, lying_stride) in [("below", 76u64), ("above", 640u64)] {
+        let mut lying = original.clone();
+        lying["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+            ["sub_window"]["row_stride"] = json!(lying_stride);
+        let parsed: Gea3ProgramPlanEnvelope =
+            serde_json::from_value(lying).expect("mirror parse");
+        let error = map_envelope_to_descriptor(
+            &parsed,
+            &parsed.programs.decode_step,
+            "decode_step",
+            &artifact_dir,
+        )
+        .expect_err(&format!(
+            "a lying stride {label} the pitch must fail the mapper"
+        ));
+        assert!(
+            error.contains("pitch-truth"),
+            "a stride {label} the producer pitch must name the pitch-truth law: {error}"
+        );
+    }
 
     // The attention-output hybrid write window (first context launch,
     // kernels[42]; its LAST resource is the windowed write) must stay
