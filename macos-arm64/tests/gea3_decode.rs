@@ -18,8 +18,8 @@ use faber_host_macos_arm64::composite_host::{CompositeHost, CompositeHostConfig,
 use faber_host_macos_arm64::device_descriptor::{
     sha256_hex, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
     DescriptorEndOfRunResult, DescriptorKernel, DescriptorLaunch, DescriptorResult,
-    DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
-    DeviceDescriptor, DeviceProgramLifetime,
+    DescriptorRuntimeSource, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
+    DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
 };
 use faber_host_macos_arm64::device_host::{DeviceLaunchBinding, DeviceRuntime, DeviceSession};
 use faber_host_macos_arm64::metal_host::MappedWeightFile;
@@ -29,6 +29,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const PLAN_SCHEMA: &str = "gea3-program-plan-v1";
+// GEA3-WIRE-BUFFER-V2 (Amendment 3 / GEA3-A1): the named successor of
+// GEA3-WIRE-BUFFER-V1, mirrored from the schema authority
+// `radix/crates/radix-mir-fmir/src/schema/wire.rs`
+// (`GEA3_WIRE_BUFFER_ABI_V2` + `WireSubWindowProjection`).  The allocation
+// law stands — one (buffer id, version), one allocation count — and a read
+// or write slot may carry a bounded sub-window of that one allocation.
+const WIRE_BUFFER_ABI: &str = "gea3-wire-buffer-v2";
 const PLAN_MEMBER: &str = "gea3-program-plan.json";
 const MODULE_IMAGE_RULE: &str =
     "module_members are independently selectable; the plan binds them by entry identity";
@@ -54,6 +61,7 @@ const DECODE_STEPS: usize = 8;
 #[serde(deny_unknown_fields)]
 struct Gea3ProgramPlanEnvelope {
     schema: String,
+    wire_buffer_abi: String,
     source: String,
     programs: Gea3Programs,
     module_members: Vec<String>,
@@ -267,6 +275,51 @@ struct Gea3BufferVersion {
     element_ty: String,
     element_count: u64,
     reduced_projection: Option<Gea3ReducedProjection>,
+    #[serde(default)]
+    sub_window: Option<Gea3SubWindowProjection>,
+}
+
+/// The hosts' typed mirror of the GEA3-WIRE-BUFFER-V2 sub-window
+/// projection (Amendment 3 / GEA3-A1): `row_count` rows of `row_width`
+/// contiguous elements at `row_stride` producer pitch, starting at
+/// `element_offset`, with the carried derived element count beside the
+/// geometry so admission can cross-check the two truths fail-closed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gea3SubWindowProjection {
+    buffer: u32,
+    element_offset: u64,
+    row_width: u64,
+    row_count: u64,
+    row_stride: u64,
+    derived_element_count: u64,
+}
+
+impl Gea3SubWindowProjection {
+    fn window_element_count(&self) -> Option<u64> {
+        self.row_width.checked_mul(self.row_count)
+    }
+
+    fn covering_span(&self) -> Option<u64> {
+        self.row_count
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(self.row_stride))
+            .and_then(|span| span.checked_add(self.row_width))
+    }
+
+    fn is_contiguous(&self) -> bool {
+        self.row_stride == self.row_width
+    }
+
+    /// The byte offset and view span of the window's device binding: the
+    /// covering span is exact for a contiguous window and bounds a strided
+    /// read-side window (never out of allocation).
+    fn byte_binding(&self) -> Option<(u64, u64)> {
+        let span = self.covering_span()?;
+        let offset_bytes = self.element_offset.checked_mul(4)?;
+        let span_bytes = span.checked_mul(4)?;
+        Some((offset_bytes, span_bytes))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -491,12 +544,95 @@ fn load_gea3_plan(artifact_dir: &Path) -> Gea3ProgramPlanEnvelope {
         .unwrap_or_else(|error| panic!("mirror-parse {}: {error}", path.display()))
 }
 
+/// The per-kernel window bindings derived from the carried sub-window
+/// projections: (kernel index, binding index) → (byte offset, view span).
+/// A slot without an entry binds its whole handle.
+type Gea3WindowBindings = BTreeMap<(u32, u32), (u64, u64)>;
+
+/// Admit one carried sub-window against the allocation it nests in (the
+/// two-truths guard mirrored from the schema authority
+/// `validate_carried_sub_window_projection`).  Returns the window's byte
+/// binding when the resource carries one.
+fn admit_sub_window(
+    resource: &Gea3DeviceResource,
+    allocation: u64,
+) -> Result<Option<(u64, u64)>, String> {
+    let Some(window) = resource.version.sub_window else {
+        return Ok(None);
+    };
+    if window.buffer != resource.buffer.id {
+        return Err(format!(
+            "resource `{}` binds buffer {} but its sub-window names buffer {}; the window addresses its own producer (GEA3-WIRE-BUFFER-V2)",
+            resource.buffer.name, resource.buffer.id, window.buffer
+        ));
+    }
+    if window.row_width == 0 || window.row_count == 0 || window.row_stride < window.row_width {
+        return Err(format!(
+            "resource `{}` carries a sub-window with degenerate geometry (width {}, rows {}, stride {})",
+            resource.buffer.name, window.row_width, window.row_count, window.row_stride
+        ));
+    }
+    let derived = window.window_element_count().ok_or_else(|| {
+        format!(
+            "resource `{}` carries a sub-window whose width · rows saturates u64",
+            resource.buffer.name
+        )
+    })?;
+    if window.derived_element_count != derived || resource.version.element_count != derived {
+        return Err(format!(
+            "resource `{}` binds {} elements with a sub-window deriving {} (width {} · rows {}); the carried and derived truths must agree (GEA3-WIRE-BUFFER-V2)",
+            resource.buffer.name,
+            resource.version.element_count,
+            window.derived_element_count,
+            window.row_width,
+            window.row_count
+        ));
+    }
+    if matches!(resource.access, Gea3ResourceAccess::ReadWrite) {
+        return Err(format!(
+            "resource `{}` carries a sub-window on a read-write slot; windows are read- or write-side facts only (GEA3-WIRE-BUFFER-V2)",
+            resource.buffer.name
+        ));
+    }
+    if matches!(resource.access, Gea3ResourceAccess::Write) && !window.is_contiguous() {
+        return Err(format!(
+            "resource `{}` carries a strided sub-window on a write slot; a scattered write is not one binding (GEA3-WIRE-BUFFER-V2)",
+            resource.buffer.name
+        ));
+    }
+    let span = window.covering_span().ok_or_else(|| {
+        format!(
+            "resource `{}` carries a sub-window whose covering span saturates u64",
+            resource.buffer.name
+        )
+    })?;
+    if window
+        .element_offset
+        .checked_add(span)
+        .is_none_or(|end| end > allocation)
+    {
+        return Err(format!(
+            "resource `{}` carries a sub-window spanning {} of {allocation} elements from offset {}; the window must nest inside its producer buffer (GEA3-WIRE-BUFFER-V2)",
+            resource.buffer.name, span, window.element_offset
+        ));
+    }
+    window
+        .byte_binding()
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "resource `{}` carries a sub-window whose byte binding overflows",
+                resource.buffer.name
+            )
+        })
+}
+
 fn map_envelope_to_descriptor(
     envelope: &Gea3ProgramPlanEnvelope,
     program: &Gea3Program,
     program_name: &str,
     artifact_dir: &Path,
-) -> Result<DeviceDescriptor, String> {
+) -> Result<(DeviceDescriptor, Gea3WindowBindings), String> {
     admit_envelope(envelope)?;
     admit_program(envelope, program, program_name)?;
 
@@ -514,6 +650,12 @@ fn map_envelope_to_descriptor(
         module_image.extend_from_slice(&bytes);
     }
 
+    // GEA3-A1 (GEA3-WIRE-BUFFER-V2): full-width bindings establish the
+    // allocation law — one (buffer id, version), one allocation count;
+    // sub-window bindings never mint a second count.  The windows are
+    // validated after every full-width declaration is known (a window may
+    // precede the full-width binding that bounds it — the attention-output
+    // concat's 15 window writes precede its full read).
     let mut shapes: BTreeMap<(u32, u32), (DeviceDataType, u64)> = BTreeMap::new();
     let mut identities: BTreeMap<u32, (String, u32, DeviceBufferRole, DeviceBufferLifetime)> =
         BTreeMap::new();
@@ -548,18 +690,23 @@ fn map_envelope_to_descriptor(
                 return Err(format!("resource `{}` is not F32", resource.buffer.name));
             }
             let key = (resource.buffer.id, resource.version.version);
-            if let Some((previous, count)) = shapes.get(&key) {
-                if *previous != dtype {
-                    return Err(format!("buffer {} version {} changes dtype", key.0, key.1));
+            if resource.version.sub_window.is_none() {
+                if let Some((previous, count)) = shapes.get(&key) {
+                    if *previous != dtype {
+                        return Err(format!(
+                            "buffer {} version {} changes dtype",
+                            key.0, key.1
+                        ));
+                    }
+                    if *count != resource.version.element_count {
+                        return Err(format!(
+                            "buffer {} version {} carries conflicting element counts {} and {}",
+                            key.0, key.1, count, resource.version.element_count
+                        ));
+                    }
+                } else {
+                    shapes.insert(key, (dtype, resource.version.element_count));
                 }
-                if *count != resource.version.element_count {
-                    return Err(format!(
-                        "buffer {} version {} carries conflicting element counts {} and {}",
-                        key.0, key.1, count, resource.version.element_count
-                    ));
-                }
-            } else {
-                shapes.insert(key, (dtype, resource.version.element_count));
             }
             let identity = (
                 resource.buffer.name.clone(),
@@ -579,6 +726,32 @@ fn map_envelope_to_descriptor(
             }
         }
     }
+    let mut windows: Gea3WindowBindings = BTreeMap::new();
+    for (kernel_index, kernel) in program.kernels.iter().enumerate() {
+        for resource in &kernel.resources {
+            let key = (resource.buffer.id, resource.version.version);
+            let allocation = shapes.get(&key).map(|(_, count)| *count).ok_or_else(|| {
+                format!(
+                    "resource `{}` binds a sub-window of buffer {} version {} with no full-width declaration (GEA3-WIRE-BUFFER-V2)",
+                    resource.buffer.name, key.0, key.1
+                )
+            })?;
+            if let Some(binding) = admit_sub_window(resource, allocation)? {
+                if windows
+                    .insert(
+                        (u32::try_from(kernel_index).expect("kernel index fits u32"), resource.binding.binding),
+                        binding,
+                    )
+                    .is_some()
+                {
+                    return Err(format!(
+                        "kernel `{}` repeats a window binding at {}",
+                        kernel.entry, resource.binding.binding
+                    ));
+                }
+            }
+        }
+    }
 
     let mut kernels = Vec::with_capacity(program.kernels.len());
     for kernel in &program.kernels {
@@ -595,7 +768,9 @@ fn map_envelope_to_descriptor(
             let (_, full_count) = shapes
                 .get(&key)
                 .ok_or_else(|| format!("resource `{}` has no keyed shape", resource.buffer.name))?;
-            if resource.version.element_count != *full_count {
+            if resource.version.element_count != *full_count
+                && resource.version.sub_window.is_none()
+            {
                 return Err(format!(
                     "resource `{}` binds a sub-window without a projection fact",
                     resource.buffer.name
@@ -605,6 +780,10 @@ fn map_envelope_to_descriptor(
                 resource.access,
                 Gea3ResourceAccess::Write | Gea3ResourceAccess::ReadWrite
             ) && resource.version.element_count != *full_count
+                && !resource
+                    .version
+                    .sub_window
+                    .is_some_and(|window| window.is_contiguous())
             {
                 return Err(format!(
                     "resource `{}` writes a partial shape",
@@ -731,30 +910,39 @@ fn map_envelope_to_descriptor(
         }
     }
 
-    Ok(DeviceDescriptor {
-        backend: DeviceBackend::Metal,
-        module_image,
-        kernels,
-        launches: program
-            .launches
-            .iter()
-            .map(|launch| DescriptorLaunch {
-                id: launch.id,
-                kernel_index: launch.kernel_index,
-            })
-            .collect(),
-        buffer_versions,
-        program_lifetime: DeviceProgramLifetime::SingleRun,
-        data_flow,
-        roots: program.roots.clone(),
-        results,
-        end_of_run_results,
-    })
+    Ok((
+        DeviceDescriptor {
+            backend: DeviceBackend::Metal,
+            module_image,
+            kernels,
+            launches: program
+                .launches
+                .iter()
+                .map(|launch| DescriptorLaunch {
+                    id: launch.id,
+                    kernel_index: launch.kernel_index,
+                })
+                .collect(),
+            buffer_versions,
+            program_lifetime: DeviceProgramLifetime::SingleRun,
+            data_flow,
+            roots: program.roots.clone(),
+            results,
+            end_of_run_results,
+        },
+        windows,
+    ))
 }
 
 fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
     if envelope.schema != PLAN_SCHEMA {
         return Err(format!("unexpected envelope schema `{}`", envelope.schema));
+    }
+    if envelope.wire_buffer_abi != WIRE_BUFFER_ABI {
+        return Err(format!(
+            "unexpected wire-buffer ABI `{}`; the plan must carry {WIRE_BUFFER_ABI} sub-window projection facts (GEA3-A1)",
+            envelope.wire_buffer_abi
+        ));
     }
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
@@ -1127,7 +1315,13 @@ fn assert_declared_logits_only(
 fn map_both(
     envelope: &Gea3ProgramPlanEnvelope,
     artifact_dir: &Path,
-) -> Result<(DeviceDescriptor, DeviceDescriptor), String> {
+) -> Result<
+    (
+        (DeviceDescriptor, Gea3WindowBindings),
+        (DeviceDescriptor, Gea3WindowBindings),
+    ),
+    String,
+> {
     let prefill = map_envelope_to_descriptor(
         envelope,
         &envelope.programs.prefill,
@@ -1141,9 +1335,11 @@ fn map_both(
         artifact_dir,
     )?;
     prefill
+        .0
         .validate()
         .map_err(|error| format!("prefill descriptor rejected: {}", error.message))?;
     decode
+        .0
         .validate()
         .map_err(|error| format!("decode descriptor rejected: {}", error.message))?;
     Ok((prefill, decode))
@@ -1168,8 +1364,9 @@ fn model_weight_names(program: &Gea3Program) -> BTreeSet<String> {
 fn gea3_descriptor_admission() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let (prefill, decode) = map_both(&envelope, &artifact_dir)
-        .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
+    let ((prefill, prefill_windows), (decode, decode_windows)) =
+        map_both(&envelope, &artifact_dir)
+            .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     assert_eq!(prefill.kernels.len(), LAUNCHES_PER_PROGRAM);
     assert_eq!(decode.kernels.len(), LAUNCHES_PER_PROGRAM);
@@ -1183,6 +1380,30 @@ fn gea3_descriptor_admission() {
         model_weight_names(&envelope.programs.decode_step).len(),
         290
     );
+
+    // GEA3-A1: the mapper accepts the carried sub-window projections.  The
+    // decode program carries the per-head read-side windows (5 key
+    // transposes + 15 score queries + 15 context values per layer) plus the
+    // 15 attention-output write windows per layer; prefill mirrors the
+    // geometry at T_p (windows are always in-bounds bindings of the one
+    // allocation).
+    let expected_decode_windows = LAYERS * (5 + 15 + 15 + 15);
+    let expected_prefill_windows = LAYERS * (5 + 15 + 15 + 15);
+    assert_eq!(
+        decode_windows.len(),
+        expected_decode_windows,
+        "decode window binding count"
+    );
+    assert_eq!(
+        prefill_windows.len(),
+        expected_prefill_windows,
+        "prefill window binding count"
+    );
+    for (byte_offset, view_span) in decode_windows.values().chain(prefill_windows.values()) {
+        assert_eq!(byte_offset % 4, 0, "window byte offsets are element aligned");
+        assert_eq!(view_span % 4, 0, "window spans are element aligned");
+        assert!(*view_span > 0, "a window binds a non-empty span");
+    }
 
     // The cache declarations are not inferred from resource extents. They
     // remain an independently admitted, capacity-bounded fact.
@@ -1278,7 +1499,7 @@ fn gea3_negative_rows_fail_closed() {
         "diagnostic must name the GEA3-WIRE-BUFFER-V1 conflict: {error}"
     );
 
-    let mut intermediate_readback = original;
+    let mut intermediate_readback = original.clone();
     let intermediate_id = intermediate_readback["programs"]["decode_step"]["kernels"][0]
         ["resources"]
         .as_array()
@@ -1304,16 +1525,118 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let envelope = load_gea3_plan(&artifact_dir);
-    let (_, decode) = map_both(&envelope, &artifact_dir).expect("real plan maps");
+    let ((_, _), (decode, _)) = map_both(&envelope, &artifact_dir).expect("real plan maps");
     assert!(assert_declared_logits_only(&decode, decode.end_of_run_results[0].buffer_id).is_ok());
     assert!(assert_declared_logits_only(&decode, u32::MAX).is_err());
+
+    // GEA3-A1 negatives: the sub-window two-truths guard at the mapper.
+    // Launch 8 (kernels[7]) is the first key transpose; its canonical input
+    // carries the strided [76,64] k-cache window.
+    let mut wrong_derived = original.clone();
+    wrong_derived["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+        ["sub_window"]["derived_element_count"] = json!(4_863);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(wrong_derived).expect("mirror parse");
+    let error = map_envelope_to_descriptor(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        &artifact_dir,
+    )
+    .expect_err("a corrupted derived count must fail the mapper");
+    assert!(
+        error.contains("carried and derived truths must agree"),
+        "diagnostic must name the two-truths law: {error}"
+    );
+
+    let mut off_the_end = original.clone();
+    off_the_end["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+        ["sub_window"]["element_offset"] = json!(5 * 64);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(off_the_end).expect("mirror parse");
+    let error = map_envelope_to_descriptor(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        &artifact_dir,
+    )
+    .expect_err("an off-the-end window must fail the mapper");
+    assert!(
+        error.contains("nest inside its producer buffer"),
+        "diagnostic must name the nesting law: {error}"
+    );
+
+    // The attention-output hybrid write window (first context launch,
+    // kernels[42]; its LAST resource is the windowed write) must stay
+    // contiguous.
+    let mut scattered_write = original.clone();
+    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][42]
+        ["resources"]
+        .as_array_mut()
+        .expect("context resources");
+    let write_index = context_resources.len() - 1;
+    context_resources[write_index]["version"]["sub_window"]["row_count"] = json!(15);
+    context_resources[write_index]["version"]["sub_window"]["row_stride"] = json!(960);
+    context_resources[write_index]["version"]["sub_window"]["derived_element_count"] =
+        json!(15 * 64);
+    context_resources[write_index]["version"]["element_count"] = json!(15 * 64);
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(scattered_write).expect("mirror parse");
+    let error = map_envelope_to_descriptor(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        &artifact_dir,
+    )
+    .expect_err("a scattered write window must fail the mapper");
+    assert!(
+        error.contains("scattered write"),
+        "diagnostic must name the write-window law: {error}"
+    );
+
+    // A sub-window without its projection fact stays rejected (the V1 law).
+    let mut bare_sub_window = original.clone();
+    bare_sub_window["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+        .as_object_mut()
+        .expect("version object")
+        .remove("sub_window");
+    let parsed: Gea3ProgramPlanEnvelope =
+        serde_json::from_value(bare_sub_window).expect("mirror parse");
+    let error = map_envelope_to_descriptor(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        &artifact_dir,
+    )
+    .expect_err("a window count without the projection fact must fail the mapper");
+    assert!(
+        error.contains("sub-window without a projection fact")
+            || error.contains("conflicting element counts"),
+        "diagnostic must name the missing-fact or one-count law: {error}"
+    );
+
+    // The ABI tag is fail-closed: a V1 plan (no successor tag) cannot map.
+    let mut v1_plan = original.clone();
+    v1_plan["wire_buffer_abi"] = json!("gea3-wire-buffer-v1");
+    let parsed: Gea3ProgramPlanEnvelope = serde_json::from_value(v1_plan).expect("mirror parse");
+    let error = map_envelope_to_descriptor(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        &artifact_dir,
+    )
+    .expect_err("a V1-tagged plan must fail the mapper");
+    assert!(
+        error.contains("wire-buffer ABI"),
+        "diagnostic must name the ABI law: {error}"
+    );
 }
 
 #[test]
 fn gea3_fake_multi_step_structural_loop() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let (prefill, decode) = map_both(&envelope, &artifact_dir)
+    let ((prefill, _), (decode, _)) = map_both(&envelope, &artifact_dir)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     // The model and KV facts are admitted once, before the fake loop starts.
@@ -1483,6 +1806,10 @@ fn gea3_physical_plan_reds(
 #[derive(Debug)]
 struct Gea3PhysicalProgram {
     descriptor: DeviceDescriptor,
+    /// GEA3-A1: the per-kernel sub-window bindings of this program —
+    /// (kernel index, binding index) → (byte offset, view span).  A slot
+    /// without an entry binds its whole handle.
+    windows: Gea3WindowBindings,
     module: DeviceHandle,
     buffers: BTreeMap<(u32, u32), DeviceHandle>,
     output: (u32, u32),
@@ -1567,9 +1894,38 @@ fn gea3_unique_slots(descriptor: &DeviceDescriptor) -> BTreeMap<(u32, u32), Desc
     slots
 }
 
+/// GEA3-A1: one launch binding for a kernel slot — the carried sub-window's
+/// byte offset and view span when the plan declares one, the whole handle
+/// otherwise.  The B4 launch-binding surface carries (handle, binding
+/// index, byte offset, view span, source); the Metal session bounds-checks
+/// offset + span against the allocation before dispatch.
+fn gea3_launch_binding(
+    handle: DeviceHandle,
+    program: &Gea3PhysicalProgram,
+    kernel_index: u32,
+    slot: &DescriptorBuffer,
+) -> Result<DeviceLaunchBinding, String> {
+    match program
+        .windows
+        .get(&(kernel_index, slot.binding))
+        .copied()
+    {
+        Some((byte_offset, view_span)) => Ok(DeviceLaunchBinding {
+            handle,
+            binding_index: slot.binding,
+            byte_offset,
+            view_span,
+            runtime_source: DescriptorRuntimeSource::Constant,
+        }),
+        None => DeviceLaunchBinding::whole_handle(handle, slot.binding)
+            .map_err(|error| error.message.clone()),
+    }
+}
+
 fn gea3_prepare_physical_program(
     runtime: &mut DeviceRuntime,
     descriptor: DeviceDescriptor,
+    windows: Gea3WindowBindings,
     shared: &mut BTreeMap<String, DeviceHandle>,
 ) -> Result<Gea3PhysicalProgram, String> {
     let module = runtime
@@ -1641,6 +1997,7 @@ fn gea3_prepare_physical_program(
         }
         Ok(Gea3PhysicalProgram {
             descriptor,
+            windows,
             module,
             buffers: buffers.clone(),
             output,
@@ -2122,8 +2479,8 @@ fn gea3_release_programs(
 
 fn gea3_run_physical(
     runtime: &mut DeviceRuntime,
-    prefill: DeviceDescriptor,
-    decode: DeviceDescriptor,
+    prefill: (DeviceDescriptor, Gea3WindowBindings),
+    decode: (DeviceDescriptor, Gea3WindowBindings),
     input_manifest: &Value,
     model_path: &Path,
     prompt_tokens: &[u32],
@@ -2136,8 +2493,14 @@ fn gea3_run_physical(
     let mut shared = BTreeMap::new();
     let mut programs = Vec::new();
     let prepare = (|| {
-        let prefill_program = gea3_prepare_physical_program(runtime, prefill, &mut shared)?;
-        let decode_program = gea3_prepare_physical_program(runtime, decode, &mut shared)?;
+        let prefill_program = gea3_prepare_physical_program(
+            runtime,
+            prefill.0,
+            prefill.1,
+            &mut shared,
+        )?;
+        let decode_program =
+            gea3_prepare_physical_program(runtime, decode.0, decode.1, &mut shared)?;
         programs.push(prefill_program);
         programs.push(decode_program);
         Ok::<(), String>(())
@@ -2268,8 +2631,7 @@ fn gea3_run_physical(
                     .get(&(slot.buffer_id, slot.version))
                     .copied()
                     .ok_or_else(|| "prefill launch buffer disappeared".to_owned())?;
-                DeviceLaunchBinding::whole_handle(handle, slot.binding)
-                    .map_err(|error| error.message.clone())
+                gea3_launch_binding(handle, &programs[0], launch.kernel_index, slot)
             })
             .collect::<Result<_, _>>()?;
         runtime
@@ -2349,8 +2711,7 @@ fn gea3_run_physical(
                         .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| "decode launch buffer disappeared".to_owned())?;
-                    DeviceLaunchBinding::whole_handle(handle, slot.binding)
-                        .map_err(|error| error.message.clone())
+                    gea3_launch_binding(handle, &programs[1], launch.kernel_index, slot)
                 })
                 .collect::<Result<_, _>>()?;
             runtime
@@ -2481,7 +2842,7 @@ fn gea3_real_metal_decode_receipt() {
     let (prefill, decode) = map_both(&envelope, &artifact_dir)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
     let plan_admission_us = u64::try_from(plan_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let production_reds = gea3_physical_plan_reds(&envelope, &prefill, &decode);
+    let production_reds = gea3_physical_plan_reds(&envelope, &prefill.0, &decode.0);
 
     let devices = enumerate_metal_physical_devices().expect("Metal device enumeration");
     assert!(
@@ -2674,7 +3035,7 @@ fn gea3_real_metal_decode_receipt() {
 
 fn gea3_run_staged_diagnostic(
     runtime: &mut DeviceRuntime,
-    decode: DeviceDescriptor,
+    decode: (DeviceDescriptor, Gea3WindowBindings),
     decode_plan: &Gea3Program,
     input_manifest: &Value,
     model_path: &Path,
@@ -2688,7 +3049,7 @@ fn gea3_run_staged_diagnostic(
     let mut shared = BTreeMap::new();
     let mut programs = Vec::new();
     let result = (|| {
-        let program = gea3_prepare_physical_program(runtime, decode, &mut shared)?;
+        let program = gea3_prepare_physical_program(runtime, decode.0, decode.1, &mut shared)?;
         programs.push(program);
         let (weight_bytes, weight_uploads) = gea3_diagnostic_model_upload(
             runtime,
@@ -2727,8 +3088,7 @@ fn gea3_run_staged_diagnostic(
                         .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| "diagnostic launch buffer disappeared".to_owned())?;
-                    DeviceLaunchBinding::whole_handle(handle, slot.binding)
-                        .map_err(|error| error.message.clone())
+                    gea3_launch_binding(handle, program, launch.kernel_index, slot)
                 })
                 .collect::<Result<_, String>>()?;
             runtime
@@ -2998,8 +3358,8 @@ fn gea3_real_metal_staged_composition_diagnostic() {
             "schema": envelope.schema,
             "source": envelope.source,
             "program": "decode-step",
-            "launch_count": decode.launches.len(),
-            "dependency_count": decode.data_flow.len(),
+            "launch_count": decode.0.launches.len(),
+            "dependency_count": decode.0.data_flow.len(),
         },
         "measurement_policy": "No production receipt fields are changed; this harness stops only after naming a first bad route entry or proving every stage through logits writeback.",
     });
