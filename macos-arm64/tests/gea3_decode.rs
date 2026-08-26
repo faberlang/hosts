@@ -2200,6 +2200,27 @@ fn gea3_update_inputs(
                 let mut mask = vec![f32::NEG_INFINITY; count];
                 mask[..valid].fill(0.0);
                 copy(handle, mask)?;
+            } else if kernel.entry == "prefill_causal_softmax" && slot.binding == 1 {
+                // GEA3-U6 num-9: the resident causal mask — 0 at or below
+                // the diagonal, negative infinity above it (the
+                // decode_masked_softmax additive idiom).  The [36,36]
+                // count is the frozen prompt geometry.
+                let count = usize::try_from(slot.element_count)
+                    .map_err(|_| "prefill causal mask count overflows host usize".to_owned())?;
+                let extent = (count as f64).sqrt();
+                if extent.fract() != 0.0 || extent < 1.0 {
+                    return Err(format!(
+                        "prefill causal mask count {count} is not a square extent"
+                    ));
+                }
+                let extent = extent as usize;
+                let mut mask = vec![f32::NEG_INFINITY; count];
+                for row in 0..extent {
+                    let row_start = row * extent;
+                    let causal = (row + 1).min(extent);
+                    mask[row_start..row_start + causal].fill(0.0);
+                }
+                copy(handle, mask)?;
             } else if (kernel.entry == "kv_append_k" || kernel.entry == "kv_append_v")
                 && slot.binding == 1
             {
@@ -3302,6 +3323,86 @@ fn gea3_run_staged_diagnostic(
                 "rows_written": rows.iter().filter(|count| **count > 0).count(),
             }));
         }
+        // GEA3-U6 num-9 write-side probe (env-gated, full f32 arrays): the
+        // num-8 receipts proved the layer-1 arena bytes equal the layer-1
+        // prefill rope_k / k-projection outputs, so the WRITE is faithful —
+        // the divergence is upstream in the prefill attention chain.  This
+        // probe dumps every non-weight write buffer of layers 0..1 (q/k/v
+        // projections, rope_q/rope_k, per-head score/softmax/transpose/
+        // context, both residuals) plus all four probed arenas so the
+        // offline comparator can diff per element against the scalar oracle.
+        let mut write_side_probe = Vec::new();
+        if std::env::var_os("GEA3_WRITE_SIDE_PROBE").is_some() {
+            let probe_entries = [
+                "prefill_rmsnorm",
+                "prefill_gemm_qo",
+                "prefill_gemm_kv",
+                "prefill_rope_q",
+                "prefill_rope_k",
+                "prefill_key_transpose",
+                "prefill_score_gemm",
+                "prefill_causal_softmax",
+                "prefill_context_gemm",
+                "prefill_residual_add",
+                "prefill_swiglu",
+            ];
+            for kernel in &prefill_plan.kernels {
+                if !probe_entries.contains(&kernel.entry.as_str()) || kernel.layer > 1 {
+                    continue;
+                }
+                for resource in &kernel.resources {
+                    if resource.access != Gea3ResourceAccess::Write
+                        || gea3_diagnostic_resource_is_weight(resource)
+                    {
+                        continue;
+                    }
+                    let handle = prefill_program
+                        .buffers
+                        .get(&(resource.buffer.id, resource.version.version))
+                        .copied()
+                        .ok_or_else(|| "probe handle disappeared".to_owned())?;
+                    let bytes = runtime
+                        .readback_bytes(&handle, DeviceDataType::F32)
+                        .map_err(|error| error.message.clone())?;
+                    let values = gea3_f32_from_bytes(&bytes)?;
+                    write_side_probe.push(json!({
+                        "entry": kernel.entry,
+                        "layer": kernel.layer,
+                        "ordinal": kernel.ordinal,
+                        "name": resource.buffer.name,
+                        "element_count": values.len(),
+                        "values": values,
+                    }));
+                }
+            }
+            for kernel in &decode_plan.kernels {
+                if kernel.entry != "kv_append_k" && kernel.entry != "kv_append_v" {
+                    continue;
+                }
+                let layer = kernel.layer;
+                if layer > 1 {
+                    continue;
+                }
+                let resource = &kernel.resources[0];
+                let handle = decode_program
+                    .buffers
+                    .get(&(resource.buffer.id, resource.version.version))
+                    .copied()
+                    .ok_or_else(|| "arena handle disappeared".to_owned())?;
+                let bytes = runtime
+                    .readback_bytes(&handle, DeviceDataType::F32)
+                    .map_err(|error| error.message.clone())?;
+                let values = gea3_f32_from_bytes(&bytes)?;
+                write_side_probe.push(json!({
+                    "entry": kernel.entry,
+                    "layer": layer,
+                    "ordinal": kernel.ordinal,
+                    "name": resource.buffer.name,
+                    "element_count": values.len(),
+                    "values": values,
+                }));
+            }
+        }
         let prefill_launch_count = programs[0].descriptor.launches.len();
         let program = programs.last().expect("decode program retained");
         let token = *prompt_tokens
@@ -3514,6 +3615,7 @@ fn gea3_run_staged_diagnostic(
                     "chain_summaries": chain_summaries,
                     "arena_row_census": arena_row_census,
                 },
+                "write_side_probe": write_side_probe,
             },
             "input_uploads": input_uploads,
             "weights": {
