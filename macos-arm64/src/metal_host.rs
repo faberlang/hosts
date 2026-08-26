@@ -1281,6 +1281,11 @@ impl FakeMetalDriver {
         ("decode_residual_add", &[4]),
         ("prefill_rmsnorm", &[5]),
         ("prefill_gemm_qo", &[5]),
+        // GEA3-U6 num-10: the chunked o-projection member rides the
+        // launch-variant seam (the inert chain read is dropped) — 4
+        // bindings: chunked concat read, weights, inert weight extra,
+        // output.
+        ("prefill_gemm_o", &[4]),
         ("prefill_gemm_kv", &[5]),
         ("prefill_gemm_gate_up", &[5]),
         ("prefill_gemm_down", &[5]),
@@ -1290,7 +1295,8 @@ impl FakeMetalDriver {
         // (2 canonical bindings; see decode_key_transpose above).
         ("prefill_key_transpose", &[2]),
         ("prefill_score_gemm", &[4]),
-        ("prefill_causal_softmax", &[3]),
+        // GEA3-U6 num-9: +1 binding — the additive causal_mask operand.
+        ("prefill_causal_softmax", &[4]),
         ("prefill_context_gemm", &[3]),
         ("prefill_swiglu", &[4]),
         ("prefill_residual_add", &[4]),

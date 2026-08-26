@@ -277,6 +277,25 @@ struct Gea3BufferVersion {
     reduced_projection: Option<Gea3ReducedProjection>,
     #[serde(default)]
     sub_window: Option<Gea3SubWindowProjection>,
+    /// GEA3-U6 num-10: the chunked-geometry declaration — a head-major
+    /// producer read whose logical rows are discontiguous `block`-wide
+    /// chunks (the prefill attention concat the o-projection consumes).
+    #[serde(default)]
+    chunked_window: Option<Gea3ChunkedWindow>,
+}
+
+/// The hosts' typed mirror of the GEA3-U6 num-10 chunked-geometry
+/// declaration: `row_count` rows of `block` contiguous elements per
+/// chunk, chunks stacked head-major at `row_count · block` pitch.
+/// Admission mirrors the emitter's operand-pitch law fail-closed:
+/// read-only, never beside a sub-window projection, and the allocation
+/// must be a whole number of chunk cells (a flat read of a chunked truth
+/// is the same defect as a strided write of a flat truth).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gea3ChunkedWindow {
+    block: u64,
+    row_count: u64,
 }
 
 /// The hosts' typed mirror of the GEA3-WIRE-BUFFER-V2 sub-window
@@ -553,6 +572,54 @@ type Gea3WindowBindings = BTreeMap<(u32, u32), (u64, u64)>;
 /// two-truths guard mirrored from the schema authority
 /// `validate_carried_sub_window_projection`).  Returns the window's byte
 /// binding when the resource carries one.
+/// Admit one carried chunked-geometry declaration against the allocation
+/// it reads (the GEA3-U6 num-10 mirror of the emitter's admission law):
+/// read-only, never beside a sub-window projection, never degenerate, and
+/// the allocation must partition into whole `block · row_count` chunk
+/// cells with the carried count spanning every cell.  A flat read of a
+/// head-major truth is not admissible — the consumer must declare the
+/// geometry it addresses through.
+fn admit_chunked_window(
+    resource: &Gea3DeviceResource,
+    chunked: Gea3ChunkedWindow,
+    allocation: u64,
+) -> Result<(), String> {
+    if matches!(resource.access, Gea3ResourceAccess::Write) {
+        return Err(format!(
+            "resource `{}` carries a chunked window on a write slot; chunked reads are read-side operand-pitch facts only (GEA3-U6 num-10)",
+            resource.buffer.name
+        ));
+    }
+    if resource.version.sub_window.is_some() {
+        return Err(format!(
+            "resource `{}` carries both a sub-window and a chunked geometry; one binding carries one read geometry (GEA3-U6 num-10)",
+            resource.buffer.name
+        ));
+    }
+    let chunk_cells = chunked
+        .block
+        .checked_mul(chunked.row_count)
+        .ok_or_else(|| {
+            format!(
+                "resource `{}` carries a chunked window whose block · rows saturates u64",
+                resource.buffer.name
+            )
+        })?;
+    if chunked.block == 0 || chunked.row_count == 0 || resource.version.element_count == 0 {
+        return Err(format!(
+            "resource `{}` carries a degenerate chunked window (block {}, rows {})",
+            resource.buffer.name, chunked.block, chunked.row_count
+        ));
+    }
+    if resource.version.element_count != allocation || allocation % chunk_cells != 0 {
+        return Err(format!(
+            "resource `{}` carries a chunked window (block {} · rows {} = {chunk_cells}) that does not partition its {allocation}-element allocation; the declared geometry must equal the producer's head-major truth (GEA3-U6 num-10)",
+            resource.buffer.name, chunked.block, chunked.row_count
+        ));
+    }
+    Ok(())
+}
+
 fn admit_sub_window(
     resource: &Gea3DeviceResource,
     allocation: u64,
@@ -758,6 +825,9 @@ fn map_envelope_to_descriptor(
                     resource.buffer.name, key.0, key.1
                 )
             })?;
+            if let Some(chunked) = resource.version.chunked_window {
+                admit_chunked_window(resource, chunked, allocation)?;
+            }
             if let Some(binding) = admit_sub_window(resource, allocation)? {
                 if windows
                     .insert(
@@ -969,7 +1039,9 @@ fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
     }
-    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 36 {
+    // GEA3-U6 num-10: 37 members — the chunked o-projection entry
+    // (prefill_gemm_o) joined the module.
+    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 37 {
         return Err("module assembly facts drifted".to_owned());
     }
     if envelope.instance_expansion.layers != LAYERS
@@ -1164,6 +1236,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "decode_score_gemm"
         | "decode_context_gemm"
         | "prefill_gemm_qo"
+        | "prefill_gemm_o"
         | "prefill_gemm_kv"
         | "prefill_gemm_gate_up"
         | "prefill_gemm_down"
@@ -1260,6 +1333,7 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "decode_residual_add",
         "prefill_rmsnorm",
         "prefill_gemm_qo",
+        "prefill_gemm_o",
         "prefill_gemm_kv",
         "prefill_gemm_gate_up",
         "prefill_gemm_down",
@@ -1558,10 +1632,11 @@ fn gea3_negative_rows_fail_closed() {
     assert!(assert_declared_logits_only(&decode, u32::MAX).is_err());
 
     // GEA3-A1 negatives: the sub-window two-truths guard at the mapper.
-    // Launch 8 (kernels[7]) is the first key transpose; its canonical input
-    // carries the strided [76,64] k-cache window.
+    // Launch 10 (kernels[9], after the num-7 append reorder) is the first
+    // key transpose; its canonical input carries the strided [76,64]
+    // k-cache window.
     let mut wrong_derived = original.clone();
-    wrong_derived["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    wrong_derived["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         ["sub_window"]["derived_element_count"] = json!(4_863);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(wrong_derived).expect("mirror parse");
@@ -1578,7 +1653,7 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let mut off_the_end = original.clone();
-    off_the_end["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    off_the_end["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         ["sub_window"]["element_offset"] = json!(5 * 64);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(off_the_end).expect("mirror parse");
@@ -1600,7 +1675,7 @@ fn gea3_negative_rows_fail_closed() {
     // below the 320 pitch and a stride above it are both rejected.
     for (label, lying_stride) in [("below", 76u64), ("above", 640u64)] {
         let mut lying = original.clone();
-        lying["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
             ["sub_window"]["row_stride"] = json!(lying_stride);
         let parsed: Gea3ProgramPlanEnvelope =
             serde_json::from_value(lying).expect("mirror parse");
@@ -1620,10 +1695,10 @@ fn gea3_negative_rows_fail_closed() {
     }
 
     // The attention-output hybrid write window (first context launch,
-    // kernels[42]; its LAST resource is the windowed write) must stay
-    // contiguous.
+    // kernels[44] after the num-7 reorder; its LAST resource is the
+    // windowed write) must stay contiguous.
     let mut scattered_write = original.clone();
-    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][42]
+    let context_resources = scattered_write["programs"]["decode_step"]["kernels"][44]
         ["resources"]
         .as_array_mut()
         .expect("context resources");
@@ -1649,7 +1724,7 @@ fn gea3_negative_rows_fail_closed() {
 
     // A sub-window without its projection fact stays rejected (the V1 law).
     let mut bare_sub_window = original.clone();
-    bare_sub_window["programs"]["decode_step"]["kernels"][7]["resources"][0]["version"]
+    bare_sub_window["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
         .as_object_mut()
         .expect("version object")
         .remove("sub_window");
@@ -2198,6 +2273,27 @@ fn gea3_update_inputs(
                 let valid = usize::try_from(valid_len).unwrap_or(usize::MAX).min(count);
                 let mut mask = vec![f32::NEG_INFINITY; count];
                 mask[..valid].fill(0.0);
+                copy(handle, mask)?;
+            } else if kernel.entry == "prefill_causal_softmax" && slot.binding == 1 {
+                // GEA3-U6 num-9: the resident causal mask — 0 at or below
+                // the diagonal, negative infinity above it (the
+                // decode_masked_softmax additive idiom).  The [36,36]
+                // count is the frozen prompt geometry.
+                let count = usize::try_from(slot.element_count)
+                    .map_err(|_| "prefill causal mask count overflows host usize".to_owned())?;
+                let extent = (count as f64).sqrt();
+                if extent.fract() != 0.0 || extent < 1.0 {
+                    return Err(format!(
+                        "prefill causal mask count {count} is not a square extent"
+                    ));
+                }
+                let extent = extent as usize;
+                let mut mask = vec![f32::NEG_INFINITY; count];
+                for row in 0..extent {
+                    let row_start = row * extent;
+                    let causal = (row + 1).min(extent);
+                    mask[row_start..row_start + causal].fill(0.0);
+                }
                 copy(handle, mask)?;
             } else if (kernel.entry == "kv_append_k" || kernel.entry == "kv_append_v")
                 && slot.binding == 1
@@ -3301,6 +3397,87 @@ fn gea3_run_staged_diagnostic(
                 "rows_written": rows.iter().filter(|count| **count > 0).count(),
             }));
         }
+        // GEA3-U6 num-9 write-side probe (env-gated, full f32 arrays): the
+        // num-8 receipts proved the layer-1 arena bytes equal the layer-1
+        // prefill rope_k / k-projection outputs, so the WRITE is faithful —
+        // the divergence is upstream in the prefill attention chain.  This
+        // probe dumps every non-weight write buffer of layers 0..1 (q/k/v
+        // projections, rope_q/rope_k, per-head score/softmax/transpose/
+        // context, both residuals) plus all four probed arenas so the
+        // offline comparator can diff per element against the scalar oracle.
+        let mut write_side_probe = Vec::new();
+        if std::env::var_os("GEA3_WRITE_SIDE_PROBE").is_some() {
+            let probe_entries = [
+                "prefill_rmsnorm",
+                "prefill_gemm_qo",
+                "prefill_gemm_o",
+                "prefill_gemm_kv",
+                "prefill_rope_q",
+                "prefill_rope_k",
+                "prefill_key_transpose",
+                "prefill_score_gemm",
+                "prefill_causal_softmax",
+                "prefill_context_gemm",
+                "prefill_residual_add",
+                "prefill_swiglu",
+            ];
+            for kernel in &prefill_plan.kernels {
+                if !probe_entries.contains(&kernel.entry.as_str()) || kernel.layer > 1 {
+                    continue;
+                }
+                for resource in &kernel.resources {
+                    if resource.access != Gea3ResourceAccess::Write
+                        || gea3_diagnostic_resource_is_weight(resource)
+                    {
+                        continue;
+                    }
+                    let handle = prefill_program
+                        .buffers
+                        .get(&(resource.buffer.id, resource.version.version))
+                        .copied()
+                        .ok_or_else(|| "probe handle disappeared".to_owned())?;
+                    let bytes = runtime
+                        .readback_bytes(&handle, DeviceDataType::F32)
+                        .map_err(|error| error.message.clone())?;
+                    let values = gea3_f32_from_bytes(&bytes)?;
+                    write_side_probe.push(json!({
+                        "entry": kernel.entry,
+                        "layer": kernel.layer,
+                        "ordinal": kernel.ordinal,
+                        "name": resource.buffer.name,
+                        "element_count": values.len(),
+                        "values": values,
+                    }));
+                }
+            }
+            for kernel in &decode_plan.kernels {
+                if kernel.entry != "kv_append_k" && kernel.entry != "kv_append_v" {
+                    continue;
+                }
+                let layer = kernel.layer;
+                if layer > 1 {
+                    continue;
+                }
+                let resource = &kernel.resources[0];
+                let handle = decode_program
+                    .buffers
+                    .get(&(resource.buffer.id, resource.version.version))
+                    .copied()
+                    .ok_or_else(|| "arena handle disappeared".to_owned())?;
+                let bytes = runtime
+                    .readback_bytes(&handle, DeviceDataType::F32)
+                    .map_err(|error| error.message.clone())?;
+                let values = gea3_f32_from_bytes(&bytes)?;
+                write_side_probe.push(json!({
+                    "entry": kernel.entry,
+                    "layer": layer,
+                    "ordinal": kernel.ordinal,
+                    "name": resource.buffer.name,
+                    "element_count": values.len(),
+                    "values": values,
+                }));
+            }
+        }
         let prefill_launch_count = programs[0].descriptor.launches.len();
         let program = programs.last().expect("decode program retained");
         let token = *prompt_tokens
@@ -3513,6 +3690,7 @@ fn gea3_run_staged_diagnostic(
                     "chain_summaries": chain_summaries,
                     "arena_row_census": arena_row_census,
                 },
+                "write_side_probe": write_side_probe,
             },
             "input_uploads": input_uploads,
             "weights": {
