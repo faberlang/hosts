@@ -972,8 +972,8 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         "decode_masked_softmax" | "prefill_causal_softmax" => {
             matches!(plan, Gea3Plan::CausalMaskedSoftmax(_))
         }
-        "embedding_gather"
-        | "decode_swiglu"
+        "embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        "decode_swiglu"
         | "decode_residual_add"
         | "prefill_swiglu"
         | "prefill_residual_add" => matches!(plan, Gea3Plan::Elementwise),
