@@ -973,10 +973,9 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
             matches!(plan, Gea3Plan::CausalMaskedSoftmax(_))
         }
         "embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
-        "decode_swiglu"
-        | "decode_residual_add"
-        | "prefill_swiglu"
-        | "prefill_residual_add" => matches!(plan, Gea3Plan::Elementwise),
+        "decode_swiglu" | "decode_residual_add" | "prefill_swiglu" | "prefill_residual_add" => {
+            matches!(plan, Gea3Plan::Elementwise)
+        }
         "kv_append_k" | "kv_append_v" | "prefill_kv_write_k" | "prefill_kv_write_v" => {
             matches!(plan, Gea3Plan::TiledMatMul(_))
         }
@@ -1794,6 +1793,237 @@ fn gea3_update_inputs(
     Ok(copied.len())
 }
 
+fn gea3_diagnostic_buffer_summary(
+    runtime: &mut DeviceRuntime,
+    handle: &DeviceHandle,
+    slot: &Gea3DeviceResource,
+) -> Result<Value, String> {
+    let bytes = runtime
+        .readback_bytes(handle, DeviceDataType::F32)
+        .map_err(|error| error.message.clone())?;
+    let values = gea3_f32_from_bytes(&bytes)?;
+    let mut finite = 0usize;
+    let mut non_zero = 0usize;
+    let mut min = None;
+    let mut max = None;
+    let mut abs_sum = 0.0_f64;
+    for value in values.iter().copied() {
+        if value.is_finite() {
+            finite += 1;
+            min = Some(min.map_or(value, |previous: f32| previous.min(value)));
+            max = Some(max.map_or(value, |previous: f32| previous.max(value)));
+            abs_sum += f64::from(value.abs());
+        }
+        if value != 0.0 {
+            non_zero += 1;
+        }
+    }
+    let first_values = values
+        .iter()
+        .take(8)
+        .map(|value| {
+            if value.is_finite() {
+                json!(*value)
+            } else {
+                json!(format!("{value:?}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "buffer_id": slot.buffer.id,
+        "version": slot.version.version,
+        "name": slot.buffer.name,
+        "role": format!("{:?}", slot.buffer.role),
+        "access": format!("{:?}", slot.access),
+        "element_count": slot.version.element_count,
+        "readback_bytes": bytes.len(),
+        "sha256": gea3_readback_hash(&values),
+        "finite_count": finite,
+        "non_zero_count": non_zero,
+        "non_zero": non_zero != 0,
+        "min": min,
+        "max": max,
+        "mean_abs": if values.is_empty() {
+            0.0
+        } else {
+            abs_sum / values.len() as f64
+        },
+        "first_values": first_values,
+    }))
+}
+
+fn gea3_diagnostic_model_upload(
+    runtime: &mut DeviceRuntime,
+    program: &Gea3PhysicalProgram,
+    shared: &BTreeMap<String, DeviceHandle>,
+    model_ranges: &BTreeMap<String, (u64, u64)>,
+    mapped: &MappedWeightFile,
+) -> Result<(u64, usize), String> {
+    let mut weight_bytes = 0_u64;
+    let mut weight_uploads = 0usize;
+    for (name, handle) in shared
+        .iter()
+        .filter_map(|(key, handle)| key.strip_prefix("weight:").map(|name| (name, *handle)))
+    {
+        let (start, end) = model_ranges
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("no frozen GGUF range for model tensor `{name}`"))?;
+        let start =
+            usize::try_from(start).map_err(|_| format!("tensor `{name}` offset overflows"))?;
+        let end = usize::try_from(end).map_err(|_| format!("tensor `{name}` end overflows"))?;
+        let bytes = mapped
+            .bytes()
+            .get(start..end)
+            .ok_or_else(|| format!("tensor `{name}` range is outside GGUF"))?;
+        let expected = handle
+            .len_bytes()
+            .ok_or_else(|| format!("tensor `{name}` handle has no byte length"))?;
+        if expected != bytes.len() as u64 {
+            return Err(format!(
+                "tensor `{name}` declares {expected} bytes but GGUF carries {}",
+                bytes.len()
+            ));
+        }
+        runtime
+            .copy_in_bytes(&handle, bytes, DeviceDataType::U8)
+            .map_err(|error| error.message.clone())?;
+        weight_bytes = weight_bytes.saturating_add(bytes.len() as u64);
+        weight_uploads += 1;
+    }
+    if weight_uploads != 290 {
+        return Err(format!(
+            "uploaded {weight_uploads} model weights, expected 290"
+        ));
+    }
+
+    // A diagnostic run must not inherit allocator contents for the many
+    // synthetic input/output slots in the exported composition.  Model
+    // weights are uploaded above; every other slot starts from an explicit
+    // zero so a zero readback names the route rather than stale device data.
+    let slots = gea3_unique_slots(&program.descriptor);
+    let mut zeroed = BTreeSet::new();
+    for (key, handle) in &program.buffers {
+        let slot = slots
+            .get(key)
+            .ok_or_else(|| "diagnostic slot metadata disappeared".to_owned())?;
+        if gea3_canonical_model_name(&slot.buffer_name).is_some() {
+            continue;
+        }
+        if zeroed.insert(handle.id) {
+            gea3_zero_handle(runtime, handle)?;
+        }
+    }
+    Ok((weight_bytes, weight_uploads))
+}
+
+fn gea3_diagnostic_resource_is_weight(resource: &Gea3DeviceResource) -> bool {
+    gea3_canonical_model_name(&resource.buffer.name).is_some()
+}
+
+fn gea3_diagnostic_read_slots(
+    runtime: &mut DeviceRuntime,
+    program: &Gea3PhysicalProgram,
+    kernel: &Gea3KernelUnit,
+    input: bool,
+) -> Result<Vec<Value>, String> {
+    kernel
+        .resources
+        .iter()
+        .filter(|resource| {
+            if gea3_diagnostic_resource_is_weight(resource) {
+                return false;
+            }
+            if input {
+                matches!(
+                    resource.access,
+                    Gea3ResourceAccess::Read | Gea3ResourceAccess::ReadWrite
+                )
+            } else {
+                matches!(
+                    resource.access,
+                    Gea3ResourceAccess::Write | Gea3ResourceAccess::ReadWrite
+                )
+            }
+        })
+        .map(|resource| {
+            let handle = program
+                .buffers
+                .get(&(resource.buffer.id, resource.version.version))
+                .ok_or_else(|| {
+                    format!(
+                        "diagnostic buffer {} version {} disappeared",
+                        resource.buffer.id, resource.version.version
+                    )
+                })?;
+            gea3_diagnostic_buffer_summary(runtime, handle, resource)
+        })
+        .collect()
+}
+
+fn gea3_diagnostic_primary_slot<'a>(
+    kernel: &'a Gea3KernelUnit,
+    input: bool,
+) -> Option<&'a Gea3DeviceResource> {
+    // Prefer the direct read edge.  A ReadWrite KV arena is a side effect of
+    // the K/V launch, not the activation consumed by the entry.  Falling back
+    // to ReadWrite keeps the helper useful for entries whose only input is a
+    // state arena.
+    kernel
+        .resources
+        .iter()
+        .filter(|resource| !gea3_diagnostic_resource_is_weight(resource))
+        .find(|resource| {
+            if input {
+                resource.access == Gea3ResourceAccess::Read
+                    && resource.buffer.role != Gea3BufferRole::Input
+            } else {
+                resource.access == Gea3ResourceAccess::Write
+            }
+        })
+        .or_else(|| {
+            kernel.resources.iter().find(|resource| {
+                !gea3_diagnostic_resource_is_weight(resource)
+                    && if input {
+                        resource.access == Gea3ResourceAccess::Read
+                    } else {
+                        resource.access == Gea3ResourceAccess::Write
+                    }
+            })
+        })
+        .or_else(|| {
+            kernel.resources.iter().find(|resource| {
+                !gea3_diagnostic_resource_is_weight(resource)
+                    && if input {
+                        matches!(
+                            resource.access,
+                            Gea3ResourceAccess::Read | Gea3ResourceAccess::ReadWrite
+                        )
+                    } else {
+                        matches!(
+                            resource.access,
+                            Gea3ResourceAccess::Write | Gea3ResourceAccess::ReadWrite
+                        )
+                    }
+            })
+        })
+}
+
+fn gea3_diagnostic_summary_non_zero(summary: &Value) -> bool {
+    summary["non_zero"].as_bool().unwrap_or(false)
+}
+
+fn gea3_diagnostic_expected_buffer(
+    descriptor: &DeviceDescriptor,
+    launch_id: u32,
+) -> Option<(u32, u32)> {
+    descriptor
+        .data_flow
+        .iter()
+        .find(|edge| edge.consumer == launch_id)
+        .map(|edge| (edge.producer, edge.buffer_id))
+}
+
 fn gea3_launch_rows(descriptor: &DeviceDescriptor) -> Vec<Value> {
     descriptor
         .launches
@@ -2407,5 +2637,347 @@ fn gea3_real_metal_decode_receipt() {
     assert_eq!(
         receipt["status"], "green",
         "GEA3-U5b physical receipt is blocked; receipt was written first"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GEA3 composition diagnostic.  This is deliberately separate from the U5b
+// receipt path: it reads every produced intermediate after each dependency-
+// ordered launch and stops at the first route transition whose upstream value
+// was non-zero but whose declared consumer/output path is zero.  It is a
+// diagnostic harness only, not a production receipt path.
+// ---------------------------------------------------------------------------
+
+fn gea3_run_staged_diagnostic(
+    runtime: &mut DeviceRuntime,
+    decode: DeviceDescriptor,
+    decode_plan: &Gea3Program,
+    input_manifest: &Value,
+    model_path: &Path,
+    prompt_tokens: &[u32],
+) -> Result<Value, String> {
+    let model_ranges = gea3_model_ranges(input_manifest)?;
+    let mapped = MappedWeightFile::open(model_path).map_err(|error| error.message.clone())?;
+    runtime
+        .retain_mapped_weight_file(mapped.clone())
+        .map_err(|error| error.message.clone())?;
+    let mut shared = BTreeMap::new();
+    let mut programs = Vec::new();
+    let result = (|| {
+        let program = gea3_prepare_physical_program(runtime, decode, &mut shared)?;
+        programs.push(program);
+        let (weight_bytes, weight_uploads) = gea3_diagnostic_model_upload(
+            runtime,
+            programs.first().expect("diagnostic program prepared"),
+            &shared,
+            &model_ranges,
+            &mapped,
+        )?;
+        let program = programs.first().expect("diagnostic program retained");
+        let token = *prompt_tokens
+            .last()
+            .ok_or_else(|| "frozen comparator prompt is empty".to_owned())?;
+        let input_uploads = gea3_update_inputs(
+            runtime,
+            program,
+            &[token],
+            u32::try_from(prompt_tokens.len()).map_err(|_| "prompt is too long".to_owned())?,
+            u32::try_from(prompt_tokens.len() + 1)
+                .map_err(|_| "decode valid length overflows".to_owned())?,
+            false,
+        )?;
+
+        let mut stages = Vec::new();
+        let mut previous_output = None;
+        let mut first_bad = None;
+        for launch in &program.descriptor.launches {
+            let descriptor_kernel = &program.descriptor.kernels[launch.kernel_index as usize];
+            let plan_kernel = &decode_plan.kernels[launch.kernel_index as usize];
+            let bindings: Vec<DeviceLaunchBinding> = descriptor_kernel
+                .buffers
+                .iter()
+                .map(|slot| {
+                    let handle = program
+                        .buffers
+                        .get(&(slot.buffer_id, slot.version))
+                        .copied()
+                        .ok_or_else(|| "diagnostic launch buffer disappeared".to_owned())?;
+                    DeviceLaunchBinding::whole_handle(handle, slot.binding)
+                        .map_err(|error| error.message.clone())
+                })
+                .collect::<Result<_, String>>()?;
+            runtime
+                .launch_kernel_bound(
+                    &program.module,
+                    &descriptor_kernel.entry,
+                    &bindings,
+                    descriptor_kernel.grid,
+                    descriptor_kernel.block,
+                )
+                .map_err(|error| error.message.clone())?;
+            runtime.sync().map_err(|error| error.message.clone())?;
+
+            let inputs = gea3_diagnostic_read_slots(runtime, program, plan_kernel, true)?;
+            let outputs = gea3_diagnostic_read_slots(runtime, program, plan_kernel, false)?;
+            let primary_input = gea3_diagnostic_primary_slot(plan_kernel, true)
+                .ok_or_else(|| format!("{} has no diagnostic input", plan_kernel.entry))?;
+            let primary_output = gea3_diagnostic_primary_slot(plan_kernel, false)
+                .ok_or_else(|| format!("{} has no diagnostic output", plan_kernel.entry))?;
+            let primary_input_summary = inputs
+                .iter()
+                .find(|summary| {
+                    summary["buffer_id"].as_u64() == Some(u64::from(primary_input.buffer.id))
+                        && summary["version"].as_u64()
+                            == Some(u64::from(primary_input.version.version))
+                })
+                .cloned()
+                .ok_or_else(|| "primary diagnostic input summary disappeared".to_owned())?;
+            let primary_output_summary = outputs
+                .iter()
+                .find(|summary| {
+                    summary["buffer_id"].as_u64() == Some(u64::from(primary_output.buffer.id))
+                        && summary["version"].as_u64()
+                            == Some(u64::from(primary_output.version.version))
+                })
+                .cloned()
+                .ok_or_else(|| "primary diagnostic output summary disappeared".to_owned())?;
+            let expected_buffer = gea3_diagnostic_expected_buffer(&program.descriptor, launch.id);
+            let upstream_non_zero = previous_output
+                .as_ref()
+                .is_some_and(gea3_diagnostic_summary_non_zero);
+            let output_non_zero = gea3_diagnostic_summary_non_zero(&primary_output_summary);
+            let wiring_mismatch =
+                expected_buffer.is_some_and(|(_, buffer_id)| buffer_id != primary_input.buffer.id);
+            let stage_is_bad =
+                launch.id > 1 && upstream_non_zero && (!output_non_zero || wiring_mismatch);
+            let abi = plan_kernel
+                .resources
+                .iter()
+                .map(|resource| {
+                    json!({
+                        "binding": resource.binding.binding,
+                        "access": format!("{:?}", resource.access),
+                        "buffer_id": resource.buffer.id,
+                        "version": resource.version.version,
+                        "name": resource.buffer.name,
+                        "role": format!("{:?}", resource.buffer.role),
+                        "element_count": resource.version.element_count,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let stage = json!({
+                "launch_id": launch.id,
+                "kernel_index": launch.kernel_index,
+                "layer": plan_kernel.layer,
+                "ordinal": plan_kernel.ordinal,
+                "entry": plan_kernel.entry,
+                "abi": {
+                    "binding_count": plan_kernel.resources.len(),
+                    "bindings": abi,
+                },
+                "expected_dependency": expected_buffer.map(|(producer, buffer_id)| json!({
+                    "producer_launch": producer,
+                    "buffer_id": buffer_id,
+                })),
+                "input": primary_input_summary,
+                "outputs": outputs,
+                "primary_output": primary_output_summary,
+                "upstream_primary_output": previous_output,
+                "wiring_mismatch": wiring_mismatch,
+                "stage_is_bad": stage_is_bad,
+                "readback_policy": "sync after this launch; read all non-weight inputs and produced outputs",
+            });
+            if stage_is_bad && first_bad.is_none() {
+                first_bad = Some(json!({
+                    "launch_id": launch.id,
+                    "entry": plan_kernel.entry,
+                    "abi": stage["abi"].clone(),
+                    "buffer_pair": {
+                        "expected_source": stage["expected_dependency"].clone(),
+                        "upstream_output": stage["upstream_primary_output"].clone(),
+                        "actual_consumer_input": stage["input"].clone(),
+                        "destination": stage["primary_output"].clone(),
+                    },
+                    "evidence": {
+                        "upstream_non_zero": upstream_non_zero,
+                        "actual_input_non_zero": gea3_diagnostic_summary_non_zero(&stage["input"]),
+                        "destination_non_zero": output_non_zero,
+                        "wiring_mismatch": wiring_mismatch,
+                    },
+                }));
+            }
+            stages.push(stage);
+            previous_output = Some(primary_output_summary);
+            if first_bad.is_some() {
+                break;
+            }
+        }
+
+        let terminal = stages.last().map(|stage| {
+            json!({
+                "launch_id": stage["launch_id"],
+                "entry": stage["entry"],
+                "buffer": stage["primary_output"],
+                "non_zero": gea3_diagnostic_summary_non_zero(&stage["primary_output"]),
+            })
+        });
+        Ok(json!({
+            "status": if first_bad.is_some() {
+                "first-bad-entry"
+            } else {
+                "composition-through-logits-writeback"
+            },
+            "route": "decode-step",
+            "token": token,
+            "input_uploads": input_uploads,
+            "weights": {
+                "upload_count": weight_uploads,
+                "bytes": weight_bytes,
+            },
+            "stages_executed": stages.len(),
+            "stages": stages,
+            "first_bad": first_bad,
+            "terminal": terminal,
+            "diagnostic_policy": "real Metal, real F32 GGUF weights, dependency-order launches, internal F32 readback after every stage; no CPU model substitute",
+        }))
+    })();
+    let release = gea3_release_programs(runtime, &mut programs);
+    match (result, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(release_error)) => Err(format!(
+            "{error}; diagnostic teardown failed: {release_error}"
+        )),
+    }
+}
+
+#[test]
+#[ignore = "diagnostic physical Metal gate; requires exact GEA3 artifact/model/receipt env"]
+fn gea3_real_metal_staged_composition_diagnostic() {
+    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("faberlang workspace root");
+    let artifact_dir = gea3_artifact_dir();
+    let receipt_path = PathBuf::from(
+        std::env::var_os("GEA3_DIAGNOSTIC_RECEIPT")
+            .expect("GEA3_DIAGNOSTIC_RECEIPT must identify the diagnostic output"),
+    );
+    let model_path = PathBuf::from(
+        std::env::var_os("GEA3_F32_GGUF").expect("GEA3_F32_GGUF must identify the frozen F32 GGUF"),
+    );
+    assert!(
+        model_path.is_file(),
+        "missing GEA3 F32 GGUF {}",
+        model_path.display()
+    );
+    let envelope = load_gea3_plan(&artifact_dir);
+    let (_, decode) = map_both(&envelope, &artifact_dir)
+        .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
+    let input_manifest_path = workspace
+        .join("radix/docs/factory/gpu-execution-architecture/evidence/gea3-input-manifest.json");
+    let input_manifest: Value = serde_json::from_slice(
+        &fs::read(&input_manifest_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", input_manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("parse {}: {error}", input_manifest_path.display()));
+    let prompt_tokens: Vec<u32> = input_manifest["prompt_fixture"]["comparator_token_ids"]
+        .as_array()
+        .expect("frozen comparator prompt token ids")
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("prompt token fits u32")
+        })
+        .collect();
+
+    let devices = enumerate_metal_physical_devices().expect("Metal device enumeration");
+    assert!(
+        !devices.is_empty(),
+        "Metal selected but no physical device identity exists"
+    );
+    let device = &devices[0];
+    let session_result = CompositeHost::new(CompositeHostConfig::device(DeviceSelection::Metal))
+        .and_then(|host| {
+            host.require_implicit_local()?;
+            Ok(host)
+        });
+    let mut receipt = json!({
+        "schema": "gea3-staged-composition-diagnostic-v1",
+        "delivery": "GEA3-U7-GEA3-numerical-closeout-diagnostic",
+        "status": if session_result.is_ok() { "physical-run" } else { "blocked" },
+        "diagnostic_only": true,
+        "machine": Command::new("hostname").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+        "revisions": {
+            "gradus": gea3_git_revision(&workspace.join("gradus")),
+            "radix": gea3_git_revision(&workspace.join("radix")),
+            "hosts": gea3_git_revision(&workspace.join("hosts")),
+        },
+        "physical_device": {
+            "backend": "Metal",
+            "ordinal": device.ordinal,
+            "registry_id": device.registry_id,
+            "model": device.device_model,
+        },
+        "plan": {
+            "schema": envelope.schema,
+            "source": envelope.source,
+            "program": "decode-step",
+            "launch_count": decode.launches.len(),
+            "dependency_count": decode.data_flow.len(),
+        },
+        "measurement_policy": "No production receipt fields are changed; this harness stops only after naming a first bad route entry or proving every stage through logits writeback.",
+    });
+    if let Ok(mut host) = session_result {
+        let execution = host
+            .device_mut()
+            .ok_or_else(|| "physical admission has no device runtime".to_owned())
+            .and_then(|runtime| {
+                gea3_run_staged_diagnostic(
+                    runtime,
+                    decode,
+                    &envelope.programs.decode_step,
+                    &input_manifest,
+                    &model_path,
+                    &prompt_tokens,
+                )
+            });
+        match execution {
+            Ok(execution) => {
+                receipt["status"] = json!(execution["status"]);
+                receipt["execution"] = execution;
+            }
+            Err(error) => {
+                receipt["status"] = json!("blocked");
+                receipt["blocked_reason"] = json!([error]);
+            }
+        }
+    } else {
+        receipt["blocked_reason"] = json!(["physical Metal session admission failed"]);
+    }
+    let parent = receipt_path.parent().expect("diagnostic receipt parent");
+    fs::create_dir_all(parent).expect("create diagnostic receipt parent");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec_pretty(&receipt).expect("serialize staged diagnostic receipt"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", receipt_path.display()));
+    eprintln!(
+        "GEA3 staged composition diagnostic: {}",
+        receipt_path.display()
+    );
+
+    assert_eq!(
+        receipt["status"], "first-bad-entry",
+        "diagnostic must name the first bad composition entry or prove the route through logits"
+    );
+    assert!(
+        receipt["execution"]["first_bad"].is_object()
+            || receipt["execution"]["status"] == "composition-through-logits-writeback",
+        "diagnostic receipt lacks first-bad evidence or terminal proof"
     );
 }
