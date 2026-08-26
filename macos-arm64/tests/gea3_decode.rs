@@ -50,6 +50,11 @@ const KV_WIDTH: u64 = 320;
 const VOCAB: u64 = 49_152;
 const HIDDEN: u64 = 960;
 const DECODE_STEPS: usize = 8;
+// PPB-U3: the optional parity timing companion the physical test emits in
+// addition to — never instead of — its `gea3-metal-receipt-v1` receipt.  The
+// environment names the output path; an unset variable is the opt-out.
+const PARITY_COMPANION_SCHEMA: &str = "gea3-parity-timing-companion-v1";
+const PARITY_COMPANION_ENV: &str = "GEA3_PARITY_TIMING_COMPANION";
 
 // ---------------------------------------------------------------------------
 // Hosts' typed serde mirror of the GEA3 transport envelope.  This is a
@@ -2507,6 +2512,14 @@ fn gea3_copy_f32(
         .map_err(|error| error.message.clone())
 }
 
+/// Observed dynamic-input uploads for one step (PPB-U3): the copy count the
+/// GEA3 receipt has always carried, plus the staged byte total the parity
+/// companion reports as a host-to-device transfer observation.
+struct Gea3InputUploads {
+    copies: usize,
+    bytes: u64,
+}
+
 fn gea3_update_inputs(
     runtime: &mut DeviceRuntime,
     program: &Gea3PhysicalProgram,
@@ -2514,10 +2527,13 @@ fn gea3_update_inputs(
     position: u32,
     valid_len: u32,
     prefill: bool,
-) -> Result<usize, String> {
+) -> Result<Gea3InputUploads, String> {
     let mut copied = BTreeSet::new();
+    let mut uploaded_bytes = 0_u64;
     let mut copy = |handle: DeviceHandle, values: Vec<f32>| -> Result<(), String> {
         if copied.insert(handle.id) {
+            uploaded_bytes =
+                uploaded_bytes.saturating_add(u64::try_from(values.len() * 4).unwrap_or(u64::MAX));
             gea3_copy_f32(runtime, &handle, &values)?;
         }
         Ok(())
@@ -2643,7 +2659,10 @@ fn gea3_update_inputs(
             }
         }
     }
-    Ok(copied.len())
+    Ok(Gea3InputUploads {
+        copies: copied.len(),
+        bytes: uploaded_bytes,
+    })
 }
 
 fn gea3_diagnostic_buffer_summary(
@@ -2973,6 +2992,500 @@ fn gea3_release_programs(
     first_error.map_or(Ok(()), Err)
 }
 
+// ---------------------------------------------------------------------------
+// PPB-U3: the optional parity timing companion (gea3-parity-timing-
+// companion-v1).  The companion is disjoint from `gea3-metal-receipt-v1`:
+// the physical test keeps emitting its original receipt unchanged and
+// additionally emits this versioned companion when the environment names an
+// output path.  Every phase is directly measured on its own clock and the
+// boundaries never overlap: the launch/encode clock ends before the queue
+// wait begins, and the queue wait ends at the declared completion point
+// (the explicit step `sync` return).  No category is a total minus other
+// terms, and a unified-memory allocation is never called a transfer without
+// an observed copy event.
+// ---------------------------------------------------------------------------
+
+/// One directly measured host-wall phase: the phase clock's own duration
+/// plus the phase boundaries on the step clock.  The duration is always an
+/// independent `elapsed` reading of the phase clock, never a difference of
+/// the two boundaries.
+struct Gea3ParityPhase {
+    start_since_step_us: u64,
+    end_since_step_us: u64,
+    duration_us: u64,
+}
+
+/// Per-step companion observations (prefill step 0, then each decode step).
+struct Gea3ParityStep {
+    mode: &'static str,
+    step: u64,
+    input_upload: Gea3ParityPhase,
+    input_upload_bytes: u64,
+    input_upload_copies: usize,
+    launch_encode: Gea3ParityPhase,
+    queue_wait: Gea3ParityPhase,
+    gpu_encoder_us: Option<u64>,
+    gpu_timestamp_count: usize,
+    gpu_start_timestamp_count: usize,
+    command_submits: usize,
+    blocking_waits: usize,
+    readback: Gea3ParityPhase,
+    readback_bytes: u64,
+}
+
+/// Run-level residency and transfer observations collected by the physical
+/// run before the prefill/decode steps.
+struct Gea3ParityResidency {
+    weight_alloc_us: u64,
+    weight_upload_us: u64,
+    weight_bytes: u64,
+    weight_uploads: u64,
+    kv_alloc_us: u64,
+    kv_zero_fill_us: u64,
+    kv_zero_fill_bytes: u64,
+    other_zero_fills: u64,
+}
+
+/// The complete PPB-U3 observation set handed to the companion builder.
+struct Gea3ParityTiming {
+    residency: Gea3ParityResidency,
+    steps: Vec<Gea3ParityStep>,
+}
+
+fn gea3_parity_measured(value: u64, basis: &str) -> Value {
+    json!({"value": value, "status": "measured", "basis": basis})
+}
+
+fn gea3_parity_count(value: u64, basis: &str) -> Value {
+    json!({"value": value, "status": "measured", "basis": basis})
+}
+
+fn gea3_parity_not_measured(reason: &str) -> Value {
+    json!({"value": Value::Null, "status": "not_measured", "reason": reason})
+}
+
+fn gea3_parity_not_observable(reason: &str) -> Value {
+    json!({"value": Value::Null, "status": "not_observable", "reason": reason})
+}
+
+fn gea3_parity_boundaries(phase: &Gea3ParityPhase) -> Value {
+    json!({
+        "start_us_since_step_start": phase.start_since_step_us,
+        "end_us_since_step_start": phase.end_since_step_us,
+        "status": "measured",
+        "basis": "monotonic step clock read at each phase boundary",
+    })
+}
+
+/// The non-overlap law, fail closed: the input-upload clock ends no later
+/// than the launch/encode clock begins, the launch/encode clock ends before
+/// the queue wait begins, and the queue wait ends at the declared
+/// completion point before the readback begins.
+fn gea3_parity_admit_step_boundaries(step: &Gea3ParityStep) -> Result<(), String> {
+    let name = format!("{} step {}", step.mode, step.step);
+    if step.input_upload.end_since_step_us > step.launch_encode.start_since_step_us {
+        return Err(format!(
+            "{name}: input-upload boundary {} overlaps launch/encode start {}",
+            step.input_upload.end_since_step_us, step.launch_encode.start_since_step_us
+        ));
+    }
+    if step.launch_encode.end_since_step_us > step.queue_wait.start_since_step_us {
+        return Err(format!(
+            "{name}: launch/encode clock ends at {} but queue wait begins at {}; the encode clock must end before the queue wait begins",
+            step.launch_encode.end_since_step_us, step.queue_wait.start_since_step_us
+        ));
+    }
+    if step.queue_wait.end_since_step_us > step.readback.start_since_step_us {
+        return Err(format!(
+            "{name}: queue wait ends at {} but readback begins at {}; the queue wait must end at the declared completion point first",
+            step.queue_wait.end_since_step_us, step.readback.start_since_step_us
+        ));
+    }
+    Ok(())
+}
+
+fn gea3_parity_step_json(step: &Gea3ParityStep) -> Value {
+    let gpu_encoder = match step.gpu_encoder_us {
+        Some(sum) => gea3_parity_measured(
+            sum,
+            "sum of per-encoder device GPU timestamps for this step (FABER_PER_OP_TIMING)",
+        ),
+        None => gea3_parity_not_measured(
+            "the driver sampled no GPU timestamps for this step; no encoder time is inferred",
+        ),
+    };
+    json!({
+        "mode": step.mode,
+        "step": step.step,
+        "host_input_upload": {
+            "duration_us": gea3_parity_measured(step.input_upload.duration_us, "phase clock around dynamic-input staging copy_in_bytes (host to device)"),
+            "bytes": gea3_parity_measured(step.input_upload_bytes, "sum of staged f32 payloads actually copied in"),
+            "copies": gea3_parity_count(step.input_upload_copies as u64, "distinct device handles staged this step"),
+            "transfer": {"status": "measured", "basis": "observed copy_in_bytes events into regular allocations"},
+            "boundary": gea3_parity_boundaries(&step.input_upload),
+        },
+        "host_launch_encode": {
+            "duration_us": gea3_parity_measured(step.launch_encode.duration_us, "launch encode wall; this clock ends before the queue wait begins"),
+            "boundary": gea3_parity_boundaries(&step.launch_encode),
+        },
+        "queue_wait": {
+            "duration_us": gea3_parity_measured(step.queue_wait.duration_us, "explicit step sync wall (command-buffer commit plus wait, one DeviceRuntime call)"),
+            "ends_at": {"value": "explicit runtime.sync() return — the declared completion point", "status": "measured"},
+            "blocking_waits": gea3_parity_count(step.blocking_waits as u64, "blocking waits inside this phase"),
+            "boundary": gea3_parity_boundaries(&step.queue_wait),
+        },
+        "gpu_encoder": {
+            "duration_us": gpu_encoder,
+            "timestamp_count": gea3_parity_count(step.gpu_timestamp_count as u64, "sampled per-encoder GPU end timestamps"),
+            "gpu_start_timestamp_count": gea3_parity_count(step.gpu_start_timestamp_count as u64, "sampled per-encoder GPU start timestamps"),
+            "clock": "device GPU timestamps (independent of the host wall phases)",
+        },
+        "command_submits": {
+            "value": step.command_submits,
+            "status": "measured",
+            "basis": "pending command-buffer commits at the step boundary",
+        },
+        "command_submit_wall": gea3_parity_not_observable(
+            "commit and waitUntilCompleted are one DeviceRuntime::sync call on this surface; a submit-only wall cannot be separated without inferring it",
+        ),
+        "device_to_host_readback": {
+            "duration_us": gea3_parity_measured(step.readback.duration_us, "phase clock around the declared logits readback"),
+            "bytes": gea3_parity_measured(step.readback_bytes, "declared logits observation bytes read back"),
+            "transfer": {"status": "measured", "basis": "observed copy_out event after the step flush"},
+            "boundary": gea3_parity_boundaries(&step.readback),
+        },
+    })
+}
+
+fn gea3_parity_summed(label: &str, values: &[u64], total_steps: usize) -> Value {
+    if values.is_empty() {
+        return gea3_parity_not_measured(&format!("no measured {label} observations to sum"));
+    }
+    json!({
+        "value": values.iter().copied().sum::<u64>(),
+        "status": "derived",
+        "steps_measured": values.len(),
+        "steps_not_measured": total_steps - values.len(),
+        "basis": format!("sum of directly measured per-step {label} phases; no term is a total minus other terms"),
+    })
+}
+
+/// Build the versioned companion from directly measured observations.  The
+/// boundary law is admitted fail-closed; nothing here subtracts a total and
+/// every absent fact keeps an explicit status.
+fn gea3_build_parity_companion(
+    timing: &Gea3ParityTiming,
+    source_receipt: &str,
+) -> Result<Value, String> {
+    for step in &timing.steps {
+        gea3_parity_admit_step_boundaries(step)?;
+    }
+    let prefill_steps: Vec<&Gea3ParityStep> = timing
+        .steps
+        .iter()
+        .filter(|step| step.mode == "prefill")
+        .collect();
+    let decode_steps: Vec<&Gea3ParityStep> = timing
+        .steps
+        .iter()
+        .filter(|step| step.mode == "decode")
+        .collect();
+    let summarize = |steps: &[&Gea3ParityStep]| -> Value {
+        json!({
+            "input_upload_us": gea3_parity_summed("input upload", &steps.iter().map(|step| step.input_upload.duration_us).collect::<Vec<_>>(), steps.len()),
+            "launch_encode_us": gea3_parity_summed("launch encode", &steps.iter().map(|step| step.launch_encode.duration_us).collect::<Vec<_>>(), steps.len()),
+            "queue_wait_us": gea3_parity_summed("queue wait", &steps.iter().map(|step| step.queue_wait.duration_us).collect::<Vec<_>>(), steps.len()),
+            "gpu_encoder_us": gea3_parity_summed("GPU encoder", &steps.iter().filter_map(|step| step.gpu_encoder_us).collect::<Vec<_>>(), steps.len()),
+            "readback_us": gea3_parity_summed("readback", &steps.iter().map(|step| step.readback.duration_us).collect::<Vec<_>>(), steps.len()),
+        })
+    };
+    let residency = &timing.residency;
+    Ok(json!({
+        "schema": PARITY_COMPANION_SCHEMA,
+        "delivery": "PPB-U3",
+        "source_test": "gea3_real_metal_decode_receipt",
+        "source_receipt_schema": "gea3-metal-receipt-v1",
+        "source_receipt_path": source_receipt,
+        "measurement_laws": [
+            "the launch/encode clock ends before the queue wait begins",
+            "the queue wait ends at the declared completion point (the explicit step sync return)",
+            "every category is directly measured on its own clock; no category is a total minus other terms",
+            "unified-memory allocation is never called a transfer without an observed copy event",
+        ],
+        "phases": {
+            "prefill": prefill_steps.iter().map(|step| gea3_parity_step_json(step)).collect::<Vec<_>>(),
+            "decode": decode_steps.iter().map(|step| gea3_parity_step_json(step)).collect::<Vec<_>>(),
+        },
+        "transfers": {
+            "weight_residency_upload": {
+                "duration_us": gea3_parity_measured(residency.weight_upload_us, "phase clock around the 290 copy_in_bytes admissions"),
+                "bytes": gea3_parity_measured(residency.weight_bytes, "GEA3 input manifest absolute GGUF ranges for the frozen model tensors"),
+                "admissions": gea3_parity_count(residency.weight_uploads, "distinct frozen model tensor identities admitted this run"),
+                "host_to_device_transfer": gea3_parity_not_observable(
+                    "admissions run over a retained unified-memory GGUF mapping and may wrap pages zero-copy; copy-versus-wrap is not observable through the DeviceRuntime surface",
+                ),
+            },
+            "kv_zero_fill": {
+                "duration_us": gea3_parity_measured(residency.kv_zero_fill_us, "phase clocks around the copy_in_bytes zero-fill of the KV arenas"),
+                "bytes": gea3_parity_measured(residency.kv_zero_fill_bytes, "32 * 2 * 76 * 320 * sizeof(F32) zero-filled on first touch"),
+                "host_to_device_transfer": {"status": "measured", "basis": "observed copy_in_bytes zero-fill events"},
+            },
+            "other_setup_zero_fills": {
+                "count": gea3_parity_count(residency.other_zero_fills, "non-KV handles zero-filled during residency setup"),
+                "duration_us": gea3_parity_not_measured(
+                    "interleaved with the residency loop and not separately clocked; no value is inferred",
+                ),
+            },
+            "residency_allocations": {
+                "weight_allocation_us": gea3_parity_measured(residency.weight_alloc_us, "device allocation clocks for the 290 shared model tensors"),
+                "kv_allocation_us": gea3_parity_measured(residency.kv_alloc_us, "device allocation clocks for the shared KV arenas"),
+                "transfer_classification": {"value": "allocation only; a unified-memory allocation is not a transfer without an observed copy event", "status": "measured"},
+            },
+        },
+        "summary": {
+            "prefill": summarize(&prefill_steps),
+            "decode": summarize(&decode_steps),
+        },
+    }))
+}
+
+fn gea3_parity_companion_path() -> Option<PathBuf> {
+    std::env::var_os(PARITY_COMPANION_ENV).map(PathBuf::from)
+}
+
+/// Write the companion when an output path is present; an absent path is
+/// the opt-out and leaves the physical run untouched.
+fn gea3_write_parity_companion(target: Option<&Path>, companion: &Value) {
+    let Some(path) = target else {
+        return;
+    };
+    let parent = path.parent().expect("parity companion parent");
+    fs::create_dir_all(parent).expect("create parity companion parent");
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(companion).expect("serialize parity timing companion"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    eprintln!("GEA3 parity timing companion: {}", path.display());
+}
+
+// PPB-U3 focused fake/admission proof.  It never touches the physical
+// route: it drives the production builder and writer with synthetic fake
+// observations, the way the fake ladder proves the launch graph.  It covers
+// the absent and the present optional output, inspects the emitted
+// companion schema, and proves the non-overlap boundary law fails closed.
+fn gea3_fake_parity_step(
+    mode: &'static str,
+    step: u64,
+    gpu_encoder_us: Option<u64>,
+) -> Gea3ParityStep {
+    Gea3ParityStep {
+        mode,
+        step,
+        input_upload: Gea3ParityPhase {
+            start_since_step_us: 0,
+            end_since_step_us: 40,
+            duration_us: 40,
+        },
+        input_upload_bytes: 1_048_576,
+        input_upload_copies: 5,
+        launch_encode: Gea3ParityPhase {
+            start_since_step_us: 40,
+            end_since_step_us: 240,
+            duration_us: 200,
+        },
+        queue_wait: Gea3ParityPhase {
+            start_since_step_us: 240,
+            end_since_step_us: 600,
+            duration_us: 360,
+        },
+        gpu_encoder_us,
+        gpu_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * 2115,
+        gpu_start_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * 2115,
+        command_submits: 1,
+        blocking_waits: 1,
+        readback: Gea3ParityPhase {
+            start_since_step_us: 600,
+            end_since_step_us: 640,
+            duration_us: 40,
+        },
+        readback_bytes: VOCAB * 4,
+    }
+}
+
+fn gea3_fake_parity_timing(steps: Vec<Gea3ParityStep>) -> Gea3ParityTiming {
+    Gea3ParityTiming {
+        residency: Gea3ParityResidency {
+            weight_alloc_us: 900,
+            weight_upload_us: 4_000,
+            weight_bytes: 1_447_284_480,
+            weight_uploads: 290,
+            kv_alloc_us: 60,
+            kv_zero_fill_us: 120,
+            kv_zero_fill_bytes: LAYERS as u64 * 2 * HISTORY_CAPACITY * KV_WIDTH * 4,
+            other_zero_fills: 3,
+        },
+        steps,
+    }
+}
+
+#[test]
+fn gea3_parity_timing_companion_optional_emission() {
+    let timing = gea3_fake_parity_timing(vec![
+        gea3_fake_parity_step("prefill", 0, Some(150)),
+        gea3_fake_parity_step("decode", 1, Some(140)),
+        // A step whose GPU timestamps were not sampled keeps the explicit
+        // not_measured status; no encoder time is inferred for it.
+        gea3_fake_parity_step("decode", 2, None),
+    ]);
+    let companion = gea3_build_parity_companion(&timing, "evidence/gea3-metal-receipt.json")
+        .expect("fake companion observations admit");
+
+    // (a) the companion is versioned and disjoint from the GEA3 receipt.
+    assert_eq!(companion["schema"], json!(PARITY_COMPANION_SCHEMA));
+    assert_eq!(companion["delivery"], json!("PPB-U3"));
+    assert_eq!(
+        companion["source_receipt_schema"],
+        json!("gea3-metal-receipt-v1")
+    );
+
+    // (b) boundary law, green: encode ends before the queue wait begins,
+    // and the queue wait ends before the readback begins, on every step.
+    let all_phase_rows = companion["phases"]["prefill"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            companion["phases"]["decode"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        );
+    for phase_row in all_phase_rows {
+        let encode_end = phase_row["host_launch_encode"]["boundary"]["end_us_since_step_start"]
+            .as_u64()
+            .expect("encode end boundary");
+        let queue_start = phase_row["queue_wait"]["boundary"]["start_us_since_step_start"]
+            .as_u64()
+            .expect("queue start boundary");
+        let queue_end = phase_row["queue_wait"]["boundary"]["end_us_since_step_start"]
+            .as_u64()
+            .expect("queue end boundary");
+        let readback_start = phase_row["device_to_host_readback"]["boundary"]
+            ["start_us_since_step_start"]
+            .as_u64()
+            .expect("readback start boundary");
+        assert!(
+            encode_end <= queue_start,
+            "encode clock must end before the queue wait begins"
+        );
+        assert!(
+            queue_end <= readback_start,
+            "queue wait must end at the declared completion point before readback"
+        );
+        assert_eq!(
+            phase_row["queue_wait"]["ends_at"]["value"],
+            json!("explicit runtime.sync() return — the declared completion point")
+        );
+    }
+
+    // (c) every phase carries an evidence status; the unsampled GPU step is
+    // explicitly not_measured and the submit-only wall is not_observable.
+    let unsampled = &companion["phases"]["decode"][1];
+    assert_eq!(
+        unsampled["gpu_encoder"]["duration_us"]["status"],
+        json!("not_measured")
+    );
+    assert!(
+        unsampled["gpu_encoder"]["duration_us"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no GPU timestamps")),
+        "the not_measured reason must name the missing fact"
+    );
+    assert_eq!(
+        unsampled["command_submit_wall"]["status"],
+        json!("not_observable")
+    );
+    let sampled = &companion["phases"]["decode"][0];
+    assert_eq!(
+        sampled["gpu_encoder"]["duration_us"]["status"],
+        json!("measured")
+    );
+
+    // (d) transfer honesty: the weight residency never claims a transfer it
+    // cannot observe, and allocation is not a transfer.
+    assert_eq!(
+        companion["transfers"]["weight_residency_upload"]["host_to_device_transfer"]["status"],
+        json!("not_observable")
+    );
+    assert_eq!(
+        companion["transfers"]["kv_zero_fill"]["host_to_device_transfer"]["status"],
+        json!("measured")
+    );
+    assert_eq!(
+        companion["transfers"]["other_setup_zero_fills"]["duration_us"]["status"],
+        json!("not_measured")
+    );
+    assert!(
+        companion["transfers"]["residency_allocations"]["transfer_classification"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("not a transfer")),
+        "allocation must be classified apart from transfer"
+    );
+
+    // (e) red control: overlapping encode/queue boundaries fail closed and
+    // name the law, so the boundary admission is a gate, not decoration.
+    let mut overlapping = gea3_fake_parity_step("decode", 3, None);
+    overlapping.launch_encode.end_since_step_us = 300;
+    overlapping.queue_wait.start_since_step_us = 250;
+    let error = gea3_build_parity_companion(
+        &gea3_fake_parity_timing(vec![overlapping]),
+        "evidence/gea3-metal-receipt.json",
+    )
+    .expect_err("overlapping boundaries must fail closed");
+    assert!(
+        error.contains("queue wait begins"),
+        "diagnostic must name the boundary law: {error}"
+    );
+
+    // (f) absent optional output: no path means no companion, and nothing
+    // is written.  Present optional output: the production writer emits the
+    // companion and the written file parses back to the same schema.
+    let absent_dir = tempfile::tempdir().expect("absent-output tempdir");
+    std::env::remove_var(PARITY_COMPANION_ENV);
+    assert!(
+        gea3_parity_companion_path().is_none(),
+        "unset environment is the opt-out"
+    );
+    gea3_write_parity_companion(gea3_parity_companion_path().as_deref(), &companion);
+    assert_eq!(
+        fs::read_dir(absent_dir.path())
+            .expect("read absent-output tempdir")
+            .count(),
+        0,
+        "no companion may be written without a path"
+    );
+
+    let present_dir = tempfile::tempdir().expect("present-output tempdir");
+    let companion_path = present_dir.path().join("gea3-parity-timing-companion.json");
+    std::env::set_var(PARITY_COMPANION_ENV, &companion_path);
+    let target = gea3_parity_companion_path().expect("companion path from environment");
+    gea3_write_parity_companion(Some(&target), &companion);
+    std::env::remove_var(PARITY_COMPANION_ENV);
+    let written: Value =
+        serde_json::from_slice(&fs::read(&companion_path).expect("read written companion"))
+            .expect("written companion is JSON");
+    assert_eq!(written["schema"], json!(PARITY_COMPANION_SCHEMA));
+    assert_eq!(
+        written["phases"]["decode"][1]["gpu_encoder"]["duration_us"]["status"],
+        json!("not_measured")
+    );
+    assert_eq!(
+        written["summary"]["decode"]["queue_wait_us"]["status"],
+        json!("derived")
+    );
+}
+
 fn gea3_run_physical(
     runtime: &mut DeviceRuntime,
     prefill: (DeviceDescriptor, Gea3WindowBindings),
@@ -2980,7 +3493,7 @@ fn gea3_run_physical(
     input_manifest: &Value,
     model_path: &Path,
     prompt_tokens: &[u32],
-) -> Result<Value, String> {
+) -> Result<(Value, Gea3ParityTiming), String> {
     let model_ranges = gea3_model_ranges(input_manifest)?;
     let mapped = MappedWeightFile::open(model_path).map_err(|error| error.message.clone())?;
     runtime
@@ -3050,6 +3563,7 @@ fn gea3_run_physical(
     let weight_upload_us = gea3_elapsed_us(weight_upload_started);
     let mut kv_bytes = 0_u64;
     let mut kv_zero_us = 0_u64;
+    let mut other_zero_fills = 0_u64;
     let mut zeroed = BTreeSet::new();
     for program in &programs {
         let resident_slots = gea3_unique_slots(&program.descriptor);
@@ -3077,6 +3591,8 @@ fn gea3_run_physical(
                     gea3_zero_handle(runtime, handle)?;
                     if slot.buffer_name.starts_with("blk.") && slot.buffer_name.contains(".kv_") {
                         kv_zero_us = kv_zero_us.saturating_add(gea3_elapsed_us(started));
+                    } else {
+                        other_zero_fills += 1;
                     }
                 }
             }
@@ -3099,9 +3615,10 @@ fn gea3_run_physical(
         return Err("GEA3 carried data-flow edges are not topologically satisfied".to_owned());
     }
     let mut step_receipts = Vec::new();
+    let mut parity_steps = Vec::new();
     let mut greedy = Vec::new();
     let prefill_started = Instant::now();
-    let prefill_copies = gea3_update_inputs(
+    let prefill_uploads = gea3_update_inputs(
         runtime,
         &programs[0],
         prompt_tokens,
@@ -3109,9 +3626,13 @@ fn gea3_run_physical(
         u32::try_from(prompt_tokens.len()).map_err(|_| "prompt is too long".to_owned())?,
         true,
     )?;
+    // PPB-U3: the input-upload phase clock starts with the step clock, so
+    // one elapsed reading is both its duration and its end boundary.
+    let prefill_upload_us = gea3_elapsed_us(prefill_started);
     let prefill_before_submit = runtime.command_submit_count();
     let prefill_before_wait = runtime.blocking_wait_count();
     let prefill_launch_started = Instant::now();
+    let prefill_encode_start_us = gea3_elapsed_us(prefill_started);
     for launch in &programs[0].descriptor.launches {
         let kernel = &programs[0].descriptor.kernels[launch.kernel_index as usize];
         let bindings: Vec<DeviceLaunchBinding> = kernel
@@ -3137,7 +3658,14 @@ fn gea3_run_physical(
             .map_err(|error| error.message.clone())?;
     }
     let prefill_encode_sync_us = gea3_elapsed_us(prefill_launch_started);
+    let prefill_encode_end_us = gea3_elapsed_us(prefill_started);
+    // PPB-U3: the queue-wait clock starts only after the encode clock has
+    // ended and stops at the declared completion point — the sync return.
+    let prefill_queue_started = Instant::now();
+    let prefill_queue_start_us = gea3_elapsed_us(prefill_started);
     runtime.sync().map_err(|error| error.message.clone())?;
+    let prefill_queue_wait_us = gea3_elapsed_us(prefill_queue_started);
+    let prefill_queue_end_us = gea3_elapsed_us(prefill_started);
     let prefill_gpu_us = runtime.take_encoder_gpu_us();
     let prefill_gpu_start_us = runtime.take_encoder_gpu_start_us();
     let prefill_submit_count = runtime
@@ -3147,6 +3675,7 @@ fn gea3_run_physical(
         .blocking_wait_count()
         .saturating_sub(prefill_before_wait);
     let prefill_readback_started = Instant::now();
+    let prefill_readback_start_us = gea3_elapsed_us(prefill_started);
     let prefill_handle = programs[0]
         .buffers
         .get(&programs[0].output)
@@ -3158,16 +3687,49 @@ fn gea3_run_physical(
             .map_err(|error| error.message.clone())?,
     )?;
     let prefill_readback_us = gea3_elapsed_us(prefill_readback_started);
+    let prefill_readback_end_us = gea3_elapsed_us(prefill_started);
     let prefill_vocab = usize::try_from(VOCAB).unwrap();
     let prefill_last = prefill_values
         .get((prompt_tokens.len().saturating_sub(1) * prefill_vocab)..)
         .ok_or_else(|| "prefill logits are shorter than the final prompt row".to_owned())?;
     let mut next_token = gea3_argmax(prefill_last)?;
     greedy.push(next_token);
+    parity_steps.push(Gea3ParityStep {
+        mode: "prefill",
+        step: 0,
+        input_upload: Gea3ParityPhase {
+            start_since_step_us: 0,
+            end_since_step_us: prefill_upload_us,
+            duration_us: prefill_upload_us,
+        },
+        input_upload_bytes: prefill_uploads.bytes,
+        input_upload_copies: prefill_uploads.copies,
+        launch_encode: Gea3ParityPhase {
+            start_since_step_us: prefill_encode_start_us,
+            end_since_step_us: prefill_encode_end_us,
+            duration_us: prefill_encode_sync_us,
+        },
+        queue_wait: Gea3ParityPhase {
+            start_since_step_us: prefill_queue_start_us,
+            end_since_step_us: prefill_queue_end_us,
+            duration_us: prefill_queue_wait_us,
+        },
+        gpu_encoder_us: (!prefill_gpu_us.is_empty()).then(|| prefill_gpu_us.iter().copied().sum()),
+        gpu_timestamp_count: prefill_gpu_us.len(),
+        gpu_start_timestamp_count: prefill_gpu_start_us.len(),
+        command_submits: prefill_submit_count,
+        blocking_waits: prefill_wait_count,
+        readback: Gea3ParityPhase {
+            start_since_step_us: prefill_readback_start_us,
+            end_since_step_us: prefill_readback_end_us,
+            duration_us: prefill_readback_us,
+        },
+        readback_bytes: u64::try_from(prefill_values.len() * 4).unwrap_or(u64::MAX),
+    });
     step_receipts.push(json!({
         "mode": "prefill",
         "step": 0,
-        "input_uploads": prefill_copies,
+        "input_uploads": prefill_uploads.copies,
         "launch_plan": "prefill",
         "launch_count": programs[0].descriptor.launches.len(),
         "data_flow_edges": {"declared": programs[0].descriptor.data_flow.len(), "satisfied": edge_prefill},
@@ -3181,7 +3743,7 @@ fn gea3_run_physical(
             .map_err(|_| "decode valid length overflows".to_owned())?;
         let position = valid_len - 1;
         let started = Instant::now();
-        let input_uploads = gea3_update_inputs(
+        let uploads = gea3_update_inputs(
             runtime,
             &programs[1],
             &[next_token],
@@ -3189,9 +3751,12 @@ fn gea3_run_physical(
             valid_len,
             false,
         )?;
+        // PPB-U3: the input-upload phase clock starts with the step clock.
+        let upload_us = gea3_elapsed_us(started);
         let before_submit = runtime.command_submit_count();
         let before_wait = runtime.blocking_wait_count();
         let launch_started = Instant::now();
+        let encode_start_us = gea3_elapsed_us(started);
         for launch in &programs[1].descriptor.launches {
             let kernel = &programs[1].descriptor.kernels[launch.kernel_index as usize];
             let bindings: Vec<DeviceLaunchBinding> = kernel
@@ -3217,12 +3782,20 @@ fn gea3_run_physical(
                 .map_err(|error| error.message.clone())?;
         }
         let encode_sync_us = gea3_elapsed_us(launch_started);
+        let encode_end_us = gea3_elapsed_us(started);
+        // PPB-U3: the queue-wait clock starts only after the encode clock
+        // has ended and stops at the declared completion point.
+        let queue_started = Instant::now();
+        let queue_start_us = gea3_elapsed_us(started);
         runtime.sync().map_err(|error| error.message.clone())?;
+        let queue_wait_us = gea3_elapsed_us(queue_started);
+        let queue_end_us = gea3_elapsed_us(started);
         let gpu_us = runtime.take_encoder_gpu_us();
         let gpu_start_us = runtime.take_encoder_gpu_start_us();
         let submit_count = runtime.command_submit_count().saturating_sub(before_submit);
         let wait_count = runtime.blocking_wait_count().saturating_sub(before_wait);
         let readback_started = Instant::now();
+        let readback_start_us = gea3_elapsed_us(started);
         let output_handle = programs[1]
             .buffers
             .get(&programs[1].output)
@@ -3234,14 +3807,47 @@ fn gea3_run_physical(
                 .map_err(|error| error.message.clone())?,
         )?;
         let readback_us = gea3_elapsed_us(readback_started);
+        let readback_end_us = gea3_elapsed_us(started);
         next_token = gea3_argmax(&values)?;
         greedy.push(next_token);
+        parity_steps.push(Gea3ParityStep {
+            mode: "decode",
+            step: (step + 1) as u64,
+            input_upload: Gea3ParityPhase {
+                start_since_step_us: 0,
+                end_since_step_us: upload_us,
+                duration_us: upload_us,
+            },
+            input_upload_bytes: uploads.bytes,
+            input_upload_copies: uploads.copies,
+            launch_encode: Gea3ParityPhase {
+                start_since_step_us: encode_start_us,
+                end_since_step_us: encode_end_us,
+                duration_us: encode_sync_us,
+            },
+            queue_wait: Gea3ParityPhase {
+                start_since_step_us: queue_start_us,
+                end_since_step_us: queue_end_us,
+                duration_us: queue_wait_us,
+            },
+            gpu_encoder_us: (!gpu_us.is_empty()).then(|| gpu_us.iter().copied().sum()),
+            gpu_timestamp_count: gpu_us.len(),
+            gpu_start_timestamp_count: gpu_start_us.len(),
+            command_submits: submit_count,
+            blocking_waits: wait_count,
+            readback: Gea3ParityPhase {
+                start_since_step_us: readback_start_us,
+                end_since_step_us: readback_end_us,
+                duration_us: readback_us,
+            },
+            readback_bytes: u64::try_from(values.len() * 4).unwrap_or(u64::MAX),
+        });
         step_receipts.push(json!({
             "mode": "decode",
             "step": step + 1,
             "position": position,
             "valid_len_after": valid_len,
-            "input_uploads": input_uploads,
+            "input_uploads": uploads.copies,
             "launch_plan": "decode",
             "launch_count": programs[1].descriptor.launches.len(),
             "data_flow_edges": {"declared": programs[1].descriptor.data_flow.len(), "satisfied": edge_decode},
@@ -3304,7 +3910,20 @@ fn gea3_run_physical(
         },
     });
     drop(gea3_release_programs(runtime, &mut programs));
-    Ok(evidence)
+    let parity = Gea3ParityTiming {
+        residency: Gea3ParityResidency {
+            weight_alloc_us: weight_allocations_us,
+            weight_upload_us,
+            weight_bytes,
+            weight_uploads,
+            kv_alloc_us: kv_allocations_us,
+            kv_zero_fill_us: kv_zero_us,
+            kv_zero_fill_bytes: kv_bytes,
+            other_zero_fills,
+        },
+        steps: parity_steps,
+    };
+    Ok((evidence, parity))
 }
 
 #[test]
@@ -3427,6 +4046,7 @@ fn gea3_real_metal_decode_receipt() {
         "blocked_reason": production_reds,
         "measurement_policy": "No unmeasured physical field is promoted; production reds stop-and-amend.",
     });
+    let mut parity_timing: Option<Gea3ParityTiming> = None;
 
     if production_reds.is_empty() && session_admitted {
         let mut host = session_result.expect("admitted Metal session disappeared");
@@ -3444,13 +4064,14 @@ fn gea3_real_metal_decode_receipt() {
                 )
             });
         match execution {
-            Ok(execution) => {
+            Ok((execution, timing)) => {
                 receipt["status"] = json!("green");
                 receipt["residency"] = execution["residency"].clone();
                 receipt["execution"] = execution["execution"].clone();
                 receipt["launch_plans"] = execution["launch_plans"].clone();
                 receipt["steps"] = execution["steps"].clone();
                 receipt["throughput"] = execution["throughput"].clone();
+                parity_timing = Some(timing);
             }
             Err(error) => {
                 receipt["status"] = json!("blocked");
@@ -3510,6 +4131,18 @@ fn gea3_real_metal_decode_receipt() {
     )
     .unwrap_or_else(|error| panic!("write {}: {error}", receipt_path.display()));
     eprintln!("GEA3 physical Metal receipt: {}", receipt_path.display());
+
+    // PPB-U3: the optional parity timing companion is emitted in addition
+    // to the unchanged GEA3 receipt above, only when the environment names
+    // an output path.  The GEA3 receipt is already complete and on disk.
+    if let Some(companion_target) = gea3_parity_companion_path() {
+        let timing = parity_timing
+            .as_ref()
+            .expect("parity companion requested but no physical timing was observed");
+        let companion = gea3_build_parity_companion(timing, &receipt_path.display().to_string())
+            .unwrap_or_else(|error| panic!("PPB-U3 companion boundary law violated: {error}"));
+        gea3_write_parity_companion(Some(&companion_target), &companion);
+    }
 
     assert_eq!(
         receipt["status"], "green",
@@ -4038,7 +4671,7 @@ fn gea3_run_staged_diagnostic(
             "token": token,
             "prefill": {
                 "launch_count": prefill_launch_count,
-                "input_uploads": prefill_uploads,
+                "input_uploads": prefill_uploads.copies,
                 "arena_count": arena_summaries.len(),
                 "arenas_non_zero": arenas_non_zero,
                 "arena_summaries_after_prefill": arena_summaries,
@@ -4048,7 +4681,7 @@ fn gea3_run_staged_diagnostic(
                 },
                 "write_side_probe": write_side_probe,
             },
-            "input_uploads": input_uploads,
+            "input_uploads": input_uploads.copies,
             "weights": {
                 "upload_count": weight_uploads,
                 "bytes": weight_bytes,
