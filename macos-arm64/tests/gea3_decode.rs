@@ -3664,6 +3664,54 @@ fn gea3_run_staged_diagnostic(
             }
         }
 
+        // GEA3-U6 num-11 terminal probe (env-gated, full f32 arrays): the
+        // rerun-#14 offline join names the terminal logits drift (L32
+        // lm_head_gemv, ~4.4e-5 vs the frozen 2e-5 terminal policy) as the
+        // only non-match row, but the per-stage summaries echo first-values
+        // only and cannot decompose a drift that small.  This probe dumps
+        // the post-L31 path in full — the layer-31 residual stream entering
+        // the head (both occurrences), the final-norm output, and the logits
+        // row — so the offline comparator can walk the terminal ops per op
+        // (final norm vs lm_head gemm vs writeback/dtype seams) on the
+        // device's own bytes.
+        let mut terminal_probe = Vec::new();
+        if std::env::var_os("GEA3_WRITE_SIDE_PROBE").is_some() {
+            for kernel in &decode_plan.kernels {
+                let probed = match kernel.entry.as_str() {
+                    "decode_residual_add" => kernel.layer == 31,
+                    "head_rmsnorm" | "lm_head_gemv" => true,
+                    _ => false,
+                };
+                if !probed {
+                    continue;
+                }
+                for resource in &kernel.resources {
+                    if resource.access != Gea3ResourceAccess::Write
+                        || gea3_diagnostic_resource_is_weight(resource)
+                    {
+                        continue;
+                    }
+                    let handle = program
+                        .buffers
+                        .get(&(resource.buffer.id, resource.version.version))
+                        .copied()
+                        .ok_or_else(|| "terminal probe handle disappeared".to_owned())?;
+                    let bytes = runtime
+                        .readback_bytes(&handle, DeviceDataType::F32)
+                        .map_err(|error| error.message.clone())?;
+                    let values = gea3_f32_from_bytes(&bytes)?;
+                    terminal_probe.push(json!({
+                        "entry": kernel.entry,
+                        "layer": kernel.layer,
+                        "ordinal": kernel.ordinal,
+                        "name": resource.buffer.name,
+                        "element_count": values.len(),
+                        "values": values,
+                    }));
+                }
+            }
+        }
+
         let terminal = stages.last().map(|stage| {
             json!({
                 "launch_id": stage["launch_id"],
@@ -3699,6 +3747,7 @@ fn gea3_run_staged_diagnostic(
             },
             "stages_executed": stages.len(),
             "stages": stages,
+            "terminal_probe": terminal_probe,
             "first_bad": first_bad,
             "first_non_finite": first_non_finite,
             "terminal": terminal,
