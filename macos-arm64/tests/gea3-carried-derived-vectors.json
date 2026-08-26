@@ -1,0 +1,212 @@
+[
+  {
+    "label": "contiguous-read-window-admits",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_query_slice", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 64, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 896, "row_width": 64, "row_count": 1, "row_stride": 64, "derived_element_count": 64 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "admit",
+    "expected_reason": null
+  },
+  {
+    "label": "strided-read-window-admits",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_k_head", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 4864, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 256, "row_width": 64, "row_count": 76, "row_stride": 320, "derived_element_count": 4864 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 24320,
+    "expected_verdict": "admit",
+    "expected_reason": null
+  },
+  {
+    "label": "strided-read-off-the-end-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_k_head_oob", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 4864, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 256, "row_width": 64, "row_count": 76, "row_stride": 320, "derived_element_count": 4864 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 24319,
+    "expected_verdict": "reject",
+    "expected_reason": "nest inside its producer buffer"
+  },
+  {
+    "label": "contiguous-write-window-admits",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_hybrid_tail", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 64, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 896, "row_width": 64, "row_count": 1, "row_stride": 64, "derived_element_count": 64 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "write",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "admit",
+    "expected_reason": null
+  },
+  {
+    "label": "strided-write-window-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_scattered_write", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 960, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 64, "row_count": 15, "row_stride": 960, "derived_element_count": 960 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "write",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "reject",
+    "expected_reason": "strided sub-window on a write slot"
+  },
+  {
+    "label": "derived-count-disagreement-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_wrong_derived", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 4864, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 64, "row_count": 76, "row_stride": 320, "derived_element_count": 4863 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 24320,
+    "expected_verdict": "reject",
+    "expected_reason": "carried and derived truths must agree"
+  },
+  {
+    "label": "carried-count-disagreement-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_wrong_carried", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 76, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 64, "row_count": 76, "row_stride": 320, "derived_element_count": 4864 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 24320,
+    "expected_verdict": "reject",
+    "expected_reason": "carried and derived truths must agree"
+  },
+  {
+    "label": "zero-row-width-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_zero_width", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 0, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 0, "row_count": 76, "row_stride": 320, "derived_element_count": 0 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 320,
+    "expected_verdict": "reject",
+    "expected_reason": "degenerate geometry"
+  },
+  {
+    "label": "zero-row-count-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_zero_rows", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 0, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 64, "row_count": 0, "row_stride": 64, "derived_element_count": 0 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 320,
+    "expected_verdict": "reject",
+    "expected_reason": "degenerate geometry"
+  },
+  {
+    "label": "overlapping-rows-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_overlap", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 4864, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 64, "row_count": 76, "row_stride": 32, "derived_element_count": 4864 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 2432,
+    "expected_verdict": "reject",
+    "expected_reason": "degenerate geometry"
+  },
+  {
+    "label": "saturating-geometry-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_saturated", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 18446744073709551615, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 0, "row_width": 18446744073709551615, "row_count": 2, "row_stride": 18446744073709551615, "derived_element_count": 18446744073709551615 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 18446744073709551615,
+    "expected_verdict": "reject",
+    "expected_reason": "saturates u64"
+  },
+  {
+    "label": "zero-buffer-id-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_zero_buffer", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 64, "reduced_projection": null, "sub_window": { "buffer": 0, "element_offset": 0, "row_width": 64, "row_count": 1, "row_stride": 64, "derived_element_count": 64 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "reject",
+    "expected_reason": "addresses its own producer"
+  },
+  {
+    "label": "foreign-buffer-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_foreign_buffer", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 4864, "reduced_projection": null, "sub_window": { "buffer": 1, "element_offset": 0, "row_width": 64, "row_count": 76, "row_stride": 320, "derived_element_count": 4864 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 24320,
+    "expected_verdict": "reject",
+    "expected_reason": "addresses its own producer"
+  },
+  {
+    "label": "read-write-slot-rejected",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_read_write", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 64, "reduced_projection": null, "sub_window": { "buffer": 13, "element_offset": 896, "row_width": 64, "row_count": 1, "row_stride": 64, "derived_element_count": 64 } },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read-write",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "reject",
+    "expected_reason": "read- or write-side facts only"
+  },
+  {
+    "label": "no-sub-window-admits",
+    "resource": {
+      "buffer": { "id": 13, "name": "parity_plain_slot", "role": "InOut", "storage": "device-handle", "lifetime": "PerStep", "semantic_value": 13 },
+      "version": { "version": 1, "element_ty": "f32", "element_count": 960, "reduced_projection": null, "sub_window": null },
+      "binding": { "group": 0, "binding": 0 },
+      "access": "read",
+      "generation": 1,
+      "initialization": "KernelInitialized"
+    },
+    "producer_element_count": 960,
+    "expected_verdict": "admit",
+    "expected_reason": null
+  }
+]
