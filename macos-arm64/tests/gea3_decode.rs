@@ -99,6 +99,17 @@ const GEA3_SOAK_L2000: Gea3Identity = Gea3Identity {
     decode_steps: 1_900,
 };
 
+// GLP-U1b: the fixed-output-length parity statue is a separate compile-time
+// identity — N=1000, margin 64, l_max = 36 + 1000 + 64 = 1100, fixed F32 KV
+// footprint 32 × 2 × 1100 × 320 × 4 = 90,112,000 bytes.
+const GEA3_FIXED1000: Gea3Identity = Gea3Identity {
+    name: "metal-m5max-fixed1000",
+    n_predict: 1_000,
+    margin: 64,
+    history_capacity: 1_100,
+    decode_steps: 1_000,
+};
+
 // PPB-U3: the optional parity timing companion the physical test emits in
 // addition to — never instead of — its `gea3-metal-receipt-v1` receipt.  The
 // environment names the output path; an unset variable is the opt-out.
@@ -142,7 +153,7 @@ impl Gea3SoakStream {
         receipt["launch_plans"] = evidence.launch_plans.clone();
         receipt["throughput"] = evidence.throughput.clone();
         receipt["partial_stream"] = json!({
-            "law": "the 60s cap may kill this run before n_predict; this file is the last cadence rewrite, not a completion claim",
+            "law": "the hard cap may kill this run before n_predict; this file is the last cadence rewrite, not a completion claim",
             "decode_steps_observed": evidence.decode_steps,
             "produced_tokens": evidence.produced_tokens,
         });
@@ -4015,11 +4026,8 @@ fn gea3_run_physical(
         "readback": {"buffer_id": programs[0].output.0, "version": programs[0].output.1, "elements": prefill_values.len(), "bytes": prefill_values.len() * 4, "sha256": gea3_readback_hash(&prefill_values), "finite": true},
         "next_token": next_token,
     }));
-    // PPB-U7: prefill produced the first continuation token; a soak stream
-    // reports it before decode begins so liveness starts at token one.
-    if let Some(stream) = stream {
-        stream.emit_progress(1);
-    }
+    // PPB-U7: progress counts decoded output tokens.  The prefill logits
+    // choose the first input to decode but do not count as generated output.
     for step in 0..identity.decode_steps {
         let valid_len = u32::try_from(prompt_tokens.len() + step + 1)
             .map_err(|_| "decode valid length overflows".to_owned())?;
@@ -4143,7 +4151,7 @@ fn gea3_run_physical(
         // line per produced token on stdout, then the cadence receipt
         // rewrite so a cap-killed arm leaves its latest measured state.
         if let Some(stream) = stream {
-            stream.emit_progress(greedy.len() as u64);
+            stream.emit_progress((step + 1) as u64);
             if (step + 1) % SOAK_RECEIPT_REWRITE_STEPS == 0 || step + 1 == identity.decode_steps {
                 let decode_walls: Vec<u64> = step_receipts
                     .iter()
@@ -4168,7 +4176,7 @@ fn gea3_run_physical(
                         "tg_ts": {"value": (step + 1) as f64 * 1_000_000.0 / decode_wall.max(1) as f64, "status": "derived", "basis": "observed decode steps / summed observed decode wall"},
                     }),
                     decode_steps: step + 1,
-                    produced_tokens: greedy.len(),
+                    produced_tokens: step + 1,
                 });
                 if let Some(companion_target) = stream.companion_path.as_ref() {
                     let timing = Gea3ParityTiming {
@@ -4215,11 +4223,11 @@ fn gea3_run_physical(
         .collect();
     let kv_alloc_us = kv_setup_us;
     // The frozen statue's committed receipt wording stays byte-stable; a
-    // soak statue names its own completed-step basis.
+    // non-frozen statue names its own completed-step basis.
     let step_count_cell = if identity.history_capacity == HISTORY_CAPACITY {
         json!({"value": identity.decode_steps, "status": "assumed", "basis": "frozen GEA3 n_predict"})
     } else {
-        json!({"value": identity.decode_steps, "status": "measured", "basis": "completed decode steps (the soak statue's pinned step count)"})
+        json!({"value": identity.decode_steps, "status": "measured", "basis": "completed decode steps (the statue's pinned step count)"})
     };
     let evidence = json!({
         "residency": residency,
@@ -4264,6 +4272,17 @@ fn gea3_run_physical(
 #[ignore = "physical Metal gate; run only with the exact §6 command"]
 fn gea3_real_metal_decode_receipt() {
     gea3_physical_receipt_run(GEA3_FROZEN_SHORT);
+}
+
+/// GLP-U1b fixed-output-length runner: the same §6 physical path
+/// re-specialized at the `metal-m5max-fixed1000` statue.  The capacity and
+/// step count are compile-time statue facts; no runtime capacity argument or
+/// session lifetime is introduced, and `DeviceProgramLifetime::SingleRun` is
+/// retained by admission.
+#[test]
+#[ignore = "physical Metal gate; run only with the exact §6 command"]
+fn gea3_fixed1000_metal_decode_receipt() {
+    gea3_physical_receipt_run(GEA3_FIXED1000);
 }
 
 /// PPB-U7 soak runner: the same §6 physical path re-specialized at the
