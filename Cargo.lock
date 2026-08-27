@@ -1298,7 +1298,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radix-codegen-shared"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "radix-diagnostics",
  "radix-hir",
@@ -1309,14 +1309,14 @@ dependencies = [
 
 [[package]]
 name = "radix-diagnostics"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "radix-hir"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "postcard",
  "radix-lexer",
@@ -1328,11 +1328,11 @@ dependencies = [
 
 [[package]]
 name = "radix-host-abi"
-version = "0.83.0"
+version = "0.84.0"
 
 [[package]]
 name = "radix-lexer"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "radix-diagnostics",
  "rustc-hash",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "radix-mir"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "handroll",
  "radix-codegen-shared",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "radix-mir-fmir"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "handroll",
  "postcard",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "radix-syntax"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "radix-lexer",
  "serde",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "radix-types"
-version = "0.83.0"
+version = "0.84.0"
 dependencies = [
  "radix-lexer",
  "radix-syntax",
