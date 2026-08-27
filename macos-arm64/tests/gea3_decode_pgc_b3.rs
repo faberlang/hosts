@@ -161,7 +161,7 @@ fn run_fake_row_launch(entry: &str, position: usize, history_values: &[f32], row
     if let DeviceRuntime::Metal(session) = &mut runtime {
         session
             .launch_kernel_bound(
-                module.id,
+                faber_host_macos_arm64::metal_host::MetalHandleId(module.id),
                 entry,
                 &metal_bindings,
                 [KV_WIDTH as u32, 1, 1],
@@ -169,7 +169,9 @@ fn run_fake_row_launch(entry: &str, position: usize, history_values: &[f32], row
             )
             .expect("direct row launch");
         session.sync().expect("direct row sync");
-        let result = session.readback_f32(output.id).expect("row readback");
+        let result = session
+            .readback_f32(faber_host_macos_arm64::metal_host::MetalHandleId(output.id))
+            .expect("row readback");
         let expected: Vec<f32> = history_values
             .iter()
             .zip(row)
