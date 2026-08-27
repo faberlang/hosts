@@ -4,8 +4,9 @@
 //! exported decode program plan and pins the one-row launch law at the
 //! host boundary: every named T=1 entry (the four projection GEMVs, the
 //! score/context attention GEMVs, `lm_head_gemv`, and the decode embedding
-//! gather) carries workgroup `(8, 1, 1)` over the unchanged output-tile
-//! grid — never the pre-change 8-row `(8, 8, 1)` tile — while every
+//! gather) carries workgroup `(w, 1, 1)` — `w` a tile-multiple lane count
+//! (the B2-RETUNE width knob, 8..=64) — over the `ceil(N / w)` grid,
+//! never the pre-change 8-row `(8, 8, 1)` tile — while every
 //! multi-row launch (the KV appends) keeps the full shared-tile
 //! workgroup.  The row-work census counts dispatched versus useful row
 //! lanes across one full decode step: the pre-change shape dispatched 8×
@@ -123,20 +124,30 @@ fn gea3_pgc_b2_decode_t1_entries_dispatch_the_one_row_workgroup() {
                 continue;
             }
             seen = true;
+            let (workgroup_x, workgroup_y, workgroup_z) = workgroup(kernel);
             assert_eq!(
-                workgroup(kernel),
-                (8, 1, 1),
-                "{name} must dispatch the one-row workgroup (8, 1, 1)"
+                (workgroup_y, workgroup_z),
+                (1, 1),
+                "{name} must dispatch the one-row workgroup (w, 1, 1)"
+            );
+            assert!(
+                workgroup_x.is_multiple_of(8) && (8..=64).contains(&workgroup_x),
+                "{name} one-row width must be a tile-multiple lane count in [8, 64], got {workgroup_x}"
             );
             assert_eq!(
                 workgroup_count(kernel),
-                (n.div_ceil(8), 1, 1),
-                "{name} keeps the output-tile grid ceil(N/8)"
+                (n.div_ceil(workgroup_x), 1, 1),
+                "{name} grid is ceil(N / w) over the one-row width"
             );
             assert_eq!(
                 kernel["plan"]["TiledMatMul"]["workgroup_y"].as_u64(),
                 Some(1),
                 "{name} plan carries the one-row workgroup fact"
+            );
+            assert_eq!(
+                kernel["plan"]["TiledMatMul"]["workgroup_x"].as_u64(),
+                Some(workgroup_x),
+                "{name} plan and launch carry the same one-row width"
             );
         }
         assert!(seen, "{name} appears in the exported decode step");
