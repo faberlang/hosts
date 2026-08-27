@@ -50,11 +50,121 @@ const KV_WIDTH: u64 = 320;
 const VOCAB: u64 = 49_152;
 const HIDDEN: u64 = 960;
 const DECODE_STEPS: usize = 8;
+
+// PPB-U7 (delivery row PPB-U7): one compile-time admission identity per
+// statue.  The frozen statue stays the byte-stable regression row; the soak
+// statue `metal-m5max-soak-l2000` is a separate compile-time fact — 2000-row
+// fixed capacity, 1900 decode steps, margin 64 — never a runtime capacity
+// argument, never a session lifetime, and `DeviceProgramLifetime::SingleRun`
+// is retained for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gea3Identity {
+    name: &'static str,
+    n_predict: usize,
+    margin: usize,
+    history_capacity: u64,
+    decode_steps: usize,
+}
+
+impl Gea3Identity {
+    /// `l_max = prompt(36) + N + margin`, derived — never hand-copied.
+    const fn l_max(self) -> u64 {
+        PREFILL_ROWS + self.n_predict as u64 + self.margin as u64
+    }
+
+    /// Fixed F32 KV footprint: 32 layers × 2 (K/V) × l_max rows × 320 × 4.
+    const fn kv_bytes(self) -> u64 {
+        LAYERS as u64 * 2 * self.l_max() * KV_WIDTH * 4
+    }
+
+    /// The mechanical derivation the receipt names beside the measured value.
+    fn kv_basis(self) -> String {
+        format!("32 * 2 * {} * {KV_WIDTH} * sizeof(F32)", self.l_max())
+    }
+}
+
+const GEA3_FROZEN_SHORT: Gea3Identity = Gea3Identity {
+    name: "metal-m5max",
+    n_predict: 8,
+    margin: 32,
+    history_capacity: HISTORY_CAPACITY,
+    decode_steps: DECODE_STEPS,
+};
+
+const GEA3_SOAK_L2000: Gea3Identity = Gea3Identity {
+    name: "metal-m5max-soak-l2000",
+    n_predict: 1_900,
+    margin: 64,
+    history_capacity: 2_000,
+    decode_steps: 1_900,
+};
+
 // PPB-U3: the optional parity timing companion the physical test emits in
 // addition to — never instead of — its `gea3-metal-receipt-v1` receipt.  The
 // environment names the output path; an unset variable is the opt-out.
 const PARITY_COMPANION_SCHEMA: &str = "gea3-parity-timing-companion-v1";
 const PARITY_COMPANION_ENV: &str = "GEA3_PARITY_TIMING_COMPANION";
+// PPB-U7: the soak runner rewrites the receipt on this cadence during decode
+// so a cap-killed process still leaves its latest measured state on disk
+// (KV residency and allocation cost are written before the first step).
+const SOAK_RECEIPT_REWRITE_STEPS: usize = 25;
+
+/// PPB-U7: the soak receipt stream.  The runner emits the U6 monotonic
+/// produced-token counter as line-delimited stdout progress during decode
+/// (one strict `{"produced_tokens": N}` JSON object per line, so a 60s-capped
+/// kill still yields the count and the fresh-at-cap evidence) and rewrites
+/// the receipt file on a fixed cadence so the kill also leaves the latest
+/// measured KV residency, allocation cost, and step state on disk.  The
+/// frozen statue passes `None` and its receipt bytes are unchanged.
+struct Gea3SoakStream {
+    identity: Gea3Identity,
+    base_receipt: Value,
+    receipt_path: PathBuf,
+    companion_path: Option<PathBuf>,
+}
+
+impl Gea3SoakStream {
+    fn emit_progress(&self, produced_tokens: u64) {
+        // One strict JSON object per line; Rust's Stdout is line-buffered,
+        // so each line reaches the polled file before the next step starts.
+        println!("{{\"produced_tokens\": {produced_tokens}}}");
+    }
+
+    /// Write the latest measured state.  No fsync is needed: the arm is
+    /// killed by a signal, not a power loss, and the page cache preserves
+    /// the last complete rewrite.
+    fn write_partial(&self, evidence: &SoakPartialEvidence) {
+        let mut receipt = self.base_receipt.clone();
+        receipt["status"] = json!("partial_streamed");
+        receipt["residency"] = evidence.residency.clone();
+        receipt["execution"] = evidence.execution.clone();
+        receipt["steps"] = evidence.steps.clone();
+        receipt["launch_plans"] = evidence.launch_plans.clone();
+        receipt["throughput"] = evidence.throughput.clone();
+        receipt["partial_stream"] = json!({
+            "law": "the 60s cap may kill this run before n_predict; this file is the last cadence rewrite, not a completion claim",
+            "decode_steps_observed": evidence.decode_steps,
+            "produced_tokens": evidence.produced_tokens,
+        });
+        if let Some(parent) = self.receipt_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&receipt) {
+            let _ = fs::write(&self.receipt_path, bytes);
+        }
+    }
+}
+
+/// The measured-so-far cells a streamed soak receipt carries.
+struct SoakPartialEvidence {
+    residency: Value,
+    execution: Value,
+    steps: Value,
+    launch_plans: Value,
+    throughput: Value,
+    decode_steps: usize,
+    produced_tokens: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Hosts' typed serde mirror of the GEA3 transport envelope.  This is a
@@ -726,9 +836,10 @@ fn map_envelope_to_descriptor(
     program: &Gea3Program,
     program_name: &str,
     artifact_dir: &Path,
+    identity: Gea3Identity,
 ) -> Result<(DeviceDescriptor, Gea3WindowBindings), String> {
-    admit_envelope(envelope)?;
-    admit_program(envelope, program, program_name)?;
+    admit_envelope(envelope, identity)?;
+    admit_program(envelope, program, program_name, identity)?;
 
     let mut module_image = Vec::new();
     for member in &envelope.module_members {
@@ -1031,7 +1142,10 @@ fn map_envelope_to_descriptor(
     ))
 }
 
-fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
+fn admit_envelope(
+    envelope: &Gea3ProgramPlanEnvelope,
+    identity: Gea3Identity,
+) -> Result<(), String> {
     if envelope.schema != PLAN_SCHEMA {
         return Err(format!("unexpected envelope schema `{}`", envelope.schema));
     }
@@ -1059,12 +1173,15 @@ fn admit_envelope(envelope: &Gea3ProgramPlanEnvelope) -> Result<(), String> {
     {
         return Err("full-model instance expansion facts drifted".to_owned());
     }
-    if envelope.kv_geometry.capacity != HISTORY_CAPACITY
-        || envelope.kv_geometry.declared_history_length != HISTORY_CAPACITY
+    if envelope.kv_geometry.capacity != identity.history_capacity
+        || envelope.kv_geometry.declared_history_length != identity.history_capacity
         || envelope.kv_geometry.dtype != "F32"
         || !envelope.kv_geometry.mask_beyond_length
     {
-        return Err("KV geometry is not the frozen capacity-bounded contract".to_owned());
+        return Err(format!(
+            "KV geometry is not the {} fixed-capacity contract",
+            identity.name
+        ));
     }
     if envelope.declared_outputs.prefill_logits != vec![PREFILL_ROWS, VOCAB]
         || envelope.declared_outputs.decode_logits != vec![VOCAB]
@@ -1078,6 +1195,7 @@ fn admit_program(
     envelope: &Gea3ProgramPlanEnvelope,
     program: &Gea3Program,
     program_name: &str,
+    identity: Gea3Identity,
 ) -> Result<(), String> {
     let expected = LAUNCHES_PER_PROGRAM;
     if program.program
@@ -1091,7 +1209,7 @@ fn admit_program(
         || program.launches.len() != expected
         || program.dependencies.len() != DEPENDENCIES_PER_PROGRAM
         || program.roots != vec![1]
-        || program.declared_history_length != HISTORY_CAPACITY
+        || program.declared_history_length != identity.history_capacity
     {
         return Err(format!("{program_name} program structural facts drifted"));
     }
@@ -1281,7 +1399,7 @@ fn admit_program(
     // need each row interval inside one prior write span.  Host-provided
     // and zero-fill buffers are initialized truths — excluded.
     gea4_intermediate_coverage(program, program_name)?;
-    admit_state_buffers(program, program_name)?;
+    admit_state_buffers(program, program_name, identity)?;
     let expected_output_count = if program_name == "prefill" {
         PREFILL_ROWS * VOCAB
     } else {
@@ -1419,7 +1537,11 @@ fn gea4_intermediate_coverage(program: &Gea3Program, program_name: &str) -> Resu
     Ok(())
 }
 
-fn admit_state_buffers(program: &Gea3Program, program_name: &str) -> Result<(), String> {
+fn admit_state_buffers(
+    program: &Gea3Program,
+    program_name: &str,
+    identity: Gea3Identity,
+) -> Result<(), String> {
     let cache_rows: Vec<&Gea3StateBuffer> = program
         .state_buffers
         .iter()
@@ -1444,9 +1566,9 @@ fn admit_state_buffers(program: &Gea3Program, program_name: &str) -> Result<(), 
             if row.layer != layer
                 || row.role != Some(Gea3BufferRole::InOut)
                 || row.dtype.as_deref() != Some("f32")
-                || row.shape.as_deref() != Some(&[HISTORY_CAPACITY, KV_WIDTH][..])
-                || row.history_capacity != Some(HISTORY_CAPACITY)
-                || row.declared_history_length != Some(HISTORY_CAPACITY)
+                || row.shape.as_deref() != Some(&[identity.history_capacity, KV_WIDTH][..])
+                || row.history_capacity != Some(identity.history_capacity)
+                || row.declared_history_length != Some(identity.history_capacity)
             {
                 return Err(format!("{program_name} KV geometry drifted for {name}"));
             }
@@ -1644,6 +1766,7 @@ fn assert_declared_logits_only(
 fn map_both(
     envelope: &Gea3ProgramPlanEnvelope,
     artifact_dir: &Path,
+    identity: Gea3Identity,
 ) -> Result<
     (
         (DeviceDescriptor, Gea3WindowBindings),
@@ -1656,12 +1779,14 @@ fn map_both(
         &envelope.programs.prefill,
         "prefill",
         artifact_dir,
+        identity,
     )?;
     let decode = map_envelope_to_descriptor(
         envelope,
         &envelope.programs.decode_step,
         "decode_step",
         artifact_dir,
+        identity,
     )?;
     prefill
         .0
@@ -1693,7 +1818,7 @@ fn model_weight_names(program: &Gea3Program) -> BTreeSet<String> {
 fn gea3_descriptor_admission() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((prefill, prefill_windows), (decode, decode_windows)) = map_both(&envelope, &artifact_dir)
+    let ((prefill, prefill_windows), (decode, decode_windows)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     assert_eq!(prefill.kernels.len(), LAUNCHES_PER_PROGRAM);
@@ -1784,12 +1909,120 @@ fn gea3_mirror_parse_rejects_malformed_plans() {
     let parsed: Gea3ProgramPlanEnvelope = serde_json::from_value(value).expect("mirror parse");
     let mut wrong_schema = parsed;
     wrong_schema.schema = "gea3-program-plan-v2".to_owned();
-    assert!(admit_envelope(&wrong_schema).is_err());
+    assert!(admit_envelope(&wrong_schema, GEA3_FROZEN_SHORT).is_err());
+}
+
+/// PPB-U7: the statue admission law is capacity-exact and cross-rejecting.
+/// A soak envelope (2000 rows) admits only under the soak identity; the
+/// frozen identity rejects it; a 1999/2001-row envelope rejects under both;
+/// and the per-layer KV state-buffer shapes follow the statue mechanically.
+/// This is the identity gate only — the full bundle admission runs in the
+/// §6-style physical pair against the real exported soak plan.
+#[test]
+fn gea3_soak_statue_admission_is_capacity_exact() {
+    assert_eq!(GEA3_SOAK_L2000.l_max(), 2_000);
+    assert_eq!(GEA3_SOAK_L2000.kv_bytes(), 163_840_000);
+    assert_eq!(
+        GEA3_SOAK_L2000.kv_basis(),
+        "32 * 2 * 2000 * 320 * sizeof(F32)"
+    );
+    assert_eq!(GEA3_FROZEN_SHORT.kv_bytes(), 6_225_920);
+
+    let envelope_for = |capacity: u64| -> Gea3ProgramPlanEnvelope {
+        let members: Vec<String> = (0..37).map(|index| format!("m{index}.metal")).collect();
+        let value = json!({
+            "schema": PLAN_SCHEMA,
+            "wire_buffer_abi": WIRE_BUFFER_ABI,
+            "source": SOURCE,
+            "programs": {
+                "prefill": empty_program("prefill", capacity),
+                "decode_step": empty_program("decode-step", capacity),
+            },
+            "module_members": members,
+            "module_image_rule": MODULE_IMAGE_RULE,
+            "instance_expansion": {
+                "layers": LAYERS,
+                "block_launches_per_layer": BLOCK_LAUNCHES_PER_LAYER,
+                "attention_heads": 15,
+                "kv_heads": 5,
+                "per_layer_weight_identities": true,
+                "per_layer_intermediates": true,
+                "per_layer_kv_buffers": true,
+            },
+            "kv_geometry": {
+                "capacity": capacity,
+                "declared_history_length": capacity,
+                "dtype": "F32",
+                "mask_beyond_length": true,
+            },
+            "declared_outputs": {
+                "prefill_logits": [PREFILL_ROWS, VOCAB],
+                "decode_logits": [VOCAB],
+            },
+        });
+        serde_json::from_value(value).expect("synthetic statue envelope parses")
+    };
+
+    let soak = envelope_for(GEA3_SOAK_L2000.history_capacity);
+    assert!(admit_envelope(&soak, GEA3_SOAK_L2000).is_ok());
+    // Cross-statue rejection: the frozen identity must refuse the soak plan.
+    let cross = admit_envelope(&soak, GEA3_FROZEN_SHORT)
+        .expect_err("the frozen identity must reject a 2000-row KV geometry");
+    assert!(cross.contains("metal-m5max"), "diagnostic {cross}");
+    let frozen = envelope_for(GEA3_FROZEN_SHORT.history_capacity);
+    assert!(admit_envelope(&frozen, GEA3_FROZEN_SHORT).is_ok());
+    assert!(admit_envelope(&frozen, GEA3_SOAK_L2000).is_err());
+    for wrong_capacity in [1_999_u64, 2_001] {
+        let envelope = envelope_for(wrong_capacity);
+        assert!(
+            admit_envelope(&envelope, GEA3_SOAK_L2000).is_err(),
+            "soak admission must reject capacity {wrong_capacity}"
+        );
+    }
+    // The state-buffer geometry law follows the same statue fact.
+    assert!(admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_SOAK_L2000).is_ok());
+    assert!(admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err());
+    assert!(admit_state_buffers(&frozen.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_ok());
+}
+
+/// A structurally minimal program for the statue admission law: the envelope
+/// and KV state facts only.  Kernel/launch counts are the full-bundle
+/// admission's business, proven by the physical pair.
+fn empty_program(spelling: &str, capacity: u64) -> Value {
+    let state_buffers: Vec<Value> = (0..LAYERS)
+        .flat_map(|layer| {
+            ["kv_k", "kv_v"].into_iter().map(move |cache| {
+                json!({
+                    "id": u32::try_from(layer * 2 + if cache == "kv_k" { 0 } else { 1 }).unwrap(),
+                    "name": format!("blk.{layer:02}.{cache}"),
+                    "layer": layer,
+                    "role": "InOut",
+                    "dtype": "f32",
+                    "shape": [capacity, KV_WIDTH],
+                    "history_capacity": capacity,
+                    "declared_history_length": capacity,
+                })
+            })
+        })
+        .collect();
+    json!({
+        "program": spelling,
+        "kernels": [],
+        "launches": [],
+        "lifetime": "single-run",
+        "results": [],
+        "allocations": [],
+        "semantic_values": [],
+        "roots": [1],
+        "dependencies": [],
+        "relations": [],
+        "state_buffers": state_buffers,
+        "declared_history_length": capacity,
+    })
 }
 
 #[test]
-fn gea3_negative_rows_fail_closed() {
-    let artifact_dir = gea3_artifact_dir();
+fn gea3_negative_rows_fail_closed() {    let artifact_dir = gea3_artifact_dir();
     let bytes = fs::read(artifact_dir.join(PLAN_MEMBER)).expect("read exported GEA3 plan");
     let original: Value = serde_json::from_slice(&bytes).expect("exported plan is JSON");
 
@@ -1800,7 +2033,7 @@ fn gea3_negative_rows_fail_closed() {
         .pop();
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(missing_edge).expect("mirror parse");
-    assert!(admit_program(&parsed, &parsed.programs.decode_step, "decode_step").is_err());
+    assert!(admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err());
 
     let mut wrong_dtype = original.clone();
     wrong_dtype["programs"]["prefill"]["kernels"][0]["resources"][0]["version"]["element_ty"] =
@@ -1811,7 +2044,8 @@ fn gea3_negative_rows_fail_closed() {
         &parsed,
         &parsed.programs.prefill,
         "prefill",
-        &artifact_dir
+        &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .is_err());
 
@@ -1825,6 +2059,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("one buffer identity cannot carry two element counts");
     assert!(
@@ -1850,6 +2085,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("intermediate readback must fail closed");
     assert!(
@@ -1858,7 +2094,7 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((_, _), (decode, _)) = map_both(&envelope, &artifact_dir).expect("real plan maps");
+    let ((_, _), (decode, _)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT).expect("real plan maps");
     assert!(assert_declared_logits_only(&decode, decode.end_of_run_results[0].buffer_id).is_ok());
     assert!(assert_declared_logits_only(&decode, u32::MAX).is_err());
 
@@ -1876,6 +2112,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("a corrupted derived count must fail the mapper");
     assert!(
@@ -1893,6 +2130,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("an off-the-end window must fail the mapper");
     assert!(
@@ -1914,6 +2152,7 @@ fn gea3_negative_rows_fail_closed() {
             &parsed.programs.decode_step,
             "decode_step",
             &artifact_dir,
+        GEA3_FROZEN_SHORT,
         )
         .expect_err(&format!(
             "a lying stride {label} the pitch must fail the mapper"
@@ -1944,6 +2183,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("a scattered write window must fail the mapper");
     assert!(
@@ -1964,6 +2204,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("a window count without the projection fact must fail the mapper");
     assert!(
@@ -1981,6 +2222,7 @@ fn gea3_negative_rows_fail_closed() {
         &parsed.programs.decode_step,
         "decode_step",
         &artifact_dir,
+        GEA3_FROZEN_SHORT,
     )
     .expect_err("a V1-tagged plan must fail the mapper");
     assert!(
@@ -2003,8 +2245,8 @@ fn gea4_admission_gates_fail_closed() {
 
     // Green control: both family programs admit as exported.
     let envelope = load_gea3_plan(&artifact_dir);
-    assert!(admit_program(&envelope, &envelope.programs.decode_step, "decode_step").is_ok());
-    assert!(admit_program(&envelope, &envelope.programs.prefill, "prefill").is_ok());
+    assert!(admit_program(&envelope, &envelope.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_ok());
+    assert!(admit_program(&envelope, &envelope.programs.prefill, "prefill", GEA3_FROZEN_SHORT).is_ok());
 
     // (a) red — the two carried copies of the grid disagree with each
     // other (dispatch_size mutated, workgroup_count left alone).
@@ -2013,7 +2255,7 @@ fn gea4_admission_gates_fail_closed() {
         json!(480);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(contradictory).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
         .expect_err("contradictory launch facts must fail closed");
     assert!(
         error.contains("launch facts disagree with each other"),
@@ -2034,7 +2276,7 @@ fn gea4_admission_gates_fail_closed() {
         embedding_output_id;
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(non_kv_misbinding).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
         .expect_err("a non-KV mis-binding must fail closed");
     assert!(
         error.contains("binding-vs-edge mismatch"),
@@ -2053,7 +2295,7 @@ fn gea4_admission_gates_fail_closed() {
     rope_edge["producer"] = json!(1);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(producer_mismatch).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
         .expect_err("a producer that never writes the edge buffer must fail closed");
     assert!(
         error.contains("binding-vs-edge mismatch"),
@@ -2074,7 +2316,7 @@ fn gea4_admission_gates_fail_closed() {
         ["version"]["sub_window"]["element_offset"] = json!(6 * 64);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(zero_intermediate).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step")
+    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
         .expect_err("an unwritten concat gap must fail closed at admission");
     assert!(
         error.contains("zero-intermediate composition"),
@@ -2086,7 +2328,7 @@ fn gea4_admission_gates_fail_closed() {
 fn gea3_fake_multi_step_structural_loop() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((prefill, _), (decode, _)) = map_both(&envelope, &artifact_dir)
+    let ((prefill, _), (decode, _)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     // The model and KV facts are admitted once, before the fake loop starts.
@@ -2527,6 +2769,7 @@ fn gea3_update_inputs(
     position: u32,
     valid_len: u32,
     prefill: bool,
+    capacity: u64,
 ) -> Result<Gea3InputUploads, String> {
     let mut copied = BTreeSet::new();
     let mut uploaded_bytes = 0_u64;
@@ -2651,8 +2894,8 @@ fn gea3_update_inputs(
                 let count = usize::try_from(slot.element_count)
                     .map_err(|_| "prefill block count overflows host usize".to_owned())?;
                 let mut block = vec![0.0; count];
-                let columns = count / HISTORY_CAPACITY as usize;
-                for diagonal in 0..columns.min(HISTORY_CAPACITY as usize) {
+                let columns = count / capacity as usize;
+                for diagonal in 0..columns.min(capacity as usize) {
                     block[diagonal * columns + diagonal] = 1.0;
                 }
                 copy(handle, block)?;
@@ -3009,6 +3252,7 @@ fn gea3_release_programs(
 /// plus the phase boundaries on the step clock.  The duration is always an
 /// independent `elapsed` reading of the phase clock, never a difference of
 /// the two boundaries.
+#[derive(Debug, Clone, Copy)]
 struct Gea3ParityPhase {
     start_since_step_us: u64,
     end_since_step_us: u64,
@@ -3016,6 +3260,7 @@ struct Gea3ParityPhase {
 }
 
 /// Per-step companion observations (prefill step 0, then each decode step).
+#[derive(Debug, Clone)]
 struct Gea3ParityStep {
     mode: &'static str,
     step: u64,
@@ -3493,6 +3738,8 @@ fn gea3_run_physical(
     input_manifest: &Value,
     model_path: &Path,
     prompt_tokens: &[u32],
+    identity: Gea3Identity,
+    stream: Option<&Gea3SoakStream>,
 ) -> Result<(Value, Gea3ParityTiming), String> {
     let model_ranges = gea3_model_ranges(input_manifest)?;
     let mapped = MappedWeightFile::open(model_path).map_err(|error| error.message.clone())?;
@@ -3601,10 +3848,11 @@ fn gea3_run_physical(
     let kv_setup_us = kv_allocations_us.saturating_add(kv_zero_us);
     // The allocation pass above counted every zero-fill handle in `zeroed`;
     // the model weights are deliberately excluded from that set.
-    let expected_kv_bytes = (LAYERS as u64) * 2 * HISTORY_CAPACITY * KV_WIDTH * 4;
+    let expected_kv_bytes = identity.kv_bytes();
     if kv_bytes != expected_kv_bytes {
         return Err(format!(
-            "KV residency is {kv_bytes} bytes, expected {expected_kv_bytes}"
+            "KV residency is {kv_bytes} bytes, expected {expected_kv_bytes} ({})",
+            identity.kv_basis()
         ));
     }
     let launch_rows_prefill = gea3_launch_rows(&programs[0].descriptor);
@@ -3613,6 +3861,34 @@ fn gea3_run_physical(
     let edge_decode = gea3_data_flow_satisfied(&programs[1].descriptor);
     if !edge_prefill || !edge_decode {
         return Err("GEA3 carried data-flow edges are not topologically satisfied".to_owned());
+    }
+    // PPB-U7: the residency cells are final here — weights uploaded, both KV
+    // arenas allocated and zero-filled — so a soak stream writes its first
+    // receipt state before any decode step runs.
+    let residency = json!({
+        "weight_allocations": {"value": 290, "status": "measured", "basis": "distinct frozen model tensor identities"},
+        "weight_bytes": {"value": weight_bytes, "status": "measured", "basis": "GEA3 input manifest absolute ranges"},
+        "weight_upload_count": {"value": weight_uploads, "status": "measured"},
+        "weight_residency_us": {"value": weight_allocations_us.saturating_add(weight_upload_us), "status": "measured", "components": {"allocation_and_program_setup": weight_allocations_us, "mapped_upload": weight_upload_us}},
+        "kv_allocations": {"value": LAYERS * 2, "status": "measured", "basis": "one shared fixed-capacity K/V arena per layer"},
+        "kv_bytes": {"value": kv_bytes, "status": "measured", "basis": identity.kv_basis()},
+        "kv_alloc_us": {"value": kv_setup_us, "status": "measured", "basis": "KV handle allocation plus first zero-fill"},
+        "zero_cpu_substitutes": {"value": 0, "status": "measured", "basis": "all model work was submitted to Metal"},
+        "zero_cpu_bridges": {"value": 0, "status": "measured", "basis": "only one-hot staging, mask/rope constants, and host argmax ran on CPU"},
+    });
+    if let Some(stream) = stream {
+        stream.write_partial(&SoakPartialEvidence {
+            residency: residency.clone(),
+            execution: json!({
+                "step_count": {"value": 0, "status": "measured", "basis": "no decode step had run when this streamed receipt was written"},
+                "prefill_wall_us": gea3_unmeasured("prefill had not run when this streamed receipt was written"),
+            }),
+            steps: json!([]),
+            launch_plans: json!({}),
+            throughput: json!({}),
+            decode_steps: 0,
+            produced_tokens: 0,
+        });
     }
     let mut step_receipts = Vec::new();
     let mut parity_steps = Vec::new();
@@ -3625,6 +3901,7 @@ fn gea3_run_physical(
         0,
         u32::try_from(prompt_tokens.len()).map_err(|_| "prompt is too long".to_owned())?,
         true,
+        identity.history_capacity,
     )?;
     // PPB-U3: the input-upload phase clock starts with the step clock, so
     // one elapsed reading is both its duration and its end boundary.
@@ -3738,7 +4015,12 @@ fn gea3_run_physical(
         "readback": {"buffer_id": programs[0].output.0, "version": programs[0].output.1, "elements": prefill_values.len(), "bytes": prefill_values.len() * 4, "sha256": gea3_readback_hash(&prefill_values), "finite": true},
         "next_token": next_token,
     }));
-    for step in 0..DECODE_STEPS {
+    // PPB-U7: prefill produced the first continuation token; a soak stream
+    // reports it before decode begins so liveness starts at token one.
+    if let Some(stream) = stream {
+        stream.emit_progress(1);
+    }
+    for step in 0..identity.decode_steps {
         let valid_len = u32::try_from(prompt_tokens.len() + step + 1)
             .map_err(|_| "decode valid length overflows".to_owned())?;
         let position = valid_len - 1;
@@ -3750,6 +4032,7 @@ fn gea3_run_physical(
             position,
             valid_len,
             false,
+            identity.history_capacity,
         )?;
         // PPB-U3: the input-upload phase clock starts with the step clock.
         let upload_us = gea3_elapsed_us(started);
@@ -3856,6 +4139,60 @@ fn gea3_run_physical(
             "readback": {"buffer_id": programs[1].output.0, "version": programs[1].output.1, "elements": values.len(), "bytes": values.len() * 4, "sha256": gea3_readback_hash(&values), "finite": true},
             "next_token": next_token,
         }));
+        // PPB-U7: the U6 monotonic produced-token counter — one strict JSON
+        // line per produced token on stdout, then the cadence receipt
+        // rewrite so a cap-killed arm leaves its latest measured state.
+        if let Some(stream) = stream {
+            stream.emit_progress(greedy.len() as u64);
+            if (step + 1) % SOAK_RECEIPT_REWRITE_STEPS == 0 || step + 1 == identity.decode_steps {
+                let decode_walls: Vec<u64> = step_receipts
+                    .iter()
+                    .skip(1)
+                    .filter_map(|row| row["timing_us"]["wall"].as_u64())
+                    .collect();
+                let decode_wall: u64 = decode_walls.iter().sum();
+                stream.write_partial(&SoakPartialEvidence {
+                    residency: residency.clone(),
+                    execution: json!({
+                        "prefill_wall_us": step_receipts.first()
+                            .and_then(|row| row["timing_us"]["wall"].as_u64())
+                            .map(|wall| json!({"value": wall, "status": "measured"}))
+                            .unwrap_or_else(|| gea3_unmeasured("prefill wall not yet recorded")),
+                        "decode_wall_us": {"value": decode_wall, "status": "measured"},
+                        "step_count": {"value": step + 1, "status": "measured", "basis": "decode steps completed when this streamed receipt was written"},
+                        "greedy_token_sequence": {"value": greedy, "status": "measured", "basis": "first-index host argmax of declared logits readback"},
+                    }),
+                    steps: json!(step_receipts),
+                    launch_plans: json!({"prefill": launch_rows_prefill, "decode": launch_rows_decode}),
+                    throughput: json!({
+                        "tg_ts": {"value": (step + 1) as f64 * 1_000_000.0 / decode_wall.max(1) as f64, "status": "derived", "basis": "observed decode steps / summed observed decode wall"},
+                    }),
+                    decode_steps: step + 1,
+                    produced_tokens: greedy.len(),
+                });
+                if let Some(companion_target) = stream.companion_path.as_ref() {
+                    let timing = Gea3ParityTiming {
+                        residency: Gea3ParityResidency {
+                            weight_alloc_us: weight_allocations_us,
+                            weight_upload_us,
+                            weight_bytes,
+                            weight_uploads,
+                            kv_alloc_us: kv_allocations_us,
+                            kv_zero_fill_us: kv_zero_us,
+                            kv_zero_fill_bytes: kv_bytes,
+                            other_zero_fills,
+                        },
+                        steps: parity_steps.clone(),
+                    };
+                    if let Ok(companion) = gea3_build_parity_companion(
+                        &timing,
+                        &stream.receipt_path.display().to_string(),
+                    ) {
+                        gea3_write_parity_companion(Some(companion_target), &companion);
+                    }
+                }
+            }
+        }
     }
     let prefill_wall_us = step_receipts
         .first()
@@ -3877,24 +4214,21 @@ fn gea3_run_physical(
         .filter_map(|row| row["timing_us"]["launch_encode_and_sync"].as_u64())
         .collect();
     let kv_alloc_us = kv_setup_us;
+    // The frozen statue's committed receipt wording stays byte-stable; a
+    // soak statue names its own completed-step basis.
+    let step_count_cell = if identity.history_capacity == HISTORY_CAPACITY {
+        json!({"value": identity.decode_steps, "status": "assumed", "basis": "frozen GEA3 n_predict"})
+    } else {
+        json!({"value": identity.decode_steps, "status": "measured", "basis": "completed decode steps (the soak statue's pinned step count)"})
+    };
     let evidence = json!({
-        "residency": {
-            "weight_allocations": {"value": 290, "status": "measured", "basis": "distinct frozen model tensor identities"},
-            "weight_bytes": {"value": weight_bytes, "status": "measured", "basis": "GEA3 input manifest absolute ranges"},
-            "weight_upload_count": {"value": weight_uploads, "status": "measured"},
-            "weight_residency_us": {"value": weight_allocations_us.saturating_add(weight_upload_us), "status": "measured", "components": {"allocation_and_program_setup": weight_allocations_us, "mapped_upload": weight_upload_us}},
-            "kv_allocations": {"value": LAYERS * 2, "status": "measured", "basis": "one shared fixed-capacity K/V arena per layer"},
-            "kv_bytes": {"value": kv_bytes, "status": "measured", "basis": "32 * 2 * 76 * 320 * sizeof(F32)"},
-            "kv_alloc_us": {"value": kv_alloc_us, "status": "measured", "basis": "KV handle allocation plus first zero-fill"},
-            "zero_cpu_substitutes": {"value": 0, "status": "measured", "basis": "all model work was submitted to Metal"},
-            "zero_cpu_bridges": {"value": 0, "status": "measured", "basis": "only one-hot staging, mask/rope constants, and host argmax ran on CPU"},
-        },
+        "residency": residency,
         "execution": {
             "prefill_wall_us": {"value": prefill_wall_us, "status": "measured"},
             "per_step_gpu_body_us": {"value": decode_gpu_us, "status": "measured", "basis": "sum of Metal encoder timestamps per decode step"},
             "launch_submit_us_per_step": {"value": decode_submit_us, "status": "measured", "basis": "host launch encode plus explicit step sync"},
             "launches_per_step": {"value": programs[1].descriptor.launches.len(), "status": "derived", "basis": "descriptor launch list"},
-            "step_count": {"value": DECODE_STEPS, "status": "assumed", "basis": "frozen GEA3 n_predict"},
+            "step_count": step_count_cell,
             "sync_wait_count": {"value": step_receipts.iter().skip(1).map(|row| row["dispatch"]["blocking_waits"].as_u64().unwrap_or(0)).sum::<u64>(), "status": "measured"},
             "sync_wait_us": {"value": step_receipts.iter().skip(1).map(|row| row["timing_us"]["launch_encode_and_sync"].as_u64().unwrap_or(0)).sum::<u64>(), "status": "measured", "basis": "explicit Metal step sync wall"},
             "logits_readback_bytes_per_step": {"value": VOCAB * 4, "status": "derived", "basis": "declared decode logits shape [49152] F32"},
@@ -3906,7 +4240,7 @@ fn gea3_run_physical(
         "steps": step_receipts,
         "throughput": {
             "pp_ts": {"value": PREFILL_ROWS as f64 * 1_000_000.0 / prefill_wall_us.max(1) as f64, "status": "derived", "basis": "prompt rows / prefill wall"},
-            "tg_ts": {"value": DECODE_STEPS as f64 * 1_000_000.0 / decode_wall_us.max(1) as f64, "status": "derived", "basis": "decode steps / summed decode wall"},
+            "tg_ts": {"value": identity.decode_steps as f64 * 1_000_000.0 / decode_wall_us.max(1) as f64, "status": "derived", "basis": "decode steps / summed decode wall"},
         },
     });
     drop(gea3_release_programs(runtime, &mut programs));
@@ -3929,6 +4263,24 @@ fn gea3_run_physical(
 #[test]
 #[ignore = "physical Metal gate; run only with the exact §6 command"]
 fn gea3_real_metal_decode_receipt() {
+    gea3_physical_receipt_run(GEA3_FROZEN_SHORT);
+}
+
+/// PPB-U7 soak runner: the same §6 physical path re-specialized at the
+/// `metal-m5max-soak-l2000` statue.  The runner emits the U6 monotonic
+/// produced-token counter as line-delimited stdout progress during decode
+/// and streams the receipt, so a 60s-capped kill still yields the count, the
+/// fresh-at-cap evidence, the KV residency, and the allocation cost.  The
+/// capacity and step count are compile-time statue facts; no runtime
+/// capacity argument or session lifetime is introduced, and
+/// `DeviceProgramLifetime::SingleRun` is retained by admission.
+#[test]
+#[ignore = "physical Metal gate; run only with the exact §6 command"]
+fn gea3_soak_metal_decode_receipt() {
+    gea3_physical_receipt_run(GEA3_SOAK_L2000);
+}
+
+fn gea3_physical_receipt_run(identity: Gea3Identity) {
     std::env::set_var("FABER_PER_OP_TIMING", "1");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -3950,7 +4302,7 @@ fn gea3_real_metal_decode_receipt() {
 
     let plan_started = Instant::now();
     let envelope = load_gea3_plan(&artifact_dir);
-    let (prefill, decode) = map_both(&envelope, &artifact_dir)
+    let (prefill, decode) = map_both(&envelope, &artifact_dir, identity)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
     let plan_admission_us = u64::try_from(plan_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let production_reds = gea3_physical_plan_reds(&envelope, &prefill.0, &decode.0);
@@ -4046,6 +4398,29 @@ fn gea3_real_metal_decode_receipt() {
         "blocked_reason": production_reds,
         "measurement_policy": "No unmeasured physical field is promoted; production reds stop-and-amend.",
     });
+    // PPB-U7: a non-frozen statue pins its identity facts in the receipt —
+    // including a cap-killed partial — so the reducer validates the pinned
+    // workload while the observed step count stays a measurement.
+    if identity != GEA3_FROZEN_SHORT {
+        receipt["statue"] = json!({
+            "name": identity.name,
+            "n_predict": identity.n_predict,
+            "margin": identity.margin,
+            "l_max": identity.l_max(),
+            "l_max_formula": format!("prompt({PREFILL_ROWS}) + n_predict({}) + margin({})", identity.n_predict, identity.margin),
+            "kv_capacity_rows": identity.history_capacity,
+            "kv_bytes": identity.kv_bytes(),
+            "kv_bytes_derivation": identity.kv_basis(),
+            "decode_steps": identity.decode_steps,
+            "single_run_lifetime_retained": true,
+        });
+    }
+    let soak_stream = (identity != GEA3_FROZEN_SHORT).then(|| Gea3SoakStream {
+        identity,
+        base_receipt: receipt.clone(),
+        receipt_path: receipt_path.clone(),
+        companion_path: gea3_parity_companion_path(),
+    });
     let mut parity_timing: Option<Gea3ParityTiming> = None;
 
     if production_reds.is_empty() && session_admitted {
@@ -4061,6 +4436,8 @@ fn gea3_real_metal_decode_receipt() {
                     &input_manifest,
                     &model_path,
                     &prompt_tokens,
+                    identity,
+                    soak_stream.as_ref(),
                 )
             });
         match execution {
@@ -4218,6 +4595,7 @@ fn gea3_run_staged_diagnostic(
             0,
             u32::try_from(prompt_tokens.len()).map_err(|_| "prompt is too long".to_owned())?,
             true,
+            HISTORY_CAPACITY,
         )?;
         for launch in &programs[0].descriptor.launches {
             let kernel = &programs[0].descriptor.kernels[launch.kernel_index as usize];
@@ -4432,6 +4810,7 @@ fn gea3_run_staged_diagnostic(
             u32::try_from(prompt_tokens.len() + 1)
                 .map_err(|_| "decode valid length overflows".to_owned())?,
             false,
+            HISTORY_CAPACITY,
         )?;
 
         let mut stages = Vec::new();
@@ -4728,7 +5107,7 @@ fn gea3_real_metal_staged_composition_diagnostic() {
         model_path.display()
     );
     let envelope = load_gea3_plan(&artifact_dir);
-    let (prefill, decode) = map_both(&envelope, &artifact_dir)
+    let (prefill, decode) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
     let input_manifest_path = workspace
         .join("radix/docs/factory/gpu-execution-architecture/evidence/gea3-input-manifest.json");
