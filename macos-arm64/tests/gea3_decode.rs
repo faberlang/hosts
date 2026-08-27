@@ -793,14 +793,15 @@ fn admit_sub_window(
             resource.buffer.name
         ));
     }
-    // GEA3-U6 num-3 pitch-truth law (the hosts mirror of the harness
-    // admission): a STRIDED read window's declared row pitch must equal the
-    // producer's actual pitch — the producer's allocation is exactly
-    // `row_stride · row_count` rows of the window — so a consumer can never
-    // address one level off the producer's real row-major layout (a window
-    // that lies about the pitch passes the count laws: carried==derived and
-    // nesting both count spans, not pitches).  Contiguous windows (stride
-    // == width) are dense by construction and skip the law.
+    // GEA3-U6 num-3 / PGC-B1 pitch-truth law (the hosts mirror of the
+    // harness admission, B1 fold-state repair): a STRIDED read window's
+    // declared row pitch must equal the producer's actual pitch — but a B1
+    // window may be a bounded prefix of the larger fixed-capacity producer
+    // (the kv arena's 1088-row bucket inside the 1100-row capacity
+    // allocation), so `row_stride · row_count` need only nest inside a
+    // whole-row allocation at the KV row width; a lying pitch remains
+    // rejected even when count and nesting laws pass.  Contiguous windows
+    // (stride == width) are dense by construction and skip the law.
     if !matches!(resource.access, Gea3ResourceAccess::Write) && !window.is_contiguous() {
         let pitch_span = window
             .row_stride
@@ -811,9 +812,13 @@ fn admit_sub_window(
                     resource.buffer.name
                 )
             })?;
-        if pitch_span != allocation {
+        let bounded_prefix = pitch_span < allocation;
+        if allocation % window.row_stride != 0
+            || pitch_span > allocation
+            || (bounded_prefix && window.row_stride != KV_WIDTH)
+        {
             return Err(format!(
-                "resource `{}` carries a strided read window declaring row_stride {} · row_count {} = {pitch_span} ≠ the producer's {allocation}-element allocation; the declared stride must equal the producer's actual pitch (GEA3-U6 num-3 pitch-truth law)",
+                "resource `{}` carries a strided read window declaring row_stride {} · row_count {} = {pitch_span} beyond or incompatible with the producer's {allocation}-element allocation; the declared stride must equal the producer's actual pitch (GEA3-U6 num-3 pitch-truth law)",
                 resource.buffer.name, window.row_stride, window.row_count
             ));
         }
