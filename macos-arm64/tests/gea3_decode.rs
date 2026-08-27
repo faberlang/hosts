@@ -3249,9 +3249,9 @@ fn gea3_release_programs(
 // ---------------------------------------------------------------------------
 // PPB-U3: the optional parity timing companion (gea3-parity-timing-
 // companion-v1).  The companion is disjoint from `gea3-metal-receipt-v1`:
-// the physical test keeps emitting its original receipt unchanged and
-// additionally emits this versioned companion when the environment names an
-// output path.  Every phase is directly measured on its own clock and the
+// the physical test emits the versioned receipt and additionally emits this
+// companion when the environment names an output path.  Every phase is
+// directly measured on its own clock and the
 // boundaries never overlap: the launch/encode clock ends before the queue
 // wait begins, and the queue wait ends at the declared completion point
 // (the explicit step `sync` return).  No category is a total minus other
@@ -3283,6 +3283,7 @@ struct Gea3ParityStep {
     gpu_encoder_us: Option<u64>,
     gpu_timestamp_count: usize,
     gpu_start_timestamp_count: usize,
+    gpu_total_encoder_count: usize,
     command_submits: usize,
     blocking_waits: usize,
     readback: Gea3ParityPhase,
@@ -3314,6 +3315,53 @@ fn gea3_parity_measured(value: u64, basis: &str) -> Value {
 
 fn gea3_parity_count(value: u64, basis: &str) -> Value {
     json!({"value": value, "status": "measured", "basis": basis})
+}
+
+fn gea3_gpu_timing_cell(
+    value: Option<u64>,
+    sampled_encoders: usize,
+    total_encoders: usize,
+    basis: &str,
+) -> Value {
+    let (value, status) = match value {
+        Some(value) => (json!(value), "measured"),
+        None => (Value::Null, "not_measured"),
+    };
+    json!({
+        "value": value,
+        "status": status,
+        "sampled_encoders": sampled_encoders,
+        "total_encoders": total_encoders,
+        "coverage": format!("{sampled_encoders}/{total_encoders}"),
+        "reason": if status == "not_measured" {
+            json!("the driver sampled no GPU timestamps for this step; no encoder time is inferred")
+        } else {
+            Value::Null
+        },
+        "basis": basis,
+    })
+}
+
+fn gea3_gpu_count_cell(value: usize, total_encoders: usize, basis: &str) -> Value {
+    json!({
+        "value": value,
+        "status": "measured",
+        "sampled_encoders": value,
+        "total_encoders": total_encoders,
+        "coverage": format!("{value}/{total_encoders}"),
+        "basis": basis,
+    })
+}
+
+fn gea3_gpu_not_measured(reason: &str, total_encoders: usize) -> Value {
+    let mut cell = gea3_gpu_timing_cell(
+        None,
+        0,
+        total_encoders,
+        "no GPU timestamp duration was observed",
+    );
+    cell["reason"] = json!(reason);
+    cell
 }
 
 fn gea3_parity_not_measured(reason: &str) -> Value {
@@ -3361,15 +3409,12 @@ fn gea3_parity_admit_step_boundaries(step: &Gea3ParityStep) -> Result<(), String
 }
 
 fn gea3_parity_step_json(step: &Gea3ParityStep) -> Value {
-    let gpu_encoder = match step.gpu_encoder_us {
-        Some(sum) => gea3_parity_measured(
-            sum,
-            "sum of per-encoder device GPU timestamps for this step (FABER_PER_OP_TIMING)",
-        ),
-        None => gea3_parity_not_measured(
-            "the driver sampled no GPU timestamps for this step; no encoder time is inferred",
-        ),
-    };
+    let gpu_encoder = gea3_gpu_timing_cell(
+        step.gpu_encoder_us,
+        step.gpu_timestamp_count,
+        step.gpu_total_encoder_count,
+        "sum of sampled per-encoder device GPU timestamps for this step (FABER_PER_OP_TIMING); coverage is explicit",
+    );
     json!({
         "mode": step.mode,
         "step": step.step,
@@ -3392,9 +3437,14 @@ fn gea3_parity_step_json(step: &Gea3ParityStep) -> Value {
         },
         "gpu_encoder": {
             "duration_us": gpu_encoder,
-            "timestamp_count": gea3_parity_count(step.gpu_timestamp_count as u64, "sampled per-encoder GPU end timestamps"),
-            "gpu_start_timestamp_count": gea3_parity_count(step.gpu_start_timestamp_count as u64, "sampled per-encoder GPU start timestamps"),
+            "timestamp_count": gea3_gpu_count_cell(step.gpu_timestamp_count, step.gpu_total_encoder_count, "sampled per-encoder GPU end timestamps"),
+            "gpu_start_timestamp_count": gea3_gpu_count_cell(step.gpu_start_timestamp_count, step.gpu_total_encoder_count, "sampled per-encoder GPU start timestamps"),
             "clock": "device GPU timestamps (independent of the host wall phases)",
+            "coverage": {
+                "sampled_encoders": step.gpu_timestamp_count,
+                "total_encoders": step.gpu_total_encoder_count,
+                "fraction": format!("{}/{}", step.gpu_timestamp_count, step.gpu_total_encoder_count),
+            },
         },
         "command_submits": {
             "value": step.command_submits,
@@ -3426,6 +3476,33 @@ fn gea3_parity_summed(label: &str, values: &[u64], total_steps: usize) -> Value 
     })
 }
 
+fn gea3_parity_gpu_summed(steps: &[&Gea3ParityStep]) -> Value {
+    let values: Vec<u64> = steps.iter().filter_map(|step| step.gpu_encoder_us).collect();
+    let sampled_encoders: Vec<usize> = steps
+        .iter()
+        .map(|step| step.gpu_timestamp_count)
+        .collect();
+    let total_encoders: Vec<usize> = steps
+        .iter()
+        .map(|step| step.gpu_total_encoder_count)
+        .collect();
+    let status = if values.is_empty() {
+        "not_measured"
+    } else {
+        "derived"
+    };
+    json!({
+        "value": values.first().map(|_| values.iter().copied().sum::<u64>()),
+        "status": status,
+        "steps_measured": values.len(),
+        "steps_not_measured": steps.len() - values.len(),
+        "sampled_encoders_per_step": sampled_encoders,
+        "total_encoders_per_step": total_encoders,
+        "coverage_per_step": steps.iter().map(|step| format!("{}/{}", step.gpu_timestamp_count, step.gpu_total_encoder_count)).collect::<Vec<_>>(),
+        "basis": "sum of sampled per-encoder GPU timestamps; each step carries its sampled/total encoder coverage",
+    })
+}
+
 /// Build the versioned companion from directly measured observations.  The
 /// boundary law is admitted fail-closed; nothing here subtracts a total and
 /// every absent fact keeps an explicit status.
@@ -3450,8 +3527,9 @@ fn gea3_build_parity_companion(
         json!({
             "input_upload_us": gea3_parity_summed("input upload", &steps.iter().map(|step| step.input_upload.duration_us).collect::<Vec<_>>(), steps.len()),
             "launch_encode_us": gea3_parity_summed("launch encode", &steps.iter().map(|step| step.launch_encode.duration_us).collect::<Vec<_>>(), steps.len()),
-            "queue_wait_us": gea3_parity_summed("queue wait", &steps.iter().map(|step| step.queue_wait.duration_us).collect::<Vec<_>>(), steps.len()),
-            "gpu_encoder_us": gea3_parity_summed("GPU encoder", &steps.iter().filter_map(|step| step.gpu_encoder_us).collect::<Vec<_>>(), steps.len()),
+            "queue_wait_us": gea3_parity_summed("queue wait (submit plus sync)", &steps.iter().map(|step| step.queue_wait.duration_us).collect::<Vec<_>>(), steps.len()),
+            "submit_sync_us": gea3_parity_summed("submit plus sync", &steps.iter().map(|step| step.queue_wait.duration_us).collect::<Vec<_>>(), steps.len()),
+            "gpu_encoder_us": gea3_parity_gpu_summed(steps),
             "readback_us": gea3_parity_summed("readback", &steps.iter().map(|step| step.readback.duration_us).collect::<Vec<_>>(), steps.len()),
         })
     };
@@ -3556,8 +3634,9 @@ fn gea3_fake_parity_step(
             duration_us: 360,
         },
         gpu_encoder_us,
-        gpu_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * 2115,
-        gpu_start_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * 2115,
+        gpu_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * LAUNCHES_PER_PROGRAM,
+        gpu_start_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * LAUNCHES_PER_PROGRAM,
+        gpu_total_encoder_count: LAUNCHES_PER_PROGRAM,
         command_submits: 1,
         blocking_waits: 1,
         readback: Gea3ParityPhase {
@@ -3652,6 +3731,14 @@ fn gea3_parity_timing_companion_optional_emission() {
         unsampled["gpu_encoder"]["duration_us"]["status"],
         json!("not_measured")
     );
+    assert_eq!(
+        unsampled["gpu_encoder"]["duration_us"]["sampled_encoders"],
+        json!(0)
+    );
+    assert_eq!(
+        unsampled["gpu_encoder"]["duration_us"]["total_encoders"],
+        json!(LAUNCHES_PER_PROGRAM)
+    );
     assert!(
         unsampled["gpu_encoder"]["duration_us"]["reason"]
             .as_str()
@@ -3666,6 +3753,34 @@ fn gea3_parity_timing_companion_optional_emission() {
     assert_eq!(
         sampled["gpu_encoder"]["duration_us"]["status"],
         json!("measured")
+    );
+    assert_eq!(
+        sampled["gpu_encoder"]["duration_us"]["sampled_encoders"],
+        json!(LAUNCHES_PER_PROGRAM)
+    );
+    assert_eq!(
+        sampled["gpu_encoder"]["duration_us"]["total_encoders"],
+        json!(LAUNCHES_PER_PROGRAM)
+    );
+
+    // A partial sample must remain honest at the duration field itself, not
+    // merely in a sibling count.  This is the fixed-1000 shape when Metal's
+    // 2,048-slot counter buffer samples 1,024 of the 2,115 encoders.
+    let mut partial = gea3_fake_parity_step("decode", 4, Some(125));
+    partial.gpu_timestamp_count = 1_024;
+    partial.gpu_start_timestamp_count = 1_024;
+    let partial_companion = gea3_build_parity_companion(
+        &gea3_fake_parity_timing(vec![partial]),
+        "evidence/gea3-metal-receipt.json",
+    )
+    .expect("partial GPU sample remains admissible");
+    assert_eq!(
+        partial_companion["phases"]["decode"][0]["gpu_encoder"]["duration_us"]["coverage"],
+        json!("1024/2115")
+    );
+    assert_eq!(
+        partial_companion["summary"]["decode"]["gpu_encoder_us"]["coverage_per_step"][0],
+        json!("1024/2115")
     );
 
     // (d) transfer honesty: the weight residency never claims a transfer it
@@ -3738,6 +3853,10 @@ fn gea3_parity_timing_companion_optional_emission() {
     );
     assert_eq!(
         written["summary"]["decode"]["queue_wait_us"]["status"],
+        json!("derived")
+    );
+    assert_eq!(
+        written["summary"]["decode"]["submit_sync_us"]["status"],
         json!("derived")
     );
 }
@@ -4005,6 +4124,7 @@ fn gea3_run_physical(
         gpu_encoder_us: (!prefill_gpu_us.is_empty()).then(|| prefill_gpu_us.iter().copied().sum()),
         gpu_timestamp_count: prefill_gpu_us.len(),
         gpu_start_timestamp_count: prefill_gpu_start_us.len(),
+        gpu_total_encoder_count: programs[0].descriptor.launches.len(),
         command_submits: prefill_submit_count,
         blocking_waits: prefill_wait_count,
         readback: Gea3ParityPhase {
@@ -4022,7 +4142,28 @@ fn gea3_run_physical(
         "launch_count": programs[0].descriptor.launches.len(),
         "data_flow_edges": {"declared": programs[0].descriptor.data_flow.len(), "satisfied": edge_prefill},
         "dispatch": {"launches": programs[0].descriptor.launches.len(), "command_submits": prefill_submit_count, "blocking_waits": prefill_wait_count},
-        "timing_us": {"wall": gea3_elapsed_us(prefill_started), "launch_encode_and_sync": prefill_encode_sync_us, "gpu_body_sum": prefill_gpu_us.iter().copied().sum::<u64>(), "gpu_timestamp_count": prefill_gpu_us.len(), "gpu_start_timestamp_count": prefill_gpu_start_us.len(), "readback": prefill_readback_us},
+        "timing_us": {
+            "wall": gea3_elapsed_us(prefill_started),
+            "launch_encode_us": prefill_encode_sync_us,
+            "submit_sync_us": prefill_queue_wait_us,
+            "gpu_body_sum": gea3_gpu_timing_cell(
+                (!prefill_gpu_us.is_empty()).then(|| prefill_gpu_us.iter().copied().sum()),
+                prefill_gpu_us.len(),
+                programs[0].descriptor.launches.len(),
+                "sum of sampled per-encoder Metal GPU timestamps; coverage is explicit",
+            ),
+            "gpu_timestamp_count": gea3_gpu_count_cell(
+                prefill_gpu_us.len(),
+                programs[0].descriptor.launches.len(),
+                "sampled per-encoder GPU end timestamps",
+            ),
+            "gpu_start_timestamp_count": gea3_gpu_count_cell(
+                prefill_gpu_start_us.len(),
+                programs[0].descriptor.launches.len(),
+                "sampled per-encoder GPU start timestamps",
+            ),
+            "readback": prefill_readback_us,
+        },
         "readback": {"buffer_id": programs[0].output.0, "version": programs[0].output.1, "elements": prefill_values.len(), "bytes": prefill_values.len() * 4, "sha256": gea3_readback_hash(&prefill_values), "finite": true},
         "next_token": next_token,
     }));
@@ -4124,6 +4265,7 @@ fn gea3_run_physical(
             gpu_encoder_us: (!gpu_us.is_empty()).then(|| gpu_us.iter().copied().sum()),
             gpu_timestamp_count: gpu_us.len(),
             gpu_start_timestamp_count: gpu_start_us.len(),
+            gpu_total_encoder_count: programs[1].descriptor.launches.len(),
             command_submits: submit_count,
             blocking_waits: wait_count,
             readback: Gea3ParityPhase {
@@ -4143,7 +4285,28 @@ fn gea3_run_physical(
             "launch_count": programs[1].descriptor.launches.len(),
             "data_flow_edges": {"declared": programs[1].descriptor.data_flow.len(), "satisfied": edge_decode},
             "dispatch": {"launches": programs[1].descriptor.launches.len(), "command_submits": submit_count, "blocking_waits": wait_count},
-            "timing_us": {"wall": gea3_elapsed_us(started), "launch_encode_and_sync": encode_sync_us, "gpu_body_sum": gpu_us.iter().copied().sum::<u64>(), "gpu_timestamp_count": gpu_us.len(), "gpu_start_timestamp_count": gpu_start_us.len(), "readback": readback_us},
+            "timing_us": {
+                "wall": gea3_elapsed_us(started),
+                "launch_encode_us": encode_sync_us,
+                "submit_sync_us": queue_wait_us,
+                "gpu_body_sum": gea3_gpu_timing_cell(
+                    (!gpu_us.is_empty()).then(|| gpu_us.iter().copied().sum()),
+                    gpu_us.len(),
+                    programs[1].descriptor.launches.len(),
+                    "sum of sampled per-encoder Metal GPU timestamps; coverage is explicit",
+                ),
+                "gpu_timestamp_count": gea3_gpu_count_cell(
+                    gpu_us.len(),
+                    programs[1].descriptor.launches.len(),
+                    "sampled per-encoder GPU end timestamps",
+                ),
+                "gpu_start_timestamp_count": gea3_gpu_count_cell(
+                    gpu_start_us.len(),
+                    programs[1].descriptor.launches.len(),
+                    "sampled per-encoder GPU start timestamps",
+                ),
+                "readback": readback_us,
+            },
             "readback": {"buffer_id": programs[1].output.0, "version": programs[1].output.1, "elements": values.len(), "bytes": values.len() * 4, "sha256": gea3_readback_hash(&values), "finite": true},
             "next_token": next_token,
         }));
@@ -4211,19 +4374,24 @@ fn gea3_run_physical(
         .skip(1)
         .filter_map(|row| row["timing_us"]["wall"].as_u64())
         .sum();
-    let decode_gpu_us: Vec<u64> = step_receipts
+    let decode_gpu_cells: Vec<Value> = step_receipts
         .iter()
         .skip(1)
-        .filter_map(|row| row["timing_us"]["gpu_body_sum"].as_u64())
+        .map(|row| row["timing_us"]["gpu_body_sum"].clone())
         .collect();
-    let decode_submit_us: Vec<u64> = step_receipts
+    let decode_launch_encode_us: Vec<u64> = step_receipts
         .iter()
         .skip(1)
-        .filter_map(|row| row["timing_us"]["launch_encode_and_sync"].as_u64())
+        .filter_map(|row| row["timing_us"]["launch_encode_us"].as_u64())
+        .collect();
+    let decode_submit_sync_us: Vec<u64> = step_receipts
+        .iter()
+        .skip(1)
+        .filter_map(|row| row["timing_us"]["submit_sync_us"].as_u64())
         .collect();
     let kv_alloc_us = kv_setup_us;
-    // The frozen statue's committed receipt wording stays byte-stable; a
-    // non-frozen statue names its own completed-step basis.
+    // Every statue uses the same receipt schema; a non-frozen statue names
+    // its own completed-step basis without changing the timing field shape.
     let step_count_cell = if identity.history_capacity == HISTORY_CAPACITY {
         json!({"value": identity.decode_steps, "status": "assumed", "basis": "frozen GEA3 n_predict"})
     } else {
@@ -4233,12 +4401,14 @@ fn gea3_run_physical(
         "residency": residency,
         "execution": {
             "prefill_wall_us": {"value": prefill_wall_us, "status": "measured"},
-            "per_step_gpu_body_us": {"value": decode_gpu_us, "status": "measured", "basis": "sum of Metal encoder timestamps per decode step"},
-            "launch_submit_us_per_step": {"value": decode_submit_us, "status": "measured", "basis": "host launch encode plus explicit step sync"},
+            "per_step_gpu_body_us": {"value": decode_gpu_cells, "status": "measured", "basis": "each per-step sampled Metal encoder sum carries its sampled/total encoder coverage"},
+            "launch_encode_us_per_step": {"value": decode_launch_encode_us, "status": "measured", "basis": "host launch encode wall before the explicit step sync"},
+            "submit_sync_us_per_step": {"value": decode_submit_sync_us, "status": "measured", "basis": "host wall around explicit Metal command-buffer submit plus wait"},
             "launches_per_step": {"value": programs[1].descriptor.launches.len(), "status": "derived", "basis": "descriptor launch list"},
             "step_count": step_count_cell,
-            "sync_wait_count": {"value": step_receipts.iter().skip(1).map(|row| row["dispatch"]["blocking_waits"].as_u64().unwrap_or(0)).sum::<u64>(), "status": "measured"},
-            "sync_wait_us": {"value": step_receipts.iter().skip(1).map(|row| row["timing_us"]["launch_encode_and_sync"].as_u64().unwrap_or(0)).sum::<u64>(), "status": "measured", "basis": "explicit Metal step sync wall"},
+            "submit_sync_count": {"value": step_receipts.iter().skip(1).map(|row| row["dispatch"]["blocking_waits"].as_u64().unwrap_or(0)).sum::<u64>(), "status": "measured", "basis": "blocking waits at the explicit Metal step boundary"},
+            "launch_encode_us": {"value": decode_launch_encode_us.iter().copied().sum::<u64>(), "status": "derived", "basis": "sum of per-step launch encode clocks"},
+            "submit_sync_us": {"value": decode_submit_sync_us.iter().copied().sum::<u64>(), "status": "derived", "basis": "sum of per-step explicit Metal command-buffer submit plus wait clocks"},
             "logits_readback_bytes_per_step": {"value": VOCAB * 4, "status": "derived", "basis": "declared decode logits shape [49152] F32"},
             "greedy_token_sequence": {"value": greedy, "status": "measured", "basis": "first-index host argmax of declared logits readback"},
             "intermediate_readbacks": {"value": 0, "status": "measured", "basis": "only declared logits observation was read back per invocation"},
@@ -4484,11 +4654,13 @@ fn gea3_physical_receipt_run(identity: Gea3Identity) {
                 });
                 receipt["execution"] = json!({
                     "prefill_wall_us": gea3_unmeasured("physical execution failed before a complete receipt"),
-                    "per_step_gpu_body_us": gea3_unmeasured("physical execution failed before a complete receipt"),
-                    "launch_submit_us_per_step": gea3_unmeasured("physical execution failed before a complete receipt"),
+                    "per_step_gpu_body_us": gea3_gpu_not_measured("physical execution failed before a complete receipt", LAUNCHES_PER_PROGRAM),
+                    "launch_encode_us_per_step": gea3_unmeasured("physical execution failed before a complete receipt"),
+                    "submit_sync_us_per_step": gea3_unmeasured("physical execution failed before a complete receipt"),
                     "launches_per_step": gea3_unmeasured("physical execution failed before a complete receipt"),
-                    "sync_wait_count": gea3_unmeasured("physical execution failed before a complete receipt"),
-                    "sync_wait_us": gea3_unmeasured("physical execution failed before a complete receipt"),
+                    "submit_sync_count": gea3_unmeasured("physical execution failed before a complete receipt"),
+                    "launch_encode_us": gea3_unmeasured("physical execution failed before a complete receipt"),
+                    "submit_sync_us": gea3_unmeasured("physical execution failed before a complete receipt"),
                     "logits_readback_bytes_per_step": gea3_unmeasured("physical execution failed before a complete receipt"),
                     "greedy_token_sequence": gea3_unmeasured("physical execution failed before a complete receipt"),
                     "intermediate_readbacks": {"value": 0, "status": "measured", "basis": "no complete physical execution receipt"},
@@ -4508,11 +4680,13 @@ fn gea3_physical_receipt_run(identity: Gea3Identity) {
         });
         receipt["execution"] = json!({
             "prefill_wall_us": gea3_unmeasured("blocked before dispatch"),
-            "per_step_gpu_body_us": gea3_unmeasured("blocked before dispatch"),
-            "launch_submit_us_per_step": gea3_unmeasured("blocked before dispatch"),
+            "per_step_gpu_body_us": gea3_gpu_not_measured("blocked before dispatch", LAUNCHES_PER_PROGRAM),
+            "launch_encode_us_per_step": gea3_unmeasured("blocked before dispatch"),
+            "submit_sync_us_per_step": gea3_unmeasured("blocked before dispatch"),
             "launches_per_step": gea3_unmeasured("blocked before dispatch"),
-            "sync_wait_count": gea3_unmeasured("blocked before dispatch"),
-            "sync_wait_us": gea3_unmeasured("blocked before dispatch"),
+            "submit_sync_count": gea3_unmeasured("blocked before dispatch"),
+            "launch_encode_us": gea3_unmeasured("blocked before dispatch"),
+            "submit_sync_us": gea3_unmeasured("blocked before dispatch"),
             "logits_readback_bytes_per_step": gea3_unmeasured("blocked before dispatch"),
             "greedy_token_sequence": gea3_unmeasured("blocked before dispatch"),
             "intermediate_readbacks": {"value": 0, "status": "measured", "basis": "no dispatch occurred"},

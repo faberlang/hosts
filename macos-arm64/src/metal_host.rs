@@ -271,8 +271,11 @@ mod unix_mmap {
 /// path. Matches the emitted `add_one` entry of the U2 proof fixture
 /// (input@0, output@1, extent@2).
 const ELEMENTWISE_ADD_ENTRY: &[u8] = b"add_one";
-/// Timestamp sample slots (two per encoder: start + end). 2048 covers the
-/// dense 419/315 census with headroom.
+/// Timestamp sample slots (two per encoder: start + end). Metal exposes at
+/// most 1,024 encoder observations through this buffer; GEA3 receipts must
+/// carry the sampled and total encoder counts instead of implying full
+/// coverage when a program has more encoders.
+const TIMESTAMP_SAMPLES_PER_ENCODER: u64 = 2;
 const TIMESTAMP_SAMPLE_CAPACITY: u64 = 2048;
 
 fn per_op_timing_wanted() -> bool {
@@ -2262,11 +2265,12 @@ impl MetalDriver for SystemMetalDriver {
         let sampled = per_op_timing_wanted()
             && self.ensure_timestamp_buffer()
             && (self.encoder_sample_count as u64)
-                .saturating_mul(2)
+                .saturating_mul(TIMESTAMP_SAMPLES_PER_ENCODER)
                 .saturating_add(1)
                 < TIMESTAMP_SAMPLE_CAPACITY;
         let encoder = if sampled {
-            let start = (self.encoder_sample_count as u64).saturating_mul(2);
+            let start =
+                (self.encoder_sample_count as u64).saturating_mul(TIMESTAMP_SAMPLES_PER_ENCODER);
             let end = start.saturating_add(1);
             let descriptor = ComputePassDescriptor::new();
             let sample_buffer = self
@@ -2464,7 +2468,8 @@ impl SystemMetalDriver {
         let dest = if encoder_count > 0 {
             match (self.device.as_ref(), self.timestamp_buffer.as_ref()) {
                 (Some(device), Some(sample_buffer)) => {
-                    let sample_count = (encoder_count as u64).saturating_mul(2);
+                    let sample_count =
+                        (encoder_count as u64).saturating_mul(TIMESTAMP_SAMPLES_PER_ENCODER);
                     let dest = device.new_buffer(
                         sample_count.saturating_mul(8),
                         MTLResourceOptions::StorageModeShared,
@@ -2554,7 +2559,7 @@ fn encoder_gpu_timeline_from_samples(
 ) -> EncoderGpuTimeline {
     let cpu_span = cpu_end.saturating_sub(cpu_start);
     let gpu_span = gpu_end.saturating_sub(gpu_start);
-    let sample_count = encoder_count.saturating_mul(2);
+    let sample_count = encoder_count.saturating_mul(TIMESTAMP_SAMPLES_PER_ENCODER as usize);
     if encoder_count == 0 || cpu_span == 0 || gpu_span == 0 || samples.len() < sample_count {
         return EncoderGpuTimeline::default();
     }
@@ -2582,7 +2587,7 @@ fn convert_encoder_gpu_timeline(
     gpu_start: u64,
     gpu_end: u64,
 ) -> EncoderGpuTimeline {
-    let sample_count = encoder_count.saturating_mul(2);
+    let sample_count = encoder_count.saturating_mul(TIMESTAMP_SAMPLES_PER_ENCODER as usize);
     if sample_count == 0 {
         return EncoderGpuTimeline::default();
     }
