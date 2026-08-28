@@ -270,6 +270,7 @@ enum Gea3Plan {
     RmsNormalization(Gea3RmsNormalizationPlan),
     Rope(Gea3RopePlan),
     CausalMaskedSoftmax(Gea3CausalMaskedSoftmaxPlan),
+    Gather(Gea3GatherPlan),
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +371,19 @@ struct Gea3RopePlan {
 struct Gea3CausalMaskedSoftmaxPlan {
     rows: u64,
     cols: u64,
+}
+
+/// PGC-R1/PGC-R3: the row-gather plan mirror — one indexed row copy per
+/// token id, superseding the one-hot selector matmul. The wire resource
+/// stamps `element_ty: "f32"` for the ids buffer (the hosts GEA3 statue is
+/// F32-only; 4 bytes per id) while the emitted MSL truth is
+/// `device const uint* ids`, pinned by `gea3_decode_pgc_r1.rs`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gea3GatherPlan {
+    id_count: u64,
+    table_cols: u64,
+    table_rows: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1609,8 +1623,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "prefill_score_gemm"
         | "prefill_context_gemm"
         | "lm_head_gemv"
-        | "prefill_lm_head_gemv"
-        | "prefill_embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        | "prefill_lm_head_gemv" => matches!(plan, Gea3Plan::TiledMatMul(_)),
         "head_rmsnorm" | "prefill_head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
             matches!(plan, Gea3Plan::RmsNormalization(_))
         }
@@ -1623,7 +1636,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         "decode_masked_softmax" | "prefill_causal_softmax" => {
             matches!(plan, Gea3Plan::CausalMaskedSoftmax(_))
         }
-        "embedding_gather" | "prefill_embedding_gather" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        "embedding_gather" | "prefill_embedding_gather" => matches!(plan, Gea3Plan::Gather(_)),
         "decode_swiglu" | "decode_residual_add" | "prefill_swiglu" | "prefill_residual_add" => {
             matches!(plan, Gea3Plan::Elementwise)
         }
@@ -2807,28 +2820,37 @@ fn gea3_update_inputs(
                 .get(&(slot.buffer_id, slot.version))
                 .ok_or_else(|| "dynamic input handle disappeared".to_owned())?;
             if (kernel.entry == "embedding_gather" || kernel.entry == "prefill_embedding_gather")
-                && slot.binding == 0
+                && slot.binding == 1
             {
+                // PGC-R1/PGC-R3: compact token-id binding — the gather
+                // consumes one u32 id per row (staged through the statue's
+                // F32 element path, 4 bytes per id), never the superseded
+                // [rows, VOCAB] one-hot selector.
                 let rows = if prefill { tokens.len() } else { 1 };
-                let expected = rows
-                    .checked_mul(VOCAB as usize)
-                    .ok_or_else(|| "one-hot input size overflows".to_owned())?;
-                if slot.element_count != expected as u64 {
+                if slot.element_count != rows as u64 {
                     return Err(format!(
-                        "embedding selector declares {} values, expected {expected}",
+                        "embedding ids declare {} values, expected {rows}",
                         slot.element_count
                     ));
                 }
-                let mut one_hot = vec![0.0; expected];
-                for (row, token) in tokens.iter().enumerate() {
-                    let token = usize::try_from(*token)
-                        .map_err(|_| "token id does not fit host usize".to_owned())?;
-                    if token >= VOCAB as usize {
-                        return Err(format!("token id {token} is outside vocab {VOCAB}"));
-                    }
-                    one_hot[row * VOCAB as usize + token] = 1.0;
-                }
-                copy(handle, one_hot)?;
+                let ids: Vec<f32> = tokens[..rows]
+                    .iter()
+                    .map(|token| {
+                        let token = usize::try_from(*token)
+                            .map_err(|_| "token id does not fit host usize".to_owned())?;
+                        if token >= VOCAB as usize {
+                            return Err(format!("token id {token} is outside vocab {VOCAB}"));
+                        }
+                        Ok(f32::from_bits(u32::try_from(token).map_err(|_| "token id does not fit u32".to_owned())?))
+                    })
+                    .collect::<Result<Vec<f32>, String>>()?;
+                copy(handle, ids)?;
+            } else if (kernel.entry == "embedding_gather" || kernel.entry == "prefill_embedding_gather")
+                && slot.binding == 0
+            {
+                // The resident [VOCAB, 960] table is weight-shaped and
+                // once-resident (PGC-C5); it is never staged per step here.
+                continue;
             } else if (kernel.entry == "prefill_rope_q" || kernel.entry == "prefill_rope_k")
                 && slot.binding == 1
                 || (kernel.entry == "decode_rope_q" || kernel.entry == "decode_rope_k")
