@@ -42,6 +42,62 @@ fn f32_from_bytes(bytes: &[u8]) -> Vec<f32> {
 const F32_BYTES: usize = 4;
 const TILE: usize = 8;
 
+fn frozen_abs_delta(
+    observed: &[f32],
+    reference: &[f32],
+    bound: f32,
+) -> Result<f32, String> {
+    if !bound.is_finite() || bound < 0.0 {
+        return Err(format!("frozen bound is not finite and non-negative: {bound}"));
+    }
+    if observed.len() != reference.len() {
+        return Err(format!(
+            "comparison length mismatch: observed {} values, reference {} values",
+            observed.len(),
+            reference.len()
+        ));
+    }
+    let mut max_abs = 0.0_f32;
+    for (&observed, &reference) in observed.iter().zip(reference) {
+        if !observed.is_finite() || !reference.is_finite() {
+            return Err(format!(
+                "comparison contains non-finite values: observed {observed}, reference {reference}"
+            ));
+        }
+        let abs = (observed - reference).abs();
+        if !abs.is_finite() {
+            return Err("comparison delta is non-finite".to_string());
+        }
+        max_abs = max_abs.max(abs);
+    }
+    if max_abs > bound {
+        return Err(format!(
+            "max_abs {max_abs} exceeds frozen bound {bound}"
+        ));
+    }
+    Ok(max_abs)
+}
+
+fn assert_frozen_abs_bound(
+    entry: &str,
+    comparison: &str,
+    observed: &[f32],
+    reference: &[f32],
+    bound: f32,
+) {
+    frozen_abs_delta(observed, reference, bound)
+        .unwrap_or_else(|error| panic!("{entry} {comparison}: {error}"));
+}
+
+#[test]
+fn frozen_old_recipe_bound_rejects_drift() {
+    let new_output = [1.0_f32, -2.0];
+    let old_output = [1.0_f32, -2.001];
+    let error = frozen_abs_delta(&new_output, &old_output, 0.0005)
+        .expect_err("old-recipe drift must exceed the frozen bound");
+    assert!(error.contains("exceeds frozen bound"));
+}
+
 /// The prefill projection family: (entry, K, N) at M=36 rows.
 const FAMILY: &[(&str, usize, usize)] = &[
     ("prefill_gemm_qo", 960, 960),
@@ -185,19 +241,24 @@ fn pgc_r4_fma_census_dispatched_vs_zero_filled_pinned() {
 /// and prove the recipe's numeric contract. Requires:
 /// - `GEA3_R4_METAL_SOURCE_DIR`: the exported artifacts dir (contains
 ///   `prefill_gemm_<name>.metal` emitted from this branch);
+/// - `GEA3_R4_OLD_METAL_SOURCE_DIR`: the frozen old R3 recipe artifacts dir;
 /// - `GEA3_R4_FROZEN_TOLERANCE`: `frozen-tolerance.json` from
 ///   `evidence/PGC-R4/`.
 ///
 /// Proves: M=36 tail band zero-fill (rows past 35 never leak garbage —
 /// the CPU reference covers exactly the 36 valid rows), the N-multiple
 /// edges (960/320/2560 full bands on the zero-barrier direct path), and
-/// the class-B tolerance vs the CPU reference at or under the frozen
-/// old-recipe-derived bounds.
+/// the class-B tolerances versus both the CPU reference and the old recipe
+/// at or under the frozen bounds. The old recipe is executed rather than
+/// inferred from the CPU reference, so the new-vs-old bound is fail-closed.
 #[test]
-#[ignore = "physical Metal gate; requires exported entry sources and the frozen tolerance record"]
+#[ignore = "physical Metal gate; requires new/old entry sources and the frozen tolerance record"]
 fn pgc_r4_physical_simdgroup_recipe_on_device() {
     let Some(source_dir) = std::env::var_os("GEA3_R4_METAL_SOURCE_DIR") else {
         panic!("GEA3_R4_METAL_SOURCE_DIR must identify the exported .metal dir");
+    };
+    let Some(old_source_dir) = std::env::var_os("GEA3_R4_OLD_METAL_SOURCE_DIR") else {
+        panic!("GEA3_R4_OLD_METAL_SOURCE_DIR must identify the frozen old-recipe .metal dir");
     };
     let Some(tolerance_path) = std::env::var_os("GEA3_R4_FROZEN_TOLERANCE") else {
         panic!("GEA3_R4_FROZEN_TOLERANCE must identify frozen-tolerance.json");
@@ -209,7 +270,7 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
     let frozen_families: std::collections::BTreeMap<String, FrozenTolerance> =
         serde_json::from_value(record.get("families").cloned().expect("families map"))
             .expect("parse frozen per-family bounds");
-    let mut session = MetalHostSession::try_open().expect("physical Metal session");
+    let session = MetalHostSession::try_open().expect("physical Metal session");
     let mut runtime = DeviceRuntime::Metal(session);
     for &(entry, k, n) in FAMILY {
         let source_path = std::path::Path::new(&source_dir).join(format!("{entry}.metal"));
@@ -224,6 +285,21 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
             !source.contains("acc += shared_a["),
             "{entry} must not carry the scalar inner product"
         );
+
+        let old_source_path =
+            std::path::Path::new(&old_source_dir).join(format!("{entry}.metal"));
+        let old_module_bytes = std::fs::read(&old_source_path)
+            .unwrap_or_else(|error| panic!("read frozen old {entry}.metal: {error}"));
+        let old_source = String::from_utf8_lossy(&old_module_bytes);
+        assert!(
+            old_source.contains("acc += shared_a["),
+            "{entry} old recipe must carry the scalar inner product"
+        );
+        assert!(
+            !old_source.contains("simdgroup_multiply_accumulate"),
+            "{entry} old recipe must not carry the simdgroup recipe"
+        );
+
         let m = PREFILL_ROWS;
         let mut next = 0x2545_F491_4F6C_DD1D_u64;
         let mut value = || {
@@ -237,6 +313,9 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
         let extra0 = runtime.alloc_bytes(F32_BYTES).expect("plan extra 0");
         let extra1 = runtime.alloc_bytes(F32_BYTES).expect("plan extra 1");
         let output_handle = runtime.alloc_bytes(m * n * F32_BYTES).expect("output");
+        let old_output_handle = runtime
+            .alloc_bytes(m * n * F32_BYTES)
+            .expect("old output");
         runtime
             .copy_in_bytes(&input_handle, &f32_bytes(&input), DeviceDataType::F32)
             .expect("input upload");
@@ -253,15 +332,19 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
         runtime
             .copy_in_bytes(&extra1, &[0u8; 4], DeviceDataType::F32)
             .expect("plan extra 1 upload");
-        runtime
-            .copy_in_bytes(
-                &output_handle,
-                &vec![0u8; m * n * F32_BYTES],
-                DeviceDataType::F32,
-            )
-            .expect("output init");
+        for output in [&output_handle, &old_output_handle] {
+            runtime
+                .copy_in_bytes(
+                    output,
+                    &vec![0u8; m * n * F32_BYTES],
+                    DeviceDataType::F32,
+                )
+                .expect("output init");
+        }
+        let old_module = runtime
+            .load_module(&old_module_bytes)
+            .expect("compile frozen old entry module");
         let module = runtime.load_module(&module_bytes).expect("compile entry module");
-        let handles = [input_handle, weights_handle, extra0, extra1, output_handle];
         let spans = [
             (m * k) as u64,
             (n * k) as u64,
@@ -269,6 +352,25 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
             1_u64,
             (m * n) as u64,
         ];
+        let old_handles = [
+            input_handle,
+            weights_handle,
+            extra0,
+            extra1,
+            old_output_handle,
+        ];
+        let old_bindings: Vec<MetalLaunchBinding> = old_handles
+            .iter()
+            .zip(spans)
+            .enumerate()
+            .map(|(index, (handle, span))| MetalLaunchBinding {
+                handle: MetalHandleId(handle.id),
+                binding_index: index as u32,
+                byte_offset: 0,
+                view_span: span * F32_BYTES as u64,
+            })
+            .collect();
+        let handles = [input_handle, weights_handle, extra0, extra1, output_handle];
         let bindings: Vec<MetalLaunchBinding> = handles
             .iter()
             .zip(spans)
@@ -285,6 +387,15 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
         };
         session
             .launch_kernel_bound(
+                MetalHandleId(old_module.id),
+                entry,
+                &old_bindings,
+                [(n.div_ceil(TILE)) as u32, (m.div_ceil(TILE)) as u32, 1],
+                [TILE as u32, TILE as u32, 1],
+            )
+            .expect("frozen old device launch");
+        session
+            .launch_kernel_bound(
                 MetalHandleId(module.id),
                 entry,
                 &bindings,
@@ -293,41 +404,65 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
             )
             .expect("device launch");
         session.sync().expect("device sync");
+        let old_observed = runtime
+            .readback_bytes(&old_output_handle, DeviceDataType::F32)
+            .expect("old output readback");
+        let old_observed = f32_from_bytes(&old_observed);
         let observed = runtime
             .readback_bytes(&output_handle, DeviceDataType::F32)
             .expect("output readback");
         let observed = f32_from_bytes(&observed);
         assert_eq!(observed.len(), m * n, "the readback covers exactly M×N");
+        assert_eq!(
+            old_observed.len(),
+            m * n,
+            "the old-recipe readback covers exactly M×N"
+        );
         // CPU reference over the 36 valid rows: proves the M tail never
         // leaks garbage into a valid row and every valid element is the
         // declared inner product within the frozen tolerance.
-        let mut max_abs = 0.0_f32;
-        let mut max_rel = 0.0_f32;
+        let mut reference = vec![0.0_f32; m * n];
         for row in 0..m {
             for col in 0..n {
-                let mut reference = 0.0_f32;
                 for i in 0..k {
-                    reference += input[row * k + i] * weights[col * k + i];
+                    reference[row * n + col] += input[row * k + i] * weights[col * k + i];
                 }
-                let got = observed[row * n + col];
-                let abs = (reference - got).abs();
-                let rel = abs / reference.abs().max(1e-3);
-                max_abs = max_abs.max(abs);
-                max_rel = max_rel.max(rel);
             }
+        }
+        let mut max_rel = 0.0_f32;
+        for (&reference, &got) in reference.iter().zip(&observed) {
+            let rel = (reference - got).abs() / reference.abs().max(1e-3);
+            assert!(rel.is_finite(), "{entry} max_rel comparison is non-finite");
+            max_rel = max_rel.max(rel);
         }
         let frozen = frozen_families
             .get(entry)
             .unwrap_or_else(|| panic!("frozen tolerance for {entry}"));
-        assert!(
-            max_abs <= frozen.max_abs_vs_cpu,
-            "{entry} max_abs {max_abs} widened past frozen {}",
-            frozen.max_abs_vs_cpu
+        assert_frozen_abs_bound(
+            entry,
+            "new recipe vs CPU",
+            &observed,
+            &reference,
+            frozen.max_abs_vs_cpu,
         );
         assert!(
             max_rel <= frozen.max_rel_vs_cpu,
             "{entry} max_rel {max_rel} widened past frozen {}",
             frozen.max_rel_vs_cpu
+        );
+        assert_frozen_abs_bound(
+            entry,
+            "old recipe vs CPU",
+            &old_observed,
+            &reference,
+            frozen.old_max_abs_vs_cpu,
+        );
+        assert_frozen_abs_bound(
+            entry,
+            "new recipe vs old recipe",
+            &observed,
+            &old_observed,
+            frozen.max_abs_vs_old,
         );
     }
 }
