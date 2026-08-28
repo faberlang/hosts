@@ -26,7 +26,9 @@ const PLAN_MEMBER: &str = "gea3-program-plan.json";
 /// The named T=1 decode entries and their output widths `N` (the
 /// `ceil(N / w)` grid extent each one dispatches). The score GEMV's width
 /// follows the artifact's statue history extent (1088 at the fixed1000
-/// pinned-gradus export).
+/// pinned-gradus export). PGC-R1: `embedding_gather` left this set — it
+/// is the row-copy gather now (workgroup (1,1,1) over 960 threads; see
+/// `gea3_decode_pgc_r1.rs`), no longer a T=1 matmul.
 const ONE_ROW_ENTRIES: &[(&str, u64)] = &[
     ("decode_gemv_qo", 960),
     ("decode_gemv_kv", 320),
@@ -35,7 +37,6 @@ const ONE_ROW_ENTRIES: &[(&str, u64)] = &[
     ("decode_score_gemm", 1088),
     ("decode_context_gemm", 64),
     ("lm_head_gemv", 49_152),
-    ("embedding_gather", 960),
 ];
 
 /// Multi-row launches that must keep the full `(8, 8, 1)` shared-tile
