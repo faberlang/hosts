@@ -1258,7 +1258,10 @@ impl FakeMetalDriver {
     /// These arities are structural fake-driver admission only; the fake does
     /// not read values or simulate any GEA3 kernel body.
     const GEA3_ENTRY_ARITIES: &[(&str, &[usize])] = &[
-        ("embedding_gather", &[4]),
+        // PGC-R1: the embedding gather takes the compact token-id ABI —
+        // table, ids, output (3) canonically; the bundle's launch adds the
+        // inert plan-extra residency binding (4).
+        ("embedding_gather", &[3, 4]),
         ("prefill_embedding_gather", &[4]),
         ("decode_rmsnorm", &[5]),
         ("decode_gemv_qo", &[5]),
