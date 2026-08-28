@@ -127,38 +127,58 @@ fn pgc_r4_prefill_gemm_launch_geometry_is_unchanged() {
     }
 }
 
-/// The dispatched-vs-useful FMA census (condition-B primary evidence,
-/// frozen numbers also recorded under `evidence/PGC-R4/census.md`): the
-/// scalar body dispatched the tile-PADDED extent `ceil(M/8)·8 × N × K`
-/// scalar FMAs per launch — the 40-row padding class — while the
-/// simdgroup recipe's per-workgroup mma work is bounded by the partial
-/// band guards, and the family's dispatched count collapses onto the
-/// useful `M × N × K` product. This test pins the arithmetic the census
-/// table records; the per-family launch counts ride the exported plan.
+/// The useful-vs-dispatched FMA census (condition-B primary evidence,
+/// frozen numbers also recorded under `evidence/PGC-R4/census.md`,
+/// corrected per CTO-B finding 2, verdict `a694cd2c`): "dispatched FMA"
+/// counts every matrix slot the 8×8 MMA executes — the simdgroup recipe
+/// dispatches the tile-PADDED extent `ceil(M/8)·8 × N × K` per launch,
+/// the same 40-row-padded slot count the old scalar body ran. The
+/// partial band's zero-filled rows are executed slots, not skipped
+/// slots: useful FMAs (`M × N × K`) and zero-filled/padded slots
+/// (dispatched − useful) are separate census columns and the
+/// padding-removal criterion is NOT met. This test pins the arithmetic
+/// the census table records; the per-family launch counts ride the
+/// exported plan.
 #[test]
-fn pgc_r4_fma_census_padding_class_is_gone() {
-    let mut padding_before: u64 = 0;
-    for (_entry, k, n) in FAMILY {
-        let useful = (PREFILL_ROWS * n * k) as u64;
-        let padded_scalar = (PREFILL_ROWS.div_ceil(TILE) * TILE * n * k) as u64;
-        padding_before += padded_scalar - useful;
-    }
+fn pgc_r4_fma_census_dispatched_vs_zero_filled_pinned() {
+    // Launch counts per admitted entry (exported plan, unchanged from the
+    // R3 family); the census totals multiply the per-launch class by
+    // these counts.
+    let launches: &[(&str, u64)] = &[
+        ("prefill_gemm_qo", 32),
+        ("prefill_gemm_kv", 64),
+        ("prefill_gemm_gate_up", 64),
+        ("prefill_gemm_down", 32),
+    ];
     // The four-entry family's 40-row padding class: 4 padded rows over
     // every (N × K) extent.
     assert_eq!(PREFILL_ROWS.div_ceil(TILE) * TILE - PREFILL_ROWS, 4);
-    assert_eq!(
-        padding_before,
-        (4 * (960 * 960 + 960 * 320 + 960 * 2560 + 2560 * 960)) as u64,
-        "the scalar body's per-launch padding class over the four entries"
-    );
-    // The simdgroup recipe admits no padded-row FMA in its census model:
-    // the partial band's zero-filled rows carry no multiply (guards
-    // zero-fill the A tile before the accumulate), so dispatched ==
-    // useful per launch.
-    for (_entry, k, n) in FAMILY {
+    let mut zero_filled_total: u64 = 0;
+    for &(entry, launches) in launches {
+        let (k, n) = FAMILY
+            .iter()
+            .find(|(name, _, _)| *name == entry)
+            .map(|&(_, k, n)| (k, n))
+            .expect("admitted entry in FAMILY");
         let useful = (PREFILL_ROWS * n * k) as u64;
-        assert_eq!(useful % (PREFILL_ROWS * n * k) as u64, 0);
+        let dispatched = (PREFILL_ROWS.div_ceil(TILE) * TILE * n * k) as u64;
+        let zero_filled = dispatched - useful;
+        // Corrected census law: dispatched counts every slot the 8×8 MMA
+        // executes, so useful FMAs do NOT equal dispatched FMAs — the
+        // partial band's zero-filled rows still execute as slots.
+        assert!(useful < dispatched, "{entry} carries a padded slot class");
+        assert_eq!(
+            zero_filled,
+            (4 * n * k) as u64,
+            "{entry} zero-filled/padded slots per launch"
+        );
+        zero_filled_total += zero_filled * launches;
     }
+    assert_eq!(
+        zero_filled_total,
+        (4 * (960 * 960 * 32 + 960 * 320 * 64 + 960 * 2560 * 64 + 2560 * 960 * 32)) as u64,
+        "the family's zero-filled/padded slot total across launches — still executed (~1.14B)"
+    );
 }
 
 /// Physical gate: compile the exported entry sources on the real device
