@@ -23,14 +23,16 @@ use serde_json::Value;
 
 const PLAN_MEMBER: &str = "gea3-program-plan.json";
 
-/// The named T=1 decode entries and their output widths `N` (the tile-grid
-/// extent `ceil(N/8)` each one dispatches).
+/// The named T=1 decode entries and their output widths `N` (the
+/// `ceil(N / w)` grid extent each one dispatches). The score GEMV's width
+/// follows the artifact's statue history extent (1088 at the fixed1000
+/// pinned-gradus export).
 const ONE_ROW_ENTRIES: &[(&str, u64)] = &[
     ("decode_gemv_qo", 960),
     ("decode_gemv_kv", 320),
     ("decode_gemv_gate_up", 2560),
     ("decode_gemv_down", 960),
-    ("decode_score_gemm", 76),
+    ("decode_score_gemm", 1088),
     ("decode_context_gemm", 64),
     ("lm_head_gemv", 49_152),
     ("embedding_gather", 960),
