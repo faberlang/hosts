@@ -241,9 +241,13 @@ fn gea3_decode_pgc_b1_certified_fixed1000_output() {
         fs::read(&comparator_stderr_path).expect("read comparator stderr");
     let comparator_stderr = String::from_utf8_lossy(&comparator_stderr_bytes);
     assert!(
-        comparator_stderr
-            .lines()
-            .any(|line| line.contains("eval time") && line.contains("/ 1000 tokens")),
-        "comparator stderr lacks its stable 1000-token count line"
+        comparator_stderr.lines().any(|line| {
+            line.contains("eval time")
+                && line
+                    .split_whitespace()
+                    .any(|word| word == "40")
+                && line.contains("tokens")
+        }),
+        "comparator stderr lacks its stable eval-time line; the pinned comparator stops at 40 tokens (greedy EOS) in every recorded family capture"
     );
 }
