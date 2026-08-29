@@ -1266,8 +1266,7 @@ impl FakeMetalDriver {
         ("decode_rmsnorm", &[5]),
         ("decode_gemv_qo", &[5]),
         ("decode_gemv_kv", &[5]),
-        ("decode_gemv_gate_up", &[5]),
-        ("decode_gemv_down", &[5]),
+        ("decode_mlp", &[8]),
         ("decode_rope_q", &[4]),
         ("decode_rope_k", &[4]),
         // GEA3-U6 num-1: the mutators launch with the expanded-plan ABI
@@ -1283,7 +1282,6 @@ impl FakeMetalDriver {
         ("decode_score_gemm", &[4]),
         ("decode_masked_softmax", &[4]),
         ("decode_context_gemm", &[3]),
-        ("decode_swiglu", &[4]),
         ("decode_residual_add", &[4]),
         ("prefill_rmsnorm", &[5]),
         ("prefill_gemm_qo", &[5]),
@@ -1293,8 +1291,7 @@ impl FakeMetalDriver {
         // output.
         ("prefill_gemm_o", &[4]),
         ("prefill_gemm_kv", &[5]),
-        ("prefill_gemm_gate_up", &[5]),
-        ("prefill_gemm_down", &[5]),
+        ("prefill_mlp", &[8]),
         ("prefill_rope_q", &[4]),
         ("prefill_rope_k", &[4]),
         // GEA3-U6 num-3: the key transposes ride the launch-variant seam
@@ -1304,7 +1301,6 @@ impl FakeMetalDriver {
         // GEA3-U6 num-9: +1 binding — the additive causal_mask operand.
         ("prefill_causal_softmax", &[4]),
         ("prefill_context_gemm", &[3]),
-        ("prefill_swiglu", &[4]),
         ("prefill_residual_add", &[4]),
         ("prefill_kv_write_k", &[4]),
         ("prefill_kv_write_v", &[4]),

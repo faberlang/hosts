@@ -41,7 +41,7 @@ const MODULE_IMAGE_RULE: &str =
     "module_members are independently selectable; the plan binds them by entry identity";
 const SOURCE: &str = "gradus/src/kernel.fab";
 const LAYERS: usize = 32;
-const BLOCK_LAUNCHES_PER_LAYER: usize = 66;
+const BLOCK_LAUNCHES_PER_LAYER: usize = 62;
 const LAUNCHES_PER_PROGRAM: usize = LAYERS * BLOCK_LAUNCHES_PER_LAYER + 3;
 const DEPENDENCIES_PER_PROGRAM: usize = LAUNCHES_PER_PROGRAM - 1;
 const PREFILL_ROWS: u64 = 36;
@@ -266,11 +266,20 @@ struct Gea3KernelUnit {
 enum Gea3Plan {
     Elementwise,
     TiledMatMul(Gea3MatMulPlan),
+    ComposedMatMul(Gea3ComposedMatMulPlan),
     Transpose(Gea3TransposePlan),
     RmsNormalization(Gea3RmsNormalizationPlan),
     Rope(Gea3RopePlan),
     CausalMaskedSoftmax(Gea3CausalMaskedSoftmaxPlan),
     Gather(Gea3GatherPlan),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Gea3ComposedMatMulPlan {
+    stages: Vec<Value>,
+    edges: Vec<Value>,
+    handoff: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1188,9 +1197,9 @@ fn admit_envelope(
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
     }
-    // GEA3-U6 num-10: 37 members — the chunked o-projection entry
-    // (prefill_gemm_o) joined the module.
-    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 37 {
+    // GEA3-A2g: 33 members — the composed MLP parents replace the six
+    // previously public MLP leaves while the chunked o-projection remains.
+    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 33 {
         return Err("module assembly facts drifted".to_owned());
     }
     if envelope.instance_expansion.layers != LAYERS
@@ -1611,19 +1620,16 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
     let admitted = match entry {
         "decode_gemv_qo"
         | "decode_gemv_kv"
-        | "decode_gemv_gate_up"
-        | "decode_gemv_down"
         | "decode_score_gemm"
         | "decode_context_gemm"
         | "prefill_gemm_qo"
         | "prefill_gemm_o"
         | "prefill_gemm_kv"
-        | "prefill_gemm_gate_up"
-        | "prefill_gemm_down"
         | "prefill_score_gemm"
         | "prefill_context_gemm"
         | "lm_head_gemv"
         | "prefill_lm_head_gemv" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        "decode_mlp" | "prefill_mlp" => matches!(plan, Gea3Plan::ComposedMatMul(_)),
         "head_rmsnorm" | "prefill_head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
             matches!(plan, Gea3Plan::RmsNormalization(_))
         }
@@ -1637,7 +1643,7 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
             matches!(plan, Gea3Plan::CausalMaskedSoftmax(_))
         }
         "embedding_gather" | "prefill_embedding_gather" => matches!(plan, Gea3Plan::Gather(_)),
-        "decode_swiglu" | "decode_residual_add" | "prefill_swiglu" | "prefill_residual_add" => {
+        "decode_residual_add" | "prefill_residual_add" => {
             matches!(plan, Gea3Plan::Elementwise)
         }
         "kv_append_k" | "kv_append_v" | "prefill_kv_write_k" | "prefill_kv_write_v" => {
@@ -1698,8 +1704,7 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "decode_rmsnorm",
         "decode_gemv_qo",
         "decode_gemv_kv",
-        "decode_gemv_gate_up",
-        "decode_gemv_down",
+        "decode_mlp",
         "decode_rope_q",
         "decode_rope_k",
         "kv_append_k",
@@ -1708,21 +1713,18 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "decode_score_gemm",
         "decode_masked_softmax",
         "decode_context_gemm",
-        "decode_swiglu",
         "decode_residual_add",
         "prefill_rmsnorm",
         "prefill_gemm_qo",
         "prefill_gemm_o",
         "prefill_gemm_kv",
-        "prefill_gemm_gate_up",
-        "prefill_gemm_down",
+        "prefill_mlp",
         "prefill_rope_q",
         "prefill_rope_k",
         "prefill_key_transpose",
         "prefill_score_gemm",
         "prefill_causal_softmax",
         "prefill_context_gemm",
-        "prefill_swiglu",
         "prefill_residual_add",
         "prefill_kv_write_k",
         "prefill_kv_write_v",
