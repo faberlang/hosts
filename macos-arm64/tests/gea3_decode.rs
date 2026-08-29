@@ -1960,7 +1960,11 @@ fn gea3_soak_statue_admission_is_capacity_exact() {
     assert_eq!(GEA3_FROZEN_SHORT.kv_bytes(), 6_225_920);
 
     let envelope_for = |capacity: u64| -> Gea3ProgramPlanEnvelope {
-        let members: Vec<String> = (0..37).map(|index| format!("m{index}.metal")).collect();
+        // A2g re-derive trigger: admit_envelope is capacity-exact on module
+        // assembly ("module assembly facts drifted") — 33 members post-A2g,
+        // was 37 pre-collapse; re-derive this builder from the admission
+        // law if the composition moves again.
+        let members: Vec<String> = (0..33).map(|index| format!("m{index}.metal")).collect();
         let value = json!({
             "schema": PLAN_SCHEMA,
             "wire_buffer_abi": WIRE_BUFFER_ABI,
@@ -3794,7 +3798,7 @@ fn gea3_parity_timing_companion_optional_emission() {
 
     // A partial sample must remain honest at the duration field itself, not
     // merely in a sibling count.  This is the fixed-1000 shape when Metal's
-    // 2,048-slot counter buffer samples 1,024 of the 2,115 encoders.
+    // 2,048-slot counter buffer samples 1,024 of the encoders.
     let mut partial = gea3_fake_parity_step("decode", 4, Some(125));
     partial.gpu_timestamp_count = 1_024;
     partial.gpu_start_timestamp_count = 1_024;
@@ -3803,13 +3807,17 @@ fn gea3_parity_timing_companion_optional_emission() {
         "evidence/gea3-metal-receipt.json",
     )
     .expect("partial GPU sample remains admissible");
+    // A2g re-derive trigger: composed MLP parents collapse 4 chain
+    // edges/layer x 32 layers, so the decode encoder total is re-derived
+    // 2,115 -> 1,987 (= 32 * 62 + 3); re-derive both rows from the census
+    // export if the A2g admission composition moves again.
     assert_eq!(
         partial_companion["phases"]["decode"][0]["gpu_encoder"]["duration_us"]["coverage"],
-        json!("1024/2115")
+        json!("1024/1987")
     );
     assert_eq!(
         partial_companion["summary"]["decode"]["gpu_encoder_us"]["coverage_per_step"][0],
-        json!("1024/2115")
+        json!("1024/1987")
     );
 
     // (d) transfer honesty: the weight residency never claims a transfer it
