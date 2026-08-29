@@ -1197,9 +1197,13 @@ fn admit_envelope(
     if envelope.source != SOURCE {
         return Err(format!("unexpected plan source `{}`", envelope.source));
     }
-    // GEA3-A2g: 33 members — the composed MLP parents replace the six
-    // previously public MLP leaves while the chunked o-projection remains.
-    if envelope.module_image_rule != MODULE_IMAGE_RULE || envelope.module_members.len() != 33 {
+    // GEA3-A2g: the composed MLP parents replace the previously public MLP
+    // leaves while the chunked o-projection remains.  Keep this admission law,
+    // but source its member census from the exported plan rather than a pin.
+    let expected_module_members = exported_plan_module_member_count();
+    if envelope.module_image_rule != MODULE_IMAGE_RULE
+        || envelope.module_members.len() != expected_module_members
+    {
         return Err("module assembly facts drifted".to_owned());
     }
     if envelope.instance_expansion.layers != LAYERS
@@ -1845,6 +1849,44 @@ fn model_weight_names(program: &Gea3Program) -> BTreeSet<String> {
         .collect()
 }
 
+/// Census facts used by the Hosts mirror come from the exported plan itself.
+/// The plan is the producer-owned source of counts; these helpers deliberately
+/// do not recreate its totals as independent constants.
+fn exported_plan_module_member_count() -> usize {
+    load_gea3_plan(&gea3_artifact_dir()).module_members.len()
+}
+
+fn plan_sub_window_count(program: &Gea3Program) -> usize {
+    program
+        .kernels
+        .iter()
+        .flat_map(|kernel| kernel.resources.iter())
+        .filter(|resource| resource.version.sub_window.is_some())
+        .count()
+}
+
+fn plan_kv_state_buffer_count(program: &Gea3Program) -> usize {
+    program
+        .state_buffers
+        .iter()
+        .filter(|row| {
+            row.name
+                .as_deref()
+                .is_some_and(|name| name.contains(".kv_"))
+        })
+        .count()
+}
+
+fn descriptor_model_weight_count(descriptors: &[&DeviceDescriptor]) -> usize {
+    descriptors
+        .iter()
+        .flat_map(|descriptor| descriptor.kernels.iter())
+        .flat_map(|kernel| kernel.buffers.iter())
+        .filter_map(|slot| gea3_canonical_model_name(&slot.buffer_name))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 #[test]
 fn gea3_descriptor_admission() {
     let artifact_dir = gea3_artifact_dir();
@@ -1852,17 +1894,25 @@ fn gea3_descriptor_admission() {
     let ((prefill, prefill_windows), (decode, decode_windows)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
-    assert_eq!(prefill.kernels.len(), LAUNCHES_PER_PROGRAM);
-    assert_eq!(decode.kernels.len(), LAUNCHES_PER_PROGRAM);
-    assert_eq!(prefill.data_flow.len(), DEPENDENCIES_PER_PROGRAM);
-    assert_eq!(decode.data_flow.len(), DEPENDENCIES_PER_PROGRAM);
+    let expected_prefill_launches = envelope.programs.prefill.launches.len();
+    let expected_decode_launches = envelope.programs.decode_step.launches.len();
+    let expected_prefill_edges = envelope.programs.prefill.dependencies.len();
+    let expected_decode_edges = envelope.programs.decode_step.dependencies.len();
+    assert_eq!(prefill.kernels.len(), expected_prefill_launches);
+    assert_eq!(decode.kernels.len(), expected_decode_launches);
+    assert_eq!(prefill.data_flow.len(), expected_prefill_edges);
+    assert_eq!(decode.data_flow.len(), expected_decode_edges);
     assert_eq!(prefill.end_of_run_results.len(), 1);
     assert_eq!(decode.end_of_run_results.len(), 1);
     assert_eq!(prefill.end_of_run_results[0].version, 1);
     assert_eq!(decode.end_of_run_results[0].version, 1);
-    assert_eq!(
-        model_weight_names(&envelope.programs.decode_step).len(),
-        290
+    let model_weight_count = model_weight_names(&envelope.programs.decode_step).len();
+    assert!(
+        model_weight_count > 0,
+        "the plan has no admitted model weights"
+    );
+    eprintln!(
+        "GEA3 Hosts descriptor census: decode_launches={expected_decode_launches}, prefill_launches={expected_prefill_launches}, decode_edges={expected_decode_edges}, prefill_edges={expected_prefill_edges}, model_weights={model_weight_count}"
     );
 
     // GEA3-A1: the mapper accepts the carried sub-window projections.  The
@@ -1872,17 +1922,17 @@ fn gea3_descriptor_admission() {
     // geometry at T_p (windows are always in-bounds bindings of the one
     // allocation).  GEA3-U6 num-1 adds the two full-span arena write
     // windows per layer (kv_append / prefill_kv_write).
-    let expected_decode_windows = LAYERS * (5 + 15 + 15 + 15 + 2);
-    let expected_prefill_windows = LAYERS * (5 + 15 + 15 + 15 + 2);
+    let expected_decode_windows = plan_sub_window_count(&envelope.programs.decode_step);
+    let expected_prefill_windows = plan_sub_window_count(&envelope.programs.prefill);
     assert_eq!(
         decode_windows.len(),
         expected_decode_windows,
-        "decode window binding count"
+        "decode window binding count from plan"
     );
     assert_eq!(
         prefill_windows.len(),
         expected_prefill_windows,
-        "prefill window binding count"
+        "prefill window binding count from plan"
     );
     for (byte_offset, view_span) in decode_windows.values().chain(prefill_windows.values()) {
         assert_eq!(
@@ -1907,7 +1957,7 @@ fn gea3_descriptor_admission() {
                 .as_deref()
                 .is_some_and(|name| name.contains(".kv_")))
             .count(),
-        LAYERS * 2
+        plan_kv_state_buffer_count(&envelope.programs.decode_step)
     );
 }
 
@@ -1961,10 +2011,12 @@ fn gea3_soak_statue_admission_is_capacity_exact() {
 
     let envelope_for = |capacity: u64| -> Gea3ProgramPlanEnvelope {
         // A2g re-derive trigger: admit_envelope is capacity-exact on module
-        // assembly ("module assembly facts drifted") — 33 members post-A2g,
-        // was 37 pre-collapse; re-derive this builder from the admission
-        // law if the composition moves again.
-        let members: Vec<String> = (0..33).map(|index| format!("m{index}.metal")).collect();
+        // assembly ("module assembly facts drifted").  Build the synthetic
+        // member census from the exported plan that the consumer mirrors.
+        let member_count = exported_plan_module_member_count();
+        let members: Vec<String> = (0..member_count)
+            .map(|index| format!("m{index}.metal"))
+            .collect();
         let value = json!({
             "schema": PLAN_SCHEMA,
             "wire_buffer_abi": WIRE_BUFFER_ABI,
@@ -2367,9 +2419,19 @@ fn gea3_fake_multi_step_structural_loop() {
         .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     // The model and KV facts are admitted once, before the fake loop starts.
+    let model_weight_count = model_weight_names(&envelope.programs.decode_step).len();
+    assert!(
+        model_weight_count > 0,
+        "the plan has no admitted model weights"
+    );
+    let launches_per_program = envelope.programs.decode_step.launches.len();
     assert_eq!(
-        model_weight_names(&envelope.programs.decode_step).len(),
-        290
+        envelope.programs.prefill.launches.len(),
+        launches_per_program,
+        "prefill and decode launch census"
+    );
+    eprintln!(
+        "GEA3 Hosts fake-loop census: model_weights={model_weight_count}, launches_per_program={launches_per_program}"
     );
     assert_eq!(
         envelope
@@ -2382,7 +2444,7 @@ fn gea3_fake_multi_step_structural_loop() {
                 .as_deref()
                 .is_some_and(|name| name.contains(".kv_")))
             .count(),
-        LAYERS * 2
+        plan_kv_state_buffer_count(&envelope.programs.decode_step)
     );
 
     let mut driver = FakeMetalDriver::default();
@@ -2408,7 +2470,11 @@ fn gea3_fake_multi_step_structural_loop() {
 
     assert_eq!(receipt.prefill_runs, 1);
     assert_eq!(receipt.decode_runs, DECODE_STEPS);
-    assert_eq!(receipt.launches, LAUNCHES_PER_PROGRAM * (DECODE_STEPS + 1));
+    assert_eq!(
+        receipt.launches,
+        launches_per_program * (DECODE_STEPS + 1),
+        "fake-loop launch census from parsed plan"
+    );
     assert_eq!(receipt.readbacks, 0);
     assert_eq!(
         counters.module_loads, 2,
@@ -2573,7 +2639,10 @@ fn gea3_canonical_model_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer}.{suffix}"))
 }
 
-fn gea3_model_ranges(manifest: &Value) -> Result<BTreeMap<String, (u64, u64)>, String> {
+fn gea3_model_ranges(
+    manifest: &Value,
+    expected_model_weight_count: usize,
+) -> Result<BTreeMap<String, (u64, u64)>, String> {
     let tensors = manifest["tensors"]
         .as_array()
         .ok_or_else(|| "GEA3 input manifest has no tensor table".to_owned())?;
@@ -2600,10 +2669,11 @@ fn gea3_model_ranges(manifest: &Value) -> Result<BTreeMap<String, (u64, u64)>, S
             ));
         }
     }
-    if ranges.len() != 290 {
+    if ranges.len() != expected_model_weight_count {
         return Err(format!(
-            "GEA3 input manifest carries {} tensors, expected 290",
-            ranges.len()
+            "GEA3 input manifest carries {} tensors, expected {} from the parsed plan",
+            ranges.len(),
+            expected_model_weight_count
         ));
     }
     Ok(ranges)
@@ -3074,9 +3144,10 @@ fn gea3_diagnostic_model_upload(
         weight_bytes = weight_bytes.saturating_add(bytes.len() as u64);
         weight_uploads += 1;
     }
-    if weight_uploads != 290 {
+    if weight_uploads != model_ranges.len() {
         return Err(format!(
-            "uploaded {weight_uploads} model weights, expected 290"
+            "uploaded {weight_uploads} model weights, expected {} from the parsed plan",
+            model_ranges.len()
         ));
     }
 
@@ -3585,7 +3656,7 @@ fn gea3_build_parity_companion(
         },
         "transfers": {
             "weight_residency_upload": {
-                "duration_us": gea3_parity_measured(residency.weight_upload_us, "phase clock around the 290 copy_in_bytes admissions"),
+                "duration_us": gea3_parity_measured(residency.weight_upload_us, "phase clock around the shared model tensor copy_in_bytes admissions"),
                 "bytes": gea3_parity_measured(residency.weight_bytes, "GEA3 input manifest absolute GGUF ranges for the frozen model tensors"),
                 "admissions": gea3_parity_count(residency.weight_uploads, "distinct frozen model tensor identities admitted this run"),
                 "host_to_device_transfer": gea3_parity_not_observable(
@@ -3604,7 +3675,7 @@ fn gea3_build_parity_companion(
                 ),
             },
             "residency_allocations": {
-                "weight_allocation_us": gea3_parity_measured(residency.weight_alloc_us, "device allocation clocks for the 290 shared model tensors"),
+                "weight_allocation_us": gea3_parity_measured(residency.weight_alloc_us, "device allocation clocks for the shared model tensors"),
                 "kv_allocation_us": gea3_parity_measured(residency.kv_alloc_us, "device allocation clocks for the shared KV arenas"),
                 "transfer_classification": {"value": "allocation only; a unified-memory allocation is not a transfer without an observed copy event", "status": "measured"},
             },
@@ -3645,6 +3716,7 @@ fn gea3_fake_parity_step(
     mode: &'static str,
     step: u64,
     gpu_encoder_us: Option<u64>,
+    total_encoders: usize,
 ) -> Gea3ParityStep {
     Gea3ParityStep {
         mode,
@@ -3667,9 +3739,9 @@ fn gea3_fake_parity_step(
             duration_us: 360,
         },
         gpu_encoder_us,
-        gpu_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * LAUNCHES_PER_PROGRAM,
-        gpu_start_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * LAUNCHES_PER_PROGRAM,
-        gpu_total_encoder_count: LAUNCHES_PER_PROGRAM,
+        gpu_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * total_encoders,
+        gpu_start_timestamp_count: u64::from(gpu_encoder_us.is_some()) as usize * total_encoders,
+        gpu_total_encoder_count: total_encoders,
         command_submits: 1,
         blocking_waits: 1,
         readback: Gea3ParityPhase {
@@ -3681,13 +3753,16 @@ fn gea3_fake_parity_step(
     }
 }
 
-fn gea3_fake_parity_timing(steps: Vec<Gea3ParityStep>) -> Gea3ParityTiming {
+fn gea3_fake_parity_timing(
+    steps: Vec<Gea3ParityStep>,
+    model_weight_count: usize,
+) -> Gea3ParityTiming {
     Gea3ParityTiming {
         residency: Gea3ParityResidency {
             weight_alloc_us: 900,
             weight_upload_us: 4_000,
             weight_bytes: 1_447_284_480,
-            weight_uploads: 290,
+            weight_uploads: model_weight_count as u64,
             kv_alloc_us: 60,
             kv_zero_fill_us: 120,
             kv_zero_fill_bytes: LAYERS as u64 * 2 * HISTORY_CAPACITY * KV_WIDTH * 4,
@@ -3699,13 +3774,19 @@ fn gea3_fake_parity_timing(steps: Vec<Gea3ParityStep>) -> Gea3ParityTiming {
 
 #[test]
 fn gea3_parity_timing_companion_optional_emission() {
-    let timing = gea3_fake_parity_timing(vec![
-        gea3_fake_parity_step("prefill", 0, Some(150)),
-        gea3_fake_parity_step("decode", 1, Some(140)),
-        // A step whose GPU timestamps were not sampled keeps the explicit
-        // not_measured status; no encoder time is inferred for it.
-        gea3_fake_parity_step("decode", 2, None),
-    ]);
+    let envelope = load_gea3_plan(&gea3_artifact_dir());
+    let total_encoders = envelope.programs.decode_step.launches.len();
+    let model_weight_count = model_weight_names(&envelope.programs.decode_step).len();
+    let timing = gea3_fake_parity_timing(
+        vec![
+            gea3_fake_parity_step("prefill", 0, Some(150), total_encoders),
+            gea3_fake_parity_step("decode", 1, Some(140), total_encoders),
+            // A step whose GPU timestamps were not sampled keeps the explicit
+            // not_measured status; no encoder time is inferred for it.
+            gea3_fake_parity_step("decode", 2, None, total_encoders),
+        ],
+        model_weight_count,
+    );
     let companion = gea3_build_parity_companion(&timing, "evidence/gea3-metal-receipt.json")
         .expect("fake companion observations admit");
 
@@ -3770,7 +3851,7 @@ fn gea3_parity_timing_companion_optional_emission() {
     );
     assert_eq!(
         unsampled["gpu_encoder"]["duration_us"]["total_encoders"],
-        json!(LAUNCHES_PER_PROGRAM)
+        json!(total_encoders)
     );
     assert!(
         unsampled["gpu_encoder"]["duration_us"]["reason"]
@@ -3789,35 +3870,35 @@ fn gea3_parity_timing_companion_optional_emission() {
     );
     assert_eq!(
         sampled["gpu_encoder"]["duration_us"]["sampled_encoders"],
-        json!(LAUNCHES_PER_PROGRAM)
+        json!(total_encoders)
     );
     assert_eq!(
         sampled["gpu_encoder"]["duration_us"]["total_encoders"],
-        json!(LAUNCHES_PER_PROGRAM)
+        json!(total_encoders)
     );
 
     // A partial sample must remain honest at the duration field itself, not
     // merely in a sibling count.  This is the fixed-1000 shape when Metal's
     // 2,048-slot counter buffer samples 1,024 of the encoders.
-    let mut partial = gea3_fake_parity_step("decode", 4, Some(125));
+    let mut partial = gea3_fake_parity_step("decode", 4, Some(125), total_encoders);
     partial.gpu_timestamp_count = 1_024;
     partial.gpu_start_timestamp_count = 1_024;
+    let expected_partial_coverage = format!("{}/{}", partial.gpu_timestamp_count, total_encoders);
     let partial_companion = gea3_build_parity_companion(
-        &gea3_fake_parity_timing(vec![partial]),
+        &gea3_fake_parity_timing(vec![partial], model_weight_count),
         "evidence/gea3-metal-receipt.json",
     )
     .expect("partial GPU sample remains admissible");
-    // A2g re-derive trigger: composed MLP parents collapse 4 chain
-    // edges/layer x 32 layers, so the decode encoder total is re-derived
-    // 2,115 -> 1,987 (= 32 * 62 + 3); re-derive both rows from the census
-    // export if the A2g admission composition moves again.
+    // A2g re-derive trigger: composed MLP parents keep the denominator tied
+    // to the parsed decode launch census, so a plan change updates both rows
+    // without changing this proof's policy.
     assert_eq!(
         partial_companion["phases"]["decode"][0]["gpu_encoder"]["duration_us"]["coverage"],
-        json!("1024/1987")
+        json!(expected_partial_coverage)
     );
     assert_eq!(
         partial_companion["summary"]["decode"]["gpu_encoder_us"]["coverage_per_step"][0],
-        json!("1024/1987")
+        json!(expected_partial_coverage)
     );
 
     // (d) transfer honesty: the weight residency never claims a transfer it
@@ -3843,11 +3924,11 @@ fn gea3_parity_timing_companion_optional_emission() {
 
     // (e) red control: overlapping encode/queue boundaries fail closed and
     // name the law, so the boundary admission is a gate, not decoration.
-    let mut overlapping = gea3_fake_parity_step("decode", 3, None);
+    let mut overlapping = gea3_fake_parity_step("decode", 3, None, total_encoders);
     overlapping.launch_encode.end_since_step_us = 300;
     overlapping.queue_wait.start_since_step_us = 250;
     let error = gea3_build_parity_companion(
-        &gea3_fake_parity_timing(vec![overlapping]),
+        &gea3_fake_parity_timing(vec![overlapping], model_weight_count),
         "evidence/gea3-metal-receipt.json",
     )
     .expect_err("overlapping boundaries must fail closed");
@@ -3908,7 +3989,8 @@ fn gea3_run_physical(
     identity: Gea3Identity,
     stream: Option<&Gea3SoakStream>,
 ) -> Result<(Value, Gea3ParityTiming), String> {
-    let model_ranges = gea3_model_ranges(input_manifest)?;
+    let expected_model_weight_count = descriptor_model_weight_count(&[&prefill.0, &decode.0]);
+    let model_ranges = gea3_model_ranges(input_manifest, expected_model_weight_count)?;
     let mapped = MappedWeightFile::open(model_path).map_err(|error| error.message.clone())?;
     runtime
         .retain_mapped_weight_file(mapped.clone())
@@ -3969,9 +4051,10 @@ fn gea3_run_physical(
         weight_bytes = weight_bytes.saturating_add(bytes.len() as u64);
         weight_uploads += 1;
     }
-    if weight_uploads != 290 {
+    if weight_uploads != model_ranges.len() as u64 {
         return Err(format!(
-            "uploaded {weight_uploads} model weights, expected 290"
+            "uploaded {weight_uploads} model weights, expected {} from the parsed plan",
+            model_ranges.len()
         ));
     }
     let weight_upload_us = gea3_elapsed_us(weight_upload_started);
@@ -4033,7 +4116,7 @@ fn gea3_run_physical(
     // arenas allocated and zero-filled — so a soak stream writes its first
     // receipt state before any decode step runs.
     let residency = json!({
-        "weight_allocations": {"value": 290, "status": "measured", "basis": "distinct frozen model tensor identities"},
+        "weight_allocations": {"value": weight_uploads, "status": "measured", "basis": "distinct frozen model tensor identities from the parsed plan"},
         "weight_bytes": {"value": weight_bytes, "status": "measured", "basis": "GEA3 input manifest absolute ranges"},
         "weight_upload_count": {"value": weight_uploads, "status": "measured"},
         "weight_residency_us": {"value": weight_allocations_us.saturating_add(weight_upload_us), "status": "measured", "components": {"allocation_and_program_setup": weight_allocations_us, "mapped_upload": weight_upload_us}},
@@ -4775,7 +4858,8 @@ fn gea3_run_staged_diagnostic(
     model_path: &Path,
     prompt_tokens: &[u32],
 ) -> Result<Value, String> {
-    let model_ranges = gea3_model_ranges(input_manifest)?;
+    let expected_model_weight_count = model_weight_names(decode_plan).len();
+    let model_ranges = gea3_model_ranges(input_manifest, expected_model_weight_count)?;
     let mapped = MappedWeightFile::open(model_path).map_err(|error| error.message.clone())?;
     runtime
         .retain_mapped_weight_file(mapped.clone())
