@@ -160,7 +160,7 @@ mod unix_mmap {
     #[cfg(not(target_os = "macos"))]
     const SC_PAGESIZE: i32 = 30;
 
-    extern "C" {
+    unsafe extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         pub(super) fn munmap(addr: *mut u8, len: usize) -> i32;
         fn sysconf(name: i32) -> i64;

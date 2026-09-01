@@ -73,7 +73,7 @@ fn octeti_push(runtime: &mut RuntimeContext, handle: *mut c_void, byte: u8) -> b
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_append(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -90,7 +90,7 @@ pub unsafe extern "C" fn __faber_rt_v1_octeti_append(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_get(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn __faber_rt_v1_octeti_get(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_length(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn __faber_rt_v1_octeti_length(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_from_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -143,7 +143,7 @@ pub unsafe extern "C" fn __faber_rt_v1_octeti_from_text(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_from_ascii(
     context: *mut FaberRtContextV1,
     value: *const c_char,
@@ -185,7 +185,7 @@ fn decode(context: *mut FaberRtContextV1, handle: *mut c_void, ascii: bool) -> F
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_get_text(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn __faber_rt_v1_octeti_get_text(
     ffi_ptr(|| decode(context, handle, false))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_get_ascii(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,

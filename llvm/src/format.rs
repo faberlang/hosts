@@ -15,7 +15,7 @@ pub(super) fn ffi_ptr_result(operation: impl FnOnce() -> FaberRtPtrResultV1) -> 
         .unwrap_or(FaberRtPtrResultV1::failure(STATUS_PANIC))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_i1(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -28,7 +28,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i1(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_i64(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -37,7 +37,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i64(
     format_scalar_values(context, template, &[value.to_string()])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_i64_i64(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -47,7 +47,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i64_i64(
     format_scalar_values(context, template, &[first.to_string(), second.to_string()])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_i64_i64_i64(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -62,7 +62,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i64_i64_i64(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_f64(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_f64(
 /// widened `0.10000000149011612` an f64 carrier would produce). This is the
 /// f32 display ABI the grouped multi-arg nota path needs so `fractus<f32>`
 /// scribe args join like the HIR-Rust lane.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_f32(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_f32(
     format_scalar_values(context, template, &[display_fractus(value)])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_text(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text(
     format_text_values(context, template, &[text])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_text_text(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text_text(
     format_text_values(context, template, &[first, second])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_text_i64(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text_i64(
     format_scalar_values(context, template, &[text, value.to_string()])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_i64_text(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -133,7 +133,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i64_text(
     format_scalar_values(context, template, &[value.to_string(), text])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_text_text_text(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text_text_text(
     format_text_values(context, template, &[first, second, third])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_text_i64_i1(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text_i64_i1(
 /// `context` must be live. `template` follows the slice validity contract of
 /// [`__faber_rt_v1_write_nota_text`]; `value` is used only for pointer-equality
 /// arena lookups and is never dereferenced directly.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_format_1_ptr_to_ptr(
     context: *mut FaberRtContextV1,
     template: FaberRtSliceV1,
@@ -195,26 +195,28 @@ pub unsafe extern "C" fn __faber_rt_v1_format_1_ptr_to_ptr(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_length(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
     out_length: *mut i64,
 ) -> FaberRtStatusV1 {
-    if context.is_null() || out_length.is_null() {
-        return STATUS_INVALID_ARGUMENT;
+    unsafe {
+        if context.is_null() || out_length.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(value) = text_value(text) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(length) = i64::try_from(value.chars().count()) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        *out_length = length;
+        STATUS_OK
     }
-    let Some(value) = text_value(text) else {
-        return STATUS_INVALID_ARGUMENT;
-    };
-    let Ok(length) = i64::try_from(value.chars().count()) else {
-        return STATUS_INVALID_ARGUMENT;
-    };
-    *out_length = length;
-    STATUS_OK
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -222,7 +224,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_i64(
     ffi_ptr_result(|| store_text(context, value.to_string()))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_f64(
     context: *mut FaberRtContextV1,
     value: f64,
@@ -230,7 +232,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_f64(
     ffi_ptr_result(|| store_text(context, display_fractus(value)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_i1(
     context: *mut FaberRtContextV1,
     value: u8,

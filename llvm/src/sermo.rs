@@ -56,7 +56,7 @@ fn find_sermo_mut(runtime: &mut RuntimeContext, handle: *mut c_void) -> Option<&
 /// Creates the `frame::Sermo` for `route`, installs `payload` as the opener
 /// (the first request frame's data), and returns an opaque arena-owned stream
 /// handle. The route's host dispatch starts on first consumption.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sermo_open(
     context: *mut FaberRtContextV1,
     route: *const FaberRtSliceV1,
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sermo_open(
 
 /// `sermo_set_opener(sermo, data)` — replace the first request frame's payload
 /// before the stream is consumed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sermo_set_opener(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sermo_set_opener(
 ///
 /// Panics (caught by the ffi boundary → `STATUS_PANIC`) if the stream
 /// produces a terminal error frame or a non-textus content frame.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_text(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_text(
 ///
 /// Panics (caught by the ffi boundary → `STATUS_PANIC`) if the stream
 /// produces a terminal error frame.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_valor(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -145,7 +145,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_valor(
 /// Extracts an `i64` from the stream; on a missing or wrong-typed payload the
 /// `fallback` substitutes instead of aborting (P6 recovery precedent). The
 /// result crosses as an arena-owned numeric box.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_i64_or(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,

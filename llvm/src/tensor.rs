@@ -162,7 +162,7 @@ fn flat_offset(shape: &[i64], indices: &[i64]) -> Result<usize, &'static str> {
 }
 
 /// Rank-0 empty tensor (`vacua`) of the requested element kind.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_new(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -182,7 +182,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_new(
 }
 
 /// Create a dense tensor filled with one scalar value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_create(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_create(
 }
 
 /// Build a tensor from a flat element lista and an i64 shape lista.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_from_flat(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_from_flat(
 }
 
 /// Tensor rank (`longitudo`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_rank(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -278,7 +278,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_rank(
 }
 
 /// Materialize shape as `lista<numerus>` (i64).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_shape(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -300,7 +300,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_shape(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_reshape(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -323,7 +323,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_reshape(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_get(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_get(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_set(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -381,7 +381,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_set(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_fill(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -413,7 +413,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_fill(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_flatten(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -429,7 +429,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_flatten(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_materialize(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -451,7 +451,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_materialize(
 }
 
 /// Contiguous axis-0 slice `[start, end)`, materialized for link honesty.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_slice(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -658,7 +658,7 @@ fn from_tensor_u16(tensor: &Tensor<u16>) -> (Vec<i64>, RuntimeCells) {
 }
 
 /// Elementwise add with broadcast.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_add(
     context: *mut FaberRtContextV1,
     lhs: *mut c_void,
@@ -667,7 +667,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_add(
     ffi_ptr(|| binary_tensor_op(context, lhs, rhs, BinaryOp::Add))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_sub(
     context: *mut FaberRtContextV1,
     lhs: *mut c_void,
@@ -676,7 +676,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_sub(
     ffi_ptr(|| binary_tensor_op(context, lhs, rhs, BinaryOp::Sub))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_mul(
     context: *mut FaberRtContextV1,
     lhs: *mut c_void,
@@ -685,7 +685,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_mul(
     ffi_ptr(|| binary_tensor_op(context, lhs, rhs, BinaryOp::Mul))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_matmul(
     context: *mut FaberRtContextV1,
     lhs: *mut c_void,
@@ -695,7 +695,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_matmul(
 }
 
 /// Element-type fold (`summa`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_sum(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -723,7 +723,7 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_sum(
 }
 
 /// Mean (`media`) in the element kind for float carriers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_mean(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -790,7 +790,7 @@ fn tensor_mean_value(tensor: &RuntimeTensor) -> Option<RuntimeValue> {
 }
 
 /// Element-width tensor conversion (`tensor ↦ tensor`) preserving shape.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tensor_convert(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,

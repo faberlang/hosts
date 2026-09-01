@@ -162,39 +162,41 @@ pub(super) struct RuntimeCliTable {
 ///
 /// `context` must be live. `descriptor` must point to `descriptor_len` bytes
 /// of compiler-emitted descriptor data (radix `cli_descriptor` v1).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_parse(
     context: *mut FaberRtContextV1,
     descriptor: *const u8,
     descriptor_len: usize,
 ) -> FaberRtPtrResultV1 {
-    ffi_ptr_result(|| {
-        if descriptor.is_null() {
-            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
-        }
-        let bytes = std::slice::from_raw_parts(descriptor, descriptor_len);
-        let decoded = match decode_descriptor(bytes) {
-            Ok(decoded) => decoded,
-            Err(reason) => cli_parse_exit(format!("invalid CLI descriptor: {reason}")),
-        };
-        let Some(runtime) = (unsafe { runtime_mut(context) }) else {
-            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
-        };
-        let arguments = runtime
-            .arguments
-            .iter()
-            .map(|argument| String::from_utf8_lossy(argument).into_owned())
-            .collect::<Vec<_>>();
-        let parsed = parse_descriptor(context, &decoded, &arguments);
-        let table = match parsed {
-            Ok(table) => table,
-            Err(message) => cli_parse_exit(message),
-        };
-        let table = StableBox::new(table);
-        let handle = table.handle();
-        runtime.cli_table = Some(table);
-        FaberRtPtrResultV1::success(handle)
-    })
+    unsafe {
+        ffi_ptr_result(|| {
+            if descriptor.is_null() {
+                return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+            }
+            let bytes = std::slice::from_raw_parts(descriptor, descriptor_len);
+            let decoded = match decode_descriptor(bytes) {
+                Ok(decoded) => decoded,
+                Err(reason) => cli_parse_exit(format!("invalid CLI descriptor: {reason}")),
+            };
+            let Some(runtime) = (unsafe { runtime_mut(context) }) else {
+                return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+            };
+            let arguments = runtime
+                .arguments
+                .iter()
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect::<Vec<_>>();
+            let parsed = parse_descriptor(context, &decoded, &arguments);
+            let table = match parsed {
+                Ok(table) => table,
+                Err(message) => cli_parse_exit(message),
+            };
+            let table = StableBox::new(table);
+            let handle = table.handle();
+            runtime.cli_table = Some(table);
+            FaberRtPtrResultV1::success(handle)
+        })
+    }
 }
 
 /// Return the stored CLI typed value table handle.
@@ -202,7 +204,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_parse(
 /// # Safety
 ///
 /// `context` must be live and `__faber_rt_v1_cli_parse` must have run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_table(context: *mut FaberRtContextV1) -> *mut c_void {
     let Some(runtime) = runtime(context) else {
         return std::ptr::null_mut();
@@ -218,7 +220,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_table(context: *mut FaberRtContextV1)
 /// # Safety
 ///
 /// `context` must be live and `__faber_rt_v1_cli_parse` must have run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_selected_command(context: *mut FaberRtContextV1) -> i64 {
     let Some(runtime) = runtime(context) else {
         return -1;
@@ -234,7 +236,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_selected_command(context: *mut FaberR
 /// # Safety
 ///
 /// `context` must be live and `__faber_rt_v1_cli_parse` must have run.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_exit_code(context: *mut FaberRtContextV1) -> i64 {
     let Some(runtime) = runtime(context) else {
         return 0;
@@ -258,7 +260,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_exit_code(context: *mut FaberRtContex
 ///
 /// `context` and `table` must be live; `index` must be an in-range pointer
 /// field.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_field_ptr(
     context: *mut FaberRtContextV1,
     table: *mut c_void,
@@ -290,7 +292,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_field_ptr(
 ///
 /// `context` and `table` must be live; `index` must be an in-range scalar
 /// field.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_field_i64(
     context: *mut FaberRtContextV1,
     table: *mut c_void,
@@ -314,7 +316,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_field_i64(
 ///
 /// `context` and `table` must be live; `index` must be an in-range scalar
 /// field.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_field_f64(
     context: *mut FaberRtContextV1,
     table: *mut c_void,
@@ -340,7 +342,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_field_f64(
 ///
 /// `context` and `table` must be live; `index` must be an in-range scalar
 /// field.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_cli_field_i1(
     context: *mut FaberRtContextV1,
     table: *mut c_void,

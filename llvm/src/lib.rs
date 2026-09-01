@@ -269,56 +269,58 @@ struct RuntimeContext {
 /// to `argc` valid C strings. A successful context must be shut down exactly
 /// once with [`__faber_rt_v1_shutdown`].
 #[allow(clippy::similar_names)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_init(
     argc: c_int,
     argv: *const *const c_char,
     out_context: *mut *mut FaberRtContextV1,
 ) -> FaberRtStatusV1 {
-    ffi_status(|| {
-        if out_context.is_null() || argc < 0 || (argc > 0 && argv.is_null()) {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: `argc` is checked non-negative by the guard above.
-        let argc = usize::try_from(argc).unwrap_or(0);
-        // Faber argumenta semantics: argv excludes the host argv[0] program
-        // path (the Rust oracle's `std::env::args()` excludes it too), so the
-        // captured context holds exactly the program arguments.
-        let mut arguments = Vec::with_capacity(argc.saturating_sub(1));
-        for index in 1..argc {
-            let value = *argv.add(index);
-            if value.is_null() {
+    unsafe {
+        ffi_status(|| {
+            if out_context.is_null() || argc < 0 || (argc > 0 && argv.is_null()) {
                 return STATUS_INVALID_ARGUMENT;
             }
-            arguments.push(std::ffi::CStr::from_ptr(value).to_bytes().to_vec());
-        }
-        let context = Box::new(RuntimeContext {
-            arguments,
-            cli_table: None,
-            texts: Vec::new(),
-            valors: Vec::new(),
-            ascii: Vec::new(),
-            octeti: Vec::new(),
-            numeric_boxes: Vec::new(),
-            instants: Vec::new(),
-            arrays: Vec::new(),
-            array_by_handle: HashMap::new(),
-            options: Vec::new(),
-            maps: Vec::new(),
-            sets: Vec::new(),
-            tensors: Vec::new(),
-            tensor_by_handle: HashMap::new(),
-            sparses: Vec::new(),
-            gradients: Vec::new(),
-            gradient_views: Vec::new(),
-            regexes: Vec::new(),
-            intervals: Vec::new(),
-            union_boxes: Vec::new(),
-            sermos: Vec::new(),
-        });
-        *out_context = Box::into_raw(context).cast();
-        STATUS_OK
-    })
+            // SAFETY: `argc` is checked non-negative by the guard above.
+            let argc = usize::try_from(argc).unwrap_or(0);
+            // Faber argumenta semantics: argv excludes the host argv[0] program
+            // path (the Rust oracle's `std::env::args()` excludes it too), so the
+            // captured context holds exactly the program arguments.
+            let mut arguments = Vec::with_capacity(argc.saturating_sub(1));
+            for index in 1..argc {
+                let value = *argv.add(index);
+                if value.is_null() {
+                    return STATUS_INVALID_ARGUMENT;
+                }
+                arguments.push(std::ffi::CStr::from_ptr(value).to_bytes().to_vec());
+            }
+            let context = Box::new(RuntimeContext {
+                arguments,
+                cli_table: None,
+                texts: Vec::new(),
+                valors: Vec::new(),
+                ascii: Vec::new(),
+                octeti: Vec::new(),
+                numeric_boxes: Vec::new(),
+                instants: Vec::new(),
+                arrays: Vec::new(),
+                array_by_handle: HashMap::new(),
+                options: Vec::new(),
+                maps: Vec::new(),
+                sets: Vec::new(),
+                tensors: Vec::new(),
+                tensor_by_handle: HashMap::new(),
+                sparses: Vec::new(),
+                gradients: Vec::new(),
+                gradient_views: Vec::new(),
+                regexes: Vec::new(),
+                intervals: Vec::new(),
+                union_boxes: Vec::new(),
+                sermos: Vec::new(),
+            });
+            *out_context = Box::into_raw(context).cast();
+            STATUS_OK
+        })
+    }
 }
 
 /// Release a context returned by [`__faber_rt_v1_init`].
@@ -327,16 +329,18 @@ pub unsafe extern "C" fn __faber_rt_v1_init(
 ///
 /// `context` must be null or a live context returned by this runtime and not
 /// previously shut down.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_shutdown(context: *mut FaberRtContextV1) {
-    if context.is_null() {
-        return;
+    unsafe {
+        if context.is_null() {
+            return;
+        }
+        drop(panic::catch_unwind(AssertUnwindSafe(|| {
+            drop(Box::from_raw(context.cast::<RuntimeContext>()));
+            drop(io::stdout().flush());
+            drop(io::stderr().flush());
+        })));
     }
-    drop(panic::catch_unwind(AssertUnwindSafe(|| {
-        drop(Box::from_raw(context.cast::<RuntimeContext>()));
-        drop(io::stdout().flush());
-        drop(io::stderr().flush());
-    })));
 }
 
 /// Return the process argumenta captured at [`__faber_rt_v1_init`] as an
@@ -349,22 +353,26 @@ pub unsafe extern "C" fn __faber_rt_v1_shutdown(context: *mut FaberRtContextV1) 
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_arguments(
     context: *mut FaberRtContextV1,
 ) -> crate::abi::FaberRtPtrResultV1 {
-    format::ffi_ptr_result(|| {
-        let Some(runtime) = (unsafe { array::runtime_mut(context) }) else {
-            return crate::abi::FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
-        };
-        let mut values = Vec::with_capacity(runtime.arguments.len());
-        for argument in &runtime.arguments {
-            let text =
-                format::store_text_owned(context, String::from_utf8_lossy(argument).into_owned());
-            values.push(array::RuntimeValue::Ptr(text));
-        }
-        array::store_array(runtime, radix_host_abi::VALUE_KIND_PTR, values)
-    })
+    unsafe {
+        format::ffi_ptr_result(|| {
+            let Some(runtime) = (unsafe { array::runtime_mut(context) }) else {
+                return crate::abi::FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+            };
+            let mut values = Vec::with_capacity(runtime.arguments.len());
+            for argument in &runtime.arguments {
+                let text = format::store_text_owned(
+                    context,
+                    String::from_utf8_lossy(argument).into_owned(),
+                );
+                values.push(array::RuntimeValue::Ptr(text));
+            }
+            array::store_array(runtime, radix_host_abi::VALUE_KIND_PTR, values)
+        })
+    }
 }
 
 /// Write one `nota` text payload followed by its canonical newline.
@@ -373,33 +381,35 @@ pub unsafe extern "C" fn __faber_rt_v1_arguments(
 ///
 /// `context` must be live. `text.data` must be readable for `text.len` bytes,
 /// except that a null pointer is allowed when the length is zero.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_write_nota_text(
     context: *mut FaberRtContextV1,
     text: FaberRtSliceV1,
 ) -> FaberRtStatusV1 {
-    ffi_status(|| {
-        if context.is_null() || (text.len > 0 && text.data.is_null()) {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        let Ok(len) = usize::try_from(text.len) else {
-            return STATUS_INVALID_ARGUMENT;
-        };
-        let bytes = if len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(text.data, len)
-        };
-        let mut stdout = io::stdout().lock();
-        match stdout
-            .write_all(bytes)
-            .and_then(|()| stdout.write_all(b"\n"))
-            .and_then(|()| stdout.flush())
-        {
-            Ok(()) => STATUS_OK,
-            Err(_) => STATUS_IO_ERROR,
-        }
-    })
+    unsafe {
+        ffi_status(|| {
+            if context.is_null() || (text.len > 0 && text.data.is_null()) {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let Ok(len) = usize::try_from(text.len) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let bytes = if len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(text.data, len)
+            };
+            let mut stdout = io::stdout().lock();
+            match stdout
+                .write_all(bytes)
+                .and_then(|()| stdout.write_all(b"\n"))
+                .and_then(|()| stdout.flush())
+            {
+                Ok(()) => STATUS_OK,
+                Err(_) => STATUS_IO_ERROR,
+            }
+        })
+    }
 }
 
 /// Evaluate one assertion without allowing a panic to cross the C ABI.
@@ -407,7 +417,7 @@ pub unsafe extern "C" fn __faber_rt_v1_write_nota_text(
 /// # Safety
 ///
 /// `context` must be live.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_assert(
     context: *mut FaberRtContextV1,
     condition: u8,
@@ -429,37 +439,39 @@ pub unsafe extern "C" fn __faber_rt_v1_assert(
 ///
 /// `context` must be live. `message` follows the slice validity contract of
 /// [`__faber_rt_v1_write_nota_text`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_assert_message(
     context: *mut FaberRtContextV1,
     condition: u8,
     message: FaberRtSliceV1,
 ) -> FaberRtStatusV1 {
-    ffi_status(|| {
-        if context.is_null() || (message.len > 0 && message.data.is_null()) {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        if condition != 0 {
-            return STATUS_OK;
-        }
-        let Ok(len) = usize::try_from(message.len) else {
-            return STATUS_INVALID_ARGUMENT;
-        };
-        let bytes = if len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(message.data, len)
-        };
-        let mut stderr = io::stderr().lock();
-        match stderr
-            .write_all(bytes)
-            .and_then(|()| stderr.write_all(b"\n"))
-            .and_then(|()| stderr.flush())
-        {
-            Ok(()) => STATUS_PANIC,
-            Err(_) => STATUS_IO_ERROR,
-        }
-    })
+    unsafe {
+        ffi_status(|| {
+            if context.is_null() || (message.len > 0 && message.data.is_null()) {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            if condition != 0 {
+                return STATUS_OK;
+            }
+            let Ok(len) = usize::try_from(message.len) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let bytes = if len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(message.data, len)
+            };
+            let mut stderr = io::stderr().lock();
+            match stderr
+                .write_all(bytes)
+                .and_then(|()| stderr.write_all(b"\n"))
+                .and_then(|()| stderr.flush())
+            {
+                Ok(()) => STATUS_PANIC,
+                Err(_) => STATUS_IO_ERROR,
+            }
+        })
+    }
 }
 
 fn write_diagnostic(
@@ -670,7 +682,7 @@ fn render_opaque_diagnostic(
 ///
 /// `context` must be null or a live runtime context. `value` is only used for
 /// pointer-equality arena lookups.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_ptr(
     context: *mut FaberRtContextV1,
     value: *const u8,
@@ -684,7 +696,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_ptr(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// readable [`FaberRtSliceV1`], with readable data for its length.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -698,7 +710,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_text(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// valid NUL-terminated C string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_ascii(
     context: *mut FaberRtContextV1,
     value: *const u8,
@@ -711,7 +723,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_ascii(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -724,7 +736,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i64(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_u64(
     context: *mut FaberRtContextV1,
     value: u64,
@@ -737,7 +749,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_u64(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i1(
     context: *mut FaberRtContextV1,
     value: u8,
@@ -750,7 +762,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i1(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f32(
     context: *mut FaberRtContextV1,
     value: f32,
@@ -763,7 +775,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f32(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f64(
     context: *mut FaberRtContextV1,
     value: f64,
@@ -776,7 +788,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f64(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i8(
     context: *mut FaberRtContextV1,
     value: i8,
@@ -789,7 +801,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i8(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i32(
     context: *mut FaberRtContextV1,
     value: i32,
@@ -802,7 +814,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i32(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context. `_value` is ignored.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_ptr(
     context: *mut FaberRtContextV1,
     value: *const u8,
@@ -816,7 +828,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_ptr(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// readable [`FaberRtSliceV1`], with readable data for its length.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -830,7 +842,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_text(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// valid NUL-terminated C string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_ascii(
     context: *mut FaberRtContextV1,
     value: *const u8,
@@ -843,7 +855,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_ascii(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -856,7 +868,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_i64(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context. `_value` is ignored.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_ptr(
     context: *mut FaberRtContextV1,
     _value: *const u8,
@@ -870,7 +882,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_ptr(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// readable [`FaberRtSliceV1`], with readable data for its length.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -884,7 +896,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_text(
 ///
 /// `context` must be null or a live runtime context. `value` must point to a
 /// valid NUL-terminated C string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_ascii(
     context: *mut FaberRtContextV1,
     value: *const u8,
@@ -897,7 +909,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_ascii(
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -911,24 +923,26 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_i64(
 ///
 /// The context and message slice follow the same validity requirements as
 /// [`__faber_rt_v1_write_nota_text`]. This function never returns.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_fatal(
     context: *mut FaberRtContextV1,
     message: FaberRtSliceV1,
 ) -> ! {
-    if !context.is_null() && (message.len == 0 || !message.data.is_null()) {
-        if let Ok(len) = usize::try_from(message.len) {
-            let bytes = if len == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(message.data, len)
-            };
-            drop(io::stderr().write_all(bytes));
-            drop(io::stderr().write_all(b"\n"));
-            drop(io::stderr().flush());
+    unsafe {
+        if !context.is_null() && (message.len == 0 || !message.data.is_null()) {
+            if let Ok(len) = usize::try_from(message.len) {
+                let bytes = if len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(message.data, len)
+                };
+                drop(io::stderr().write_all(bytes));
+                drop(io::stderr().write_all(b"\n"));
+                drop(io::stderr().flush());
+            }
         }
+        std::process::abort()
     }
-    std::process::abort()
 }
 
 /// Abort for a message whose opaque runtime representation has no byte-length
@@ -937,7 +951,7 @@ pub unsafe extern "C" fn __faber_rt_v1_fatal(
 /// # Safety
 ///
 /// `context` must be live. `message` is intentionally never dereferenced.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_fatal_opaque(
     context: *mut FaberRtContextV1,
     _message: *const u8,
@@ -962,7 +976,7 @@ fn ffi_status(operation: impl FnOnce() -> FaberRtStatusV1) -> FaberRtStatusV1 {
 /// # Safety
 ///
 /// `context` must be null or a live runtime context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_numerus_overflow(context: *mut FaberRtContextV1) -> ! {
     if !context.is_null() {
         drop(io::stderr().write_all(b"numerus overflow\n"));
@@ -972,12 +986,12 @@ pub unsafe extern "C" fn __faber_rt_v1_numerus_overflow(context: *mut FaberRtCon
 }
 
 #[cfg(not(test))]
-extern "C" {
+unsafe extern "C" {
     fn __faber_program_entry_v1(context: *mut FaberRtContextV1) -> FaberRtExitV1;
 }
 
 #[cfg(not(test))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::similar_names)]
 /// C process entry owned by the LLVM host runtime.
 ///
@@ -985,21 +999,23 @@ extern "C" {
 ///
 /// The platform launcher must provide the normal C `argc`/`argv` contract.
 pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
-    let mut context = ptr::null_mut();
-    let init = __faber_rt_v1_init(argc, argv, &raw mut context);
-    if !init.is_ok() {
-        return init.code;
-    }
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| __faber_program_entry_v1(context)))
-        .unwrap_or(FaberRtExitV1 {
-            process_code: STATUS_PANIC.code,
-            status: STATUS_PANIC,
-        });
-    __faber_rt_v1_shutdown(context);
-    if outcome.status.is_ok() {
-        outcome.process_code
-    } else {
-        outcome.status.code
+    unsafe {
+        let mut context = ptr::null_mut();
+        let init = __faber_rt_v1_init(argc, argv, &raw mut context);
+        if !init.is_ok() {
+            return init.code;
+        }
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| __faber_program_entry_v1(context)))
+            .unwrap_or(FaberRtExitV1 {
+                process_code: STATUS_PANIC.code,
+                status: STATUS_PANIC,
+            });
+        __faber_rt_v1_shutdown(context);
+        if outcome.status.is_ok() {
+            outcome.process_code
+        } else {
+            outcome.status.code
+        }
     }
 }
 

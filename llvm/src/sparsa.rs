@@ -121,7 +121,7 @@ fn empty_sparse(kind: FaberRtValueKindV1, shape: &[i64]) -> Option<RuntimeSparse
 }
 
 /// Empty sparse tensor with explicit shape lista.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_new(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -141,7 +141,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_new(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_get(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_get(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_set(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_set(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_nonzero(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -249,7 +249,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_nonzero(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_rank(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -270,7 +270,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_rank(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_densify(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_densify(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
     context: *mut FaberRtContextV1,
     tensor: *mut c_void,

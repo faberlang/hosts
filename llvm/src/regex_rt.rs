@@ -35,7 +35,7 @@ fn find_regex(runtime: &RuntimeContext, handle: *mut c_void) -> Option<&Regex> {
 }
 
 /// `textus ↦ regex` — preserve pattern text without engine validation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_regex_from_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -49,7 +49,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_text(
 }
 
 /// `ascii ↦ regex`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_regex_from_ascii(
     context: *mut FaberRtContextV1,
     value: *const c_char,
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_ascii(
 }
 
 /// Pattern text extraction for diagnostics / display.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_regex_get_text(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -108,7 +108,7 @@ pub struct RegexLiteralDescriptorV1 {
 /// `context` must be live. `descriptor` must be a readable
 /// [`RegexLiteralDescriptorV1`] whose `pattern` is a valid NUL-terminated C
 /// string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_regex_literal_1_ptr_to_ptr(
     context: *mut FaberRtContextV1,
     descriptor: *const RegexLiteralDescriptorV1,

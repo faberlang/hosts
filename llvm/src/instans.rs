@@ -47,7 +47,7 @@ pub(super) fn find(runtime: &RuntimeContext, handle: *mut c_void) -> Option<Inst
         .map(|value| **value)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_instans_from_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -66,7 +66,7 @@ pub unsafe extern "C" fn __faber_rt_v1_instans_from_text(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_instans_from_valor(
     context: *mut FaberRtContextV1,
     valor: *const Valor,
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn __faber_rt_v1_instans_from_valor(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_instans_retag(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -105,7 +105,7 @@ pub unsafe extern "C" fn __faber_rt_v1_instans_retag(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_instans_get_text(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn __faber_rt_v1_instans_get_text(
 /// `Instans { nanos: …, praecisio: … }`), NOT the RFC3339 wire text that the
 /// `↦ textus` conversion produces. The diagnostic path uses this symbol;
 /// `instans_get_text` stays for the explicit text conversion.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_instans_display(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -169,7 +169,7 @@ fn compare_instans(
     u8::from(predicate(lhs, rhs))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_lt_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_lt_2_ptr_ptr_to_i1(
     compare_instans(lhs, rhs, |lhs, rhs| lhs < rhs)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_gt_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_gt_2_ptr_ptr_to_i1(
     compare_instans(lhs, rhs, |lhs, rhs| lhs > rhs)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_lte_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_lte_2_ptr_ptr_to_i1(
     compare_instans(lhs, rhs, |lhs, rhs| lhs <= rhs)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_gte_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_gte_2_ptr_ptr_to_i1(
 /// handles, so `adfirma a ≡ b` false-failed, latched `STATUS_PANIC`, and the
 /// L9 exit-struct fix surfaced a nonzero exit code. Value equality mirrors the
 /// ordering family above and restores Rust-oracle parity.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_eq_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_eq_2_ptr_ptr_to_i1(
 }
 
 /// `instans ≠ instans` value inequality (`i1`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_compare_ne_2_ptr_ptr_to_i1(
     lhs: *mut c_void,
     rhs: *mut c_void,
@@ -227,7 +227,7 @@ pub unsafe extern "C" fn __faber_rt_v1_compare_ne_2_ptr_ptr_to_i1(
 }
 
 /// Current wall-clock instant as an `instans<ns>` handle (`norma:time.nunc`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_tempus_nunc(
     context: *mut FaberRtContextV1,
 ) -> FaberRtPtrResultV1 {

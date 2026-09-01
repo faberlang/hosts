@@ -42,7 +42,7 @@ fn query(
     .unwrap_or(STATUS_PANIC)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_is_empty(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -51,7 +51,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_is_empty(
     query(context, out, || Some(text_value(text)?.is_empty()))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_concat(
     context: *mut FaberRtContextV1,
     first: *const FaberRtSliceV1,
@@ -66,7 +66,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_concat(
     ffi_ptr_result(|| store_text(context, format!("{first}{second}")))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_contains(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_contains(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_starts_with(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -90,7 +90,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_starts_with(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_ends_with(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -115,7 +115,7 @@ fn transform(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_uppercase(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_uppercase(
     transform(context, text, |text| text.to_uppercase())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_lowercase(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -131,7 +131,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_lowercase(
     transform(context, text, |text| text.to_lowercase())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_trim(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_trim(
     transform(context, text, |text| text.trim().to_owned())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_slice(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_slice(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_replace(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_replace(
     transform(context, text, |text| text.replace(&old, &new))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_split(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_split(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_parse_integer(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_parse_integer(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_parse_float(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_parse_float(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_truthy(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
@@ -280,7 +280,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_truthy(
     query(context, out, || Some(!text_value(text)?.is_empty()))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_ascii_truthy(
     context: *mut FaberRtContextV1,
     ascii: *const c_char,
@@ -305,7 +305,7 @@ pub unsafe extern "C" fn __faber_rt_v1_ascii_truthy(
 /// fresh arena allocation, so `adfirma runtimeText ≡ "literal"` false-failed,
 /// latched `STATUS_PANIC`, and the L9 exit-struct fix surfaced a nonzero exit
 /// code. Value equality restores Rust-oracle parity.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_eq(
     lhs: *const FaberRtSliceV1,
     rhs: *const FaberRtSliceV1,
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_eq(
 }
 
 /// `textus ≠ textus` value inequality (`i1`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_text_ne(
     lhs: *const FaberRtSliceV1,
     rhs: *const FaberRtSliceV1,
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_ne(
 
 /// `ascii ≡ ascii` value equality (`i1`) over null-terminated ASCII byte
 /// payloads (same rationale as [`__faber_rt_v1_text_eq`]).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_ascii_eq(lhs: *const c_char, rhs: *const c_char) -> u8 {
     u8::from(match (ascii_bytes(lhs), ascii_bytes(rhs)) {
         (Some(lhs), Some(rhs)) => lhs == rhs,
@@ -339,7 +339,7 @@ pub unsafe extern "C" fn __faber_rt_v1_ascii_eq(lhs: *const c_char, rhs: *const 
 }
 
 /// `ascii ≠ ascii` value inequality (`i1`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_ascii_ne(lhs: *const c_char, rhs: *const c_char) -> u8 {
     u8::from(match (ascii_bytes(lhs), ascii_bytes(rhs)) {
         (Some(lhs), Some(rhs)) => lhs != rhs,

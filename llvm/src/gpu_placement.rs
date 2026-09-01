@@ -50,7 +50,7 @@ where
 ///
 /// `data_ptr` must be readable for `data_len` bytes, or null when `data_len`
 /// is zero. `dtype` is reserved for future dtype validation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_gpu_v1_copy_in(
     logical_id: u64,
     data_ptr: *const u8,
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn __faber_gpu_v1_copy_in(
 ///
 /// `dest_ptr` must be writable for `dest_capacity` bytes. `actual_len` must
 /// be a writable `u64` output slot. Both must be non-null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_gpu_v1_readback(
     logical_id: u64,
     dest_ptr: *mut u8,
@@ -131,7 +131,7 @@ pub unsafe extern "C" fn __faber_gpu_v1_readback(
 ///
 /// `_logical_id` is reserved for future per-buffer barrier semantics.
 /// This implementation ignores it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_gpu_v1_sync(_logical_id: u64) -> FaberRtStatusV1 {
     STATUS_OK
 }

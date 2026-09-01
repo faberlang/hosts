@@ -20,7 +20,7 @@ fn ffi_ptr(operation: impl FnOnce() -> FaberRtPtrResultV1) -> FaberRtPtrResultV1
 ///
 /// `context` must be null or a live runtime context. `error` is an opaque
 /// payload handle; it is never dereferenced.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_fallible_error(
     context: *mut FaberRtContextV1,
     error: *mut c_void,

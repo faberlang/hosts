@@ -340,7 +340,8 @@ fn write_env(opener: &Valor) -> HostResult<ProviderReply> {
         ));
     }
     let _guard = environment_lock()?;
-    std::env::set_var(name, value);
+    // SAFETY: environment_lock serializes all environment mutation across threads.
+    unsafe { std::env::set_var(name, value) };
     Ok(ProviderReply::vacuum())
 }
 

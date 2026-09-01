@@ -504,7 +504,7 @@ impl<'a> IntoIterator for &'a RuntimeCells {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_new(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -547,7 +547,7 @@ pub(super) fn store_array_cells(
     FaberRtPtrResultV1::success(handle)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_push(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -571,7 +571,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_push(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_extend(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -608,7 +608,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_extend(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_length(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -631,7 +631,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_length(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_get(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -659,7 +659,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_get(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_set(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -687,7 +687,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_set(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_clone(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -705,7 +705,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_clone(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_contains(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -732,7 +732,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_contains(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_is_empty(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -752,7 +752,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_is_empty(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_reverse(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -769,7 +769,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_reverse(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_range(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -794,7 +794,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_range(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_option(
     context: *mut FaberRtContextV1,
     array: *mut c_void,

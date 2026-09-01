@@ -21,7 +21,7 @@ pub(super) struct RuntimeOption {
     pub(super) value: Option<RuntimeValue>,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_none(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -37,7 +37,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_none(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_some(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -54,7 +54,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_some(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_is_present(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_is_present(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_get(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_get(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_get_or(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -186,7 +186,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_get_or(
 ///
 /// `option` must be a live box pointer produced by the option construction
 /// path for the same payload type.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_option_unwrap_ptr(option: *mut c_void) -> *mut c_void {
     option
 }
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn __faber_rt_v1_option_unwrap_ptr(option: *mut c_void) ->
 /// `context` must be null or a live runtime context. `option` is only used
 /// for pointer-equality arena lookups and bit-pattern decoding; it is never
 /// dereferenced unless it is a known payload handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_option(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_option(
 ///
 /// `context` must be null or a live runtime context. `option` is only used
 /// for pointer-equality arena lookups and bit-pattern decoding.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_option(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_mone_option(
 ///
 /// `context` must be null or a live runtime context. `option` is only used
 /// for pointer-equality arena lookups and bit-pattern decoding.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_scribe_option(
     context: *mut FaberRtContextV1,
     option: *mut c_void,
@@ -254,7 +254,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_scribe_option(
 ///
 /// `context` must be null or a live runtime context. `option` is only used
 /// for pointer-equality arena lookups and bit-pattern decoding.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_diagnostic_vide_option(
     context: *mut FaberRtContextV1,
     option: *mut c_void,

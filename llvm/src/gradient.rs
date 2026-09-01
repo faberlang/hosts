@@ -90,7 +90,7 @@ fn checked_element_count(shape: &[i64]) -> Option<usize> {
 /// v1 admits only `VALUE_KIND_F32`. Returns an opaque handle or
 /// `STATUS_INVALID_ARGUMENT` on null/negative shape, unknown kind, or
 /// overflow.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_gradient_create(
     context: *mut FaberRtContextV1,
     shape: *const i64,
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn __faber_rt_v1_gradient_create(
 /// Validates shape match element-by-element. Accumulation is element-wise add:
 /// `stored[i] += incoming[i]`. Returns `STATUS_INVALID_ARGUMENT` on unknown
 /// handle, shape mismatch, or null addresses.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_gradient_accumulate(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn __faber_rt_v1_gradient_accumulate(
 /// pointer + length and `i64` shape pointer + rank — safe to dereference from
 /// C/LLVM without exposing Rust layout or Vec internals. Returns
 /// `FaberRtPtrResultV1::failure` on unknown handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_gradient_read(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn __faber_rt_v1_gradient_read(
 ///
 /// Sets every element in the flat buffer to `0.0`. Returns
 /// `STATUS_INVALID_ARGUMENT` on unknown handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_gradient_zero(
     context: *mut FaberRtContextV1,
     handle: *mut c_void,

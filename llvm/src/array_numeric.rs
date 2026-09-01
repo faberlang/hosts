@@ -8,7 +8,7 @@ use radix_host_abi::FaberRtValueKindV1;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_sort(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -27,7 +27,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_sort(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_sum(
     context: *mut FaberRtContextV1,
     array: *mut c_void,

@@ -29,7 +29,7 @@ fn runtime(context: *mut FaberRtContextV1) -> Option<&'static mut RuntimeContext
 ///
 /// TOML parsing is not yet implemented on the LLVM host; the provider fails
 /// closed with a stable unsupported status.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_toml_solve(
     context: *mut FaberRtContextV1,
     _text: *const FaberRtSliceV1,
@@ -49,7 +49,7 @@ pub unsafe extern "C" fn __faber_rt_v1_toml_solve(
 /// `context` must be live. `value` must be a `valor` handle created by this
 /// runtime. `key` follows the slice validity contract of
 /// [`__faber_rt_v1_write_nota_text`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_cape(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_cape(
 ///
 /// `context` must be live. `value` must be a `valor` handle created by this
 /// runtime.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_json_pange(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn __faber_rt_v1_json_pange(
 ///
 /// `context` must be live. `wire` follows the slice validity contract of
 /// [`__faber_rt_v1_write_nota_text`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_json_solve(
     context: *mut FaberRtContextV1,
     wire: *const FaberRtSliceV1,
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn __faber_rt_v1_json_solve(
 ///
 /// `context` must be live. `wire` follows the slice validity contract of
 /// [`__faber_rt_v1_write_nota_text`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_json_tempta(
     context: *mut FaberRtContextV1,
     wire: *const FaberRtSliceV1,

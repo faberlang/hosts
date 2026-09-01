@@ -11,7 +11,7 @@ use faber::{FromValor, Valor};
 use std::ffi::{CStr, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -19,7 +19,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_i64(
     store_valor(context, Valor::Numerus(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_f64(
     context: *mut FaberRtContextV1,
     value: f64,
@@ -27,7 +27,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_f64(
     store_valor(context, Valor::Fractus(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_i1(
     context: *mut FaberRtContextV1,
     value: u8,
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_i1(
     store_valor(context, Valor::Bivalens(value != 0))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_text(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -46,7 +46,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_text(
     store_valor(context, Valor::Textus(value))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_ascii(
     context: *mut FaberRtContextV1,
     value: *const c_char,
@@ -64,7 +64,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_ascii(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_nihil(
     context: *mut FaberRtContextV1,
 ) -> FaberRtPtrResultV1 {
@@ -105,7 +105,7 @@ fn extract<T: FromValor>(
     .unwrap_or(STATUS_PANIC)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_i64(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -114,7 +114,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_i64(
     extract(context, value, out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_f64(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_f64(
     extract(context, value, out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_i1(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_i1(
     .unwrap_or(STATUS_PANIC)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_text(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_text(
     store_text(context, extracted)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_ascii(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_ascii(
     result.unwrap_or(FaberRtPtrResultV1::failure(STATUS_PANIC))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_nihil(
     context: *mut FaberRtContextV1,
     value: *const Valor,
@@ -222,7 +222,7 @@ pub(super) fn find_valor(runtime: &RuntimeContext, handle: *mut c_void) -> Optio
 /// [`Valor`] storage, and union boxes as opaque handle pointers, so the
 /// conversion is a pointer-preserving re-interpretation: the returned handle
 /// is the input handle. A null or dangling handle fails closed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_convert_runtime_1_ptr_to_ptr(
     context: *mut FaberRtContextV1,
     value: *mut c_void,

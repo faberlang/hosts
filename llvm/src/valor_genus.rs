@@ -31,7 +31,7 @@ fn runtime(context: *mut FaberRtContextV1) -> Option<&'static mut RuntimeContext
     (!context.is_null()).then(|| unsafe { &mut *context.cast::<RuntimeContext>() })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_genus(
     context: *mut FaberRtContextV1,
     count: u64,
@@ -61,7 +61,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_genus(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_genus(
     context: *mut FaberRtContextV1,
     valor: *const Valor,

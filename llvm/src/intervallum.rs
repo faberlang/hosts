@@ -74,7 +74,7 @@ fn store_optional_interval(
 }
 
 /// Construct `intervallum<numerus>`: `inclusive` is 0 (‥) or 1 (…).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_new(
     context: *mut FaberRtContextV1,
     initium: i64,
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_new(
 }
 
 /// Interval intersection; empty results are option-none of ptr payload.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_intersect(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -114,7 +114,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_intersect(
 }
 
 /// Interval union when overlap or adjacent; empty results are option-none.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_union(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_union(
 }
 
 /// Discrete span count (`longitudo`) for numerus intervals.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_length(
     context: *mut FaberRtContextV1,
     interval: *mut c_void,
@@ -156,7 +156,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_length(
 }
 
 /// Point containment (`continet` / `intra`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_contains(
     context: *mut FaberRtContextV1,
     interval: *mut c_void,
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_contains(
 }
 
 /// Clamp a numerus value into an interval (refinement-target conversio).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_clamp_i64(
     context: *mut FaberRtContextV1,
     value: i64,
@@ -202,7 +202,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_clamp_i64(
 }
 
 /// Range-to-range clamp: each bound of `source` coerced into `target`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_clamp(
     context: *mut FaberRtContextV1,
     source: *mut c_void,
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_clamp(
 }
 
 /// Materialize interval values into a lista of numerus.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_materialize_array(
     context: *mut FaberRtContextV1,
     interval: *mut c_void,
@@ -245,7 +245,7 @@ pub unsafe extern "C" fn __faber_rt_v1_interval_materialize_array(
 }
 
 /// Materialize interval values into a 1-d numerus tensor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_interval_materialize_tensor(
     context: *mut FaberRtContextV1,
     interval: *mut c_void,

@@ -24,7 +24,7 @@ pub(super) struct RuntimeSet {
     pub(super) values: Vec<RuntimeValue>,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_new(
     context: *mut FaberRtContextV1,
     key_kind: FaberRtValueKindV1,
@@ -41,7 +41,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_new(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_put(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -92,7 +92,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_put(
 ///
 /// `aggregate` must be a live map handle created by this runtime; `key` must
 /// be a readable text descriptor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_aggregate_set_index_ptr_i64(
     aggregate: *mut c_void,
     key: *const FaberRtSliceV1,
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn __faber_rt_v1_aggregate_set_index_ptr_i64(
     }));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_option(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_option(
 }
 
 /// Non-optional tabula index: write the value or fail closed when missing.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_get(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_get(
 
 macro_rules! map_query {
     ($name:ident, $predicate:expr) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(
             context: *mut FaberRtContextV1,
             map: *mut c_void,
@@ -233,7 +233,7 @@ map_query!(__faber_rt_v1_map_delete, |map: &mut RuntimeMap, key| {
     map.entries.len() != before
 });
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_length(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_length(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_is_empty(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -279,7 +279,7 @@ fn map_size_query<T: Copy>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_keys(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn __faber_rt_v1_map_keys(
     map_values(context, map, true)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_map_values(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -348,7 +348,7 @@ fn canonical_array_element_kind(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_new(
     context: *mut FaberRtContextV1,
     kind: FaberRtValueKindV1,
@@ -364,7 +364,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_new(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_add(
     context: *mut FaberRtContextV1,
     set: *mut c_void,
@@ -392,7 +392,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_add(
 }
 
 /// `lista ↦ copia` — dedupe array elements into a set of the same value kind.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_from_array(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -416,7 +416,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_from_array(
 }
 
 /// `copia ↦ lista` — materialize set members into an array (unordered).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_array_from_set(
     context: *mut FaberRtContextV1,
     set: *mut c_void,
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn __faber_rt_v1_array_from_set(
 
 macro_rules! set_query {
     ($name:ident, $remove:expr) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(
             context: *mut FaberRtContextV1,
             set: *mut c_void,
@@ -470,7 +470,7 @@ macro_rules! set_query {
 set_query!(__faber_rt_v1_set_contains, false);
 set_query!(__faber_rt_v1_set_delete, true);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_length(
     context: *mut FaberRtContextV1,
     set: *mut c_void,
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_length(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_is_empty(
     context: *mut FaberRtContextV1,
     set: *mut c_void,
@@ -516,7 +516,7 @@ fn set_size_query<T: Copy>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_union(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -530,7 +530,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_union(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_intersection(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -544,7 +544,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_intersection(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_difference(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -558,7 +558,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_difference(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_symmetric_difference(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -573,7 +573,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_symmetric_difference(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_is_subset(
     context: *mut FaberRtContextV1,
     left: *mut c_void,
@@ -585,7 +585,7 @@ pub unsafe extern "C" fn __faber_rt_v1_set_is_subset(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_set_is_superset(
     context: *mut FaberRtContextV1,
     left: *mut c_void,

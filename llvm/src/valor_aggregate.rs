@@ -31,7 +31,7 @@ fn context_ptr(runtime: &mut RuntimeContext) -> *mut FaberRtContextV1 {
     std::ptr::from_mut(runtime).cast()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_octeti_new(
     context: *mut FaberRtContextV1,
     value: *const FaberRtSliceV1,
@@ -70,7 +70,7 @@ pub(super) fn find_octeti(runtime: &RuntimeContext, handle: *mut c_void) -> Opti
         .map(super::StableBox::as_ref)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_octeti(
     context: *mut FaberRtContextV1,
     octeti: *mut c_void,
@@ -87,7 +87,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_octeti(
 }
 
 /// `tensor ↦ valor` — box flat tensor elements as a Valor lista (kernel bridge).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_tensor(
     context: *mut FaberRtContextV1,
     tensor: *mut c_void,
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_tensor(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_array(
     context: *mut FaberRtContextV1,
     array: *mut c_void,
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_array(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_map(
     context: *mut FaberRtContextV1,
     map: *mut c_void,
@@ -164,7 +164,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_map(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_octeti(
     context: *mut FaberRtContextV1,
     valor: *const Valor,
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_octeti(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_array(
     context: *mut FaberRtContextV1,
     valor: *const Valor,
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn __faber_rt_v1_valor_get_array(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_valor_get_map(
     context: *mut FaberRtContextV1,
     valor: *const Valor,

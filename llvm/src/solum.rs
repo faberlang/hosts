@@ -12,7 +12,7 @@ use crate::abi::{
 use radix_host_abi::VALUE_KIND_PTR;
 use std::io::{self, BufRead};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_solum_read_text(
     context: *mut FaberRtContextV1,
     path: *const FaberRtSliceV1,
@@ -26,7 +26,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_read_text(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_solum_read_lines(
     context: *mut FaberRtContextV1,
     path: *const FaberRtSliceV1,
@@ -52,7 +52,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_read_lines(
     store_array(runtime, VALUE_KIND_PTR, values)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_solum_read_bytes(
     context: *mut FaberRtContextV1,
     path: *const FaberRtSliceV1,
@@ -70,7 +70,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_read_bytes(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_solum_write_text(
     context: *mut FaberRtContextV1,
     path: *const FaberRtSliceV1,
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_write_text(
 /// # Safety
 ///
 /// `context` must be live.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_read_line_0_to_ptr(
     context: *mut FaberRtContextV1,
 ) -> FaberRtPtrResultV1 {
