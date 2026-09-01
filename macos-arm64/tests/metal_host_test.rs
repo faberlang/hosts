@@ -9,8 +9,8 @@ use faber_host_macos_arm64::device_host::{DeviceLaunchBinding, DeviceRuntime, De
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::metal_host::{MappedWeightFile, MetalHandleId, MetalLaunchBinding};
 use faber_host_macos_arm64::{
-    probe_metal_environment, CudaHostSession, FakeCudaDriver, FakeMetalDriver, MetalHostSession,
-    E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
+    CudaHostSession, E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
+    FakeCudaDriver, FakeMetalDriver, MetalHostSession, probe_metal_environment,
 };
 use host_coordinator::{DeviceBackend, DeviceHandle, DeviceHandleKind};
 

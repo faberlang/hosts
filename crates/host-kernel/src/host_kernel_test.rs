@@ -156,17 +156,19 @@ fn registration_and_dispatch_are_manifest_checked() {
         )
         .expect("dispatch route");
     assert_eq!(reply, ProviderReply::item(Valor::Textus("ok".to_owned())));
-    assert!(kernel
-        .dispatch(
-            &RequestFrame {
-                conversation_id: "c2".to_owned(),
-                route: "test:missing".to_owned(),
-                opener: Valor::Nihil,
-                target: None,
-            },
-            &context(),
-        )
-        .is_err());
+    assert!(
+        kernel
+            .dispatch(
+                &RequestFrame {
+                    conversation_id: "c2".to_owned(),
+                    route: "test:missing".to_owned(),
+                    opener: Valor::Nihil,
+                    target: None,
+                },
+                &context(),
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -280,9 +282,11 @@ fn unsupported_manifest_versions_are_rejected() {
         .expect_err("unsupported manifest versions must fail closed");
 
     assert_eq!(error.code, "E_INVALID_ARGS");
-    assert!(error
-        .message
-        .contains("unsupported provider manifest version 2"));
+    assert!(
+        error
+            .message
+            .contains("unsupported provider manifest version 2")
+    );
     assert!(!kernel.supports_route("test:echo"));
 }
 
@@ -474,9 +478,11 @@ fn dispatch_rejects_provider_reply_that_violates_manifest_result_contract() {
         .expect_err("byte reply must not satisfy valor contract");
 
     assert_eq!(error.code, "E_INTERNAL");
-    assert!(error
-        .message
-        .contains("does not match declared result contract"));
+    assert!(
+        error
+            .message
+            .contains("does not match declared result contract")
+    );
 }
 
 #[test]
@@ -673,9 +679,11 @@ fn dispatch_rejects_request_opener_that_violates_manifest_contract() {
         .expect_err("numerus opener must not satisfy textus contract");
 
     assert_eq!(error.code, "E_INVALID_ARGS");
-    assert!(error
-        .message
-        .contains("does not match declared opener contract"));
+    assert!(
+        error
+            .message
+            .contains("does not match declared opener contract")
+    );
 }
 
 #[test]

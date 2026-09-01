@@ -1,8 +1,8 @@
 //! PPE-P2: pure cursor-to-binding projection tests.
 
 use faber_host_macos_arm64::composite_host::invocation_binding::{
-    project_invocation_bindings, RopeConfig, INVOCATION_STATE, KV_PREFIX_IDS, PROMPT_TOKENS,
-    Q_PREFIX_IDS, ROPE_COS, ROPE_SIN,
+    INVOCATION_STATE, KV_PREFIX_IDS, PROMPT_TOKENS, Q_PREFIX_IDS, ROPE_COS, ROPE_SIN, RopeConfig,
+    project_invocation_bindings,
 };
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DeviceBufferInitialization,

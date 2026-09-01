@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{
+    CudaHostSession, DeviceRuntimeSet, FakeCudaDriver, FakeMetalDriver, MetalHostSession,
     enumerate_cuda_physical_devices, enumerate_metal_physical_devices, probe_cuda_environment,
-    probe_metal_environment, CudaHostSession, DeviceRuntimeSet, FakeCudaDriver, FakeMetalDriver,
-    MetalHostSession,
+    probe_metal_environment,
 };
-use host_coordinator::device_identity::PhysicalDeviceId;
 use host_coordinator::DeviceBackend;
+use host_coordinator::device_identity::PhysicalDeviceId;
 
 fn fake_metal(id: PhysicalDeviceId) -> (PhysicalDeviceId, DeviceRuntime) {
     let session =

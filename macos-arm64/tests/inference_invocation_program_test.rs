@@ -23,7 +23,7 @@ use device_descriptor::{
     DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
     DeviceDataType, KvCacheDescriptor,
 };
-use inference_state::{InvocationMode, SequencePhase, E_INVALID_ARGS, E_KV_PHASE};
+use inference_state::{E_INVALID_ARGS, E_KV_PHASE, InvocationMode, SequencePhase};
 use invocation_program::{AdmittedDescriptor, InvocationPrograms, SCALAR_DECODE_QUERY_ROWS};
 use residency::{ModelIdentity, ResidentAllocation};
 

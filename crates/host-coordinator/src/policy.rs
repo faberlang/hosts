@@ -46,7 +46,7 @@
 
 use crate::backend::DeviceBackend;
 use crate::device_identity::{
-    push_bool, push_str, push_u64, DeviceHealthGeneration, PhysicalDeviceId,
+    DeviceHealthGeneration, PhysicalDeviceId, push_bool, push_str, push_u64,
 };
 use crate::device_set::{
     DeviceSet, DeviceSetSelection, DeviceTopologySnapshot, LinkGateError, MembershipError,
@@ -898,12 +898,12 @@ fn gate_topology(plan: &CandidatePlan, topology: &DeviceTopologySnapshot) -> Vec
                 LinkGateError::NoLinkRecorded { from, to } => format!(
                     "transfer {from} → {to}: no directed link recorded; unmeasured pairs are never assumed"
                 ),
-                LinkGateError::NotAttempted { from, to } => format!(
-                    "transfer {from} → {to}: directed link is NOT ATTEMPTED"
-                ),
-                LinkGateError::Rejected { from, to, reason } => format!(
-                    "transfer {from} → {to}: directed link rejected ({reason})"
-                ),
+                LinkGateError::NotAttempted { from, to } => {
+                    format!("transfer {from} → {to}: directed link is NOT ATTEMPTED")
+                }
+                LinkGateError::Rejected { from, to, reason } => {
+                    format!("transfer {from} → {to}: directed link rejected ({reason})")
+                }
             };
             out.push(GateViolation {
                 gate: GateClass::Topology,

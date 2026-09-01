@@ -3,8 +3,8 @@
 use faber::Valor;
 use host_cuda::cuda_host::E_CUDA_DRIVER;
 use host_cuda::{
-    probe_cuda_environment, CudaHostSession, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
-    E_CUDA_UNAVAILABLE,
+    CudaHostSession, E_CUDA_INVALID_HANDLE, E_CUDA_UNAVAILABLE, FakeCudaDriver,
+    probe_cuda_environment,
 };
 use host_device_core::device_descriptor::DeviceDataType;
 

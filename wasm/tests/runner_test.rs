@@ -14,7 +14,7 @@
 //! validation/import/link/initialization/entry/trap/runtime distinctions.
 
 use faber_host_wasm::{
-    OutcomeCategory, RunConfig, RunOutcome, WasmRtV1Host, WASM_IMPORT_MODULE_V1,
+    OutcomeCategory, RunConfig, RunOutcome, WASM_IMPORT_MODULE_V1, WasmRtV1Host,
 };
 
 const SIC_WASM: &[u8] = include_bytes!("fixtures/sic.wasm");

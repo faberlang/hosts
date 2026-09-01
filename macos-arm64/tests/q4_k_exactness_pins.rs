@@ -9,7 +9,7 @@
 //! `fixtures/q4-k-exactness/q4_k_exactness.receipt.md`.
 
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_gemv, GemvKernel, QuantizedFormat, QuantizedGemvBind,
+    GemvKernel, QuantizedFormat, QuantizedGemvBind, dispatch_gemv,
 };
 
 const GGUF_COLUMNS: &[u8] = include_bytes!("fixtures/q4-k-exactness/q4k-cols62-69.gguf.bin");

@@ -11,7 +11,7 @@
 //! parse errors print `error: {message}` to stderr and exit with code 2; help
 //! and version output print to stdout and exit 0.
 
-use super::array::{runtime_mut, store_array, RuntimeValue};
+use super::array::{RuntimeValue, runtime_mut, store_array};
 use super::format::store_text_owned;
 use super::option::store_option;
 use super::valor_aggregate::store_octeti;

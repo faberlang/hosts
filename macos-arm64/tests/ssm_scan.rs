@@ -7,7 +7,7 @@
 
 use faber_host_macos_arm64::kernel::library::KernelBodyError;
 use faber_host_macos_arm64::kernel::ssm_scan::{
-    dispatch_ssm_scan, SsmScanBind, SsmScanKernel, SsmScanLayout, SsmScanRegime,
+    SsmScanBind, SsmScanKernel, SsmScanLayout, SsmScanRegime, dispatch_ssm_scan,
 };
 
 fn cpu_additive_scan(input: &[f32], length: usize, state_dim: usize) -> Vec<f32> {

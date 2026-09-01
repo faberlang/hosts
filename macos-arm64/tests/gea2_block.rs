@@ -29,10 +29,10 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
-use faber_host_macos_arm64::{enumerate_metal_physical_devices, FakeMetalDriver, MetalHostSession};
+use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession, enumerate_metal_physical_devices};
 use host_coordinator::DeviceBackend;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PLAN_ENVELOPE_SCHEMA: &str = "gea2-program-plan-v1";
 const PLAN_MEMBER: &str = "gea2-program-plan.json";

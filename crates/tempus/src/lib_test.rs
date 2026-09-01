@@ -55,14 +55,16 @@ fn clock_routes_return_scalar_items() {
         now.contents.as_slice(),
         [ProviderContent::Item(Valor::Instans(_))]
     ));
-    assert!(faber::Instans::try_from_valor(
-        match &now.contents[0] {
-            ProviderContent::Item(value) => value,
-            _ => unreachable!("wall clock must return an item"),
-        },
-        InstansPraecisio::Nanosecunda,
-    )
-    .is_some());
+    assert!(
+        faber::Instans::try_from_valor(
+            match &now.contents[0] {
+                ProviderContent::Item(value) => value,
+                _ => unreachable!("wall clock must return an item"),
+            },
+            InstansPraecisio::Nanosecunda,
+        )
+        .is_some()
+    );
 
     for route in ["tempus:monotonicum", "tempus:activum"] {
         let reply = provider

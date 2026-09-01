@@ -19,9 +19,9 @@ use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::kernel::HostResult;
 
 use super::library::{
-    dispatch_selected, BindDescriptor, BindLayout, KernelBodyError, LibraryDispatch,
-    QkvProjectionBind, QkvProjectionLayout, QkvProjectionWeight, QuantizedFormat,
-    QuantizedGemvBind,
+    BindDescriptor, BindLayout, KernelBodyError, LibraryDispatch, QkvProjectionBind,
+    QkvProjectionLayout, QkvProjectionWeight, QuantizedFormat, QuantizedGemvBind,
+    dispatch_selected,
 };
 
 /// Concrete dimensions baked into the fused Metal family module.
@@ -449,7 +449,7 @@ pub fn dispatch_fused_qkv_device(
                     return Err(crate::kernel::HostError::invalid_args(format!(
                         "fused library {label} requires f32 or packed u8, got {}",
                         dtype.spelling()
-                    )))
+                    )));
                 }
             }
         };

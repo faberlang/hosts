@@ -13,8 +13,8 @@
 //! as declared (never re-derived) — not vocabulary this module introduces.
 
 use crate::bound_plan::{
-    bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
-    LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
+    LogicalPartitionId, PartitionBinding, bind,
 };
 use crate::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use crate::device_set::DeviceSet;
@@ -34,10 +34,10 @@ use crate::partition::{
     TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
 };
 use crate::transport::{
-    expected_copy_time_nanos, select_copy_path, validate_before_copy, ByteRange, CopyPath,
-    DirectedPair, HostStagedAdapter, MeasuredRates, PairAdmissionError, PeerAdapter,
-    PeerPairMeasurement, PeerPairRegistry, SourceValue, StagingPool, TransferBudget, TransferError,
-    TransferRejection, TransferSpec, TransportAdapter, TransportReceipt,
+    ByteRange, CopyPath, DirectedPair, HostStagedAdapter, MeasuredRates, PairAdmissionError,
+    PeerAdapter, PeerPairMeasurement, PeerPairRegistry, SourceValue, StagingPool, TransferBudget,
+    TransferError, TransferRejection, TransferSpec, TransportAdapter, TransportReceipt,
+    expected_copy_time_nanos, select_copy_path, validate_before_copy,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -46,7 +46,7 @@ use std::time::Duration;
 const UUID_A: &str = "GPU-3e017562-9ec3-da9a-962d-b8bd5f9e24be";
 const UUID_B: &str = "GPU-22222222-3333-4444-5555-666666666666";
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000; // fixed sample time
-                                                   // An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
+// An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
 const LOGICAL_HASH: &str =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

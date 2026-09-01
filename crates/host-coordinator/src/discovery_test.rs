@@ -184,17 +184,17 @@ fn stale_generation_rejects_stale_snapshot() {
 /// A capability change (an admission-gating fact) advances the health epoch.
 #[test]
 fn capability_change_advances_the_health_epoch() {
-    let gen = DeviceHealthGeneration::initial();
-    let changed_gen = gen.advance();
+    let generation = DeviceHealthGeneration::initial();
+    let changed_gen = generation.advance();
     let mut changed = t1_entry();
     changed.capabilities.sm_count = 32; // capability set changed
     changed.health_generation = changed_gen;
 
-    assert!(gen < changed_gen);
+    assert!(generation < changed_gen);
     let mut devices = BTreeMap::new();
     devices.insert(DeviceOrdinal::new(0), changed);
     let snap = DeviceDiscoverySnapshot::new(PROBE_TIME, devices, P2pProbeState::NotAttempted);
-    assert!(snap.is_stale(gen));
+    assert!(snap.is_stale(generation));
     assert!(snap.is_current_generation(changed_gen));
 }
 
@@ -202,28 +202,28 @@ fn capability_change_advances_the_health_epoch() {
 /// distinct id and an epoch advance.
 #[test]
 fn replacement_at_same_ordinal_advances_the_health_epoch() {
-    let gen = DeviceHealthGeneration::initial();
+    let generation = DeviceHealthGeneration::initial();
     let old = PhysicalDeviceId::cuda(PCI_UUID, Some(DRIVER_UUID.to_owned()));
     let replaced = PhysicalDeviceId::cuda("GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", None);
 
     assert_eq!(replaced.change_against(&old), IdentityChange::Replaced);
     assert_ne!(replaced, old);
-    let next = gen.advance();
-    assert!(next > gen);
-    assert!(gen.is_stale(next));
+    let next = generation.advance();
+    assert!(next > generation);
+    assert!(generation.is_stale(next));
 }
 
 /// Device removal is a presence change: the epoch advances and the old sample
 /// becomes stale.
 #[test]
 fn removal_advances_the_health_epoch() {
-    let gen = DeviceHealthGeneration::initial();
+    let generation = DeviceHealthGeneration::initial();
     let empty: BTreeMap<DeviceOrdinal, DeviceDiscoveryEntry> = BTreeMap::new();
     let removed = DeviceDiscoverySnapshot::new(PROBE_TIME + 2, empty, P2pProbeState::NotAttempted);
 
     assert!(removed.devices().is_empty());
-    let next = gen.advance();
-    assert!(next > gen);
+    let next = generation.advance();
+    assert!(next > generation);
     assert!(t1_snapshot().is_stale(next));
 }
 
@@ -525,9 +525,11 @@ fn every_directed_p2p_pair_is_explicitly_not_attempted() {
     // The single-device host carries zero directed link rows and no admitted
     // link anywhere in the topology.
     assert_eq!(topo.links().count(), 0);
-    assert!(!topo
-        .links()
-        .any(|l| matches!(l.state(), DeviceLinkState::Admitted { .. })));
+    assert!(
+        !topo
+            .links()
+            .any(|l| matches!(l.state(), DeviceLinkState::Admitted { .. }))
+    );
 
     // A self-move is a local copy, not a P2P row (T1 §3).
     assert_eq!(topo.traversal_allowed(&pharos, &pharos), Ok(()));
@@ -558,10 +560,12 @@ fn independent_device_loss_row_is_explicitly_not_attempted() {
     assert_eq!(entry.health_generation, DeviceHealthGeneration::initial());
 
     // No degraded row exists anywhere in the representation.
-    assert!(!snap
-        .devices()
-        .values()
-        .any(|e| matches!(e.health, DeviceHealth::Degraded(_))));
+    assert!(
+        !snap
+            .devices()
+            .values()
+            .any(|e| matches!(e.health, DeviceHealth::Degraded(_)))
+    );
 
     // No removal/loss row exists either: a removal would shrink or empty the
     // device map at an advanced epoch. The map is exhaustive — exactly one

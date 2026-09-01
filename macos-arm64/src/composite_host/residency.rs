@@ -16,9 +16,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::inference_state::{
-    CursorFacts, FailureOutcome, InferenceSessionState, InvocationMode, InvocationTransaction,
-    PlannedInvocation, ResetReceipt, SequencePhase, SessionError, SessionInspection,
-    E_INVALID_ARGS,
+    CursorFacts, E_INVALID_ARGS, FailureOutcome, InferenceSessionState, InvocationMode,
+    InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase, SessionError,
+    SessionInspection,
 };
 use crate::device_descriptor::{
     DescriptorAllocation, DescriptorInvocationState, DescriptorView, DeviceBufferLifetime,

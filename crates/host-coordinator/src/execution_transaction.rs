@@ -85,7 +85,7 @@ pub use receipt::{
     TransactionReceipt, TransactionTimings,
 };
 pub use reservation::{
-    BudgetClass, ReservationRecord, EVENT_OBJECT_BYTES, TRANSACTION_SCRATCH_BYTES_PER_PARTITION,
+    BudgetClass, EVENT_OBJECT_BYTES, ReservationRecord, TRANSACTION_SCRATCH_BYTES_PER_PARTITION,
 };
 pub use state_machine::{PublicationOrdinal, TransactionFailure, TransactionId, TransactionState};
 pub use transaction::ExecutionTransaction;

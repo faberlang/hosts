@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use faber::{frame, FrameStatus, Instans, InstansPraecisio, Scrinium, Valor};
+use faber::{FrameStatus, Instans, InstansPraecisio, Scrinium, Valor, frame};
 use faber_host_macos_arm64::kernel::frame_data;
 use faber_host_macos_arm64::kernel::valor_wire::valor_to_json;
 use faber_host_macos_arm64::{Direction, Frame, HostKernel, Status};
@@ -76,10 +76,12 @@ fn opens_host_echo_as_bidirectional_conversation() {
     assert_eq!(done.parent_id.as_deref(), Some(request_id.as_str()));
     assert!(conversation.recv().is_none());
     assert!(conversation.is_complete());
-    assert!(conversation
-        .sent()
-        .iter()
-        .any(|frame| frame.status == Status::Done));
+    assert!(
+        conversation
+            .sent()
+            .iter()
+            .any(|frame| frame.status == Status::Done)
+    );
 }
 
 #[test]
@@ -208,14 +210,18 @@ fn manifest_lists_builtin_host_echo_and_no_default_providers() {
 
     assert_eq!(manifest.host, "macos-arm64");
     assert_eq!(manifest.manifest_version, 1);
-    assert!(manifest
-        .builtins
-        .iter()
-        .any(|item| item.name == "host:echo"));
-    assert!(manifest
-        .builtins
-        .iter()
-        .any(|item| item.name == "consolum:scribe"));
+    assert!(
+        manifest
+            .builtins
+            .iter()
+            .any(|item| item.name == "host:echo")
+    );
+    assert!(
+        manifest
+            .builtins
+            .iter()
+            .any(|item| item.name == "consolum:scribe")
+    );
     assert!(manifest.providers.is_empty());
 }
 
@@ -717,10 +723,12 @@ fn solum_vincula_creates_symlink_and_rejects_existing_target() {
         std::fs::read_link(&link).expect("read symlink target"),
         PathBuf::from(relative_target)
     );
-    assert!(std::fs::symlink_metadata(&link)
-        .expect("stat symlink")
-        .file_type()
-        .is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("stat symlink")
+            .file_type()
+            .is_symlink()
+    );
 
     let duplicate = kernel.route(&Frame::request_with(
         "solum:vincula",
@@ -976,16 +984,20 @@ fn cli_manifest_prints_host_echo() {
     assert!(output.status.success());
     let json: Value = serde_json::from_slice(&output.stdout).expect("manifest should be JSON");
     assert_eq!(json["host"], Value::String("macos-arm64".into()));
-    assert!(json["builtins"]
-        .as_array()
-        .expect("builtins should be an array")
-        .iter()
-        .any(|item| item["name"] == Value::String("host:echo".into())));
-    assert!(json["builtins"]
-        .as_array()
-        .expect("builtins should be an array")
-        .iter()
-        .any(|item| item["name"] == Value::String("consolum:scribe".into())));
+    assert!(
+        json["builtins"]
+            .as_array()
+            .expect("builtins should be an array")
+            .iter()
+            .any(|item| item["name"] == Value::String("host:echo".into()))
+    );
+    assert!(
+        json["builtins"]
+            .as_array()
+            .expect("builtins should be an array")
+            .iter()
+            .any(|item| item["name"] == Value::String("consolum:scribe".into()))
+    );
 }
 
 #[test]

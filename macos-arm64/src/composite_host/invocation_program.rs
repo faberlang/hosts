@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use super::inference_state::{
-    CursorFacts, InvocationMode, PlannedInvocation, SessionError, E_INVALID_ARGS,
+    CursorFacts, E_INVALID_ARGS, InvocationMode, PlannedInvocation, SessionError,
 };
 use super::residency::{ModelIdentity, ModelSpec, ResolvedHandles, SequenceSpec, SessionResidency};
 use crate::device_descriptor::{

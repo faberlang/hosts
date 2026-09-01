@@ -6,8 +6,8 @@
 
 use crate::backend::DeviceBackend;
 use crate::bound_plan::{
-    bind, AdmitError, AdmittedLogicalPlan, BindError, BoundDistributedPlan, BoundPlanKind,
-    DeclaredPlacementConstraint, LaunchResourceDemand, LogicalPartitionId, PartitionBinding,
+    AdmitError, AdmittedLogicalPlan, BindError, BoundDistributedPlan, BoundPlanKind,
+    DeclaredPlacementConstraint, LaunchResourceDemand, LogicalPartitionId, PartitionBinding, bind,
 };
 use crate::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use crate::device_set::{DeviceSet, MembershipError};
@@ -26,7 +26,7 @@ const UUID_A: &str = "GPU-3e017562-9ec3-da9a-962d-b8bd5f9e24be";
 const UUID_B: &str = "GPU-22222222-3333-4444-5555-666666666666";
 const UUID_C: &str = "GPU-88888888-9999-aaaa-bbbb-cccccccccccc";
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000; // fixed sample time
-                                                   // An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
+// An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
 const LOGICAL_HASH: &str =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

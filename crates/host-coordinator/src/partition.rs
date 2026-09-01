@@ -54,7 +54,7 @@
 //! `hardware_isolation_claimed=false` — and serializes deterministically
 //! (canonical bytes; never A10 bytes).
 
-use crate::device_identity::{push_bool, push_u64, PhysicalDeviceId};
+use crate::device_identity::{PhysicalDeviceId, push_bool, push_u64};
 use std::collections::BTreeSet;
 
 /// Machine-local identity of one virtual partition.

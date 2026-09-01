@@ -7,7 +7,7 @@
 //! drivers prove sequencing only.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,7 +20,7 @@ use host_coordinator::discovery::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::device_descriptor::{fnv1a64, DeviceDataType};
+use crate::device_descriptor::{DeviceDataType, fnv1a64};
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};

@@ -3,9 +3,9 @@
 //! Sparse storage reuses `faber::Sparsa<T>` (COO map of non-default entries).
 //! Dense bridges go through the Stage 4V tensor arena carrier.
 
-use super::array::{find_array, read_value, write_value, RuntimeValue};
-use super::tensor::{find_tensor, store_tensor_from_parts, tensor_to_runtime_values};
 use super::RuntimeContext;
+use super::array::{RuntimeValue, find_array, read_value, write_value};
+use super::tensor::{find_tensor, store_tensor_from_parts, tensor_to_runtime_values};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,

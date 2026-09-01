@@ -6,8 +6,8 @@
 //! faber/runtime/rust package keeps no HTTP implementation.
 
 use crate::{
-    bytes_value, headers_value, integer_arg, is_token_byte, list_args, lock, response_headers,
-    text_arg, DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_BODY_BYTES, bytes_value, headers_value, integer_arg, is_token_byte, list_args,
+    lock, response_headers, text_arg,
 };
 use faber::Valor;
 use host_kernel::{DispatchContext, HostError, HostResult, ProviderReply};

@@ -18,7 +18,7 @@ use super::cli::{
     __faber_rt_v1_cli_selected_command,
 };
 use super::*;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 
 #[test]
 fn abi_status_codes_match_radix_host_abi_authority() {
@@ -996,12 +996,16 @@ fn typed_map_preserves_value_semantics() {
             VALUE_KIND_I64,
         )
     };
-    assert!(unsafe { &*present.value.cast::<RuntimeOption>() }
-        .value
-        .is_some());
-    assert!(unsafe { &*missing.value.cast::<RuntimeOption>() }
-        .value
-        .is_none());
+    assert!(
+        unsafe { &*present.value.cast::<RuntimeOption>() }
+            .value
+            .is_some()
+    );
+    assert!(
+        unsafe { &*missing.value.cast::<RuntimeOption>() }
+            .value
+            .is_none()
+    );
     let mut length = 0i64;
     assert_eq!(
         unsafe { __faber_rt_v1_map_length(context, map.value, &raw mut length) },
@@ -4611,7 +4615,7 @@ fn descriptor_single_numerus_binding() -> Vec<u8> {
     bytes.push(0); // mode single
     bytes.push(0); // no version
     bytes.push(0); // no description
-                   // name
+    // name
     bytes.extend_from_slice(&5u16.to_le_bytes());
     bytes.extend_from_slice(b"smoke");
     // exit: Binding("exitum")

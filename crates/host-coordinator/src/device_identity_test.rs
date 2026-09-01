@@ -126,7 +126,7 @@ fn health_generation_is_a_monotonic_epoch() {
 /// never conflated. This test pins the identity-domain accessors.
 #[test]
 fn health_generation_exposes_raw_epoch_value() {
-    let gen = DeviceHealthGeneration::initial().advance().advance();
-    assert_eq!(gen.get(), 3);
-    assert_eq!(format!("{gen}"), "3");
+    let generation = DeviceHealthGeneration::initial().advance().advance();
+    assert_eq!(generation.get(), 3);
+    assert_eq!(format!("{generation}"), "3");
 }

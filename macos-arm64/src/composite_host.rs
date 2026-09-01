@@ -66,10 +66,10 @@ mod residency;
 mod session;
 
 pub use inference_state::{
-    CandidateRows, CursorFacts, FailureOutcome, FailureStage, InferenceSessionState,
-    InvocationMode, InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase,
-    SessionError, SessionInspection, VerificationCommit, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE,
-    E_KV_POISONED, E_KV_RELEASED, E_KV_STALE,
+    CandidateRows, CursorFacts, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED,
+    E_KV_RELEASED, E_KV_STALE, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
+    InvocationTransaction, PlannedInvocation, ResetReceipt, SequencePhase, SessionError,
+    SessionInspection, VerificationCommit,
 };
 pub use paired_session::PairedProgramSession;
 pub use receipt::{
@@ -85,11 +85,11 @@ pub use session::{
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use host_coordinator::bound_plan::{BoundDistributedPlan, BoundPlanKind};
 pub use host_coordinator::DeviceBackend;
+pub use host_coordinator::bound_plan::{BoundDistributedPlan, BoundPlanKind};
 
 use host_coordinator::bound_plan::{
-    bind, AdmittedLogicalPlan, LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, LogicalPartitionId, PartitionBinding, bind,
 };
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
@@ -102,14 +102,14 @@ use host_coordinator::partition::{
     VirtualDevicePartition, VirtualDevicePartitionId,
 };
 
-use crate::device_descriptor::{errors as descriptor_errors, sha256_hex, DeviceDescriptor};
+use crate::device_descriptor::{DeviceDescriptor, errors as descriptor_errors, sha256_hex};
 use crate::device_host::DeviceRuntime;
 use crate::device_runtime_set::DeviceRuntimeSet;
 
 use self::invocation_binding::RopeConfig;
+use crate::Frame;
 use crate::kernel::{HostError, HostKernel, HostResult};
 use crate::manifest::CapabilityManifest;
-use crate::Frame;
 
 /// Logical-plan hash of the host-synthesized N=1 implicit-local plan.
 /// Physical ids never enter this domain (MD-A1/A15/A17).

@@ -40,20 +40,20 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use host_coordinator::DeviceBackend;
 use host_coordinator::bound_plan::BindError;
 use host_coordinator::discovery::DeviceDiscoverySnapshot;
 use host_coordinator::execution_transaction::{
     ExecutionTransaction, FakeExecutionBackend, TransactionId, TransactionState,
 };
 use host_coordinator::partition::{FixtureIdentityClass, TransportClass};
-use host_coordinator::DeviceBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::composite_host::invocation_binding::RopeConfig;
 use crate::composite_host::{
-    admitted_backends, resolve_device_selection, CompositeHost, CompositeHostConfig,
-    DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection, KvCacheTimingReceipt,
-    PairedProgramSession, PreparedResidentSession, PreparedSessionReceipt,
+    CompositeHost, CompositeHostConfig, DeviceByteBuffer, DeviceExecutionReceipt, DeviceSelection,
+    KvCacheTimingReceipt, PairedProgramSession, PreparedResidentSession, PreparedSessionReceipt,
+    admitted_backends, resolve_device_selection,
 };
 use crate::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
@@ -63,11 +63,11 @@ use crate::device_descriptor::{
 };
 use crate::device_host::DeviceSession;
 use crate::distributed_translate::{
-    bind_policy_for_declared_count, bind_translated, translate_device_section_bytes, TranslateError,
+    TranslateError, bind_policy_for_declared_count, bind_translated, translate_device_section_bytes,
 };
 use crate::kernel::library_runtime::FusedLibraryDispatchReceipt;
 use crate::kernel::{HostError, HostResult};
-use crate::metal_host::{process_resident_bytes, MappedWeightFile, MappedWeightPaging};
+use crate::metal_host::{MappedWeightFile, MappedWeightPaging, process_resident_bytes};
 
 /// The versioned control protocol carried by `device-execute`.
 ///
@@ -670,7 +670,7 @@ pub fn parse_control_request(bytes: &[u8]) -> HostResult<DeviceExecuteControlReq
         other => {
             return Err(HostError::invalid_args(format!(
                 "device-execute control verb `{other}` is not one of load, step, reset, release"
-            )))
+            )));
         }
     };
     let has_v2_fields = wire.mode.is_some()

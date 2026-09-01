@@ -1,7 +1,7 @@
 [package]
 name = "faber-host-llvm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Versioned host runtime for Faber LLVM executables"
 license = "MIT"
 

@@ -17,7 +17,7 @@
 //! those Metal bodies must match.  Plan recognition stays in radix-mir
 //! (M8-U1a); this module owns the family bodies and the module assembly.
 
-use super::library::{block_value, KernelBodyError, QuantizedFormat};
+use super::library::{KernelBodyError, QuantizedFormat, block_value};
 
 /// The only router-weight layout currently minted by the family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

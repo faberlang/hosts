@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use host_kernel::{
     CancellationProbe, DispatchContext, Kernel, ProviderContent, ProviderReply, RequestFrame,

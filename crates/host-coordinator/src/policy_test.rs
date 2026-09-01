@@ -14,8 +14,8 @@ use crate::discovery::{
 };
 use crate::partition::{PartitionBudgetLedger, SafePhysicalLimit};
 use crate::policy::{
-    evaluate, CandidatePlan, DeclaredConstraints, DeviceAssignment, GateClass, Objective,
-    ObjectiveFacts, ObjectiveScore, PolicyOutcome, PolicyRequest, RequiredCapabilities, Transfer,
+    CandidatePlan, DeclaredConstraints, DeviceAssignment, GateClass, Objective, ObjectiveFacts,
+    ObjectiveScore, PolicyOutcome, PolicyRequest, RequiredCapabilities, Transfer, evaluate,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -449,9 +449,11 @@ fn cs1_split_passes_whole_on_one_fails_budget_exceeded() {
     assert_eq!(violation.device.as_ref(), Some(&a));
     assert!(violation.failing_fact.contains("budget_exceeded"));
     assert!(violation.failing_fact.contains(&SMOLLM2_BYTES.to_string()));
-    assert!(violation
-        .failing_fact
-        .contains(&PARTITION_LIMIT_BYTES.to_string()));
+    assert!(
+        violation
+            .failing_fact
+            .contains(&PARTITION_LIMIT_BYTES.to_string())
+    );
 
     // The split plan passes every gate and is the only ranked plan.
     assert_eq!(outcome.ranked.len(), 1);
@@ -1350,9 +1352,11 @@ fn receipt_names_snapshot_constraints_rejected_and_selected() {
         DeviceHealthGeneration::initial()
     );
     assert_eq!(receipt.per_device_budget.len(), 2);
-    assert!(receipt
-        .per_device_budget
-        .contains(&(a.clone(), SafePhysicalLimit::new(PARTITION_LIMIT_BYTES))));
+    assert!(
+        receipt
+            .per_device_budget
+            .contains(&(a.clone(), SafePhysicalLimit::new(PARTITION_LIMIT_BYTES)))
+    );
     assert_eq!(
         receipt.total_budget,
         Some(SafePhysicalLimit::new(MESH_TOTAL_BYTES))
@@ -1364,9 +1368,11 @@ fn receipt_names_snapshot_constraints_rejected_and_selected() {
     let rejected = &receipt.rejected[0];
     assert_eq!(rejected.plan, "whole");
     assert_eq!(rejected.violations[0].gate, GateClass::RequiredMemory);
-    assert!(rejected.violations[0]
-        .failing_fact
-        .contains("budget_exceeded"));
+    assert!(
+        rejected.violations[0]
+            .failing_fact
+            .contains("budget_exceeded")
+    );
 
     // Selected devices + ranks + objective scores.
     assert_eq!(receipt.ranked, outcome.ranked);
@@ -1383,10 +1389,12 @@ fn receipt_names_snapshot_constraints_rejected_and_selected() {
 
     // Determinism fingerprint: 16 lowercase hex chars, stable per evaluation.
     assert_eq!(receipt.determinism_fingerprint.len(), 16);
-    assert!(receipt
-        .determinism_fingerprint
-        .chars()
-        .all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        receipt
+            .determinism_fingerprint
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
     let again = evaluate_all(
         &snap,
         &selection,

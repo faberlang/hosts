@@ -1,5 +1,5 @@
 use faber::Valor;
-use host_kernel::{parse_manifest, Kernel};
+use host_kernel::{Kernel, parse_manifest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::PathBuf;

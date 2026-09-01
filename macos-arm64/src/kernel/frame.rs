@@ -5,9 +5,9 @@ use faber::Valor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::kernel::HostError;
 use crate::kernel::frame_data::{empty, is_empty_tabula};
 use crate::kernel::valor_wire::{json_to_valor, serde_field, valor_to_json};
-use crate::kernel::HostError;
 
 pub type FrameData = Valor;
 

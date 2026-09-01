@@ -4,10 +4,10 @@
 //! option handle of a pointer payload (`VALUE_KIND_PTR`) so `vel`/coalesce and
 //! `est nihil` share one encoding.
 
-use super::array::{store_array, RuntimeValue};
+use super::RuntimeContext;
+use super::array::{RuntimeValue, store_array};
 use super::option::store_option;
 use super::tensor::store_tensor_from_parts;
-use super::RuntimeContext;
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,

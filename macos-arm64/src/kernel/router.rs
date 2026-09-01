@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use faber::Valor;
 
-use crate::kernel::{frame_data, Frame, HostError, Status, Syscall, SyscallInfo};
+use crate::kernel::{Frame, HostError, Status, Syscall, SyscallInfo, frame_data};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {

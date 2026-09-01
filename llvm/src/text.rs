@@ -1,18 +1,18 @@
 //! First-order Unicode text queries and transformations for LLVM-host handles.
 
-use super::array::{store_array, RuntimeValue};
-use super::format::{store_text, text_value};
 use super::RuntimeContext;
+use super::array::{RuntimeValue, store_array};
+use super::format::{store_text, text_value};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
     STATUS_PANIC,
 };
 use radix_host_abi::{
-    VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8,
-    VALUE_KIND_PTR, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
+    VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I8, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64,
+    VALUE_KIND_PTR, VALUE_KIND_U8, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64,
 };
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 
 fn ffi_ptr_result(operation: impl FnOnce() -> FaberRtPtrResultV1) -> FaberRtPtrResultV1 {

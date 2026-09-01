@@ -16,8 +16,8 @@
 
 use crate::backend::DeviceBackend;
 use crate::device_identity::{
-    push_bool, push_str, push_u32, push_u64, DeviceHealthGeneration, DeviceOrdinal,
-    PhysicalDeviceId,
+    DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId, push_bool, push_str, push_u32,
+    push_u64,
 };
 use std::collections::BTreeMap;
 

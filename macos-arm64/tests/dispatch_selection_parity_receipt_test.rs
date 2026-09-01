@@ -6,15 +6,15 @@
 //! This remains a focused host test: it exercises the production Metal-library
 //! runtime bridge and does not change dispatch policy.
 
+use faber_host_macos_arm64::MetalHostSession;
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_gemv, residual, rms, select_decode_gemv, select_residual_rms_norm, BindDescriptor,
-    BindLayout, GemvKernel, KernelBodyError, QkvProjectionBind, QkvProjectionLayout,
-    QkvProjectionWeight, QuantizedFormat, QuantizedGemvBind,
+    BindDescriptor, BindLayout, GemvKernel, KernelBodyError, QkvProjectionBind,
+    QkvProjectionLayout, QkvProjectionWeight, QuantizedFormat, QuantizedGemvBind, dispatch_gemv,
+    residual, rms, select_decode_gemv, select_residual_rms_norm,
 };
 use faber_host_macos_arm64::kernel::library_runtime::{
-    dispatch_metal_library, library_family_msl, LibraryFamilyMslFacts, MetalLibraryDispatch,
+    LibraryFamilyMslFacts, MetalLibraryDispatch, dispatch_metal_library, library_family_msl,
 };
-use faber_host_macos_arm64::MetalHostSession;
 
 const K: usize = 32;
 const KV_A_CAPACITY_ROWS: usize = 4;
@@ -672,11 +672,7 @@ fn qkv_single_body_selection_parity_receipt_covers_both_rungs_and_uniforms() {
                 );
                 eprintln!(
                     "M4-U2b parity receipt: runtime=metal-library rung={} entry=Some(QkvProjection) decode_gemv={} max_ulp={} max_relative_error={:.3e} rows={} qkv=single-body",
-                    rung.name,
-                    decode_gemv,
-                    max_ulp,
-                    max_relative_error,
-                    fixture.rows,
+                    rung.name, decode_gemv, max_ulp, max_relative_error, fixture.rows,
                 );
             }
         }

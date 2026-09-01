@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use faber_host_macos_arm64::MetalHostSession;
 use faber_host_macos_arm64::composite_host::{
     CompositeHost, DeviceByteBuffer, PreparedResidentSession,
 };
@@ -19,13 +20,12 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
-use faber_host_macos_arm64::kernel::library::{dispatch, CausalAttentionBind, LibraryKernel};
+use faber_host_macos_arm64::kernel::library::{CausalAttentionBind, LibraryKernel, dispatch};
 use faber_host_macos_arm64::kernel::ssm::{
-    ssm_family_dispatch, ssm_family_msl, SsmFamilyDispatch, SsmFamilyMslFacts,
+    SsmFamilyDispatch, SsmFamilyMslFacts, ssm_family_dispatch, ssm_family_msl,
 };
 use faber_host_macos_arm64::kernel::ssm_conv1d::SsmConv1dBind;
 use faber_host_macos_arm64::kernel::ssm_scan::SsmScanBind;
-use faber_host_macos_arm64::MetalHostSession;
 use host_coordinator::DeviceBackend;
 
 // ---------------------------------------------------------------------------

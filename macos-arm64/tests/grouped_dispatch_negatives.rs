@@ -6,8 +6,8 @@
 //! wrong-layout families are covered here on `GroupedExpertGemmBind`.
 
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_grouped_expert_gemm, GroupedExpertGemmBind, GroupedExpertGemmKernel,
-    GroupedExpertGemmLayout, KernelBodyError, QuantizedFormat,
+    GroupedExpertGemmBind, GroupedExpertGemmKernel, GroupedExpertGemmLayout, KernelBodyError,
+    QuantizedFormat, dispatch_grouped_expert_gemm,
 };
 
 const ROWS: u64 = 7;

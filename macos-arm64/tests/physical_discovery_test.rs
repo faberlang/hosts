@@ -2,13 +2,13 @@
 //! snapshot facts. Ordinals are locators, never identity.
 
 use faber_host_macos_arm64::{
-    discover_cuda_snapshot, discover_metal_snapshot, enumerate_cuda_physical_devices,
-    enumerate_metal_physical_devices, probe_cuda_environment, probe_metal_environment,
-    CudaPhysicalDevice, MetalPhysicalDevice,
+    CudaPhysicalDevice, MetalPhysicalDevice, discover_cuda_snapshot, discover_metal_snapshot,
+    enumerate_cuda_physical_devices, enumerate_metal_physical_devices, probe_cuda_environment,
+    probe_metal_environment,
 };
+use host_coordinator::DeviceBackend;
 use host_coordinator::device_identity::{DeviceOrdinal, IdentityChange, PhysicalDeviceId};
 use host_coordinator::discovery::DeviceDiscoverySnapshot;
-use host_coordinator::DeviceBackend;
 
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 

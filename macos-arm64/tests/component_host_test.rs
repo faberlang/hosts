@@ -1,8 +1,8 @@
+use faber_host_macos_arm64::Status;
 use faber_host_macos_arm64::component::{
-    ComponentHost, COMPONENT_CODE_HOST_ECHO, COMPONENT_CODE_PG_QUERY,
+    COMPONENT_CODE_HOST_ECHO, COMPONENT_CODE_PG_QUERY, ComponentHost,
 };
 use faber_host_macos_arm64::kernel::valor_wire::valor_to_json;
-use faber_host_macos_arm64::Status;
 use serde_json::Value;
 
 fn data_json(response: &faber_host_macos_arm64::Frame) -> Value {

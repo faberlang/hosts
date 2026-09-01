@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use host_coordinator::bound_plan::{
-    bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
-    LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
+    LogicalPartitionId, PartitionBinding, bind,
 };
 use host_coordinator::device_identity::{DeviceHealthGeneration, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
@@ -38,9 +38,9 @@ use host_coordinator::partition::{
     SafePhysicalLimit, TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
 };
 use radix_mir_fmir::schema::{
-    FmirDeviceSection, WireCollectiveKind, WireExecutionCommitBoundary, WireExecutionOperation,
-    WirePlacementConstraint, WireStorageLayout, WireTransferDirection,
-    WIRE_DISTRIBUTED_SECTION_VERSION,
+    FmirDeviceSection, WIRE_DISTRIBUTED_SECTION_VERSION, WireCollectiveKind,
+    WireExecutionCommitBoundary, WireExecutionOperation, WirePlacementConstraint,
+    WireStorageLayout, WireTransferDirection,
 };
 use radix_mir_fmir::{admit_device_section_with_compat, default_compatibility_table};
 

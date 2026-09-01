@@ -10,10 +10,10 @@ use std::time::Instant;
 use host_coordinator::{DeviceBackend, DeviceHandle};
 
 use crate::device_descriptor::{
-    errors as descriptor_errors, fnv1a64, DescriptorAllocation, DescriptorInvocationState,
-    DescriptorLaunchBinding, DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization,
-    DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
-    DeviceProgramLifetime, KvCacheDescriptor, PackedStorageFormat, E_DEVICE_DESCRIPTOR,
+    DescriptorAllocation, DescriptorInvocationState, DescriptorLaunchBinding,
+    DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
+    KvCacheDescriptor, PackedStorageFormat, errors as descriptor_errors, fnv1a64,
 };
 use crate::device_host::{
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
@@ -21,8 +21,8 @@ use crate::device_host::{
 use crate::device_registry::DriverCounters;
 use crate::kernel::library::{QkvProjectionBind, QuantizedFormat};
 use crate::kernel::library_runtime::{
-    dispatch_fused_qkv_device, dispatch_fused_residual_rms_device, FusedLibraryDeviceBuffer,
-    FusedLibraryDispatchReceipt, FusedQkvDeviceDispatch, FusedResidualRmsDeviceDispatch,
+    FusedLibraryDeviceBuffer, FusedLibraryDispatchReceipt, FusedQkvDeviceDispatch,
+    FusedResidualRmsDeviceDispatch, dispatch_fused_qkv_device, dispatch_fused_residual_rms_device,
 };
 use crate::kernel::{HostError, HostResult};
 

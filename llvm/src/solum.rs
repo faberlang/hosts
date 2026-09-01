@@ -1,9 +1,9 @@
 //! Filesystem boundaries used by LLVM-host `norma:fs` providers.
 
-use super::array::{store_array, RuntimeValue};
+use super::RuntimeContext;
+use super::array::{RuntimeValue, store_array};
 use super::format::{store_text, text_value};
 use super::valor_aggregate::store_octeti;
-use super::RuntimeContext;
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_IO_ERROR,

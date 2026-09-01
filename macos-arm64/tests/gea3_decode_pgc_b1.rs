@@ -8,7 +8,7 @@
 //! output certificate.
 
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -243,9 +243,7 @@ fn gea3_decode_pgc_b1_certified_fixed1000_output() {
     assert!(
         comparator_stderr.lines().any(|line| {
             line.contains("eval time")
-                && line
-                    .split_whitespace()
-                    .any(|word| word == "40")
+                && line.split_whitespace().any(|word| word == "40")
                 && line.contains("tokens")
         }),
         "comparator stderr lacks its stable eval-time line; the pinned comparator stops at 40 tokens (greedy EOS) in every recorded family capture"

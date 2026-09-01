@@ -40,7 +40,7 @@
 //! MD1-H1.
 
 use crate::backend::DeviceBackend;
-use crate::device_identity::{push_str, push_u64, DeviceHealthGeneration, PhysicalDeviceId};
+use crate::device_identity::{DeviceHealthGeneration, PhysicalDeviceId, push_str, push_u64};
 use crate::device_set::{DeviceSet, MembershipError};
 use crate::discovery::{DeviceCapabilities, DeviceDiscoverySnapshot, DeviceDiscoverySnapshotId};
 use crate::partition::{

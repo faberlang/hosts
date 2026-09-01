@@ -68,10 +68,12 @@ fn mode_and_relative_symlink_operations_preserve_contract() {
         std::fs::read_link(&link).expect("read link"),
         Path::new("payload.txt")
     );
-    assert!(std::fs::symlink_metadata(&link)
-        .expect("stat link")
-        .file_type()
-        .is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("stat link")
+            .file_type()
+            .is_symlink()
+    );
 
     std::fs::remove_file(&link).expect("cleanup link");
     std::fs::remove_file(&file).expect("cleanup file");

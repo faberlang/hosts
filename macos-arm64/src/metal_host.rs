@@ -28,7 +28,7 @@ use metal::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::device_descriptor::{errors, DeviceDataType};
+use crate::device_descriptor::{DeviceDataType, errors};
 use crate::device_registry::{DriverCounters, FakeFailureStage, HandleRegistry};
 use crate::kernel::frame_data;
 use crate::kernel::{HostError, HostResult};
@@ -184,11 +184,7 @@ mod unix_mmap {
 
     pub(super) fn page_size() -> usize {
         let value = unsafe { sysconf(SC_PAGESIZE) };
-        if value > 0 {
-            value as usize
-        } else {
-            4096
-        }
+        if value > 0 { value as usize } else { 4096 }
     }
 
     pub(super) fn resident_bytes() -> u64 {
@@ -1539,7 +1535,7 @@ impl FakeMetalDriver {
         buffers: &[u64],
         sim: &FakeQkvCarrierSim,
     ) -> HostResult<()> {
-        use crate::kernel::library::{qkv_projection, QkvProjectionBind, QkvProjectionWeight};
+        use crate::kernel::library::{QkvProjectionBind, QkvProjectionWeight, qkv_projection};
 
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake launch missing module"));
@@ -2623,11 +2619,7 @@ fn msl_kernel_entry_names(source: &str) -> Option<Vec<String>> {
         names.push(trimmed[..name_len].to_owned());
         rest = &trimmed[name_len..];
     }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 fn metal_driver(message: impl Into<String>) -> HostError {

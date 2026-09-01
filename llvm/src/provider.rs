@@ -6,9 +6,9 @@
 //! provider semantics or fails closed with a stable unsupported status that
 //! the emitted program latches honestly (Stage 5 owns the semantic surface).
 
+use super::RuntimeContext;
 use super::convert::{store_valor, with_valor};
 use super::format::{store_text, text_value};
-use super::RuntimeContext;
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, STATUS_INVALID_ARGUMENT, STATUS_PANIC, STATUS_UNSUPPORTED,

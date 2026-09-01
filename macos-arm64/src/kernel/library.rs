@@ -2408,7 +2408,7 @@ pub fn rope(
         _ => {
             return Err(KernelBodyError::ShapeMismatch(
                 "rope bind has no rope layout",
-            ))
+            ));
         }
     };
     let pairs = dim / 2;

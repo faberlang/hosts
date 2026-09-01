@@ -2,7 +2,7 @@
 
 use faber_host_macos_arm64::kernel::library::KernelBodyError;
 use faber_host_macos_arm64::kernel::ssm_conv1d::{
-    dispatch_ssm_conv1d, SsmConv1dBind, SsmConv1dKernel, SsmConv1dLayout,
+    SsmConv1dBind, SsmConv1dKernel, SsmConv1dLayout, dispatch_ssm_conv1d,
 };
 
 #[test]

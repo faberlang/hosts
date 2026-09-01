@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use crate::composite_host::invocation_binding::{project_invocation_bindings, RopeConfig};
+use crate::composite_host::invocation_binding::{RopeConfig, project_invocation_bindings};
 use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
 use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
 use crate::device_host::{DeviceRuntime, DeviceSession};
@@ -21,8 +21,8 @@ use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};
 
 use super::inference_state::{
-    FailureStage, InferenceSessionState, InvocationMode, InvocationTransaction, ResetReceipt,
-    SequencePhase, SessionError, E_KV_STALE,
+    E_KV_STALE, FailureStage, InferenceSessionState, InvocationMode, InvocationTransaction,
+    ResetReceipt, SequencePhase, SessionError,
 };
 use super::session::{FusedAttentionAxes, ProgramInner, ProgramSession};
 use super::{DeviceExecutionReceipt, KvCacheTimingReceipt};

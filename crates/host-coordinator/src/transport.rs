@@ -689,13 +689,14 @@ impl TransferError {
                     "transfer {transfer} exceeded its declared {declared_timeout:?} timeout ({elapsed_nanos} ns elapsed)"
                 ),
             ),
-            Self::Failed { transfer, detail } => BackendError::operation(
-                partition,
-                format!("transfer {transfer} failed: {detail}"),
-            ),
+            Self::Failed { transfer, detail } => {
+                BackendError::operation(partition, format!("transfer {transfer} failed: {detail}"))
+            }
             Self::PeerNotAdmitted { pair } => BackendError::operation(
                 partition,
-                format!("peer transfer on unmeasured directed pair {pair} is not admitted (T2 §6 — NOT ATTEMPTED)"),
+                format!(
+                    "peer transfer on unmeasured directed pair {pair} is not admitted (T2 §6 — NOT ATTEMPTED)"
+                ),
             ),
             Self::PeerNotAttempted { pair, detail } => BackendError::operation(
                 partition,

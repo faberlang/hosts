@@ -1,7 +1,7 @@
 //! Typed ordering and arithmetic over arena-owned LLVM arrays.
 
-use super::array::{find_array, find_array_mut, write_value, RuntimeArray};
 use super::RuntimeContext;
+use super::array::{RuntimeArray, find_array, find_array_mut, write_value};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC};
 use radix_host_abi::FaberRtValueKindV1;

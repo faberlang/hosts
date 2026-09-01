@@ -6,8 +6,8 @@
 //! in the test or library body.
 
 use faber_host_macos_arm64::kernel::library::{
-    self, dispatch_gemv, select_decode_gemv, GemvKernel, KernelBodyError, QuantizedFormat,
-    QuantizedGemvBind,
+    self, GemvKernel, KernelBodyError, QuantizedFormat, QuantizedGemvBind, dispatch_gemv,
+    select_decode_gemv,
 };
 
 fn q4_k_ones_block() -> Vec<u8> {

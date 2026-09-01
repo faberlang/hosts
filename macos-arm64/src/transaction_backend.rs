@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use host_coordinator::DeviceHandle;
 use host_coordinator::bound_plan::LogicalPartitionId;
 use host_coordinator::device_identity::PhysicalDeviceId;
 use host_coordinator::execution_transaction::{
@@ -21,7 +22,6 @@ use host_coordinator::transport::{
     ByteRange, HostStagedAdapter, SourceValue, TransferBudget, TransferError, TransferSpec,
     TransportAdapter, TransportReceipt,
 };
-use host_coordinator::DeviceHandle;
 
 use crate::device_descriptor::DeviceDataType;
 use crate::device_host::{DeviceRuntime, DeviceSession};

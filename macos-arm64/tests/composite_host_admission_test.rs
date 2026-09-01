@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use faber_host_macos_arm64::composite_host::{
-    implicit_local_n1_logical_hash, resolve_device_selection, BoundPlanKind, CompositeHost,
-    CompositeHostConfig, DeviceSelection,
+    BoundPlanKind, CompositeHost, CompositeHostConfig, DeviceSelection,
+    implicit_local_n1_logical_hash, resolve_device_selection,
 };
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DescriptorLaunch,
@@ -18,8 +18,8 @@ use faber_host_macos_arm64::device_descriptor::{
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{CudaHostSession, FakeCudaDriver, FakeMetalDriver, MetalHostSession};
-use host_coordinator::partition::{FixtureIdentityClass, HardwareIsolationClaim, TransportClass};
 use host_coordinator::DeviceBackend;
+use host_coordinator::partition::{FixtureIdentityClass, HardwareIsolationClaim, TransportClass};
 
 const MODULE_IMAGE: &[u8] = b"// fake compiler-owned module image";
 

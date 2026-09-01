@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use faber_host_macos_arm64::MetalHostSession;
 use faber_host_macos_arm64::composite_host::{
     CompositeHost, DeviceByteBuffer, PreparedResidentSession,
 };
@@ -20,14 +21,13 @@ use faber_host_macos_arm64::device_descriptor::{
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::kernel::library::{
-    dispatch_grouped_expert_gemm_selected, dispatch_selected, GroupedExpertGemmBind,
-    GroupedExpertGemmKernel, KernelBodyError, LibraryDispatch, QuantizedFormat,
+    GroupedExpertGemmBind, GroupedExpertGemmKernel, KernelBodyError, LibraryDispatch,
+    QuantizedFormat, dispatch_grouped_expert_gemm_selected, dispatch_selected,
 };
 use faber_host_macos_arm64::kernel::moe::{
-    dispatch_router_selection, moe_family_msl, MoeFamilyMslFacts, RouterSelectionBind,
-    RouterSelectionKernel,
+    MoeFamilyMslFacts, RouterSelectionBind, RouterSelectionKernel, dispatch_router_selection,
+    moe_family_msl,
 };
-use faber_host_macos_arm64::MetalHostSession;
 use host_coordinator::DeviceBackend;
 
 // ---------------------------------------------------------------------------

@@ -136,7 +136,7 @@ impl ComponentHost {
             None => {
                 return Err(ComponentHostError::new(
                     "component export returned no value",
-                ))
+                ));
             }
         };
         let response = store.data_mut().last_response.take().ok_or_else(|| {

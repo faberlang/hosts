@@ -11,21 +11,21 @@ use std::collections::BTreeMap;
 
 use faber::Valor;
 use faber_host_macos_arm64::composite_host::{
-    resolve_device_selection, CompletionBoundary, CompositeHost, CompositeHostConfig, DataFlowEdge,
-    DeviceSelection,
+    CompletionBoundary, CompositeHost, CompositeHostConfig, DataFlowEdge, DeviceSelection,
+    resolve_device_selection,
 };
 use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, sha256_hex, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
-    DescriptorEndOfRunResult, DescriptorKernel, DescriptorLaunch, DescriptorResult,
-    DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
-    DeviceDescriptor, DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH,
-    E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
-    E_NO_DEVICE_PROGRAM,
+    DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
+    DescriptorKernel, DescriptorLaunch, DescriptorResult, DeviceBufferInitialization,
+    DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
+    DeviceProgramLifetime, E_BACKEND_UNAVAILABLE, E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR,
+    E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH, E_DEVICE_SHAPE_MISMATCH, E_NO_DEVICE_PROGRAM,
+    fnv1a64, sha256_hex,
 };
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession, E_DEVICE_INVALID_HANDLE};
 use faber_host_macos_arm64::device_registry::FakeFailureStage;
-use faber_host_macos_arm64::kernel::{frame_data, HostError};
+use faber_host_macos_arm64::kernel::{HostError, frame_data};
 use faber_host_macos_arm64::metal_host::E_METAL_DRIVER;
 use faber_host_macos_arm64::{
     CapabilityManifest, CudaHostSession, FakeCudaDriver, FakeMetalDriver, Frame, MetalHostSession,
@@ -912,22 +912,26 @@ fn same_buffer_versions_bind_by_key_across_launches() {
             .collect::<Vec<_>>(),
         vec![(9, 1), (9, 2)]
     );
-    assert!(descriptor
-        .buffer_versions
-        .contains(&DescriptorBufferVersion {
-            buffer_id: 9,
-            version: 1,
-            element_ty: DeviceDataType::F32,
-            element_count: 2,
-        }));
-    assert!(descriptor
-        .buffer_versions
-        .contains(&DescriptorBufferVersion {
-            buffer_id: 9,
-            version: 2,
-            element_ty: DeviceDataType::F32,
-            element_count: 4,
-        }));
+    assert!(
+        descriptor
+            .buffer_versions
+            .contains(&DescriptorBufferVersion {
+                buffer_id: 9,
+                version: 1,
+                element_ty: DeviceDataType::F32,
+                element_count: 2,
+            })
+    );
+    assert!(
+        descriptor
+            .buffer_versions
+            .contains(&DescriptorBufferVersion {
+                buffer_id: 9,
+                version: 2,
+                element_ty: DeviceDataType::F32,
+                element_count: 4,
+            })
+    );
 }
 
 #[test]
@@ -1034,22 +1038,26 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
             },
         ]
     );
-    assert!(descriptor
-        .buffer_versions
-        .contains(&DescriptorBufferVersion {
-            buffer_id: 9,
-            version: 1,
-            element_ty: DeviceDataType::F32,
-            element_count: 2,
-        }));
-    assert!(descriptor
-        .buffer_versions
-        .contains(&DescriptorBufferVersion {
-            buffer_id: 9,
-            version: 2,
-            element_ty: DeviceDataType::F32,
-            element_count: 4,
-        }));
+    assert!(
+        descriptor
+            .buffer_versions
+            .contains(&DescriptorBufferVersion {
+                buffer_id: 9,
+                version: 1,
+                element_ty: DeviceDataType::F32,
+                element_count: 2,
+            })
+    );
+    assert!(
+        descriptor
+            .buffer_versions
+            .contains(&DescriptorBufferVersion {
+                buffer_id: 9,
+                version: 2,
+                element_ty: DeviceDataType::F32,
+                element_count: 4,
+            })
+    );
     assert_eq!(descriptor.data_flow.len(), 2);
     // F3: the carried graph is acyclic and fully reachable from the declared
     // root (launch 11), so the repeated-launch chain is schedulable.
@@ -3009,8 +3017,8 @@ fn repeating_step_end_of_run_readback_once_after_loop() {
     // Creation: module + the two PerProgram params allocated once; the
     // PerStep/PerProgram end-of-run buffers are not read back during steps.
     assert_eq!(session.session_handle_count(), 3); // module + w + b
-                                                   // S5A-U1: the declared end-of-run set rides the descriptor (validated
-                                                   // fail-closed before any launch).
+    // S5A-U1: the declared end-of-run set rides the descriptor (validated
+    // fail-closed before any launch).
     session
         .init_params(&training_step_params())
         .expect("once-init params");
@@ -3221,9 +3229,10 @@ fn end_of_run_observations_fail_closed_on_invalid_declarations() {
         version: 1,
     }]);
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(err
-        .message
-        .contains("never read both per step and at the end"));
+    assert!(
+        err.message
+            .contains("never read both per step and at the end")
+    );
 
     // (b) An ObservationPoint buffer that is NOT a per-step result: the
     // only readback class the session reads within a step — rejected for
@@ -3246,9 +3255,10 @@ fn end_of_run_observations_fail_closed_on_invalid_declarations() {
         "an observation-point buffer is a per-step result class, never an end-of-run observation",
     );
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(err
-        .message
-        .contains("only per-step and per-program buffers"));
+    assert!(
+        err.message
+            .contains("only per-step and per-program buffers")
+    );
 
     // (c) A read-only Input buffer (never written by the program) cannot be
     // a FINAL value. The legacy training-step fixture's params are
@@ -3860,9 +3870,10 @@ fn fan_out_does_not_mask_a_different_producer() {
         .validate()
         .expect_err("a different producer must still fail after admitted fan-out");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
-    assert!(err
-        .message
-        .contains("one value generation has exactly one producer"));
+    assert!(
+        err.message
+            .contains("one value generation has exactly one producer")
+    );
 }
 
 /// F3 red test: a consumer scheduled before its producer is a missing

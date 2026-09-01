@@ -5,17 +5,17 @@
 //! Runtime cursor values never join the graph hash. Declared binding
 //! indices and order are the launch records.
 
-use faber_host_macos_arm64::cuda_host::{FakeCudaDriver, E_CUDA_UNSUPPORTED};
+use faber_host_macos_arm64::cuda_host::{E_CUDA_UNSUPPORTED, FakeCudaDriver};
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorAllocation, DescriptorBuffer, DescriptorBufferVersion, DescriptorInvocationState,
     DescriptorKernel, DescriptorLaunch, DescriptorLaunchBinding, DescriptorResult,
     DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
-    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, KvCacheDescriptor,
-    E_DEVICE_ABI_MISMATCH, E_DEVICE_SHAPE_MISMATCH,
+    DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
+    E_DEVICE_ABI_MISMATCH, E_DEVICE_SHAPE_MISMATCH, KvCacheDescriptor,
 };
 use faber_host_macos_arm64::device_host::{
-    handles_in_binding_order, resolve_launch_bindings, validate_launch_bindings,
     DeviceLaunchBinding, DeviceRuntime, DeviceSession, InvocationStateBuffer,
+    handles_in_binding_order, resolve_launch_bindings, validate_launch_bindings,
 };
 use faber_host_macos_arm64::{CudaHostSession, FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;

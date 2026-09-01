@@ -12,8 +12,8 @@
 //! as declared (never re-derived) — not vocabulary this module introduces.
 
 use crate::bound_plan::{
-    bind, AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
-    LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, BindError, BoundDistributedPlan, DeclaredPlacementConstraint,
+    LogicalPartitionId, PartitionBinding, bind,
 };
 use crate::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use crate::device_set::DeviceSet;
@@ -23,12 +23,13 @@ use crate::discovery::{
 };
 use crate::execution_transaction::{
     AbortError, BackendError, BarrierRef, BoundaryRef, BudgetClass, CollectiveBroadcastMirror,
-    CollectiveRef, CommitError, ConstructError, DeviceExecutionBackend, ExecuteError,
-    ExecutionTransaction, FakeExecutionBackend, LaunchRef, MirroredDtype, MirroredStorageLayout,
-    OperationEvent, OperationRef, PrepareError, PublicationOrdinal, ReservationRecord, StagedWrite,
+    CollectiveRef, CommitError, ConstructError, DeviceExecutionBackend, EVENT_OBJECT_BYTES,
+    ExecuteError, ExecutionTransaction, FakeExecutionBackend, LaunchRef, MirroredDtype,
+    MirroredStorageLayout, OperationEvent, OperationRef, PrepareError, PublicationOrdinal,
+    ReservationRecord, StagedWrite, TRANSACTION_SCRATCH_BYTES_PER_PARTITION,
     TransactionCommitBoundary, TransactionDecision, TransactionFailure, TransactionId,
     TransactionOperation, TransactionState, TransferDirectionMirror, TransferOperationMirror,
-    TransferRef, TransportPathMirror, EVENT_OBJECT_BYTES, TRANSACTION_SCRATCH_BYTES_PER_PARTITION,
+    TransferRef, TransportPathMirror,
 };
 use crate::partition::{
     AdmissionRequest, FixtureIdentityClass, HardwareIsolationClaim, PartitionBudgetLedger,
@@ -45,7 +46,7 @@ use std::time::Duration;
 const UUID_A: &str = "GPU-3e017562-9ec3-da9a-962d-b8bd5f9e24be";
 const UUID_B: &str = "GPU-22222222-3333-4444-5555-666666666666";
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000; // fixed sample time
-                                                   // An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
+// An admitted (validated) logical hash in the sha256: spelling (FC17/FC11).
 const LOGICAL_HASH: &str =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1282,18 +1283,22 @@ fn receipt_records_reservation_executed_bytes_and_sync_events() {
     assert_eq!(declared_total, declared_write_bytes(&fixture_operations()));
 
     // Synchronization events include the boundary completions.
-    assert!(receipt
-        .synchronization_events
-        .contains(&OperationEvent::BarrierCompleted {
-            partition: partition_id(0),
-            barrier_ref: BarrierRef::new("barrier-main"),
-        }));
-    assert!(receipt
-        .synchronization_events
-        .contains(&OperationEvent::LaunchCompleted {
-            partition: partition_id(1),
-            launch_ref: LaunchRef::new("launch-proj-b"),
-        }));
+    assert!(
+        receipt
+            .synchronization_events
+            .contains(&OperationEvent::BarrierCompleted {
+                partition: partition_id(0),
+                barrier_ref: BarrierRef::new("barrier-main"),
+            })
+    );
+    assert!(
+        receipt
+            .synchronization_events
+            .contains(&OperationEvent::LaunchCompleted {
+                partition: partition_id(1),
+                launch_ref: LaunchRef::new("launch-proj-b"),
+            })
+    );
 }
 
 /// The S4 selected-transport section (CTO sanity-check amendment on MD3-T1):

@@ -19,10 +19,10 @@ use faber_host_macos_arm64::composite_host::{
     CompositeHost, DeviceByteBuffer, PreparedResidentSession,
 };
 use faber_host_macos_arm64::device_descriptor::{
-    fnv1a64, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
+    DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorKernel,
     DescriptorLaunch, DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime,
     DeviceBufferRole, DeviceDataType, DeviceDescriptor, DeviceProgramLifetime, E_DEVICE_DESCRIPTOR,
-    E_DEVICE_SHAPE_MISMATCH,
+    E_DEVICE_SHAPE_MISMATCH, fnv1a64,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::device_registry::FakeFailureStage;

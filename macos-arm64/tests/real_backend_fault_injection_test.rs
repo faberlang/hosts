@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use faber_host_macos_arm64::{
-    enumerate_cuda_physical_devices, enumerate_metal_physical_devices, probe_cuda_environment,
-    probe_metal_environment, DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram,
+    DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram, enumerate_cuda_physical_devices,
+    enumerate_metal_physical_devices, probe_cuda_environment, probe_metal_environment,
 };
+use host_coordinator::DeviceBackend;
 use host_coordinator::bound_plan::{
-    bind, AdmittedLogicalPlan, BoundDistributedPlan, LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, BoundDistributedPlan, LogicalPartitionId, PartitionBinding, bind,
 };
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
@@ -35,7 +36,6 @@ use host_coordinator::partition::{
     TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
 };
 use host_coordinator::transport::TransferBudget;
-use host_coordinator::DeviceBackend;
 
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 const LOGICAL_HASH: &str =

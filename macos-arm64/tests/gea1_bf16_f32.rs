@@ -20,10 +20,10 @@ use faber_host_macos_arm64::device_descriptor::{
 };
 use faber_host_macos_arm64::metal_host::MetalLaunchBinding;
 use faber_host_macos_arm64::{
-    enumerate_metal_physical_devices, FakeMetalDriver, MetalHandleId, MetalHostSession,
+    FakeMetalDriver, MetalHandleId, MetalHostSession, enumerate_metal_physical_devices,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const BF16_ENTRY: &str = "gemv_bf16_f32acc";
 const F32_ENTRY: &str = "gemv_f32_f32acc";
@@ -388,10 +388,12 @@ fn load_bundle(root: &Path) -> Vec<PreparedEntry> {
     let manifest: BundleManifest =
         serde_json::from_slice(&manifest_bytes).expect("valid GEA1 artifact bundle manifest");
     assert_eq!(manifest.schema, "gea1-artifact-bundle-v1");
-    assert!(manifest
-        .required_members
-        .iter()
-        .any(|member| member == "gea1-artifact-bundle-manifest.json"));
+    assert!(
+        manifest
+            .required_members
+            .iter()
+            .any(|member| member == "gea1-artifact-bundle-manifest.json")
+    );
     for member in &manifest.required_members {
         assert!(
             root.join(member).is_file(),

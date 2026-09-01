@@ -1110,10 +1110,7 @@ impl DeviceDescriptor {
                     if *first_semantic != slot.semantic_value {
                         return Err(errors::abi_mismatch(format!(
                             "device buffer `{}` (id {}) is referenced with conflicting semantic value identities {} and {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            first_semantic,
-                            slot.semantic_value
+                            slot.buffer_name, slot.buffer_id, first_semantic, slot.semantic_value
                         )));
                     }
                 } else {
@@ -1670,7 +1667,10 @@ impl KvCacheDescriptor {
             if end > allocation.capacity_bytes {
                 return Err(errors::shape_mismatch(format!(
                     "device descriptor view on allocation {} spans {} bytes from base {} but allocation capacity is {} bytes",
-                    view.allocation_id, view.maximum_span, view.static_base, allocation.capacity_bytes
+                    view.allocation_id,
+                    view.maximum_span,
+                    view.static_base,
+                    allocation.capacity_bytes
                 )));
             }
         }
@@ -1931,7 +1931,7 @@ fn role_conflict(first: DeviceBufferRole, second: DeviceBufferRole) -> bool {
 /// Stable error constructors shared by the descriptor validator, the
 /// composite host, and the launch adapters.
 pub mod errors {
-    use super::{HostError, E_BACKEND_UNAVAILABLE, E_NO_DEVICE_PROGRAM};
+    use super::{E_BACKEND_UNAVAILABLE, E_NO_DEVICE_PROGRAM, HostError};
 
     pub fn backend_unavailable(message: impl Into<String>) -> HostError {
         HostError {

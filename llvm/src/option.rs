@@ -1,8 +1,8 @@
 //! Arena-owned scalar and opaque-handle options for the LLVM host ABI.
 
-use super::array::{read_value, valid_kind, write_value, RuntimeValue};
+use super::array::{RuntimeValue, read_value, valid_kind, write_value};
 use super::format::{find_text, text_value};
-use super::{opaque_value_text, unsupported_opaque_diagnostic, write_diagnostic, RuntimeContext};
+use super::{RuntimeContext, opaque_value_text, unsupported_opaque_diagnostic, write_diagnostic};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
@@ -10,8 +10,8 @@ use crate::abi::{
 use faber::{display_bivalens, display_fractus};
 use radix_host_abi::{
     FaberRtValueKindV1, VALUE_KIND_F16, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
-    VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
-    VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
+    VALUE_KIND_I8, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT,
+    VALUE_KIND_U8, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64,
 };
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};

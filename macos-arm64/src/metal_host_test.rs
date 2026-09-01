@@ -1,4 +1,4 @@
-use super::{encoder_gpu_timeline_from_samples, EncoderGpuTimeline};
+use super::{EncoderGpuTimeline, encoder_gpu_timeline_from_samples};
 
 #[test]
 fn timeline_converts_ticks_relative_to_first_start() {

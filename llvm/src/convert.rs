@@ -1,14 +1,14 @@
 //! Scalar conversion into runtime-owned opaque `valor` handles.
 
-use super::format::{store_text, text_value};
 use super::RuntimeContext;
+use super::format::{store_text, text_value};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
     STATUS_PANIC,
 };
 use faber::{FromValor, Valor};
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 
 #[no_mangle]

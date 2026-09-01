@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{
-    enumerate_cuda_physical_devices, enumerate_metal_physical_devices, probe_cuda_environment,
-    probe_metal_environment, CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet,
-    FakeCudaDriver, FakeMetalDriver, LaunchProgram, MetalHostSession,
+    CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet, FakeCudaDriver, FakeMetalDriver,
+    LaunchProgram, MetalHostSession, enumerate_cuda_physical_devices,
+    enumerate_metal_physical_devices, probe_cuda_environment, probe_metal_environment,
 };
+use host_coordinator::DeviceBackend;
 use host_coordinator::bound_plan::{
-    bind, AdmittedLogicalPlan, BoundDistributedPlan, LogicalPartitionId, PartitionBinding,
+    AdmittedLogicalPlan, BoundDistributedPlan, LogicalPartitionId, PartitionBinding, bind,
 };
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
 use host_coordinator::device_set::DeviceSet;
@@ -35,7 +36,6 @@ use host_coordinator::partition::{
     TransportClass, VirtualDevicePartition, VirtualDevicePartitionId,
 };
 use host_coordinator::transport::{CopyPath, TransferBudget};
-use host_coordinator::DeviceBackend;
 
 const PROBE_TIME: u64 = 1_752_717_600_000_000_000;
 const LOGICAL_HASH: &str =

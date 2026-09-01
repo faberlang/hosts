@@ -3,9 +3,9 @@ use host_kernel::{CancellationProbe, ProviderContent};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -597,7 +597,7 @@ impl Wire {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    break
+                    break;
                 }
                 Err(error) => panic!("drain failed: {error}"),
             }
@@ -640,9 +640,10 @@ fn streaming_response_writes_chunked_frames() {
     respond_finish(&provider, writer, false).expect("finish stream");
     let head = client.read_headers();
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked"));
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    );
     assert!(head.contains("x-faber-request-id: http-"));
     assert_eq!(client.read_chunked_body(), b"hello world");
     provider
@@ -959,20 +960,22 @@ impl EchoFixture {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_connections = Arc::clone(&connections);
         let thread_stop = Arc::clone(&stop);
-        let thread = thread::spawn(move || loop {
-            if thread_stop.load(Ordering::SeqCst) {
-                break;
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    thread_connections.fetch_add(1, Ordering::SeqCst);
-                    let conn_stop = Arc::clone(&thread_stop);
-                    thread::spawn(move || serve_echo_connection(stream, &conn_stop));
+        let thread = thread::spawn(move || {
+            loop {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        thread_connections.fetch_add(1, Ordering::SeqCst);
+                        let conn_stop = Arc::clone(&thread_stop);
+                        thread::spawn(move || serve_echo_connection(stream, &conn_stop));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         });
         Self {

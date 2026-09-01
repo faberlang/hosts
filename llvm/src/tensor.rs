@@ -4,21 +4,21 @@
 //! `sectio` materialize so the link surface stays honest without exposing Rust
 //! layout. Element-width conversion and sparse remain residual families.
 
+use super::RuntimeContext;
 use super::array::{
-    find_array, read_value, store_array, store_array_cells, write_value, RuntimeArray,
-    RuntimeCells, RuntimeValue,
+    RuntimeArray, RuntimeCells, RuntimeValue, find_array, read_value, store_array,
+    store_array_cells, write_value,
 };
 use super::option::store_option;
-use super::RuntimeContext;
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
-use faber::tensor::{
-    tensor_flat_offset, tensor_shape_element_count, tensor_shape_has_element_count,
-    ERR_INDEX_OUT_OF_BOUNDS, ERR_NEGATIVE_DIM, ERR_NEGATIVE_INDEX,
-};
 use faber::Tensor;
+use faber::tensor::{
+    ERR_INDEX_OUT_OF_BOUNDS, ERR_NEGATIVE_DIM, ERR_NEGATIVE_INDEX, tensor_flat_offset,
+    tensor_shape_element_count, tensor_shape_has_element_count,
+};
 use radix_host_abi::{FaberRtValueKindV1, VALUE_KIND_I64};
 use std::ffi::c_void;
 use std::io::Write;

@@ -8,9 +8,8 @@
 mod inference_state;
 
 use inference_state::{
-    CursorFacts, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
-    SequencePhase, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
-    E_KV_STALE,
+    CursorFacts, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
+    E_KV_STALE, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode, SequencePhase,
 };
 
 fn fresh(capacity: u32) -> InferenceSessionState {

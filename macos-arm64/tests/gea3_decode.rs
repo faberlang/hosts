@@ -16,17 +16,17 @@ use std::time::Instant;
 
 use faber_host_macos_arm64::composite_host::{CompositeHost, CompositeHostConfig, DeviceSelection};
 use faber_host_macos_arm64::device_descriptor::{
-    sha256_hex, DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow,
-    DescriptorEndOfRunResult, DescriptorKernel, DescriptorLaunch, DescriptorResult,
-    DescriptorRuntimeSource, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
-    DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
+    DescriptorBuffer, DescriptorBufferVersion, DescriptorDataFlow, DescriptorEndOfRunResult,
+    DescriptorKernel, DescriptorLaunch, DescriptorResult, DescriptorRuntimeSource,
+    DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole, DeviceDataType,
+    DeviceDescriptor, DeviceProgramLifetime, sha256_hex,
 };
 use faber_host_macos_arm64::device_host::{DeviceLaunchBinding, DeviceRuntime, DeviceSession};
 use faber_host_macos_arm64::metal_host::MappedWeightFile;
-use faber_host_macos_arm64::{enumerate_metal_physical_devices, FakeMetalDriver, MetalHostSession};
+use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession, enumerate_metal_physical_devices};
 use host_coordinator::{DeviceBackend, DeviceHandle};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PLAN_SCHEMA: &str = "gea3-program-plan-v1";
 // GEA3-WIRE-BUFFER-V2 (Amendment 3 / GEA3-A1): the named successor of
@@ -2074,12 +2074,14 @@ fn gea3_soak_statue_admission_is_capacity_exact() {
     assert!(
         admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err()
     );
-    assert!(admit_state_buffers(
-        &frozen.programs.decode_step,
-        "decode_step",
-        GEA3_FROZEN_SHORT
-    )
-    .is_ok());
+    assert!(
+        admit_state_buffers(
+            &frozen.programs.decode_step,
+            "decode_step",
+            GEA3_FROZEN_SHORT
+        )
+        .is_ok()
+    );
 }
 
 /// A structurally minimal program for the statue admission law: the envelope
@@ -2131,31 +2133,35 @@ fn gea3_negative_rows_fail_closed() {
         .pop();
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(missing_edge).expect("mirror parse");
-    assert!(admit_program(
-        &parsed,
-        &parsed.programs.decode_step,
-        "decode_step",
-        GEA3_FROZEN_SHORT
-    )
-    .is_err());
+    assert!(
+        admit_program(
+            &parsed,
+            &parsed.programs.decode_step,
+            "decode_step",
+            GEA3_FROZEN_SHORT
+        )
+        .is_err()
+    );
 
     let mut wrong_dtype = original.clone();
     wrong_dtype["programs"]["prefill"]["kernels"][0]["resources"][0]["version"]["element_ty"] =
         json!("bf16");
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(wrong_dtype).expect("mirror parse");
-    assert!(map_envelope_to_descriptor(
-        &parsed,
-        &parsed.programs.prefill,
-        "prefill",
-        &artifact_dir,
-        GEA3_FROZEN_SHORT,
-    )
-    .is_err());
+    assert!(
+        map_envelope_to_descriptor(
+            &parsed,
+            &parsed.programs.prefill,
+            "prefill",
+            &artifact_dir,
+            GEA3_FROZEN_SHORT,
+        )
+        .is_err()
+    );
 
     let mut conflicting_shape = original.clone();
-    conflicting_shape["programs"]["decode_step"]["kernels"][1]["resources"][0]["version"]
-        ["element_count"] = json!(961);
+    conflicting_shape["programs"]["decode_step"]["kernels"][1]["resources"][0]["version"]["element_count"] =
+        json!(961);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(conflicting_shape).expect("mirror parse");
     let error = map_envelope_to_descriptor(
@@ -2172,14 +2178,14 @@ fn gea3_negative_rows_fail_closed() {
     );
 
     let mut intermediate_readback = original.clone();
-    let intermediate_id = intermediate_readback["programs"]["decode_step"]["kernels"][0]
-        ["resources"]
-        .as_array()
-        .expect("resources")
-        .iter()
-        .find(|resource| resource["access"] == "write")
-        .and_then(|resource| resource["buffer"]["id"].as_u64())
-        .expect("first intermediate output");
+    let intermediate_id =
+        intermediate_readback["programs"]["decode_step"]["kernels"][0]["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .find(|resource| resource["access"] == "write")
+            .and_then(|resource| resource["buffer"]["id"].as_u64())
+            .expect("first intermediate output");
     intermediate_readback["programs"]["decode_step"]["results"][0]["buffer"]["id"] =
         json!(intermediate_id);
     let parsed: Gea3ProgramPlanEnvelope =
@@ -2208,8 +2214,8 @@ fn gea3_negative_rows_fail_closed() {
     // key transpose; its canonical input carries the strided [76,64]
     // k-cache window.
     let mut wrong_derived = original.clone();
-    wrong_derived["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]
-        ["sub_window"]["derived_element_count"] = json!(4_863);
+    wrong_derived["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]["sub_window"]
+        ["derived_element_count"] = json!(4_863);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(wrong_derived).expect("mirror parse");
     let error = map_envelope_to_descriptor(
@@ -2249,8 +2255,8 @@ fn gea3_negative_rows_fail_closed() {
     // below the 320 pitch and a stride above it are both rejected.
     for (label, lying_stride) in [("below", 76u64), ("above", 640u64)] {
         let mut lying = original.clone();
-        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]["sub_window"]
-            ["row_stride"] = json!(lying_stride);
+        lying["programs"]["decode_step"]["kernels"][9]["resources"][0]["version"]["sub_window"]["row_stride"] =
+            json!(lying_stride);
         let parsed: Gea3ProgramPlanEnvelope = serde_json::from_value(lying).expect("mirror parse");
         let error = map_envelope_to_descriptor(
             &parsed,
@@ -2350,20 +2356,24 @@ fn gea4_admission_gates_fail_closed() {
 
     // Green control: both family programs admit as exported.
     let envelope = load_gea3_plan(&artifact_dir);
-    assert!(admit_program(
-        &envelope,
-        &envelope.programs.decode_step,
-        "decode_step",
-        GEA3_FROZEN_SHORT
-    )
-    .is_ok());
-    assert!(admit_program(
-        &envelope,
-        &envelope.programs.prefill,
-        "prefill",
-        GEA3_FROZEN_SHORT
-    )
-    .is_ok());
+    assert!(
+        admit_program(
+            &envelope,
+            &envelope.programs.decode_step,
+            "decode_step",
+            GEA3_FROZEN_SHORT
+        )
+        .is_ok()
+    );
+    assert!(
+        admit_program(
+            &envelope,
+            &envelope.programs.prefill,
+            "prefill",
+            GEA3_FROZEN_SHORT
+        )
+        .is_ok()
+    );
 
     // (a) red — the two carried copies of the grid disagree with each
     // other (dispatch_size mutated, workgroup_count left alone).
@@ -3874,10 +3884,10 @@ fn gea3_parity_timing_companion_optional_emission() {
         let queue_end = phase_row["queue_wait"]["boundary"]["end_us_since_step_start"]
             .as_u64()
             .expect("queue end boundary");
-        let readback_start = phase_row["device_to_host_readback"]["boundary"]
-            ["start_us_since_step_start"]
-            .as_u64()
-            .expect("readback start boundary");
+        let readback_start =
+            phase_row["device_to_host_readback"]["boundary"]["start_us_since_step_start"]
+                .as_u64()
+                .expect("readback start boundary");
         assert!(
             encode_end <= queue_start,
             "encode clock must end before the queue wait begins"

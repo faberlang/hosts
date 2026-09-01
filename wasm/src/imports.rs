@@ -8,15 +8,15 @@
 //! "must not return a plausible default").
 
 use crate::collections::{
+    CollectionValue, CursorYieldBuffer, MapValue, OptionValue, RuntimeValue, TensorValue,
     display_fractus, runtime_value_eq, tensor_flat_offset, tensor_shape_element_count,
-    value_from_i64, value_to_i64, CollectionValue, CursorYieldBuffer, MapValue, OptionValue,
-    RuntimeValue, TensorValue,
+    value_from_i64, value_to_i64,
 };
 use crate::outcome::RunOutcome;
 use radix_host_abi::{
     SYMBOL_CURSOR_STREAM, VALUE_KIND_ASCII, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
-    VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR, VALUE_KIND_TEXT,
-    VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8, VALUE_KIND_VALOR,
+    VALUE_KIND_I8, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT,
+    VALUE_KIND_U8, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_VALOR,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use wasmtime::{FuncType, Instance, Linker, Module, Store, Val, ValType};
@@ -1865,11 +1865,7 @@ fn bind_format_1_ptr_to_ptr(linker: &mut Linker<HostState>) -> Result<(), wasmti
 }
 
 fn display_bivalens(value: i32) -> &'static str {
-    if value != 0 {
-        "verum"
-    } else {
-        "falsum"
-    }
+    if value != 0 { "verum" } else { "falsum" }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 [package]
 name = "faber-host-macos-arm64"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "macOS arm64 host runtime prototype for Faber Wasm components"
 license = "MIT"
 publish = false

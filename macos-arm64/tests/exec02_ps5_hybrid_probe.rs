@@ -6,11 +6,11 @@
 //! lands; this test proves that the two state families remain separate while
 //! both prefill and one-token decode use their named regimes.
 
-use faber_host_macos_arm64::kernel::library::{dispatch, CausalAttentionBind, LibraryKernel};
+use faber_host_macos_arm64::kernel::library::{CausalAttentionBind, LibraryKernel, dispatch};
 use faber_host_macos_arm64::kernel::ssm_conv1d::{
-    dispatch_ssm_conv1d, SsmConv1dBind, SsmConv1dKernel,
+    SsmConv1dBind, SsmConv1dKernel, dispatch_ssm_conv1d,
 };
-use faber_host_macos_arm64::kernel::ssm_scan::{dispatch_ssm_scan, SsmScanBind, SsmScanKernel};
+use faber_host_macos_arm64::kernel::ssm_scan::{SsmScanBind, SsmScanKernel, dispatch_ssm_scan};
 
 const MODEL_BLOCK: usize = 0;
 const PREFILL_TOKENS: usize = 3;

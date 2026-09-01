@@ -3,12 +3,12 @@
 
 use std::collections::BTreeMap;
 
+use host_cuda::CudaHostSession;
 use host_cuda::cuda_host::FakeCudaDriver;
 use host_cuda::cuda_launch_adapter::{
-    launch_descriptor, parse_descriptor, AdapterBufferRole, NumericOracle, NvvmElementType,
-    NVVM_DESCRIPTOR_SCHEMA_VERSION,
+    AdapterBufferRole, NVVM_DESCRIPTOR_SCHEMA_VERSION, NumericOracle, NvvmElementType,
+    launch_descriptor, parse_descriptor,
 };
-use host_cuda::CudaHostSession;
 use host_device_core::device_descriptor::{
     E_DEVICE_ABI_MISMATCH, E_DEVICE_DESCRIPTOR, E_DEVICE_DTYPE_MISMATCH, E_DEVICE_ENTRY_MISMATCH,
     E_DEVICE_SHAPE_MISMATCH,

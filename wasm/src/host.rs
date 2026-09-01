@@ -10,7 +10,7 @@ use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
 use crate::config::RunConfig;
 use crate::error::HostError;
 use crate::imports::{
-    bind_external_imports, link_v1_imports, preflight_imports, preflight_package_imports, HostState,
+    HostState, bind_external_imports, link_v1_imports, preflight_imports, preflight_package_imports,
 };
 use crate::outcome::RunOutcome;
 

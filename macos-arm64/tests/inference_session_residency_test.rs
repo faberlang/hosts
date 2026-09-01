@@ -20,8 +20,8 @@ use device_descriptor::{
     DeviceDataType,
 };
 use inference_state::{
-    FailureOutcome, FailureStage, InvocationMode, SequencePhase, E_INVALID_ARGS, E_KV_OVERFLOW,
-    E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,
+    E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED, FailureOutcome,
+    FailureStage, InvocationMode, SequencePhase,
 };
 use residency::{ModelIdentity, ModelSpec, ResidentAllocation, SequenceSpec, SessionResidency};
 

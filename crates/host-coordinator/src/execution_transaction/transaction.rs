@@ -16,7 +16,7 @@ use crate::execution_transaction::receipt::{
     TransactionReceipt, TransactionTimings,
 };
 use crate::execution_transaction::reservation::{
-    derive_declared_write_set, derive_reservation, BudgetClass, ReservationRecord,
+    BudgetClass, ReservationRecord, derive_declared_write_set, derive_reservation,
 };
 use crate::execution_transaction::state_machine::{
     PublicationOrdinal, TransactionFailure, TransactionId, TransactionState,

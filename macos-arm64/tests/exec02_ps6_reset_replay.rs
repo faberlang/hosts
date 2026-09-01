@@ -9,10 +9,10 @@
 mod inference_state;
 
 use faber_host_macos_arm64::kernel::ssm_conv1d::{
-    dispatch_ssm_conv1d, SsmConv1dBind, SsmConv1dKernel,
+    SsmConv1dBind, SsmConv1dKernel, dispatch_ssm_conv1d,
 };
-use faber_host_macos_arm64::kernel::ssm_scan::{dispatch_ssm_scan, SsmScanBind, SsmScanKernel};
-use inference_state::{InferenceSessionState, InvocationMode, SequencePhase, E_KV_STALE};
+use faber_host_macos_arm64::kernel::ssm_scan::{SsmScanBind, SsmScanKernel, dispatch_ssm_scan};
+use inference_state::{E_KV_STALE, InferenceSessionState, InvocationMode, SequencePhase};
 
 const SSM_LENGTH: usize = 3;
 const SSM_STATE_DIM: usize = 4;

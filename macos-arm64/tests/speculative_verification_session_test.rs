@@ -9,9 +9,9 @@
 mod inference_state;
 
 use inference_state::{
-    CandidateRows, FailureOutcome, FailureStage, InferenceSessionState, InvocationMode,
-    SequencePhase, VerificationCommit, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED,
-    E_KV_STALE,
+    CandidateRows, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_STALE,
+    FailureOutcome, FailureStage, InferenceSessionState, InvocationMode, SequencePhase,
+    VerificationCommit,
 };
 
 fn at_l(capacity: u32, prefix: u32) -> InferenceSessionState {

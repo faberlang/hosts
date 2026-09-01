@@ -1,10 +1,10 @@
 //! Atomic named-field conversion between physical LLVM genus values and Valor maps.
 
-use super::array::{read_value, write_value, RuntimeValue};
+use super::RuntimeContext;
+use super::array::{RuntimeValue, read_value, write_value};
 use super::convert::store_valor;
 use super::format::text_value;
 use super::valor_aggregate::{runtime_value_to_valor, valor_to_runtime_value};
-use super::RuntimeContext;
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
@@ -15,7 +15,7 @@ use radix_host_abi::{
     FaberRtValueKindV1, VALUE_KIND_ASCII, VALUE_KIND_INSTANS, VALUE_KIND_OPTION_I64,
 };
 use std::collections::BTreeMap;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::panic::{self, AssertUnwindSafe};
 
 fn ffi_ptr(operation: impl FnOnce() -> FaberRtPtrResultV1) -> FaberRtPtrResultV1 {

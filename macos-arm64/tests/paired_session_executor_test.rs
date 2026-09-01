@@ -5,10 +5,10 @@
 //! their selected v2 mode through a real resident step.
 
 use faber_host_macos_arm64::composite_host::invocation_binding::{
-    RopeConfig, KV_PREFIX_IDS, PROMPT_TOKENS, Q_PREFIX_IDS, ROPE_COS, ROPE_SIN,
+    KV_PREFIX_IDS, PROMPT_TOKENS, Q_PREFIX_IDS, ROPE_COS, ROPE_SIN, RopeConfig,
 };
 use faber_host_macos_arm64::composite_host::{
-    CompositeHost, DeviceByteBuffer, SequencePhase, E_KV_PHASE, E_KV_POISONED,
+    CompositeHost, DeviceByteBuffer, E_KV_PHASE, E_KV_POISONED, SequencePhase,
 };
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorBuffer, DescriptorBufferVersion, DescriptorKernel, DescriptorLaunch,
@@ -539,15 +539,16 @@ fn paired_device_failure_releases_the_shared_owner() {
         .expect_err("launch failure");
     assert!(error.message.contains("injected failure"));
     assert_eq!(pair.live_handles(), 0);
-    assert!(pair
-        .execute_invocation(&invocation(
+    assert!(
+        pair.execute_invocation(&invocation(
             DeviceExecuteInvocationMode::ScalarDecode,
             Some(42),
             0,
             0,
             1,
         ))
-        .is_err());
+        .is_err()
+    );
     let reset_err = pair
         .reset()
         .expect_err("poisoned sequence rejects reset; rollback is not proven");

@@ -12,7 +12,7 @@ use wasmtime::{Config, Engine, Linker, Module, Store, TypedFunc};
 
 use crate::kernel::frame_data;
 
-use crate::syscall_import::{route_capability_code, CAPABILITY_CALL_IMPORT};
+use crate::syscall_import::{CAPABILITY_CALL_IMPORT, route_capability_code};
 use crate::{Frame, HostKernel, Status};
 
 pub type WasmResult<T> = Result<T, WasmHostError>;

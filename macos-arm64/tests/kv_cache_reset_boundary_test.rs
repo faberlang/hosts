@@ -21,8 +21,8 @@ use device_descriptor::{
     DeviceBufferLifetime, DeviceDataType,
 };
 use inference_state::{
-    CursorFacts, FailureStage, InvocationMode, SequencePhase, SessionInspection, E_KV_OVERFLOW,
-    E_KV_POISONED,
+    CursorFacts, E_KV_OVERFLOW, E_KV_POISONED, FailureStage, InvocationMode, SequencePhase,
+    SessionInspection,
 };
 use residency::{
     AllocationIdentity, ModelIdentity, ModelSpec, ResidentAllocation, SequenceSpec,

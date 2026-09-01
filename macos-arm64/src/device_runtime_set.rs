@@ -8,8 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use host_coordinator::device_identity::PhysicalDeviceId;
 use host_coordinator::DeviceBackend;
+use host_coordinator::device_identity::PhysicalDeviceId;
 
 use crate::cuda_host::enumerate_cuda_physical_devices;
 use crate::device_host::DeviceRuntime;

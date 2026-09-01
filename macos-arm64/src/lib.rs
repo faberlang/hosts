@@ -24,21 +24,21 @@ pub mod transaction_backend;
 pub mod wasm;
 
 pub use cuda_host::{
-    discover_cuda_snapshot, enumerate_cuda_physical_devices, probe_cuda_environment, CudaEnvReport,
-    CudaHandleId, CudaHostSession, CudaPhysicalDevice, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
-    E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED,
+    CudaEnvReport, CudaHandleId, CudaHostSession, CudaPhysicalDevice, E_CUDA_INVALID_HANDLE,
+    E_CUDA_UNAVAILABLE, E_CUDA_UNSUPPORTED, FakeCudaDriver, discover_cuda_snapshot,
+    enumerate_cuda_physical_devices, probe_cuda_environment,
 };
 pub use cuda_launch_adapter::{
-    launch_descriptor, parse_descriptor, AdapterBufferRole, AdapterLaunchReceipt, NumericOracle,
-    NvvmElementType, NvvmLaunchBuffer, NvvmLaunchPlan, OracleCheck, NVVM_DESCRIPTOR_SCHEMA_VERSION,
-    NVVM_DESCRIPTOR_TARGET,
+    AdapterBufferRole, AdapterLaunchReceipt, NVVM_DESCRIPTOR_SCHEMA_VERSION,
+    NVVM_DESCRIPTOR_TARGET, NumericOracle, NvvmElementType, NvvmLaunchBuffer, NvvmLaunchPlan,
+    OracleCheck, launch_descriptor, parse_descriptor,
 };
 pub use device_runtime_set::DeviceRuntimeSet;
 pub use kernel::{Conversation, Direction, Frame, HostError, HostKernel, Status};
 pub use manifest::{CapabilityManifest, RegisteredProvider, SyscallManifest};
 pub use metal_host::{
-    discover_metal_snapshot, enumerate_metal_physical_devices, probe_metal_environment,
-    FakeMetalDriver, MetalEnvReport, MetalHandleId, MetalHostSession, MetalPhysicalDevice,
-    E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED,
+    E_METAL_INVALID_HANDLE, E_METAL_UNAVAILABLE, E_METAL_UNSUPPORTED, FakeMetalDriver,
+    MetalEnvReport, MetalHandleId, MetalHostSession, MetalPhysicalDevice, discover_metal_snapshot,
+    enumerate_metal_physical_devices, probe_metal_environment,
 };
 pub use transaction_backend::{DeviceRuntimeBackend, LaunchProgram};

@@ -1,7 +1,7 @@
 [package]
 name = "host-device-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Backend-neutral device descriptor, session, and lifecycle primitives for Faber hosts"
 license = "MIT"
 publish = false

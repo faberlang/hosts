@@ -218,17 +218,19 @@ fn qkv_projection_rotates_query_rows_at_cursor_position() {
     };
     // Default position 0: row i rotates at table row i.
     let (q, v) = run(0);
-    assert!(q
-        .iter()
-        .zip([1.0f32, 2.0, -4.0, 3.0])
-        .all(|(a, e)| (a - e).abs() <= 1.0e-6));
+    assert!(
+        q.iter()
+            .zip([1.0f32, 2.0, -4.0, 3.0])
+            .all(|(a, e)| (a - e).abs() <= 1.0e-6)
+    );
     assert!(v.iter().zip(&input).all(|(a, e)| (a - e).abs() <= 1.0e-6));
     // Cursor position 1: row i rotates at table row 1 + i.
     let (q, v) = run(1);
-    assert!(q
-        .iter()
-        .zip([-2.0f32, 1.0, -3.0, -4.0])
-        .all(|(a, e)| (a - e).abs() <= 1.0e-6));
+    assert!(
+        q.iter()
+            .zip([-2.0f32, 1.0, -3.0, -4.0])
+            .all(|(a, e)| (a - e).abs() <= 1.0e-6)
+    );
     assert!(v.iter().zip(&input).all(|(a, e)| (a - e).abs() <= 1.0e-6));
 }
 

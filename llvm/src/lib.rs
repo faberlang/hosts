@@ -62,7 +62,7 @@ use convert::{
     __faber_rt_v1_valor_i1, __faber_rt_v1_valor_i64, __faber_rt_v1_valor_nihil,
     __faber_rt_v1_valor_text,
 };
-use faber::{display_bivalens, display_fractus, Valor};
+use faber::{Valor, display_bivalens, display_fractus};
 #[cfg(test)]
 use format::{
     __faber_rt_v1_format_1_ptr_to_ptr, __faber_rt_v1_format_f32, __faber_rt_v1_format_f64,
@@ -71,7 +71,7 @@ use format::{
     __faber_rt_v1_format_text_i64_i1, __faber_rt_v1_format_text_text, __faber_rt_v1_text_f64,
     __faber_rt_v1_text_i1, __faber_rt_v1_text_i64, __faber_rt_v1_text_length,
 };
-use format::{text_value, RuntimeText};
+use format::{RuntimeText, text_value};
 #[cfg(test)]
 use gpu_placement::{__faber_gpu_v1_copy_in, __faber_gpu_v1_readback, __faber_gpu_v1_sync};
 #[cfg(test)]
@@ -115,12 +115,12 @@ use provider::{
 };
 #[cfg(test)]
 use radix_host_abi::{
-    FaberRtValueKindV1, ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST,
-    ARRAY_OPTION_REMOVE_FIRST, ARRAY_OPTION_REMOVE_LAST, ARRAY_RANGE_DROP_FIRST, ARRAY_RANGE_SLICE,
-    ARRAY_RANGE_TAKE, ARRAY_RANGE_TAKE_LAST, INSTANS_PRECISION_MICROS, INSTANS_PRECISION_MILLIS,
+    ARRAY_OPTION_FIRST, ARRAY_OPTION_INDEX, ARRAY_OPTION_LAST, ARRAY_OPTION_REMOVE_FIRST,
+    ARRAY_OPTION_REMOVE_LAST, ARRAY_RANGE_DROP_FIRST, ARRAY_RANGE_SLICE, ARRAY_RANGE_TAKE,
+    ARRAY_RANGE_TAKE_LAST, FaberRtValueKindV1, INSTANS_PRECISION_MICROS, INSTANS_PRECISION_MILLIS,
     INSTANS_PRECISION_SECONDS, VALUE_KIND_ASCII, VALUE_KIND_F16, VALUE_KIND_F32, VALUE_KIND_F64,
-    VALUE_KIND_I1, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_I8, VALUE_KIND_PTR,
-    VALUE_KIND_TEXT, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64, VALUE_KIND_U8,
+    VALUE_KIND_I1, VALUE_KIND_I8, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_PTR,
+    VALUE_KIND_TEXT, VALUE_KIND_U8, VALUE_KIND_U16, VALUE_KIND_U32, VALUE_KIND_U64,
 };
 #[cfg(test)]
 use regex_rt::{

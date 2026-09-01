@@ -9,7 +9,7 @@ use faber_host_macos_arm64::composite_host::KvCacheBindingSession;
 use faber_host_macos_arm64::device_descriptor::{
     DescriptorAllocation, DescriptorInvocationState, DescriptorLaunchBinding,
     DescriptorRuntimeSource, DescriptorView, DeviceBufferInitialization, DeviceBufferLifetime,
-    DeviceDataType, KvCacheDescriptor, E_DEVICE_SHAPE_MISMATCH,
+    DeviceDataType, E_DEVICE_SHAPE_MISMATCH, KvCacheDescriptor,
 };
 use faber_host_macos_arm64::device_host::{DeviceLaunchBinding, DeviceRuntime};
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};

@@ -567,10 +567,7 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
         if kernel.element_count != first_input.element_count {
             return Err(errors::shape_mismatch(format!(
                 "nvvm descriptor kernel `{}` records kernel element_count {} but its first input buffer (binding {}) declares {}",
-                kernel.entry,
-                kernel.element_count,
-                first_input.binding,
-                first_input.element_count
+                kernel.entry, kernel.element_count, first_input.binding, first_input.element_count
             )));
         }
     }
@@ -755,12 +752,12 @@ fn validate_tree_reduction_plan(
         Some(op) => {
             return Err(errors::descriptor(format!(
                 "nvvm descriptor plan tree_reduction (kernel `{entry}`) declares unknown op `{op}`"
-            )))
+            )));
         }
         None => {
             return Err(errors::descriptor(format!(
                 "nvvm descriptor plan tree_reduction (kernel `{entry}`) is missing op"
-            )))
+            )));
         }
     }
     if buffers.len() < 2 {

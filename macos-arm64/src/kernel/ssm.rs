@@ -10,8 +10,8 @@
 //! module assembly and the plan-dispatch seams.
 
 use super::library::KernelBodyError;
-use super::ssm_conv1d::{dispatch_ssm_conv1d, SsmConv1dBind, SsmConv1dKernel};
-use super::ssm_scan::{dispatch_ssm_scan, SsmScanBind, SsmScanKernel};
+use super::ssm_conv1d::{SsmConv1dBind, SsmConv1dKernel, dispatch_ssm_conv1d};
+use super::ssm_scan::{SsmScanBind, SsmScanKernel, dispatch_ssm_scan};
 
 /// Concrete geometry minted into the SSM family Metal module.  The Metal
 /// bodies follow the concrete-dim emitter convention: the plan facts are

@@ -5,8 +5,8 @@ use faber_host_macos_arm64::cuda_host::E_CUDA_DRIVER;
 use faber_host_macos_arm64::device_descriptor::DeviceDataType;
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession};
 use faber_host_macos_arm64::{
-    probe_cuda_environment, CudaHostSession, FakeCudaDriver, E_CUDA_INVALID_HANDLE,
-    E_CUDA_UNAVAILABLE,
+    CudaHostSession, E_CUDA_INVALID_HANDLE, E_CUDA_UNAVAILABLE, FakeCudaDriver,
+    probe_cuda_environment,
 };
 
 #[test]
