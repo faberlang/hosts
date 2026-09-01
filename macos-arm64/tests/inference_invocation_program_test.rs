@@ -286,7 +286,10 @@ fn verification_program_is_materialized_as_a_distinct_multi_row_graph() {
         selected.artifact(),
         programs.residency().model().artifacts().verification()
     );
-    assert_ne!(selected.artifact(), programs.select(InvocationMode::ScalarDecode).artifact());
+    assert_ne!(
+        selected.artifact(),
+        programs.select(InvocationMode::ScalarDecode).artifact()
+    );
 
     let prefill = programs
         .begin_selected(InvocationMode::Prefill)
@@ -296,7 +299,10 @@ fn verification_program_is_materialized_as_a_distinct_multi_row_graph() {
         .begin_selected(InvocationMode::Verification)
         .expect("materialized verification admits at committed L");
     assert_eq!(verification.coordinates().prefix_before, 4);
-    assert_eq!(verification.coordinates().query_rows, VERIFICATION_QUERY_ROWS);
+    assert_eq!(
+        verification.coordinates().query_rows,
+        VERIFICATION_QUERY_ROWS
+    );
 }
 
 #[test]

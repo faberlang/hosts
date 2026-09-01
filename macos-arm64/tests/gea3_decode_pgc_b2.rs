@@ -178,8 +178,7 @@ fn gea3_pgc_b2_decode_row_work_census_counts_useful_versus_dispatched() {
     let census = row_work_census(&kernels);
     assert!(census.launches > 0, "the decode step has T=1 launches");
     assert_eq!(
-        census.dispatched_row_lanes,
-        census.useful_row_lanes,
+        census.dispatched_row_lanes, census.useful_row_lanes,
         "every dispatched row lane is useful after PGC-B2"
     );
     // The pre-change census (workgroup y = 8 on the same launches): the
@@ -203,15 +202,11 @@ fn gea3_pgc_b2_host_session_encodes_the_one_row_threadgroup() {
         FakeMetalDriver::default().with_known_entry("decode_gemv_qo"),
     ))
     .expect("fake Metal admission");
-    let input = runtime
-        .alloc_bytes(960 * 4)
-        .expect("input allocation");
+    let input = runtime.alloc_bytes(960 * 4).expect("input allocation");
     let weights = runtime
         .alloc_bytes(960 * 960 * 4)
         .expect("weights allocation");
-    let output = runtime
-        .alloc_bytes(960 * 4)
-        .expect("output allocation");
+    let output = runtime.alloc_bytes(960 * 4).expect("output allocation");
     let module = runtime.load_module(b"pgc-b2-one-row").expect("module");
     let binding = |handle, index, span| MetalLaunchBinding {
         handle,

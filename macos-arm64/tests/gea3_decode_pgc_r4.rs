@@ -22,15 +22,18 @@
 //! claim lives here (condition-B rider).
 
 use faber_host_macos_arm64::device_descriptor::DeviceDataType;
-use faber_host_macos_arm64::metal_host::{MetalLaunchBinding, MetalHandleId};
 use faber_host_macos_arm64::device_host::{DeviceRuntime, DeviceSession};
+use faber_host_macos_arm64::metal_host::{MetalHandleId, MetalLaunchBinding};
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
 use host_coordinator::DeviceBackend;
 
 const PREFILL_ROWS: usize = 36;
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn f32_from_bytes(bytes: &[u8]) -> Vec<f32> {
@@ -42,13 +45,11 @@ fn f32_from_bytes(bytes: &[u8]) -> Vec<f32> {
 const F32_BYTES: usize = 4;
 const TILE: usize = 8;
 
-fn frozen_abs_delta(
-    observed: &[f32],
-    reference: &[f32],
-    bound: f32,
-) -> Result<f32, String> {
+fn frozen_abs_delta(observed: &[f32], reference: &[f32], bound: f32) -> Result<f32, String> {
     if !bound.is_finite() || bound < 0.0 {
-        return Err(format!("frozen bound is not finite and non-negative: {bound}"));
+        return Err(format!(
+            "frozen bound is not finite and non-negative: {bound}"
+        ));
     }
     if observed.len() != reference.len() {
         return Err(format!(
@@ -71,9 +72,7 @@ fn frozen_abs_delta(
         max_abs = max_abs.max(abs);
     }
     if max_abs > bound {
-        return Err(format!(
-            "max_abs {max_abs} exceeds frozen bound {bound}"
-        ));
+        return Err(format!("max_abs {max_abs} exceeds frozen bound {bound}"));
     }
     Ok(max_abs)
 }
@@ -175,7 +174,11 @@ fn pgc_r4_prefill_gemm_launch_geometry_is_unchanged() {
                 MetalHandleId(module.id),
                 entry,
                 &bindings,
-                [(n.div_ceil(TILE)) as u32, (PREFILL_ROWS.div_ceil(TILE)) as u32, 1],
+                [
+                    (n.div_ceil(TILE)) as u32,
+                    (PREFILL_ROWS.div_ceil(TILE)) as u32,
+                    1,
+                ],
                 [TILE as u32, TILE as u32, 1],
             )
             .unwrap_or_else(|error| panic!("{entry} launch: {error}"));
@@ -286,8 +289,7 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
             "{entry} must not carry the scalar inner product"
         );
 
-        let old_source_path =
-            std::path::Path::new(&old_source_dir).join(format!("{entry}.metal"));
+        let old_source_path = std::path::Path::new(&old_source_dir).join(format!("{entry}.metal"));
         let old_module_bytes = std::fs::read(&old_source_path)
             .unwrap_or_else(|error| panic!("read frozen old {entry}.metal: {error}"));
         let old_source = String::from_utf8_lossy(&old_module_bytes);
@@ -303,28 +305,26 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
         let m = PREFILL_ROWS;
         let mut next = 0x2545_F491_4F6C_DD1D_u64;
         let mut value = || {
-            next = next.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            next = next
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             ((next >> 33) as i32) as f32 / (1u64 << 31) as f32
         };
         let input: Vec<f32> = (0..m * k).map(|_| value()).collect();
         let weights: Vec<f32> = (0..n * k).map(|_| value()).collect();
         let input_handle = runtime.alloc_bytes(input.len() * F32_BYTES).expect("input");
-        let weights_handle = runtime.alloc_bytes(weights.len() * F32_BYTES).expect("weights");
+        let weights_handle = runtime
+            .alloc_bytes(weights.len() * F32_BYTES)
+            .expect("weights");
         let extra0 = runtime.alloc_bytes(F32_BYTES).expect("plan extra 0");
         let extra1 = runtime.alloc_bytes(F32_BYTES).expect("plan extra 1");
         let output_handle = runtime.alloc_bytes(m * n * F32_BYTES).expect("output");
-        let old_output_handle = runtime
-            .alloc_bytes(m * n * F32_BYTES)
-            .expect("old output");
+        let old_output_handle = runtime.alloc_bytes(m * n * F32_BYTES).expect("old output");
         runtime
             .copy_in_bytes(&input_handle, &f32_bytes(&input), DeviceDataType::F32)
             .expect("input upload");
         runtime
-            .copy_in_bytes(
-                &weights_handle,
-                &f32_bytes(&weights),
-                DeviceDataType::F32,
-            )
+            .copy_in_bytes(&weights_handle, &f32_bytes(&weights), DeviceDataType::F32)
             .expect("weights upload");
         runtime
             .copy_in_bytes(&extra0, &[0u8; 4], DeviceDataType::F32)
@@ -334,24 +334,16 @@ fn pgc_r4_physical_simdgroup_recipe_on_device() {
             .expect("plan extra 1 upload");
         for output in [&output_handle, &old_output_handle] {
             runtime
-                .copy_in_bytes(
-                    output,
-                    &vec![0u8; m * n * F32_BYTES],
-                    DeviceDataType::F32,
-                )
+                .copy_in_bytes(output, &vec![0u8; m * n * F32_BYTES], DeviceDataType::F32)
                 .expect("output init");
         }
         let old_module = runtime
             .load_module(&old_module_bytes)
             .expect("compile frozen old entry module");
-        let module = runtime.load_module(&module_bytes).expect("compile entry module");
-        let spans = [
-            (m * k) as u64,
-            (n * k) as u64,
-            1_u64,
-            1_u64,
-            (m * n) as u64,
-        ];
+        let module = runtime
+            .load_module(&module_bytes)
+            .expect("compile entry module");
+        let spans = [(m * k) as u64, (n * k) as u64, 1_u64, 1_u64, (m * n) as u64];
         let old_handles = [
             input_handle,
             weights_handle,

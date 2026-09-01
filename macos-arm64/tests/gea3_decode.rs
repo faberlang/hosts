@@ -1891,8 +1891,9 @@ fn descriptor_model_weight_count(descriptors: &[&DeviceDescriptor]) -> usize {
 fn gea3_descriptor_admission() {
     let artifact_dir = gea3_artifact_dir();
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((prefill, prefill_windows), (decode, decode_windows)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
-        .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
+    let ((prefill, prefill_windows), (decode, decode_windows)) =
+        map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT)
+            .unwrap_or_else(|error| panic!("GEA3 plan → DeviceDescriptor mapping failed: {error}"));
 
     let expected_prefill_launches = envelope.programs.prefill.launches.len();
     let expected_decode_launches = envelope.programs.decode_step.launches.len();
@@ -2067,9 +2068,18 @@ fn gea3_soak_statue_admission_is_capacity_exact() {
         );
     }
     // The state-buffer geometry law follows the same statue fact.
-    assert!(admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_SOAK_L2000).is_ok());
-    assert!(admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err());
-    assert!(admit_state_buffers(&frozen.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_ok());
+    assert!(
+        admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_SOAK_L2000).is_ok()
+    );
+    assert!(
+        admit_state_buffers(&soak.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err()
+    );
+    assert!(admit_state_buffers(
+        &frozen.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT
+    )
+    .is_ok());
 }
 
 /// A structurally minimal program for the statue admission law: the envelope
@@ -2109,7 +2119,8 @@ fn empty_program(spelling: &str, capacity: u64) -> Value {
 }
 
 #[test]
-fn gea3_negative_rows_fail_closed() {    let artifact_dir = gea3_artifact_dir();
+fn gea3_negative_rows_fail_closed() {
+    let artifact_dir = gea3_artifact_dir();
     let bytes = fs::read(artifact_dir.join(PLAN_MEMBER)).expect("read exported GEA3 plan");
     let original: Value = serde_json::from_slice(&bytes).expect("exported plan is JSON");
 
@@ -2120,7 +2131,13 @@ fn gea3_negative_rows_fail_closed() {    let artifact_dir = gea3_artifact_dir();
         .pop();
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(missing_edge).expect("mirror parse");
-    assert!(admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_err());
+    assert!(admit_program(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT
+    )
+    .is_err());
 
     let mut wrong_dtype = original.clone();
     wrong_dtype["programs"]["prefill"]["kernels"][0]["resources"][0]["version"]["element_ty"] =
@@ -2181,7 +2198,8 @@ fn gea3_negative_rows_fail_closed() {    let artifact_dir = gea3_artifact_dir();
     );
 
     let envelope = load_gea3_plan(&artifact_dir);
-    let ((_, _), (decode, _)) = map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT).expect("real plan maps");
+    let ((_, _), (decode, _)) =
+        map_both(&envelope, &artifact_dir, GEA3_FROZEN_SHORT).expect("real plan maps");
     assert!(assert_declared_logits_only(&decode, decode.end_of_run_results[0].buffer_id).is_ok());
     assert!(assert_declared_logits_only(&decode, u32::MAX).is_err());
 
@@ -2239,7 +2257,7 @@ fn gea3_negative_rows_fail_closed() {    let artifact_dir = gea3_artifact_dir();
             &parsed.programs.decode_step,
             "decode_step",
             &artifact_dir,
-        GEA3_FROZEN_SHORT,
+            GEA3_FROZEN_SHORT,
         )
         .expect_err(&format!(
             "a lying stride {label} the pitch must fail the mapper"
@@ -2332,8 +2350,20 @@ fn gea4_admission_gates_fail_closed() {
 
     // Green control: both family programs admit as exported.
     let envelope = load_gea3_plan(&artifact_dir);
-    assert!(admit_program(&envelope, &envelope.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT).is_ok());
-    assert!(admit_program(&envelope, &envelope.programs.prefill, "prefill", GEA3_FROZEN_SHORT).is_ok());
+    assert!(admit_program(
+        &envelope,
+        &envelope.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT
+    )
+    .is_ok());
+    assert!(admit_program(
+        &envelope,
+        &envelope.programs.prefill,
+        "prefill",
+        GEA3_FROZEN_SHORT
+    )
+    .is_ok());
 
     // (a) red — the two carried copies of the grid disagree with each
     // other (dispatch_size mutated, workgroup_count left alone).
@@ -2342,8 +2372,13 @@ fn gea4_admission_gates_fail_closed() {
         json!(480);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(contradictory).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
-        .expect_err("contradictory launch facts must fail closed");
+    let error = admit_program(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT,
+    )
+    .expect_err("contradictory launch facts must fail closed");
     assert!(
         error.contains("launch facts disagree with each other"),
         "diagnostic must name the carried-facts law: {error}"
@@ -2363,8 +2398,13 @@ fn gea4_admission_gates_fail_closed() {
         embedding_output_id;
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(non_kv_misbinding).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
-        .expect_err("a non-KV mis-binding must fail closed");
+    let error = admit_program(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT,
+    )
+    .expect_err("a non-KV mis-binding must fail closed");
     assert!(
         error.contains("binding-vs-edge mismatch"),
         "diagnostic must name the every-edge law: {error}"
@@ -2382,8 +2422,13 @@ fn gea4_admission_gates_fail_closed() {
     rope_edge["producer"] = json!(1);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(producer_mismatch).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
-        .expect_err("a producer that never writes the edge buffer must fail closed");
+    let error = admit_program(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT,
+    )
+    .expect_err("a producer that never writes the edge buffer must fail closed");
     assert!(
         error.contains("binding-vs-edge mismatch"),
         "diagnostic must name the every-edge law: {error}"
@@ -2403,8 +2448,13 @@ fn gea4_admission_gates_fail_closed() {
         ["version"]["sub_window"]["element_offset"] = json!(6 * 64);
     let parsed: Gea3ProgramPlanEnvelope =
         serde_json::from_value(zero_intermediate).expect("mirror parse");
-    let error = admit_program(&parsed, &parsed.programs.decode_step, "decode_step", GEA3_FROZEN_SHORT)
-        .expect_err("an unwritten concat gap must fail closed at admission");
+    let error = admit_program(
+        &parsed,
+        &parsed.programs.decode_step,
+        "decode_step",
+        GEA3_FROZEN_SHORT,
+    )
+    .expect_err("an unwritten concat gap must fail closed at admission");
     assert!(
         error.contains("zero-intermediate composition"),
         "diagnostic must name the structural readback gate: {error}"
@@ -2917,11 +2967,15 @@ fn gea3_update_inputs(
                         if token >= VOCAB as usize {
                             return Err(format!("token id {token} is outside vocab {VOCAB}"));
                         }
-                        Ok(f32::from_bits(u32::try_from(token).map_err(|_| "token id does not fit u32".to_owned())?))
+                        Ok(f32::from_bits(
+                            u32::try_from(token)
+                                .map_err(|_| "token id does not fit u32".to_owned())?,
+                        ))
                     })
                     .collect::<Result<Vec<f32>, String>>()?;
                 copy(handle, ids)?;
-            } else if (kernel.entry == "embedding_gather" || kernel.entry == "prefill_embedding_gather")
+            } else if (kernel.entry == "embedding_gather"
+                || kernel.entry == "prefill_embedding_gather")
                 && slot.binding == 0
             {
                 // The resident [VOCAB, 960] table is weight-shaped and
@@ -3581,11 +3635,11 @@ fn gea3_parity_summed(label: &str, values: &[u64], total_steps: usize) -> Value 
 }
 
 fn gea3_parity_gpu_summed(steps: &[&Gea3ParityStep]) -> Value {
-    let values: Vec<u64> = steps.iter().filter_map(|step| step.gpu_encoder_us).collect();
-    let sampled_encoders: Vec<usize> = steps
+    let values: Vec<u64> = steps
         .iter()
-        .map(|step| step.gpu_timestamp_count)
+        .filter_map(|step| step.gpu_encoder_us)
         .collect();
+    let sampled_encoders: Vec<usize> = steps.iter().map(|step| step.gpu_timestamp_count).collect();
     let total_encoders: Vec<usize> = steps
         .iter()
         .map(|step| step.gpu_total_encoder_count)

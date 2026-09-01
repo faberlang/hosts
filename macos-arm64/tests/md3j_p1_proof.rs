@@ -17,8 +17,8 @@ use faber_host_macos_arm64::distributed_translate::{
     translate_device_section_bytes,
 };
 use faber_host_macos_arm64::{
-    CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram, discover_cuda_snapshot,
-    enumerate_cuda_physical_devices, probe_cuda_environment,
+    discover_cuda_snapshot, enumerate_cuda_physical_devices, probe_cuda_environment,
+    CudaHostSession, DeviceRuntimeBackend, DeviceRuntimeSet, LaunchProgram,
 };
 use host_coordinator::bound_plan::{BoundDistributedPlan, LogicalPartitionId};
 use host_coordinator::device_identity::PhysicalDeviceId;
@@ -146,16 +146,12 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
     assert_eq!(receipt_82.bind_shape, "8:2");
     assert!(receipt_82.communication_graph_edge_count > 0);
     assert_eq!(receipt_82.snapshot_id, snapshot.id().hex());
-    assert!(
-        receipt_82
-            .logical_distributed_plan_hash
-            .starts_with("sha256:")
-    );
-    assert!(
-        receipt_82
-            .bound_distributed_plan_hash
-            .starts_with("sha256:")
-    );
+    assert!(receipt_82
+        .logical_distributed_plan_hash
+        .starts_with("sha256:"));
+    assert!(receipt_82
+        .bound_distributed_plan_hash
+        .starts_with("sha256:"));
     assert_eq!(receipt_82.transaction_state, "prepared");
 
     let translated = translate_device_section_bytes(EIGHT_RANK)

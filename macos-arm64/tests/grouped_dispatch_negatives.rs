@@ -16,7 +16,14 @@ const N: u64 = 2;
 const EXPERTS: u64 = 2;
 
 fn bind() -> GroupedExpertGemmBind {
-    GroupedExpertGemmBind::contiguous(ROWS, K, N, EXPERTS, QuantizedFormat::Q8_0, [N as u32, ROWS as u32, 1])
+    GroupedExpertGemmBind::contiguous(
+        ROWS,
+        K,
+        N,
+        EXPERTS,
+        QuantizedFormat::Q8_0,
+        [N as u32, ROWS as u32, 1],
+    )
 }
 
 fn uniform_shapes() -> Vec<[u64; 2]> {

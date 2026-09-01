@@ -168,8 +168,7 @@ fn decode_without_declared_q_prefix_ids_still_projects_the_fused_route() {
     // slot (the fused-route graph) must still project; the K/V gather table
     // remains mandatory on every decode descriptor.
     let mut descriptor = descriptor(1, 4, None);
-    descriptor
-        .kernels[0]
+    descriptor.kernels[0]
         .buffers
         .push(input(5, KV_PREFIX_IDS, 4));
     let invocation = decode_invocation(Some(42), 3, 3, 4);
@@ -267,7 +266,10 @@ fn decode_capacity_rope_table_is_indexed_by_absolute_position() {
     assert_eq!(cos.len(), (pairs * rows) as usize);
     let row = 5usize;
     for pair in 0..pairs as usize {
-        let angle = 5.0_f64 * ROPE.theta.powf(-(2.0 * pair as f64) / f64::from(ROPE.head_dim));
+        let angle = 5.0_f64
+            * ROPE
+                .theta
+                .powf(-(2.0 * pair as f64) / f64::from(ROPE.head_dim));
         assert_eq!(
             cos[row * pairs as usize + pair].to_bits(),
             (angle.cos() as f32).to_bits()

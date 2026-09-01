@@ -469,7 +469,10 @@ fn map_envelope_to_descriptor(
         }
         let path = artifact_dir.join(member);
         let bytes = fs::read(&path).map_err(|error| {
-            format!("module member `{}` is missing from the exported bundle: {error}", path.display())
+            format!(
+                "module member `{}` is missing from the exported bundle: {error}",
+                path.display()
+            )
         })?;
         if bytes.is_empty() {
             return Err(format!("module member `{member}` is empty"));
@@ -494,7 +497,10 @@ fn map_envelope_to_descriptor(
         ));
     }
     if program.roots != vec![1] {
-        return Err(format!("GEA2 roots must be exactly [1], got {:?}", program.roots));
+        return Err(format!(
+            "GEA2 roots must be exactly [1], got {:?}",
+            program.roots
+        ));
     }
     for (index, launch) in program.launches.iter().enumerate() {
         let expected_id = u32::try_from(index + 1).expect("launch id fits u32");
@@ -646,12 +652,14 @@ fn map_envelope_to_descriptor(
 
     let buffer_versions = shapes
         .into_iter()
-        .map(|((buffer_id, version), (element_ty, element_count))| DescriptorBufferVersion {
-            buffer_id,
-            version,
-            element_ty,
-            element_count,
-        })
+        .map(
+            |((buffer_id, version), (element_ty, element_count))| DescriptorBufferVersion {
+                buffer_id,
+                version,
+                element_ty,
+                element_count,
+            },
+        )
         .collect();
 
     let data_flow = program
@@ -669,8 +677,10 @@ fn map_envelope_to_descriptor(
         Gea2ProgramLifetime::SingleRun => DeviceProgramLifetime::SingleRun,
         Gea2ProgramLifetime::RepeatingStep(count) => {
             if count == 0 {
-                return Err("GEA2 plan declares a repeating-step lifetime with a zero step count"
-                    .to_owned());
+                return Err(
+                    "GEA2 plan declares a repeating-step lifetime with a zero step count"
+                        .to_owned(),
+                );
             }
             DeviceProgramLifetime::RepeatingStep
         }
@@ -842,8 +852,7 @@ fn gea2_artifact_dir() -> PathBuf {
 
 fn load_gea2_plan(artifact_dir: &Path) -> Gea2ProgramPlanEnvelope {
     let path = artifact_dir.join(PLAN_MEMBER);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("mirror-parse {}: {error}", path.display()))
 }
@@ -871,12 +880,20 @@ fn gea2_descriptor_admission() {
     assert_eq!(descriptor.launches.len(), 64);
     assert_eq!(descriptor.data_flow.len(), 78);
     assert_eq!(descriptor.roots, vec![1]);
-    assert_eq!(descriptor.buffer_versions.len(), 101, "101 distinct buffer version keys");
+    assert_eq!(
+        descriptor.buffer_versions.len(),
+        101,
+        "101 distinct buffer version keys"
+    );
     assert_eq!(descriptor.results.len(), 1);
     assert_eq!(descriptor.end_of_run_results.len(), 0);
     assert!(!descriptor.module_image.is_empty());
     assert_eq!(
-        descriptor.launches.iter().map(|launch| launch.id).collect::<Vec<_>>(),
+        descriptor
+            .launches
+            .iter()
+            .map(|launch| launch.id)
+            .collect::<Vec<_>>(),
         (1..=64).collect::<Vec<_>>()
     );
 
@@ -905,7 +922,11 @@ fn gea2_descriptor_admission() {
             }
         }
     }
-    assert_eq!(weight_ids.len(), 12, "twelve block tensors are per-program inputs");
+    assert_eq!(
+        weight_ids.len(),
+        12,
+        "twelve block tensors are per-program inputs"
+    );
     for weight in weight_ids {
         let slots = descriptor
             .kernels
@@ -914,7 +935,10 @@ fn gea2_descriptor_admission() {
             .filter(|slot| slot.buffer_id == weight);
         for slot in slots {
             assert_eq!(slot.role, DeviceBufferRole::Input);
-            assert_eq!(slot.initialization, DeviceBufferInitialization::HostProvided);
+            assert_eq!(
+                slot.initialization,
+                DeviceBufferInitialization::HostProvided
+            );
             assert_eq!(slot.element_ty, DeviceDataType::F32);
         }
     }
@@ -1022,12 +1046,16 @@ fn gea2_descriptor_admission() {
     assert_eq!(value_windows.len(), 15);
     for (position, name) in value_windows.iter().enumerate() {
         assert_eq!(
-            name, &format!("v_head_{}", position / 3),
+            name,
+            &format!("v_head_{}", position / 3),
             "context_gemm {position} must bind its GQA kv-head value window"
         );
     }
     assert_eq!(
-        value_windows.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        value_windows
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         5,
         "the 15 context_gemm instances resolve to the 5 distinct per-KV-head v windows"
     );
@@ -1121,7 +1149,10 @@ fn gea2_mirror_parse_rejects_malformed_plans() {
         serde_json::from_value(truncated).expect("truncated launches still mirror");
     let error = map_envelope_to_descriptor(&parsed, &artifact_dir)
         .expect_err("a 63-launch plan must fail closed");
-    assert!(error.contains("64"), "instance expansion must fail closed: {error}");
+    assert!(
+        error.contains("64"),
+        "instance expansion must fail closed: {error}"
+    );
 
     // A missing dependency edge fails the mapper closed.
     let mut missing_edge = value.clone();
@@ -1174,7 +1205,10 @@ fn gea2_mirror_parse_rejects_malformed_plans() {
         serde_json::from_value(missing_member).expect("member list still mirrors");
     let error = map_envelope_to_descriptor(&parsed, &artifact_dir)
         .expect_err("a missing module member must fail closed");
-    assert!(error.contains("absent.metal"), "member rejection names the member: {error}");
+    assert!(
+        error.contains("absent.metal"),
+        "member rejection names the member: {error}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,7 +1222,9 @@ fn gea2_descriptor_validate_rejects_plan_shape_violations() {
     let envelope = load_gea2_plan(&artifact_dir);
     let descriptor = map_envelope_to_descriptor(&envelope, &artifact_dir)
         .expect("the real GEA2 plan maps to a descriptor");
-    descriptor.validate().expect("the mapped descriptor validates");
+    descriptor
+        .validate()
+        .expect("the mapped descriptor validates");
 
     // Single producer: one value generation has exactly one producer. Give
     // ln1 (buffer 100, produced by launch 1) a second producer.
@@ -1373,7 +1409,11 @@ fn gea2_fake_sequence_has_no_cpu_substitute() {
     let declared_entries: Vec<String> = descriptor
         .launches
         .iter()
-        .map(|launch| descriptor.kernels[launch.kernel_index as usize].entry.clone())
+        .map(|launch| {
+            descriptor.kernels[launch.kernel_index as usize]
+                .entry
+                .clone()
+        })
         .collect();
     assert_eq!(receipt.launch_entries, declared_entries);
 
@@ -1399,7 +1439,10 @@ fn gea2_fake_sequence_has_no_cpu_substitute() {
         101,
         "the plan's 101 version-keyed buffers are the whole allocation set"
     );
-    assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
+    assert_eq!(
+        receipt.readbacks, 1,
+        "the declared output is the only readback"
+    );
     assert_eq!(receipt.outputs.len(), 1);
     let output_id = descriptor.results[0].buffer_id;
     let output = &receipt.outputs[&output_id];
@@ -1435,8 +1478,15 @@ fn gea2_fake_sequence_rejects_intermediate_readback() {
     // counter, asserted above); the step-boundary transfer set is exactly
     // the one declared readback.
     let device = host.device().expect("device present");
-    assert_eq!(device.driver_counters().uploads, 12, "twelve declared host tensors upload once");
-    assert_eq!(receipt.transfers, 1, "one declared readback is the only step-boundary transfer");
+    assert_eq!(
+        device.driver_counters().uploads,
+        12,
+        "twelve declared host tensors upload once"
+    );
+    assert_eq!(
+        receipt.transfers, 1,
+        "one declared readback is the only step-boundary transfer"
+    );
 
     // A readback attempted outside the declared output fails closed before
     // any launch: declaring the PerStep intermediate ln1 (buffer 100,
@@ -1662,7 +1712,11 @@ a10cc1512eabd3dde888204e902eca88bddb4951/SmolLM2-360M-Instruct-f32.gguf",
 fn gea2_scalar_block_inputs(manifest: &Value) -> (Gea2ScalarBlockInputs, u64, usize) {
     let workspace = workspace_root();
     let gguf_path = gea2_f32_gguf_path();
-    assert!(gguf_path.is_file(), "missing F32 GGUF {}", gguf_path.display());
+    assert!(
+        gguf_path.is_file(),
+        "missing F32 GGUF {}",
+        gguf_path.display()
+    );
     assert_eq!(
         sha256_file(&gguf_path),
         manifest["model"]["derived_f32_gguf"]["sha256"]
@@ -1683,7 +1737,10 @@ fn gea2_scalar_block_inputs(manifest: &Value) -> (Gea2ScalarBlockInputs, u64, us
             *gguf_name,
             "U1 manifest tensor order drifted at row {row}"
         );
-        assert_eq!(tensor["values"].as_u64().expect("values") as usize, *elements);
+        assert_eq!(
+            tensor["values"].as_u64().expect("values") as usize,
+            *elements
+        );
         let range = [
             tensor["absolute_range"][0].as_u64().expect("range start"),
             tensor["absolute_range"][1].as_u64().expect("range end"),
@@ -1711,7 +1768,9 @@ fn gea2_scalar_block_inputs(manifest: &Value) -> (Gea2ScalarBlockInputs, u64, us
     assert_eq!(activation.len(), GEA2_T * GEA2_D * 4);
     assert_eq!(
         sha256_bytes(&activation),
-        manifest["activation"]["sha256"].as_str().expect("activation digest"),
+        manifest["activation"]["sha256"]
+            .as_str()
+            .expect("activation digest"),
         "activation fixture drifted against the U1 manifest"
     );
     let rope_path = workspace.join("gradus/fixtures/rope/gea2-rope-table.f32");
@@ -1720,7 +1779,9 @@ fn gea2_scalar_block_inputs(manifest: &Value) -> (Gea2ScalarBlockInputs, u64, us
     assert_eq!(rope_bytes.len(), GEA2_T * 32 * 3 * 4);
     assert_eq!(
         sha256_bytes(&rope_bytes),
-        manifest["rope_table"]["sha256"].as_str().expect("rope digest"),
+        manifest["rope_table"]["sha256"]
+            .as_str()
+            .expect("rope digest"),
         "rope table drifted against the U1 manifest"
     );
 
@@ -1827,7 +1888,13 @@ fn oracle_scalar_block(inputs: &Gea2ScalarBlockInputs) -> Vec<f32> {
 
 /// A head window `[rows, width]` carved from a packed `[rows, heads*width]`
 /// projection (the plan's per-head windowed entries write exactly these).
-fn oracle_head_window(packed: &[f32], rows: usize, head: usize, heads: usize, width: usize) -> Vec<f32> {
+fn oracle_head_window(
+    packed: &[f32],
+    rows: usize,
+    head: usize,
+    heads: usize,
+    width: usize,
+) -> Vec<f32> {
     let mut window = vec![0.0_f32; rows * width];
     for row in 0..rows {
         for d in 0..width {
@@ -1913,8 +1980,7 @@ fn oracle_scalar_block_rows(inputs: &Gea2ScalarBlockInputs) -> Gea2ScalarBlockRo
             for d in 0..GEA2_HD {
                 let mut acc = 0.0_f32;
                 for col in 0..GEA2_T {
-                    acc += prob[row * GEA2_T + col]
-                        * v[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
+                    acc += prob[row * GEA2_T + col] * v[col * GEA2_KV * GEA2_HD + kv * GEA2_HD + d];
                 }
                 context[row * GEA2_HD + d] = acc;
             }
@@ -2005,9 +2071,8 @@ fn ulp_distance(left: f32, right: f32) -> u32 {
 #[ignore = "reads the frozen F32 GGUF from the local model cache (the §6 fixture identity)"]
 fn gea2_scalar_block_oracle_pins_row_zero_under_out_in_weights() {
     let workspace = workspace_root();
-    let manifest_path = workspace.join(
-        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
-    );
+    let manifest_path = workspace
+        .join("radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json");
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path)
             .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
@@ -2034,7 +2099,10 @@ fn gea2_scalar_block_oracle_pins_row_zero_under_out_in_weights() {
 fn gea2_compare_block_output(expected: &[f32], observed: &[f32]) -> (f32, f32, u32, usize) {
     assert_eq!(expected.len(), observed.len());
     assert!(
-        expected.iter().chain(observed).all(|value| value.is_finite()),
+        expected
+            .iter()
+            .chain(observed)
+            .all(|value| value.is_finite()),
         "the block comparison rejects non-finite values"
     );
     let mut max_abs = 0.0_f32;
@@ -2087,7 +2155,8 @@ fn gea2_real_host_inputs(
                 other => panic!("unknown HostProvided GEA2 tensor `{other}`"),
             };
             assert_eq!(
-                values.len() as u64, slot.element_count,
+                values.len() as u64,
+                slot.element_count,
                 "tensor `{}` byte length disagrees with the plan's declared shape",
                 slot.buffer_name
             );
@@ -2117,9 +2186,8 @@ fn gea2_real_metal_block_receipt() {
     );
 
     // Frozen identities: the U1 manifest gates every input byte.
-    let manifest_path = workspace.join(
-        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
-    );
+    let manifest_path = workspace
+        .join("radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json");
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path)
             .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
@@ -2127,11 +2195,26 @@ fn gea2_real_metal_block_receipt() {
     .expect("valid GEA2 U1 input manifest");
     assert_eq!(manifest["schema"], "gea2-input-manifest-v1");
     assert_eq!(manifest["delivery"], "GEA2-U1");
-    assert_eq!(manifest["geometry"]["token_rows"].as_u64(), Some(GEA2_T as u64));
-    assert_eq!(manifest["geometry"]["hidden_dim"].as_u64(), Some(GEA2_D as u64));
-    assert_eq!(manifest["geometry"]["query_heads"].as_u64(), Some(GEA2_H as u64));
-    assert_eq!(manifest["geometry"]["kv_heads"].as_u64(), Some(GEA2_KV as u64));
-    assert_eq!(manifest["geometry"]["intermediate_dim"].as_u64(), Some(GEA2_F as u64));
+    assert_eq!(
+        manifest["geometry"]["token_rows"].as_u64(),
+        Some(GEA2_T as u64)
+    );
+    assert_eq!(
+        manifest["geometry"]["hidden_dim"].as_u64(),
+        Some(GEA2_D as u64)
+    );
+    assert_eq!(
+        manifest["geometry"]["query_heads"].as_u64(),
+        Some(GEA2_H as u64)
+    );
+    assert_eq!(
+        manifest["geometry"]["kv_heads"].as_u64(),
+        Some(GEA2_KV as u64)
+    );
+    assert_eq!(
+        manifest["geometry"]["intermediate_dim"].as_u64(),
+        Some(GEA2_F as u64)
+    );
     let (inputs, tensor_range_read_us, tensor_range_read_bytes) =
         gea2_scalar_block_inputs(&manifest);
 
@@ -2193,8 +2276,8 @@ fn gea2_real_metal_block_receipt() {
     // The real session: physical Metal, one module compile, one execution.
     let runtime =
         DeviceRuntime::Metal(MetalHostSession::try_open().expect("physical Metal admission"));
-    let mut host = CompositeHost::with_device(runtime, "metal-device")
-        .expect("real-metal composite");
+    let mut host =
+        CompositeHost::with_device(runtime, "metal-device").expect("real-metal composite");
     let mut session = host
         .create_program_session(&descriptor)
         .expect("real GEA2 program session");
@@ -2219,16 +2302,27 @@ fn gea2_real_metal_block_receipt() {
     let declared_entries: Vec<String> = descriptor
         .launches
         .iter()
-        .map(|launch| descriptor.kernels[launch.kernel_index as usize].entry.clone())
+        .map(|launch| {
+            descriptor.kernels[launch.kernel_index as usize]
+                .entry
+                .clone()
+        })
         .collect();
     assert_eq!(receipt.launch_entries, declared_entries);
-    assert_eq!(receipt.fused_library_dispatches.len(), 0, "zero CPU substitutes");
+    assert_eq!(
+        receipt.fused_library_dispatches.len(),
+        0,
+        "zero CPU substitutes"
+    );
     assert!(
         receipt.allocated_buffer_versions.len() == 101,
         "the plan's 101 version-keyed buffers are the whole allocation set"
     );
     let counters = host.device().expect("device present").driver_counters();
-    assert_eq!(counters.uploads, 12, "each declared host tensor uploads exactly once");
+    assert_eq!(
+        counters.uploads, 12,
+        "each declared host tensor uploads exactly once"
+    );
     // S2-8 real-device counter contract: the system driver reports module
     // lifecycle counters as zero (only the fake drivers count them); the
     // single module compile is proven by the 64 launches executing against
@@ -2237,14 +2331,30 @@ fn gea2_real_metal_block_receipt() {
         counters.module_loads, 0,
         "system driver reports module counters as zero (S2-8 real-device gate)"
     );
-    assert_eq!(receipt.readbacks, 1, "the declared output is the only readback");
+    assert_eq!(
+        receipt.readbacks, 1,
+        "the declared output is the only readback"
+    );
     assert_eq!(receipt.outputs.len(), 1);
-    assert_eq!(receipt.transfers, 1, "one step-boundary transfer: the declared readback");
-    assert_eq!(receipt.syncs, 1, "one step-boundary sync after the last launch");
+    assert_eq!(
+        receipt.transfers, 1,
+        "one step-boundary transfer: the declared readback"
+    );
+    assert_eq!(
+        receipt.syncs, 1,
+        "one step-boundary sync after the last launch"
+    );
     let output_id = descriptor.results[0].buffer_id;
     let observed = &receipt.outputs[&output_id];
-    assert_eq!(observed.len(), GEA2_T * GEA2_D, "the declared [8,960] output in full");
-    assert!(observed.iter().all(|value| value.is_finite()), "finite physical output");
+    assert_eq!(
+        observed.len(),
+        GEA2_T * GEA2_D,
+        "the declared [8,960] output in full"
+    );
+    assert!(
+        observed.iter().all(|value| value.is_finite()),
+        "finite physical output"
+    );
 
     // Dependency-edge satisfaction: 78 declared edges, producer before consumer.
     assert_eq!(descriptor.data_flow.len(), 78);
@@ -2255,7 +2365,11 @@ fn gea2_real_metal_block_receipt() {
             let satisfied = receipt.launch_ids.contains(&edge.producer)
                 && receipt.launch_ids.contains(&edge.consumer)
                 && edge.producer < edge.consumer;
-            assert!(satisfied, "edge {}→{} unsatisfied", edge.producer, edge.consumer);
+            assert!(
+                satisfied,
+                "edge {}→{} unsatisfied",
+                edge.producer, edge.consumer
+            );
             json!({
                 "producer": edge.producer,
                 "consumer": edge.consumer,
@@ -2273,13 +2387,11 @@ fn gea2_real_metal_block_receipt() {
     // aggregate-conjunction-of-maxima form. The aggregate metrics remain in
     // the receipt for the record.
     let expected = oracle_scalar_block(&inputs);
-    let (max_abs, max_rel, max_ulp, first_index) =
-        gea2_compare_block_output(&expected, observed);
+    let (max_abs, max_rel, max_ulp, first_index) = gea2_compare_block_output(&expected, observed);
     let (policy_pass, failing_elements) =
         gea2_element_wise_passes(&expected, observed, 5e-4, 2e-5, 1024);
     assert_eq!(
-        failing_elements,
-        0,
+        failing_elements, 0,
         "the amended element-wise gate must pass every block element"
     );
     let sample_rows: Vec<Value> = (0..8)
@@ -2565,8 +2677,10 @@ fn gea2_diagnostic_descriptor() -> DeviceDescriptor {
     for (index, kernel) in envelope.program.kernels.iter().enumerate() {
         let launch_id = u32::try_from(index + 1).expect("launch id fits u32");
         for resource in &kernel.resources {
-            if matches!(resource.access, Gea2ResourceAccess::Write | Gea2ResourceAccess::ReadWrite)
-            {
+            if matches!(
+                resource.access,
+                Gea2ResourceAccess::Write | Gea2ResourceAccess::ReadWrite
+            ) {
                 observed.insert(resource.buffer.id, (resource.version.version, launch_id));
             }
         }
@@ -2708,24 +2822,114 @@ struct Gea2FrozenTolerance {
 /// composition changes (aggregate-conjunction-of-maxima → element-wise
 /// disjunction, CTO ruling f51387e4).
 const GEA2_FROZEN_TOLERANCES: [Gea2FrozenTolerance; 18] = [
-    Gea2FrozenTolerance { family: "rmsnorm_pre_attention", atol: 2.0e-5, rtol: 2.0e-5, ulp: 256 },
-    Gea2FrozenTolerance { family: "q_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "k_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "v_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "rope_q", atol: 2.0e-6, rtol: 2.0e-6, ulp: 64 },
-    Gea2FrozenTolerance { family: "rope_k", atol: 2.0e-6, rtol: 2.0e-6, ulp: 64 },
-    Gea2FrozenTolerance { family: "score_gemm", atol: 2.0e-5, rtol: 1.0e-5, ulp: 256 },
-    Gea2FrozenTolerance { family: "causal_softmax", atol: 2.0e-6, rtol: 2.0e-6, ulp: 128 },
-    Gea2FrozenTolerance { family: "context_gemm", atol: 2.0e-5, rtol: 1.0e-5, ulp: 256 },
-    Gea2FrozenTolerance { family: "o_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "residual_1", atol: 0.0, rtol: 0.0, ulp: 0 },
-    Gea2FrozenTolerance { family: "rmsnorm_post_attention", atol: 2.0e-5, rtol: 2.0e-5, ulp: 256 },
-    Gea2FrozenTolerance { family: "gate_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "up_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "swiglu", atol: 5.0e-6, rtol: 5.0e-6, ulp: 128 },
-    Gea2FrozenTolerance { family: "down_projection_gemm", atol: 1.0e-4, rtol: 1.0e-5, ulp: 512 },
-    Gea2FrozenTolerance { family: "residual_2", atol: 0.0, rtol: 0.0, ulp: 0 },
-    Gea2FrozenTolerance { family: "block_output", atol: 5.0e-4, rtol: 2.0e-5, ulp: 1024 },
+    Gea2FrozenTolerance {
+        family: "rmsnorm_pre_attention",
+        atol: 2.0e-5,
+        rtol: 2.0e-5,
+        ulp: 256,
+    },
+    Gea2FrozenTolerance {
+        family: "q_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "k_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "v_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "rope_q",
+        atol: 2.0e-6,
+        rtol: 2.0e-6,
+        ulp: 64,
+    },
+    Gea2FrozenTolerance {
+        family: "rope_k",
+        atol: 2.0e-6,
+        rtol: 2.0e-6,
+        ulp: 64,
+    },
+    Gea2FrozenTolerance {
+        family: "score_gemm",
+        atol: 2.0e-5,
+        rtol: 1.0e-5,
+        ulp: 256,
+    },
+    Gea2FrozenTolerance {
+        family: "causal_softmax",
+        atol: 2.0e-6,
+        rtol: 2.0e-6,
+        ulp: 128,
+    },
+    Gea2FrozenTolerance {
+        family: "context_gemm",
+        atol: 2.0e-5,
+        rtol: 1.0e-5,
+        ulp: 256,
+    },
+    Gea2FrozenTolerance {
+        family: "o_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "residual_1",
+        atol: 0.0,
+        rtol: 0.0,
+        ulp: 0,
+    },
+    Gea2FrozenTolerance {
+        family: "rmsnorm_post_attention",
+        atol: 2.0e-5,
+        rtol: 2.0e-5,
+        ulp: 256,
+    },
+    Gea2FrozenTolerance {
+        family: "gate_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "up_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "swiglu",
+        atol: 5.0e-6,
+        rtol: 5.0e-6,
+        ulp: 128,
+    },
+    Gea2FrozenTolerance {
+        family: "down_projection_gemm",
+        atol: 1.0e-4,
+        rtol: 1.0e-5,
+        ulp: 512,
+    },
+    Gea2FrozenTolerance {
+        family: "residual_2",
+        atol: 0.0,
+        rtol: 0.0,
+        ulp: 0,
+    },
+    Gea2FrozenTolerance {
+        family: "block_output",
+        atol: 5.0e-4,
+        rtol: 2.0e-5,
+        ulp: 1024,
+    },
 ];
 
 fn gea2_frozen_tolerance(family: &str) -> Gea2FrozenTolerance {
@@ -2824,18 +3028,24 @@ fn gea2_amended_block_gate_passes_v5_noise_and_fails_semantic_errors() {
     ];
     let v5_noise = [
         -1.049_453_3_f32,
-        2.080_202_0e-5_f32,  // abs 2.384e-7 on a 2.1e-5 element
-        -62.708_584_f32,     // abs 4.959e-5 on a 62.7 element
+        2.080_202_0e-5_f32, // abs 2.384e-7 on a 2.1e-5 element
+        -62.708_584_f32,    // abs 4.959e-5 on a 62.7 element
         1.0_f32,
         -0.5_f32,
     ];
     let (passes, failing) = gea2_element_wise_passes(&expected, &v5_noise, 5e-4, 2e-5, 1024);
-    assert!(passes, "the v5 noise class must pass the amended block gate");
+    assert!(
+        passes,
+        "the v5 noise class must pass the amended block gate"
+    );
     assert_eq!(failing, 0);
     // The old aggregate conjunction fails the same row (max_rel > rtol).
     let (max_abs, max_rel, max_ulp) = gea2_row_metrics(&expected, &v5_noise);
     assert!(max_abs <= 5e-4, "the abs channel governs the noise class");
-    assert!(max_rel > 2e-5 && max_ulp > 1024, "the rel/ulp channels are the old failures");
+    assert!(
+        max_rel > 2e-5 && max_ulp > 1024,
+        "the rel/ulp channels are the old failures"
+    );
     // Semantic-scale errors fail.
     let mut semantic = expected;
     semantic[0] += 0.5;
@@ -2862,9 +3072,8 @@ fn gea2_amended_block_gate_passes_v5_noise_and_fails_semantic_errors() {
 #[ignore = "physical Metal gate; run only with GEA2_ARTIFACT_DIR + GEA2_DEVICE_ROWS set"]
 fn gea2_real_metal_diagnostic_rows() {
     let workspace = workspace_root();
-    let manifest_path = workspace.join(
-        "radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json",
-    );
+    let manifest_path = workspace
+        .join("radix/docs/factory/gpu-execution-architecture/evidence/gea2-input-manifest.json");
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path)
             .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
@@ -2883,8 +3092,8 @@ fn gea2_real_metal_diagnostic_rows() {
 
     let runtime =
         DeviceRuntime::Metal(MetalHostSession::try_open().expect("physical Metal admission"));
-    let mut host = CompositeHost::with_device(runtime, "metal-device")
-        .expect("real-metal composite");
+    let mut host =
+        CompositeHost::with_device(runtime, "metal-device").expect("real-metal composite");
     let mut session = host
         .create_program_session(&descriptor)
         .expect("diagnostic GEA2 program session");
@@ -2893,11 +3102,7 @@ fn gea2_real_metal_diagnostic_rows() {
         .execute_with_weight_bytes(&BTreeMap::new(), &uploads)
         .expect("the 64-launch GEA2 block executes on physical Metal");
     session.teardown().expect("ordered diagnostic teardown");
-    assert_eq!(
-        receipt.outputs.len(),
-        89,
-        "every observed row is read back"
-    );
+    assert_eq!(receipt.outputs.len(), 89, "every observed row is read back");
 
     // Per-launch comparison in launch order under the GEA2-U5j amended
     // gate: each observed buffer maps to its declared frozen family (the
@@ -2922,9 +3127,7 @@ fn gea2_real_metal_diagnostic_rows() {
             .kernels
             .iter()
             .flat_map(|kernel| kernel.buffers.iter())
-            .find(|slot| {
-                slot.buffer_id == result.buffer_id && slot.version == result.version
-            })
+            .find(|slot| slot.buffer_id == result.buffer_id && slot.version == result.version)
             .expect("observed buffer has a descriptor slot");
         let family = gea2_diagnostic_family(&slot.buffer_name);
         let expected = &reference[&result.buffer_id];

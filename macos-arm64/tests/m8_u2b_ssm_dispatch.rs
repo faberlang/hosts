@@ -102,21 +102,12 @@ fn fill_attention_kv(sequence: usize, value_offset: f32) -> Vec<f32> {
             let within_group = index % (sequence * HEAD_DIM);
             let token = within_group / HEAD_DIM;
             let dimension = within_group % HEAD_DIM;
-            value_offset
-                + group as f32 * 0.003
-                + token as f32 * 0.001
-                + dimension as f32 * 0.00001
+            value_offset + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001
         })
         .collect()
 }
 
-fn cpu_attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    seq_block: usize,
-    query_seq: usize,
-) -> Vec<f32> {
+fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], seq_block: usize, query_seq: usize) -> Vec<f32> {
     let q_row = Q_PER_KV * query_seq * HEAD_DIM;
     let q_head = query_seq * HEAD_DIM;
     let k_row = seq_block * HEAD_DIM;
@@ -150,9 +141,7 @@ fn cpu_attention(
                     let value = weights
                         .iter()
                         .enumerate()
-                        .map(|(token, weight)| {
-                            *weight * v[k_base + token * HEAD_DIM + dimension]
-                        })
+                        .map(|(token, weight)| *weight * v[k_base + token * HEAD_DIM + dimension])
                         .sum::<f32>()
                         / row_sum;
                     output[output_base + dimension] = value;
@@ -214,7 +203,11 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
         output: &mut conv_prefill,
     })
     .expect("plan-path SSM prefill convolution");
-    assert_close(&conv_prefill, &expected_conv_prefill, "SSM prefill convolution");
+    assert_close(
+        &conv_prefill,
+        &expected_conv_prefill,
+        "SSM prefill convolution",
+    );
 
     let expected_state_prefill = cpu_scan(&expected_conv_prefill, PREFILL_TOKENS, SSM_STATE_SIZE);
     let scan_prefill_bind = SsmScanBind::prefill(
@@ -236,7 +229,12 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
     // plan seams (the decode regime row).
     let decode_input = synthetic_ssm_input(1);
     let expected_conv_decode = cpu_conv1d(&decode_input, 1, SSM_STATE_SIZE, &conv_kernel);
-    let conv_decode_bind = SsmConv1dBind::channels_last(1, SSM_STATE_SIZE as u64, SSM_CONV_KERNEL as u64, [SSM_STATE_SIZE as u32, 1, 1]);
+    let conv_decode_bind = SsmConv1dBind::channels_last(
+        1,
+        SSM_STATE_SIZE as u64,
+        SSM_CONV_KERNEL as u64,
+        [SSM_STATE_SIZE as u32, 1, 1],
+    );
     let mut conv_decode = vec![0.0; expected_conv_decode.len()];
     ssm_family_dispatch(SsmFamilyDispatch::SsmConv1d {
         library_entry: Some("SsmConv1d"),
@@ -246,7 +244,11 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
         output: &mut conv_decode,
     })
     .expect("plan-path SSM decode convolution");
-    assert_close(&conv_decode, &expected_conv_decode, "SSM decode convolution");
+    assert_close(
+        &conv_decode,
+        &expected_conv_decode,
+        "SSM decode convolution",
+    );
 
     let previous_state = &state_prefill[(PREFILL_TOKENS - 1) * SSM_STATE_SIZE..];
     let decode_state_input: Vec<f32> = previous_state
@@ -254,7 +256,8 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
         .zip(&conv_decode)
         .map(|(previous, update)| previous + update)
         .collect();
-    let scan_decode_bind = SsmScanBind::decode(SSM_STATE_SIZE as u64, [SSM_STATE_SIZE as u32, 1, 1]);
+    let scan_decode_bind =
+        SsmScanBind::decode(SSM_STATE_SIZE as u64, [SSM_STATE_SIZE as u32, 1, 1]);
     let mut state_decode = vec![0.0; SSM_STATE_SIZE];
     ssm_family_dispatch(SsmFamilyDispatch::SsmScan {
         library_entry: Some("SsmScan"),
@@ -290,7 +293,13 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
     .expect("landed attention prefill body");
     assert_close(
         &attention_prefill,
-        &cpu_attention(&prefill_q, &prefill_k, &prefill_v, PREFILL_TOKENS, PREFILL_TOKENS),
+        &cpu_attention(
+            &prefill_q,
+            &prefill_k,
+            &prefill_v,
+            PREFILL_TOKENS,
+            PREFILL_TOKENS,
+        ),
         "KV prefill output",
     );
 
@@ -301,8 +310,12 @@ fn run_hybrid_probe_layer() -> Vec<Vec<u8>> {
     for group in 0..KV_HEAD_COUNT {
         for dimension in 0..HEAD_DIM {
             let token = PREFILL_TOKENS;
-            decode_k.push(0.01 + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001);
-            decode_v.push(0.04 + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001);
+            decode_k.push(
+                0.01 + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001,
+            );
+            decode_v.push(
+                0.04 + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001,
+            );
         }
     }
     let decode_bind = CausalAttentionBind::grouped(
@@ -587,7 +600,9 @@ fn ssm_layer_descriptor(
 
 /// CPU parity oracle for one SSM layer through the plan dispatch seams.
 fn ssm_layer_cpu_oracle(length: u64, state_dim: u64, kernel_width: u64) -> Vec<f32> {
-    let kernel: Vec<f32> = (0..kernel_width).map(|tap| 0.25 - tap as f32 * 0.05).collect();
+    let kernel: Vec<f32> = (0..kernel_width)
+        .map(|tap| 0.25 - tap as f32 * 0.05)
+        .collect();
     let input: Vec<f32> = (0..length * state_dim)
         .map(|index| {
             let token = index / state_dim;

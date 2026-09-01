@@ -197,7 +197,12 @@ fn head_chain_terminal_binding_reads_one_vocab_row_with_c2_next_token() {
             module,
             "head_rmsnorm",
             &[
-                binding(activation, 0, hidden_view.byte_offset(), hidden_view.byte_span()),
+                binding(
+                    activation,
+                    0,
+                    hidden_view.byte_offset(),
+                    hidden_view.byte_span(),
+                ),
                 binding(weight, 1, 0, HIDDEN as u64 * F32_BYTES as u64),
                 binding(plan_extra, 2, 0, F32_BYTES as u64),
                 binding(norm_row, 3, 0, HIDDEN as u64 * F32_BYTES as u64),

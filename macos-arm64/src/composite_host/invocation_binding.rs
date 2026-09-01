@@ -98,7 +98,9 @@ pub fn project_invocation_bindings(
 
     let required = match invocation.mode {
         DeviceExecuteInvocationMode::Prefill => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", ""],
-        DeviceExecuteInvocationMode::ScalarDecode => [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", KV_PREFIX_IDS],
+        DeviceExecuteInvocationMode::ScalarDecode => {
+            [PROMPT_TOKENS, ROPE_COS, ROPE_SIN, "", KV_PREFIX_IDS]
+        }
     };
     let required = required.into_iter().filter(|name| !name.is_empty());
     let inputs = declared_input_specs(descriptor, required)?;

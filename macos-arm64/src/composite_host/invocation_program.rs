@@ -141,9 +141,7 @@ impl InvocationPrograms {
             ));
         }
         if descriptor.verification_query_rows == 0 {
-            return Err(invalid_args(
-                "verification query_rows must be at least 1",
-            ));
+            return Err(invalid_args("verification query_rows must be at least 1"));
         }
         if descriptor.verification_query_rows > descriptor.capacity {
             return Err(invalid_args(format!(

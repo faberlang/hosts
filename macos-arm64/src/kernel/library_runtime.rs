@@ -1010,12 +1010,13 @@ mod tests {
         let pooled_after = runtime
             .readback_f32(&pooled_handle)
             .expect("read pooled buffer");
-        for (actual, want) in pooled_after.iter().zip(
-            pooled
+        for (actual, want) in
+            pooled_after
                 .iter()
-                .enumerate()
-                .map(|(index, value)| value + skip.get(index.wrapping_sub(4)).copied().unwrap_or(0.0)),
-        ) {
+                .zip(pooled.iter().enumerate().map(|(index, value)| {
+                    value + skip.get(index.wrapping_sub(4)).copied().unwrap_or(0.0)
+                }))
+        {
             assert!(
                 (actual - want).abs() <= 1.0e-6 * want.abs().max(1.0),
                 "expected pooled {want}, wrote {actual}"
@@ -1033,9 +1034,7 @@ mod tests {
             MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
                 .expect("fake Metal admission"),
         );
-        let handle = runtime
-            .alloc_bytes(16)
-            .expect("allocate bridge buffer");
+        let handle = runtime.alloc_bytes(16).expect("allocate bridge buffer");
         let view = FusedLibraryDeviceBuffer {
             handle: &handle,
             dtype: DeviceDataType::F32,

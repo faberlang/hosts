@@ -10,9 +10,7 @@ use faber_host_macos_arm64::kernel::library::{dispatch, CausalAttentionBind, Lib
 use faber_host_macos_arm64::kernel::ssm_conv1d::{
     dispatch_ssm_conv1d, SsmConv1dBind, SsmConv1dKernel,
 };
-use faber_host_macos_arm64::kernel::ssm_scan::{
-    dispatch_ssm_scan, SsmScanBind, SsmScanKernel,
-};
+use faber_host_macos_arm64::kernel::ssm_scan::{dispatch_ssm_scan, SsmScanBind, SsmScanKernel};
 
 const MODEL_BLOCK: usize = 0;
 const PREFILL_TOKENS: usize = 3;
@@ -85,10 +83,7 @@ fn fill_attention_kv(sequence: usize, value_offset: f32) -> Vec<f32> {
             let within_group = index % (sequence * HEAD_DIM);
             let token = within_group / HEAD_DIM;
             let dimension = within_group % HEAD_DIM;
-            value_offset
-                + group as f32 * 0.003
-                + token as f32 * 0.001
-                + dimension as f32 * 0.00001
+            value_offset + group as f32 * 0.003 + token as f32 * 0.001 + dimension as f32 * 0.00001
         })
         .collect()
 }
@@ -127,13 +122,7 @@ fn assert_attention_kv_prefix(prefill: &[f32], decode: &[f32], label: &str) {
     }
 }
 
-fn cpu_attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    seq_block: usize,
-    query_seq: usize,
-) -> Vec<f32> {
+fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], seq_block: usize, query_seq: usize) -> Vec<f32> {
     let q_row = Q_PER_KV * query_seq * HEAD_DIM;
     let q_head = query_seq * HEAD_DIM;
     let k_row = seq_block * HEAD_DIM;
@@ -152,8 +141,7 @@ fn cpu_attention(
                 for token in 0..visible {
                     let mut dot = 0.0;
                     for dimension in 0..HEAD_DIM {
-                        dot += q[q_base + dimension]
-                            * k[k_base + token * HEAD_DIM + dimension];
+                        dot += q[q_base + dimension] * k[k_base + token * HEAD_DIM + dimension];
                     }
                     scores.push(dot * scale);
                 }
@@ -168,9 +156,7 @@ fn cpu_attention(
                     let value = weights
                         .iter()
                         .enumerate()
-                        .map(|(token, weight)| {
-                            *weight * v[k_base + token * HEAD_DIM + dimension]
-                        })
+                        .map(|(token, weight)| *weight * v[k_base + token * HEAD_DIM + dimension])
                         .sum::<f32>()
                         / row_sum;
                     output[output_base + dimension] = value;
@@ -200,17 +186,17 @@ fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
 
 #[test]
 fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
-    assert_eq!(MODEL_BLOCK % 4, 0, "fixture must be a hybrid MODEL-01 block");
+    assert_eq!(
+        MODEL_BLOCK % 4,
+        0,
+        "fixture must be a hybrid MODEL-01 block"
+    );
     assert_eq!(HEAD_COUNT, KV_HEAD_COUNT * Q_PER_KV);
 
     let conv_kernel = [0.25f32, -0.1, 0.05, 0.02];
     let prefill_input = synthetic_ssm_input(PREFILL_TOKENS);
-    let expected_conv_prefill = cpu_conv1d(
-        &prefill_input,
-        PREFILL_TOKENS,
-        SSM_STATE_SIZE,
-        &conv_kernel,
-    );
+    let expected_conv_prefill =
+        cpu_conv1d(&prefill_input, PREFILL_TOKENS, SSM_STATE_SIZE, &conv_kernel);
     let conv_prefill_bind = SsmConv1dBind::channels_last(
         PREFILL_TOKENS as u64,
         SSM_STATE_SIZE as u64,
@@ -226,7 +212,11 @@ fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
         &mut conv_prefill,
     )
     .expect("PS1 SSM prefill body");
-    assert_close(&conv_prefill, &expected_conv_prefill, "SSM prefill convolution");
+    assert_close(
+        &conv_prefill,
+        &expected_conv_prefill,
+        "SSM prefill convolution",
+    );
 
     let expected_state_prefill = cpu_scan(&expected_conv_prefill, PREFILL_TOKENS, SSM_STATE_SIZE);
     let scan_prefill_bind = SsmScanBind::prefill(
@@ -261,7 +251,11 @@ fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
         &mut conv_decode,
     )
     .expect("PS1 SSM decode body");
-    assert_close(&conv_decode, &expected_conv_decode, "SSM decode convolution");
+    assert_close(
+        &conv_decode,
+        &expected_conv_decode,
+        "SSM decode convolution",
+    );
 
     let previous_state = &state_prefill[(PREFILL_TOKENS - 1) * SSM_STATE_SIZE..];
     let decode_state_input: Vec<f32> = previous_state
@@ -269,10 +263,8 @@ fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
         .zip(&conv_decode)
         .map(|(previous, update)| previous + update)
         .collect();
-    let scan_decode_bind = SsmScanBind::decode(
-        SSM_STATE_SIZE as u64,
-        [SSM_STATE_SIZE as u32, 1, 1],
-    );
+    let scan_decode_bind =
+        SsmScanBind::decode(SSM_STATE_SIZE as u64, [SSM_STATE_SIZE as u32, 1, 1]);
     let mut state_decode = vec![0.0; SSM_STATE_SIZE];
     dispatch_ssm_scan(
         SsmScanKernel::Additive,
@@ -306,15 +298,29 @@ fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
     .expect("landed attention prefill body");
     assert_close(
         &attention_prefill,
-        &cpu_attention(&prefill_q, &prefill_k, &prefill_v, PREFILL_TOKENS, PREFILL_TOKENS),
+        &cpu_attention(
+            &prefill_q,
+            &prefill_k,
+            &prefill_v,
+            PREFILL_TOKENS,
+            PREFILL_TOKENS,
+        ),
         "KV prefill output",
     );
 
     let decode_q = fill_attention_q(1, 0.025);
     let decode_k = extend_attention_kv(&prefill_k, 0.01);
     let decode_v = extend_attention_kv(&prefill_v, 0.04);
-    assert_attention_kv_prefix(&prefill_k, &decode_k, "decode KV state starts from prefill rows");
-    assert_attention_kv_prefix(&prefill_v, &decode_v, "decode KV values start from prefill rows");
+    assert_attention_kv_prefix(
+        &prefill_k,
+        &decode_k,
+        "decode KV state starts from prefill rows",
+    );
+    assert_attention_kv_prefix(
+        &prefill_v,
+        &decode_v,
+        "decode KV values start from prefill rows",
+    );
     let decode_bind = CausalAttentionBind::grouped(
         HEAD_DIM as u64,
         (PREFILL_TOKENS + 1) as u64,
@@ -342,5 +348,4 @@ fn qwen35moe_hybrid_layer_prefill_and_decode_keep_state_families_separate() {
     println!(
         "EXEC02-PS5 layer=blk.{MODEL_BLOCK} state=SSM prefill_rows={PREFILL_TOKENS} decode_rows=1 state_size={SSM_STATE_SIZE}; state=KV prefill_rows={PREFILL_TOKENS} decode_rows=1 kv_heads={KV_HEAD_COUNT} q_heads={HEAD_COUNT} q_per_kv={Q_PER_KV} head_dim={HEAD_DIM}; regimes=prefill,decode"
     );
-
 }

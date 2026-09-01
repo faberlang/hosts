@@ -31,7 +31,9 @@ const SELECTOR_BYTES_BEFORE: usize = PREFILL_ROWS * VOCAB * F32_BYTES;
 /// The fixed-1000 prompt's token ids (the fixture's parity record owns the
 /// real values; these stand in as arbitrary in-range ids).
 fn token_ids() -> Vec<u32> {
-    (0..PREFILL_ROWS).map(|row| ((row * 1_373) % VOCAB) as u32).collect()
+    (0..PREFILL_ROWS)
+        .map(|row| ((row * 1_373) % VOCAB) as u32)
+        .collect()
 }
 
 fn ids_le_bytes(ids: &[u32]) -> Vec<u8> {
@@ -43,13 +45,16 @@ fn pgc_r1_device_embedding_launch_binds_compact_token_ids() {
     assert_eq!(SELECTOR_BYTES_BEFORE, 7_077_888);
     assert_eq!(IDS_BYTES, 144);
 
-    let session =
-        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()
+    let session = MetalHostSession::with_driver(Box::new(
+        FakeMetalDriver::default()
             .with_known_entry("prefill_embedding_gather")
-            .with_known_entry("embedding_gather")))
-        .expect("fake Metal");
+            .with_known_entry("embedding_gather"),
+    ))
+    .expect("fake Metal");
     let mut runtime = DeviceRuntime::Metal(session);
-    let module = runtime.load_module(b"pgc-r1-embedding-gather").expect("module");
+    let module = runtime
+        .load_module(b"pgc-r1-embedding-gather")
+        .expect("module");
     let table = runtime.alloc_bytes(TABLE_BYTES).expect("table");
     let ids = runtime.alloc_bytes(IDS_BYTES).expect("ids");
     let plan_extra = runtime.alloc_bytes(F32_BYTES).expect("inert plan extra");
@@ -59,10 +64,17 @@ fn pgc_r1_device_embedding_launch_binds_compact_token_ids() {
     let ids_bytes = ids_le_bytes(&token_ids());
     assert_eq!(ids_bytes.len(), IDS_BYTES);
     runtime
-        .copy_in_bytes(&ids, &ids_bytes, faber_host_macos_arm64::device_descriptor::DeviceDataType::U8)
+        .copy_in_bytes(
+            &ids,
+            &ids_bytes,
+            faber_host_macos_arm64::device_descriptor::DeviceDataType::U8,
+        )
         .expect("ids upload");
     let observed = runtime
-        .readback_bytes(&ids, faber_host_macos_arm64::device_descriptor::DeviceDataType::U8)
+        .readback_bytes(
+            &ids,
+            faber_host_macos_arm64::device_descriptor::DeviceDataType::U8,
+        )
         .expect("ids readback");
     assert_eq!(observed, ids_bytes, "token ids round-trip byte-exact");
 
@@ -122,13 +134,16 @@ fn pgc_r1_device_embedding_launch_binds_compact_token_ids() {
 /// 960-element row copy.
 #[test]
 fn pgc_r1_device_decode_member_is_one_row_copy() {
-    let session =
-        MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()
+    let session = MetalHostSession::with_driver(Box::new(
+        FakeMetalDriver::default()
             .with_known_entry("prefill_embedding_gather")
-            .with_known_entry("embedding_gather")))
-        .expect("fake Metal");
+            .with_known_entry("embedding_gather"),
+    ))
+    .expect("fake Metal");
     let mut runtime = DeviceRuntime::Metal(session);
-    let module = runtime.load_module(b"pgc-r1-embedding-gather").expect("module");
+    let module = runtime
+        .load_module(b"pgc-r1-embedding-gather")
+        .expect("module");
     let table = runtime.alloc_bytes(TABLE_BYTES).expect("table");
     let ids = runtime.alloc_bytes(F32_BYTES).expect("one id");
     let output = runtime.alloc_bytes(HIDDEN * F32_BYTES).expect("one row");

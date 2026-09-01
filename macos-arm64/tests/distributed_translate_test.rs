@@ -97,7 +97,11 @@ fn snapshot_entry(ordinal: u32, identity: PhysicalDeviceId, model: &str) -> Devi
 fn one_physical_snapshot() -> DeviceDiscoverySnapshot {
     DeviceDiscoverySnapshot::from_enumerated(
         PROBE_TIME,
-        [snapshot_entry(0, snapshot_device(), "synthetic 8:1 fixture")],
+        [snapshot_entry(
+            0,
+            snapshot_device(),
+            "synthetic 8:1 fixture",
+        )],
     )
 }
 
@@ -366,7 +370,10 @@ fn eight_rank_split_two_binds_contiguous_halves_deterministically() {
         .map(|partition| partition.as_str().to_owned())
         .collect();
     let expected_order: Vec<String> = (0..8).map(|id| format!("partition-{id}")).collect();
-    assert_eq!(plan_order, expected_order, "plan order is the split's rank order");
+    assert_eq!(
+        plan_order, expected_order,
+        "plan order is the split's rank order"
+    );
 
     let snapshot = two_physical_snapshot();
     let policy = BindPolicy::SplitAcrossMembership { bind_count: 2 };
@@ -520,7 +527,10 @@ fn split_two_binding_table_keeps_identity_classes_distinct() {
         physical_ids.is_disjoint(&virtual_ids),
         "virtual and physical identity namespaces must never merge"
     );
-    assert_eq!(bound.fixture_identity_class(), FixtureIdentityClass::Virtual);
+    assert_eq!(
+        bound.fixture_identity_class(),
+        FixtureIdentityClass::Virtual
+    );
 }
 
 #[test]
