@@ -31,3 +31,11 @@ metal = "0.33"
 [dev-dependencies]
 hygiene-ratchet = { path = "../../radix/crates/hygiene-ratchet" }
 tempfile = "3"
+# kernel-codegen Unit 4: the physical numeric fixture builds the four-child
+# MLP device program through the real generic constructor and emits its MSL
+# through the real device-artifact path (never hand-written MSL).
+radix-hir = { path = "../../radix/crates/radix-hir" }
+radix-lexer = { path = "../../radix/crates/radix-lexer" }
+radix-mir = { path = "../../radix/crates/radix-mir" }
+radix-mir-metal = { path = "../../radix/crates/radix-mir-metal" }
+radix-types = { path = "../../radix/crates/radix-types" }

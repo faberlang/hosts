@@ -514,7 +514,12 @@ dependencies = [
  "metal",
  "postcard",
  "processus",
+ "radix-hir",
+ "radix-lexer",
+ "radix-mir",
  "radix-mir-fmir",
+ "radix-mir-metal",
+ "radix-types",
  "serde",
  "serde_json",
  "solum",
@@ -1367,6 +1372,19 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "radix-mir-metal"
+version = "0.84.0"
+dependencies = [
+ "radix-codegen-shared",
+ "radix-hir",
+ "radix-lexer",
+ "radix-mir",
+ "radix-mir-fmir",
+ "radix-types",
+ "rustc-hash",
 ]
 
 [[package]]
