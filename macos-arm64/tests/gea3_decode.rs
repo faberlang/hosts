@@ -41,9 +41,16 @@ const MODULE_IMAGE_RULE: &str =
     "module_members are independently selectable; the plan binds them by entry identity";
 const SOURCE: &str = "gradus/src/kernel.fab";
 const LAYERS: usize = 32;
-const BLOCK_LAUNCHES_PER_LAYER: usize = 62;
+// kernel-codegen Unit 5: the exported decode/prefill blocks launch the
+// compiler-generated four-child MLP (`decode_mlp__0..3` /
+// `prefill_mlp__0..3`) instead of one composed parent row, so the per-layer
+// census is the 61 ordinary rows plus the four generated children.
+const BLOCK_LAUNCHES_PER_LAYER: usize = 65;
 const LAUNCHES_PER_PROGRAM: usize = LAYERS * BLOCK_LAUNCHES_PER_LAYER + 3;
-const DEPENDENCIES_PER_PROGRAM: usize = LAUNCHES_PER_PROGRAM - 1;
+// Every launch chains once, and each layer's generated join child carries a
+// second producer edge (the fan-in child holds one edge per producing
+// operand), so the edge census carries one extra edge per layer.
+const DEPENDENCIES_PER_PROGRAM: usize = LAUNCHES_PER_PROGRAM - 1 + LAYERS;
 const PREFILL_ROWS: u64 = 36;
 const HISTORY_CAPACITY: u64 = 76;
 const KV_WIDTH: u64 = 320;
@@ -1621,6 +1628,11 @@ fn admit_state_buffers(
 }
 
 fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
+    // Named rows pin their specialized recipes; every other entry — the
+    // compiler-generated MLP children included — is admitted by plan kind
+    // (kernel-codegen Unit 5): an ordinary TiledMatMul or Elementwise
+    // descriptor is legal whatever its generated name, and a legal recipe
+    // never fails as an unknown GEA3 entry.
     let admitted = match entry {
         "decode_gemv_qo"
         | "decode_gemv_kv"
@@ -1632,8 +1644,11 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "prefill_score_gemm"
         | "prefill_context_gemm"
         | "lm_head_gemv"
-        | "prefill_lm_head_gemv" => matches!(plan, Gea3Plan::TiledMatMul(_)),
-        "decode_mlp" | "prefill_mlp" => matches!(plan, Gea3Plan::ComposedMatMul(_)),
+        | "prefill_lm_head_gemv"
+        | "kv_append_k"
+        | "kv_append_v"
+        | "prefill_kv_write_k"
+        | "prefill_kv_write_v" => matches!(plan, Gea3Plan::TiledMatMul(_)),
         "head_rmsnorm" | "prefill_head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
             matches!(plan, Gea3Plan::RmsNormalization(_))
         }
@@ -1650,15 +1665,16 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         "decode_residual_add" | "prefill_residual_add" => {
             matches!(plan, Gea3Plan::Elementwise)
         }
-        "kv_append_k" | "kv_append_v" | "prefill_kv_write_k" | "prefill_kv_write_v" => {
-            matches!(plan, Gea3Plan::TiledMatMul(_))
-        }
-        other => return Err(format!("unknown GEA3 entry `{other}`")),
+        // The generated child class (and any future decomposed child):
+        // ordinary plans admit generically by kind, not by name.
+        _ => matches!(plan, Gea3Plan::TiledMatMul(_) | Gea3Plan::Elementwise),
     };
     if admitted {
         Ok(())
     } else {
-        Err(format!("GEA3 entry `{entry}` carries the wrong recipe"))
+        Err(format!(
+            "GEA3 entry `{entry}` carries the wrong recipe {plan:?}"
+        ))
     }
 }
 
@@ -1708,7 +1724,12 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "decode_rmsnorm",
         "decode_gemv_qo",
         "decode_gemv_kv",
-        "decode_mlp",
+        // kernel-codegen Unit 5: the exported MLP launches the compiler-
+        // generated children (`decode_mlp__0..3`), not a composed parent.
+        "decode_mlp__0",
+        "decode_mlp__1",
+        "decode_mlp__2",
+        "decode_mlp__3",
         "decode_rope_q",
         "decode_rope_k",
         "kv_append_k",
@@ -1722,7 +1743,10 @@ fn fake_entry_names() -> impl Iterator<Item = &'static str> {
         "prefill_gemm_qo",
         "prefill_gemm_o",
         "prefill_gemm_kv",
-        "prefill_mlp",
+        "prefill_mlp__0",
+        "prefill_mlp__1",
+        "prefill_mlp__2",
+        "prefill_mlp__3",
         "prefill_rope_q",
         "prefill_rope_k",
         "prefill_key_transpose",
