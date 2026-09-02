@@ -4005,7 +4005,7 @@ fn gea3_parity_timing_companion_optional_emission() {
     // is written.  Present optional output: the production writer emits the
     // companion and the written file parses back to the same schema.
     let absent_dir = tempfile::tempdir().expect("absent-output tempdir");
-    std::env::remove_var(PARITY_COMPANION_ENV);
+    unsafe { std::env::remove_var(PARITY_COMPANION_ENV) };
     assert!(
         gea3_parity_companion_path().is_none(),
         "unset environment is the opt-out"
@@ -4021,10 +4021,10 @@ fn gea3_parity_timing_companion_optional_emission() {
 
     let present_dir = tempfile::tempdir().expect("present-output tempdir");
     let companion_path = present_dir.path().join("gea3-parity-timing-companion.json");
-    std::env::set_var(PARITY_COMPANION_ENV, &companion_path);
+    unsafe { std::env::set_var(PARITY_COMPANION_ENV, &companion_path) };
     let target = gea3_parity_companion_path().expect("companion path from environment");
     gea3_write_parity_companion(Some(&target), &companion);
-    std::env::remove_var(PARITY_COMPANION_ENV);
+    unsafe { std::env::remove_var(PARITY_COMPANION_ENV) };
     let written: Value =
         serde_json::from_slice(&fs::read(&companion_path).expect("read written companion"))
             .expect("written companion is JSON");
@@ -4654,7 +4654,7 @@ fn gea3_soak_metal_decode_receipt() {
 }
 
 fn gea3_physical_receipt_run(identity: Gea3Identity) {
-    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    unsafe { std::env::set_var("FABER_PER_OP_TIMING", "1") };
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
@@ -5466,7 +5466,7 @@ fn gea3_run_staged_diagnostic(
 #[test]
 #[ignore = "diagnostic physical Metal gate; requires exact GEA3 artifact/model/receipt env"]
 fn gea3_real_metal_staged_composition_diagnostic() {
-    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    unsafe { std::env::set_var("FABER_PER_OP_TIMING", "1") };
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
