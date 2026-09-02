@@ -273,20 +273,11 @@ struct Gea3KernelUnit {
 enum Gea3Plan {
     Elementwise,
     TiledMatMul(Gea3MatMulPlan),
-    ComposedMatMul(Gea3ComposedMatMulPlan),
     Transpose(Gea3TransposePlan),
     RmsNormalization(Gea3RmsNormalizationPlan),
     Rope(Gea3RopePlan),
     CausalMaskedSoftmax(Gea3CausalMaskedSoftmaxPlan),
     Gather(Gea3GatherPlan),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Gea3ComposedMatMulPlan {
-    stages: Vec<Value>,
-    edges: Vec<Value>,
-    handoff: String,
 }
 
 #[derive(Debug, Deserialize)]
