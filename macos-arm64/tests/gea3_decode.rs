@@ -43,9 +43,10 @@ const SOURCE: &str = "gradus/src/kernel.fab";
 const LAYERS: usize = 32;
 // kernel-codegen Unit 5: the exported decode/prefill blocks launch the
 // compiler-generated four-child MLP (`decode_mlp__0..3` /
-// `prefill_mlp__0..3`) instead of one composed parent row, so the per-layer
-// census is the 61 ordinary rows plus the four generated children.
-const BLOCK_LAUNCHES_PER_LAYER: usize = 65;
+// `prefill_mlp__0..3`) plus the explicit post-MLP residual row instead of
+// one composed parent row, so the per-layer census is 62 ordinary rows plus
+// the four generated children.
+const BLOCK_LAUNCHES_PER_LAYER: usize = 66;
 const LAUNCHES_PER_PROGRAM: usize = LAYERS * BLOCK_LAUNCHES_PER_LAYER + 3;
 // Every launch chains once, and each layer's generated join child carries a
 // second producer edge (the fan-in child holds one edge per producing
@@ -459,6 +460,31 @@ struct Gea3SubWindowProjection {
     row_count: u64,
     row_stride: u64,
     derived_element_count: u64,
+    /// Optional typed invocation-state source for the static window
+    /// envelope.  `None` is the constant row; `position` is the decode KV
+    /// append's cursor-relative row.
+    #[serde(default)]
+    runtime_source: Option<Gea3RuntimeSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Gea3RuntimeSource {
+    Position,
+    ValidLenAfter,
+    QueryRows,
+    SequenceEpoch,
+}
+
+impl Gea3RuntimeSource {
+    fn descriptor(self) -> DescriptorRuntimeSource {
+        match self {
+            Self::Position => DescriptorRuntimeSource::Position,
+            Self::ValidLenAfter => DescriptorRuntimeSource::ValidLenAfter,
+            Self::QueryRows => DescriptorRuntimeSource::QueryRows,
+            Self::SequenceEpoch => DescriptorRuntimeSource::SequenceEpoch,
+        }
+    }
 }
 
 impl Gea3SubWindowProjection {
@@ -480,11 +506,19 @@ impl Gea3SubWindowProjection {
     /// The byte offset and view span of the window's device binding: the
     /// covering span is exact for a contiguous window and bounds a strided
     /// read-side window (never out of allocation).
-    fn byte_binding(&self) -> Option<(u64, u64)> {
+    fn byte_binding(&self) -> Option<Gea3WindowBinding> {
         let span = self.covering_span()?;
         let offset_bytes = self.element_offset.checked_mul(4)?;
         let span_bytes = span.checked_mul(4)?;
-        Some((offset_bytes, span_bytes))
+        Some(Gea3WindowBinding {
+            byte_offset: offset_bytes,
+            view_span: span_bytes,
+            runtime_source: self.runtime_source.map_or(
+                DescriptorRuntimeSource::Constant,
+                Gea3RuntimeSource::descriptor,
+            ),
+            runtime_step_bytes: self.row_stride.checked_mul(4)?,
+        })
     }
 }
 
@@ -710,10 +744,21 @@ fn load_gea3_plan(artifact_dir: &Path) -> Gea3ProgramPlanEnvelope {
         .unwrap_or_else(|error| panic!("mirror-parse {}: {error}", path.display()))
 }
 
+/// One per-kernel window binding derived from a carried sub-window
+/// projection.  The static envelope and typed cursor source stay together so
+/// the physical route cannot silently drop the source while mapping JSON.
+#[derive(Debug, Clone, Copy)]
+struct Gea3WindowBinding {
+    byte_offset: u64,
+    view_span: u64,
+    runtime_source: DescriptorRuntimeSource,
+    runtime_step_bytes: u64,
+}
+
 /// The per-kernel window bindings derived from the carried sub-window
-/// projections: (kernel index, binding index) → (byte offset, view span).
+/// projections: (kernel index, binding index) → typed window binding.
 /// A slot without an entry binds its whole handle.
-type Gea3WindowBindings = BTreeMap<(u32, u32), (u64, u64)>;
+type Gea3WindowBindings = BTreeMap<(u32, u32), Gea3WindowBinding>;
 
 /// Admit one carried sub-window against the allocation it nests in (the
 /// two-truths guard mirrored from the schema authority
@@ -770,7 +815,7 @@ fn admit_chunked_window(
 fn admit_sub_window(
     resource: &Gea3DeviceResource,
     allocation: u64,
-) -> Result<Option<(u64, u64)>, String> {
+) -> Result<Option<Gea3WindowBinding>, String> {
     let Some(window) = resource.version.sub_window else {
         return Ok(None);
     };
@@ -1636,10 +1681,13 @@ fn check_recipe(entry: &str, plan: &Gea3Plan) -> Result<(), String> {
         | "prefill_context_gemm"
         | "lm_head_gemv"
         | "prefill_lm_head_gemv"
-        | "kv_append_k"
-        | "kv_append_v"
         | "prefill_kv_write_k"
         | "prefill_kv_write_v" => matches!(plan, Gea3Plan::TiledMatMul(_)),
+        // KV append is the generic library's elementwise row update
+        // (`history + row`), not a matrix product.  Its output is projected
+        // into the arena by the resource window, so the compiler export's
+        // Elementwise recipe is the typed plan the physical host must admit.
+        "kv_append_k" | "kv_append_v" => matches!(plan, Gea3Plan::Elementwise),
         "head_rmsnorm" | "prefill_head_rmsnorm" | "decode_rmsnorm" | "prefill_rmsnorm" => {
             matches!(plan, Gea3Plan::RmsNormalization(_))
         }
@@ -1950,14 +1998,29 @@ fn gea3_descriptor_admission() {
         expected_prefill_windows,
         "prefill window binding count from plan"
     );
-    for (byte_offset, view_span) in decode_windows.values().chain(prefill_windows.values()) {
+    for window in decode_windows.values().chain(prefill_windows.values()) {
         assert_eq!(
-            byte_offset % 4,
+            window.byte_offset % 4,
             0,
             "window byte offsets are element aligned"
         );
-        assert_eq!(view_span % 4, 0, "window spans are element aligned");
-        assert!(*view_span > 0, "a window binds a non-empty span");
+        assert_eq!(window.view_span % 4, 0, "window spans are element aligned");
+        assert!(window.view_span > 0, "a window binds a non-empty span");
+    }
+
+    // The row-view clean break carries the cursor source as a typed plan
+    // fact.  Both the history input and arena output of each decode append
+    // must materialize at the current position; a static row-zero binding
+    // corrupts the already-prefilled cache before attention reads it.
+    let dynamic_windows = decode_windows
+        .values()
+        .filter(|window| window.runtime_source == DescriptorRuntimeSource::Position)
+        .collect::<Vec<_>>();
+    assert_eq!(dynamic_windows.len(), LAYERS * 4);
+    for window in dynamic_windows {
+        assert_eq!(window.byte_offset, 0);
+        assert_eq!(window.view_span, KV_WIDTH * 4);
+        assert_eq!(window.runtime_step_bytes, KV_WIDTH * 4);
     }
 
     // The cache declarations are not inferred from resource extents. They
@@ -2769,22 +2832,70 @@ fn gea3_unique_slots(descriptor: &DeviceDescriptor) -> BTreeMap<(u32, u32), Desc
 /// GEA3-A1: one launch binding for a kernel slot — the carried sub-window's
 /// byte offset and view span when the plan declares one, the whole handle
 /// otherwise.  The B4 launch-binding surface carries (handle, binding
-/// index, byte offset, view span, source); the Metal session bounds-checks
-/// offset + span against the allocation before dispatch.
+/// index, byte offset, view span, source); cursor-relative windows are
+/// materialized from the invocation position before the Metal bounds check.
 fn gea3_launch_binding(
     handle: DeviceHandle,
     program: &Gea3PhysicalProgram,
     kernel_index: u32,
     slot: &DescriptorBuffer,
+    position: u32,
 ) -> Result<DeviceLaunchBinding, String> {
     match program.windows.get(&(kernel_index, slot.binding)).copied() {
-        Some((byte_offset, view_span)) => Ok(DeviceLaunchBinding {
-            handle,
-            binding_index: slot.binding,
-            byte_offset,
-            view_span,
-            runtime_source: DescriptorRuntimeSource::Constant,
-        }),
+        Some(window) => {
+            let byte_offset = match window.runtime_source {
+                DescriptorRuntimeSource::Constant | DescriptorRuntimeSource::SequenceEpoch => {
+                    window.byte_offset
+                }
+                DescriptorRuntimeSource::Position => window
+                    .byte_offset
+                    .checked_add(
+                        u64::from(position)
+                            .checked_mul(window.runtime_step_bytes)
+                            .ok_or_else(|| {
+                                format!(
+                                    "kernel {kernel_index} binding {} position offset overflows",
+                                    slot.binding
+                                )
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "kernel {kernel_index} binding {} position offset overflows",
+                            slot.binding
+                        )
+                    })?,
+                DescriptorRuntimeSource::ValidLenAfter | DescriptorRuntimeSource::QueryRows => {
+                    return Err(format!(
+                        "kernel {kernel_index} binding {} carries unsupported GEA3 runtime source {:?}",
+                        slot.binding, window.runtime_source
+                    ));
+                }
+            };
+            let view_span = window.view_span;
+            let allocation_bytes = handle
+                .len_bytes()
+                .ok_or_else(|| format!("kernel {kernel_index} binding has no byte length"))?;
+            let end = byte_offset.checked_add(view_span).ok_or_else(|| {
+                format!(
+                    "kernel {kernel_index} binding {} live view overflows",
+                    slot.binding
+                )
+            })?;
+            if end > allocation_bytes {
+                return Err(format!(
+                    "kernel {kernel_index} binding {} live view spans {view_span} bytes from offset {byte_offset}, allocation is {allocation_bytes} bytes",
+                    slot.binding
+                ));
+            }
+            Ok(DeviceLaunchBinding {
+                handle,
+                binding_index: slot.binding,
+                byte_offset,
+                view_span,
+                runtime_source: window.runtime_source,
+            })
+        }
         None => DeviceLaunchBinding::whole_handle(handle, slot.binding)
             .map_err(|error| error.message.clone()),
     }
@@ -4250,7 +4361,7 @@ fn gea3_run_physical(
                     .get(&(slot.buffer_id, slot.version))
                     .copied()
                     .ok_or_else(|| "prefill launch buffer disappeared".to_owned())?;
-                gea3_launch_binding(handle, &programs[0], launch.kernel_index, slot)
+                gea3_launch_binding(handle, &programs[0], launch.kernel_index, slot, 0)
             })
             .collect::<Result<_, _>>()?;
         runtime
@@ -4399,7 +4510,7 @@ fn gea3_run_physical(
                         .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| "decode launch buffer disappeared".to_owned())?;
-                    gea3_launch_binding(handle, &programs[1], launch.kernel_index, slot)
+                    gea3_launch_binding(handle, &programs[1], launch.kernel_index, slot, position)
                 })
                 .collect::<Result<_, _>>()?;
             runtime
@@ -5001,7 +5112,7 @@ fn gea3_run_staged_diagnostic(
                         .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| "prefill launch buffer disappeared".to_owned())?;
-                    gea3_launch_binding(handle, &programs[0], launch.kernel_index, slot)
+                    gea3_launch_binding(handle, &programs[0], launch.kernel_index, slot, 0)
                 })
                 .collect::<Result<_, String>>()?;
             runtime
@@ -5222,7 +5333,14 @@ fn gea3_run_staged_diagnostic(
                         .get(&(slot.buffer_id, slot.version))
                         .copied()
                         .ok_or_else(|| "diagnostic launch buffer disappeared".to_owned())?;
-                    gea3_launch_binding(handle, program, launch.kernel_index, slot)
+                    gea3_launch_binding(
+                        handle,
+                        program,
+                        launch.kernel_index,
+                        slot,
+                        u32::try_from(prompt_tokens.len())
+                            .map_err(|_| "diagnostic position overflows")?,
+                    )
                 })
                 .collect::<Result<_, String>>()?;
             runtime
