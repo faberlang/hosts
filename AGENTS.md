@@ -22,14 +22,25 @@ asked. Container law: [`../AGENTS.md`](../AGENTS.md).
 Path deps expect sibling `faberlang/{faber,radix}` for library/product work.
 Public generated-Rust carriers live under `faber/runtime/rust`.
 
-GPU architecture follows the canonical public
+All host work follows the canonical public
+[Host Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/host-execution-architecture.md).
+Hosts is a microkernel for physical capabilities and execution. Libraries own
+portable behavior; Radix supplies complete target artifacts and execution
+descriptors. A new library operation must not require a Hosts implementation.
+If a future Linux, Windows, browser, or device host would have to copy the
+code, it belongs in the owning library or Radix unless it is a genuinely new
+physical capability.
+
+GPU work additionally follows
 [GPU Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/gpu-execution-architecture.md).
 Gradus owns ML semantics, logical placement and sharding intent, and all ML
 kernel source in Faber. Radix compiles target artifacts and explicit execution
 facts. Hosts owns physical discovery, virtual-partition admission, binding,
-residency, launch, synchronization, and readback. Do not add an ML kernel body,
-recover missing model facts from resource extents, or silently run a CPU
-implementation on a declared GPU path.
+residency, launch, synchronization, and readback. Do not add or template an ML
+kernel body, decode a packed representation as an operator, recover missing
+model facts from names or resource extents, probe semantic alternatives, or
+silently run a CPU implementation on a declared GPU path. A missing artifact
+or descriptor fact is an upstream failure and must fail closed here.
 
 ## Invariants
 
@@ -39,6 +50,8 @@ implementation on a declared GPU path.
 3. One directory per host **product**. Shared kernel/providers live under `crates/`.
 4. Library crates keep **explicit** path deps (no workspace inheritance) so Faber core-support can embed them alone.
 5. Do not restore `host-kernel-rs` / `host-native-rs` / `host-providers-rs` as live source trees.
+6. Existing library-semantic bodies in this repo are migration debt, not
+   extension points or precedent.
 
 ## Validation
 

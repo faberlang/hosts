@@ -2,10 +2,20 @@
 
 Platform host **products** and shared host **libraries** for Faber-produced artifacts.
 
+Hosts is an execution microkernel. Faber libraries define portable behavior,
+Radix produces complete target artifacts and execution descriptors, and Hosts
+binds those facts to operating systems, browsers, and physical devices. Hosts
+does not implement library algorithms. See the canonical
+[Host Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/host-execution-architecture.md).
+
 Radix compiles Faber and emits host ABI imports (`radix-host-abi`). This repo owns:
 
 1. **Libraries** — kernel, native adapter, capability providers  
 2. **Products** — platform/browser runtimes that load artifacts and supply capabilities
+
+It may implement a new physical capability or execution primitive. Adding an
+operation to Norma, Triga, Tela, Gradus, or another library must not require a
+parallel implementation in each host product.
 
 ## Layout
 
