@@ -1,0 +1,15 @@
+version = 1
+baseline_commit = "e8fee5b2da972cceb956633cbf13a47349bea46e"
+ceiling = 2
+
+[[entry]]
+id = "still-present"
+class = "operation-dispatch"
+path = "retired.rs"
+symbol = "StillPresentPhysicalHandle"
+
+[[entry]]
+id = "removed-symbol"
+class = "semantic-cpu"
+path = "retired.rs"
+symbol = "RemovedSemanticCpuBody"

@@ -1,0 +1,201 @@
+version = 1
+baseline_commit = "e8fee5b2da972cceb956633cbf13a47349bea46e"
+ceiling = 33
+
+[[entry]]
+id = "metal-library-source"
+class = "target-source"
+path = "macos-arm64/src/kernel/library_runtime.rs"
+symbol = "library_family_msl"
+
+[[entry]]
+id = "metal-moe-source"
+class = "target-source"
+path = "macos-arm64/src/kernel/moe.rs"
+symbol = "moe_family_msl"
+
+[[entry]]
+id = "metal-ssm-source"
+class = "target-source"
+path = "macos-arm64/src/kernel/ssm.rs"
+symbol = "ssm_family_msl"
+
+[[entry]]
+id = "webgpu-matmul-proof-source"
+class = "target-source"
+path = "webgpu-browser/public/src/app-matmul.mjs"
+symbol = "MATMUL_WGSL"
+
+[[entry]]
+id = "webgpu-placement-oracle-source"
+class = "target-source"
+path = "webgpu-browser/public/src/placement-contract-oracle.mjs"
+symbol = "MUL_BY_TWO_WGSL"
+
+[[entry]]
+id = "library-dispatch"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/library.rs"
+symbol = "LibraryDispatch"
+
+[[entry]]
+id = "library-kernel"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/library.rs"
+symbol = "LibraryKernel"
+
+[[entry]]
+id = "metal-library-dispatch"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/library_runtime.rs"
+symbol = "MetalLibraryDispatch"
+
+[[entry]]
+id = "router-selection-kernel"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/moe.rs"
+symbol = "RouterSelectionKernel"
+
+[[entry]]
+id = "ssm-family-dispatch"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/ssm.rs"
+symbol = "SsmFamilyDispatch"
+
+[[entry]]
+id = "ssm-conv1d-kernel"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/ssm_conv1d.rs"
+symbol = "SsmConv1dKernel"
+
+[[entry]]
+id = "ssm-scan-kernel"
+class = "operation-dispatch"
+path = "macos-arm64/src/kernel/ssm_scan.rs"
+symbol = "SsmScanKernel"
+
+[[entry]]
+id = "fused-qkv-plan"
+class = "operation-dispatch"
+path = "macos-arm64/src/composite_host/session.rs"
+symbol = "FusedQkvPlan"
+
+[[entry]]
+id = "fused-residual-rms-plan"
+class = "operation-dispatch"
+path = "macos-arm64/src/composite_host/session.rs"
+symbol = "FusedResidualRmsPlan"
+
+[[entry]]
+id = "coordinator-operation-family"
+class = "operation-dispatch"
+path = "crates/host-coordinator/src/capability.rs"
+symbol = "OpFamily"
+
+[[entry]]
+id = "fused-qkv-cpu-bridge"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/library_runtime.rs"
+symbol = "dispatch_fused_qkv_device"
+
+[[entry]]
+id = "fused-residual-rms-cpu-bridge"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/library_runtime.rs"
+symbol = "dispatch_fused_residual_rms_device"
+
+[[entry]]
+id = "qkv-cpu-body"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/library.rs"
+symbol = "qkv_projection"
+
+[[entry]]
+id = "quantized-gemv-cpu-body"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/library.rs"
+symbol = "quantized_gemv"
+
+[[entry]]
+id = "router-cpu-body"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/moe.rs"
+symbol = "router_selection"
+
+[[entry]]
+id = "ssm-conv1d-cpu-body"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/ssm_conv1d.rs"
+symbol = "ssm_conv1d"
+
+[[entry]]
+id = "ssm-scan-cpu-body"
+class = "semantic-cpu"
+path = "macos-arm64/src/kernel/ssm_scan.rs"
+symbol = "ssm_scan"
+
+[[entry]]
+id = "webgpu-reduction-cpu-body"
+class = "semantic-cpu"
+path = "webgpu-browser/public/src/backend/webgpu-runtime.js"
+symbol = "combineReductionPartials"
+
+[[entry]]
+id = "webgpu-gradient-cpu-body"
+class = "semantic-cpu"
+path = "webgpu-browser/public/src/backend/webgpu-runtime.js"
+symbol = "accumulateGradient"
+
+[[entry]]
+id = "rope-fact-inference"
+class = "model-reconstruction"
+path = "macos-arm64/src/device_execute.rs"
+symbol = "infer_rope_theta"
+
+[[entry]]
+id = "gguf-input-inference"
+class = "model-reconstruction"
+path = "macos-arm64/src/device_execute.rs"
+symbol = "inputs_from_gguf"
+
+[[entry]]
+id = "gguf-tensor-facts"
+class = "model-reconstruction"
+path = "macos-arm64/src/device_execute.rs"
+symbol = "GgufTensorFact"
+
+[[entry]]
+id = "packed-range-inference"
+class = "model-reconstruction"
+path = "macos-arm64/src/device_execute.rs"
+symbol = "packed_format_for_range"
+
+[[entry]]
+id = "coordinator-repack-policy"
+class = "model-reconstruction"
+path = "crates/host-coordinator/src/repack_plan.rs"
+symbol = "RepackSelection"
+
+[[entry]]
+id = "device-kv-descriptor"
+class = "model-reconstruction"
+path = "crates/host-device-core/src/device_descriptor.rs"
+symbol = "KvCacheDescriptor"
+
+[[entry]]
+id = "fake-execution-backend"
+class = "numerical-fake"
+path = "crates/host-coordinator/src/execution_transaction/backend.rs"
+symbol = "FakeExecutionBackend"
+
+[[entry]]
+id = "fake-metal-driver"
+class = "numerical-fake"
+path = "macos-arm64/src/metal_host.rs"
+symbol = "FakeMetalDriver"
+
+[[entry]]
+id = "fake-cuda-driver"
+class = "numerical-fake"
+path = "crates/host-cuda/src/cuda_host.rs"
+symbol = "FakeCudaDriver"

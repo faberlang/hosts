@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# HEP-2 proof: new target source fails, and a removed debt row lowers the ledger.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$ROOT/scripta/check-host-execution-purity"
+FIXTURES="$ROOT/scripta/fixtures/host-execution-purity"
+
+"$CHECK"
+
+set +e
+red_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/red-target-source" \
+  --ledger "$FIXTURES/red-target-source-ledger.toml" 2>&1)"
+red_status=$?
+set -e
+if [[ "$red_status" -eq 0 ]]; then
+  printf '%s\n' "host-execution-purity test: red target-source fixture passed" >&2
+  exit 1
+fi
+if [[ "$red_output" != *"unallowlisted target-source literal"* ]]; then
+  printf '%s\n' "host-execution-purity test: red fixture failed for the wrong reason" >&2
+  printf '%s\n' "$red_output" >&2
+  exit 1
+fi
+
+retired_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/retired-debt" \
+  --ledger "$FIXTURES/retired-debt-ledger.toml" \
+  --previous-ledger "$FIXTURES/retired-debt-previous-ledger.toml")"
+if [[ "$retired_output" != *"debt-count=1"* || "$retired_output" != *"(lower from 2)"* ]]; then
+  printf '%s\n' "host-execution-purity test: retired debt did not lower the ledger" >&2
+  printf '%s\n' "$retired_output" >&2
+  exit 1
+fi
+
+printf '%s\n' "host-execution-purity test: red fixture and debt reduction green"

@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Temporary exact no-growth ratchet for Host semantic debt."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+SOURCE_ROOTS = (
+    "macos-arm64/src",
+    "llvm/src",
+    "wasm/src",
+    "webgpu-browser/public/src",
+    "crates",
+)
+SOURCE_SUFFIXES = {".rs", ".js", ".mjs", ".ts", ".tsx"}
+LEDGER_CLASSES = {
+    "target-source",
+    "operation-dispatch",
+    "semantic-cpu",
+    "model-reconstruction",
+    "numerical-fake",
+}
+TARGET_SOURCE = re.compile(
+    r"#include <metal_stdlib>|using namespace metal|@(?:compute|vertex|fragment)"
+)
+OPERATION_VOCABULARY = re.compile(
+    r"\b(?:Qkv|Rms|Rope|Softmax|Attention|Moe|Router|Ssm|Gemv|Quantized|"
+    r"Swiglu|OpFamily|LibraryDispatch|Fused(?:Qkv|Residual)|KvCache)\w*\b"
+)
+FALLBACK_VOCABULARY = re.compile(
+    r"\b(?:simulate_[A-Za-z0-9_]*|[A-Za-z0-9_]*_cpu|"
+    r"combineReductionPartials|accumulateGradient|Fake[A-Za-z0-9_]*)\b"
+)
+MODEL_VOCABULARY = re.compile(
+    r"\b(?:GGUF|Gguf|SmolLM|Qwen|infer_rope_theta|packed_format_for_range|"
+    r"inputs_from_gguf|KvCacheDescriptor)\b"
+)
+FORBIDDEN_DEPENDENCIES = re.compile(
+    r"^\s*(?:gradus|norma|triga|tela)\s*=", re.MULTILINE
+)
+
+
+@dataclass(frozen=True)
+class Entry:
+    identifier: str
+    debt_class: str
+    relative_path: Path
+    symbol: str
+
+
+@dataclass(frozen=True)
+class AddedLine:
+    relative_path: Path
+    number: int
+    text: str
+
+
+def fail(message: str) -> None:
+    print(f"host-execution-purity: FAIL — {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_args() -> argparse.Namespace:
+    root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(
+        description="reject Host semantic-debt growth against the frozen HEP-1 baseline"
+    )
+    parser.add_argument("--root", type=Path, default=root)
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        default=root / "docs/factory/host-execution-purity/debt-ledger.toml",
+    )
+    parser.add_argument(
+        "--previous-ledger",
+        type=Path,
+        help="optional prior ledger; proves the current ledger count only decreased",
+    )
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help="scan an arbitrary fixture tree as entirely newly-added source",
+    )
+    return parser.parse_args()
+
+
+def read_ledger(path: Path) -> tuple[str, int, list[Entry]]:
+    if not path.is_file():
+        fail(f"ledger is missing: {path}")
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        fail(f"ledger is malformed: {error}")
+
+    if data.get("version") != 1:
+        fail("ledger version must be 1")
+    baseline = data.get("baseline_commit")
+    if not isinstance(baseline, str) or not re.fullmatch(r"[0-9a-f]{40}", baseline):
+        fail("ledger baseline_commit must be a full Git object id")
+    ceiling = data.get("ceiling")
+    if not isinstance(ceiling, int) or ceiling < 1:
+        fail("ledger ceiling must be a positive integer")
+
+    raw_entries = data.get("entry")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        fail("ledger must contain at least one entry")
+
+    entries: list[Entry] = []
+    identifiers: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            fail("ledger entry must be a table")
+        identifier = raw.get("id")
+        debt_class = raw.get("class")
+        relative_path = raw.get("path")
+        symbol = raw.get("symbol")
+        if not all(isinstance(value, str) and value for value in (
+            identifier,
+            debt_class,
+            relative_path,
+            symbol,
+        )):
+            fail("ledger entry requires non-empty id, class, path, and symbol")
+        if debt_class not in LEDGER_CLASSES:
+            fail(f"unknown ledger class for {identifier}: {debt_class}")
+        candidate = Path(relative_path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            fail(f"ledger path is not a relative source path: {relative_path}")
+        identity = (relative_path, symbol)
+        if identifier in identifiers or identity in identities:
+            fail(f"duplicate ledger entry: {identifier}")
+        identifiers.add(identifier)
+        identities.add(identity)
+        entries.append(Entry(identifier, debt_class, candidate, symbol))
+    if len(entries) > ceiling:
+        fail(f"ledger debt count {len(entries)} exceeds frozen ceiling {ceiling}")
+    return baseline, ceiling, entries
+
+
+def tracked_production_files(root: Path, fixture: bool) -> list[Path]:
+    if fixture:
+        candidates = (
+            candidate
+            for candidate in root.rglob("*")
+            if candidate.is_file() and candidate.suffix in SOURCE_SUFFIXES
+        )
+    else:
+        command = ["git", "-C", str(root), "ls-files", *SOURCE_ROOTS]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        if result.returncode:
+            fail(f"cannot list tracked production files: {result.stderr.strip()}")
+        tracked = [root / line for line in result.stdout.splitlines()]
+        untracked_result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if untracked_result.returncode:
+            fail(f"cannot list untracked sources: {untracked_result.stderr.strip()}")
+        untracked = [root / line for line in untracked_result.stdout.splitlines()]
+        candidates = (*tracked, *untracked)
+
+    files: list[Path] = []
+    for candidate in candidates:
+        relative = candidate.relative_to(root)
+        text = relative.as_posix()
+        if not fixture and not any(
+            relative.is_relative_to(Path(source_root)) for source_root in SOURCE_ROOTS
+        ):
+            continue
+        if (
+            candidate.suffix not in SOURCE_SUFFIXES
+            or text.endswith("_test.rs")
+            or "/tests/" in text
+            or text.endswith("check.mjs")
+            or text.endswith("proof.mjs")
+            or "/vendor/" in text
+            or "/generated/" in text
+        ):
+            continue
+        files.append(candidate)
+    return sorted(files)
+
+
+def assert_current_entries(root: Path, entries: list[Entry]) -> None:
+    for entry in entries:
+        source = root / entry.relative_path
+        if not source.is_file():
+            fail(
+                f"stale ledger entry {entry.identifier}: required path is absent "
+                f"({entry.relative_path}); remove the row with the deletion"
+            )
+        try:
+            content = source.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            fail(f"ledger entry {entry.identifier} is not text: {entry.relative_path}")
+        if entry.symbol not in content:
+            fail(
+                f"stale ledger entry {entry.identifier}: symbol {entry.symbol} "
+                f"is absent from {entry.relative_path}; remove the row with the deletion"
+            )
+
+
+def added_lines(root: Path, baseline: str, files: list[Path], fixture: bool) -> list[AddedLine]:
+    if fixture:
+        result: list[AddedLine] = []
+        for source in files:
+            relative = source.relative_to(root)
+            for number, text in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+                result.append(AddedLine(relative, number, text))
+        return result
+
+    paths = [source.relative_to(root).as_posix() for source in files]
+    ancestor = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", baseline, "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    if ancestor.returncode:
+        fail(f"frozen baseline {baseline} is not an ancestor of HEAD")
+    command = ["git", "-C", str(root), "diff", "--no-ext-diff", "--unified=0", baseline, "--", *paths]
+    diff = subprocess.run(command, text=True, capture_output=True, check=False)
+    if diff.returncode:
+        fail(f"cannot read source diff from frozen baseline: {diff.stderr.strip()}")
+
+    output: list[AddedLine] = []
+    current: Path | None = None
+    line_number = 0
+    for line in diff.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current = Path(line[6:])
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            line_number = int(match.group(1)) if match else 0
+            continue
+        if current is None or not line_number:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            output.append(AddedLine(current, line_number, line[1:]))
+            line_number += 1
+        elif not line.startswith("-"):
+            line_number += 1
+
+    untracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if untracked.returncode:
+        fail(f"cannot list untracked sources: {untracked.stderr.strip()}")
+    for relative_text in untracked.stdout.splitlines():
+        source = root / relative_text
+        if source not in files:
+            continue
+        for number, text in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+            output.append(AddedLine(Path(relative_text), number, text))
+    return output
+
+
+def check_added_source(lines: list[AddedLine]) -> list[str]:
+    violations: list[str] = []
+    categories = (
+        ("unallowlisted target-source literal", TARGET_SOURCE),
+        ("new operation/model vocabulary", OPERATION_VOCABULARY),
+        ("new semantic CPU fallback or numerical fake", FALLBACK_VOCABULARY),
+        ("new model or descriptor reconstruction", MODEL_VOCABULARY),
+    )
+    for line in lines:
+        for label, pattern in categories:
+            if pattern.search(line.text):
+                violations.append(
+                    f"{label}: {line.relative_path}:{line.number}: {line.text.strip()}"
+                )
+    return violations
+
+
+def check_dependencies(root: Path) -> list[str]:
+    manifests = sorted(root.rglob("Cargo.toml"))
+    violations: list[str] = []
+    for manifest in manifests:
+        text = manifest.read_text(encoding="utf-8")
+        if FORBIDDEN_DEPENDENCIES.search(text):
+            violations.append(f"new library implementation dependency: {manifest.relative_to(root)}")
+    return violations
+
+
+def main() -> None:
+    args = parse_args()
+    root = args.root.resolve()
+    ledger = args.ledger.resolve()
+    baseline, ceiling, entries = read_ledger(ledger)
+    files = tracked_production_files(root, args.fixture)
+    assert_current_entries(root, entries)
+
+    previous_count: int | None = None
+    if args.previous_ledger:
+        _, _, previous_entries = read_ledger(args.previous_ledger.resolve())
+        previous_count = len(previous_entries)
+        if len(entries) >= previous_count:
+            fail(
+                f"current debt count {len(entries)} did not lower from prior "
+                f"ledger count {previous_count}"
+            )
+
+    violations = check_added_source(added_lines(root, baseline, files, args.fixture))
+    violations.extend(check_dependencies(root))
+    if violations:
+        for violation in violations:
+            print(f"host-execution-purity: FAIL — {violation}", file=sys.stderr)
+        raise SystemExit(1)
+
+    suffix = (
+        f" (lower from {previous_count})"
+        if previous_count is not None
+        else ""
+    )
+    print(
+        f"host-execution-purity: PASS — debt-count={len(entries)} "
+        f"ceiling={ceiling} production-files={len(files)}{suffix}"
+    )
+    for entry in entries:
+        print(
+            f"host-execution-purity: debt-row={entry.identifier} "
+            f"class={entry.debt_class} path={entry.relative_path} symbol={entry.symbol}"
+        )
+    if args.previous_ledger:
+        current_identifiers = {entry.identifier for entry in entries}
+        for entry in previous_entries:
+            if entry.identifier not in current_identifiers:
+                print(f"host-execution-purity: retired-row={entry.identifier}")
+
+
+if __name__ == "__main__":
+    main()
