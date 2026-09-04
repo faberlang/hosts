@@ -1,6 +1,6 @@
 # DELIVERY: HEP-2 exact Host semantic-debt ratchet
 
-**Status**: active — implementation-ready ratchet phase
+**Status**: done — exact ratchet and red-first proof committed in Hosts `be8ef1e`
 **Campaign authority:** ../../../../radix/docs/factory/host-execution-purity/CAMPAIGN.md
 **Census authority:** ../../../../radix/docs/factory/host-execution-purity/host-semantic-census.md
 **Binding decisions:** ../../../../radix/docs/factory/host-execution-purity/architecture-rulings.md
