@@ -107,7 +107,7 @@ impl RouterSelectionBind {
                 "router selection has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "router selection has a zero dispatch axis",
             ));
@@ -288,7 +288,7 @@ pub fn router_selection(
 
     let mut logits = vec![0.0f32; experts];
     for row in 0..rows {
-        for expert in 0..experts {
+        for (expert, expert_logit) in logits.iter_mut().enumerate() {
             let mut logit = 0.0f32;
             for block_index in 0..blocks {
                 let block_base = expert * expert_stride + block_index * block_bytes;
@@ -299,7 +299,7 @@ pub fn router_selection(
                     logit += activation[activation_base + element] * weight;
                 }
             }
-            logits[expert] = logit;
+            *expert_logit = logit;
         }
         let row_ids = &mut expert_ids[row * active..(row + 1) * active];
         let row_weights = &mut expert_weights[row * active..(row + 1) * active];

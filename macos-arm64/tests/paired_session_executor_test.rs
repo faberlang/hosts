@@ -24,6 +24,10 @@ use host_coordinator::DeviceBackend;
 
 const MODULE_IMAGE: &[u8] = b"// paired fake module image";
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture builder exposes every independently varied descriptor-slot field and adds no behavioral branching"
+)]
 fn slot(
     id: u32,
     name: &str,

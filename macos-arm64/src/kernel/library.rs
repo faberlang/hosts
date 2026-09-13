@@ -115,17 +115,17 @@ impl BindDescriptor {
                 "bind dimensions and strides have different ranks",
             ));
         }
-        if self.dims.iter().any(|dim| *dim == 0) {
+        if self.dims.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero dimension",
             ));
         }
-        if self.strides.iter().any(|stride| *stride == 0) {
+        if self.strides.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero dispatch axis",
             ));
@@ -311,7 +311,7 @@ impl QuantizedGemvBind {
                 "quantized GEMV has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "quantized GEMV has a zero dispatch axis",
             ));
@@ -468,7 +468,7 @@ impl GroupedExpertGemmBind {
                 "grouped expert GEMM has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "grouped expert GEMM has a zero dispatch axis",
             ));
@@ -687,7 +687,7 @@ impl QkvProjectionBind {
                 "QKV projection layout is not servable",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "QKV projection bind has a zero dispatch axis",
             ));
@@ -845,6 +845,10 @@ fn qkv_rotate(values: &mut [f32], head_dim: usize, rotate_half: bool, cos: &[f32
 /// receives its bias but no rotation.  The three matrices are reduced in one
 /// body and written directly to their grouped output views.  A mismatch in
 /// the optional bias or RoPE bind is rejected before touching output memory.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused Q/K/V body keeps each weight, optional bias, rotation table, and output explicit so cross-lane binding mistakes stay visible"
+)]
 pub fn qkv_projection(
     bind: &QkvProjectionBind,
     activation: &[f32],
@@ -1150,9 +1154,9 @@ pub fn residual_rms_norm(
     }
     for_each_row(bind, |_, base, width, stride| {
         let mut summed = vec![0.0f32; width];
-        for col in 0..width {
+        for (col, value) in summed.iter_mut().enumerate() {
             let offset = base + col * stride;
-            summed[col] = residual[offset] + skip[offset];
+            *value = residual[offset] + skip[offset];
         }
         let mut sumsq = 0.0f32;
         for value in &summed {
@@ -1275,6 +1279,10 @@ impl CausalAttentionBind {
     /// Construct a strided attention bind while retaining the same logical
     /// axes as [`Self::grouped`].
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor mirrors the descriptor's explicit logical axes, per-view strides, and dispatch grid without inferring layout facts"
+    )]
     pub fn strided(
         head_dim: u64,
         seq_block: u64,
@@ -1320,7 +1328,7 @@ impl CausalAttentionBind {
                 "causal attention query rows exceed the sequence block",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "causal attention bind has a zero dispatch axis",
             ));
@@ -1875,7 +1883,7 @@ fn gemv_q5_0(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
             let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
             let k_base = ib * 32;
-            for lane in 0..SIMDGROUP_WIDTH {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
                 let pair = lane % 16;
                 let q = block[6 + pair];
                 let high = if lane < 16 {
@@ -1885,8 +1893,7 @@ fn gemv_q5_0(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
                 };
                 let nibble = if lane < 16 { q & 0x0f } else { q >> 4 };
                 let weight = (f32::from((nibble | high as u8) as i8) - 16.0) * d;
-                lane_sums[lane] +=
-                    buffers.activation[(k_base + lane) * buffers.input_stride] * weight;
+                *lane_sum += buffers.activation[(k_base + lane) * buffers.input_stride] * weight;
             }
         }
         buffers.output[column * buffers.output_stride] = simdgroup_reduce(lane_sums);
@@ -1906,14 +1913,14 @@ fn gemv_q4_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
             let dmin = half_to_f32(u16::from_le_bytes([block[2], block[3]]));
             let scales = &block[4..16];
             let k_base = ib * 256;
-            for lane in 0..SIMDGROUP_WIDTH {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
                 for group in 0..8 {
                     let (scale, min) = get_scale_min_k4(group, scales);
                     let qs = block[16 + (group / 2) * 32 + lane];
                     let nibble = if group % 2 == 0 { qs & 0x0f } else { qs >> 4 };
                     let weight = d * f32::from(scale) * f32::from(nibble) - dmin * f32::from(min);
                     let index = k_base + group * 32 + lane;
-                    lane_sums[lane] += buffers.activation[index * buffers.input_stride] * weight;
+                    *lane_sum += buffers.activation[index * buffers.input_stride] * weight;
                 }
             }
         }
@@ -1931,11 +1938,11 @@ fn gemv_q5_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
             let base = col_start + ib * 176;
             let block = &buffers.packed_weight[base..base + 176];
             let k_base = ib * 256;
-            for lane in 0..SIMDGROUP_WIDTH {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
                 for group in 0..8 {
                     let element = group * 32 + lane;
                     let weight = block_value(QuantizedFormat::Q5K, block, element)?;
-                    lane_sums[lane] +=
+                    *lane_sum +=
                         buffers.activation[(k_base + element) * buffers.input_stride] * weight;
                 }
             }
@@ -1955,7 +1962,7 @@ fn gemv_q6_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
             let block = &buffers.packed_weight[base..base + 210];
             let d = half_to_f32(u16::from_le_bytes([block[208], block[209]]));
             let k_base = ib * 256;
-            for lane in 0..SIMDGROUP_WIDTH {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
                 for group in 0..8 {
                     let element = group * 32 + lane;
                     let half = (element / 128) * 128;
@@ -1971,7 +1978,7 @@ fn gemv_q6_k(buffers: &mut GemvBuffers<'_>) -> Result<(), KernelBodyError> {
                     let (q, scale_slot) = q6_k_lane_quant(q_lane, ql0, ql1, qh, scale_index)?;
                     let scale = i8::from_ne_bytes([block[192 + scale_slot]]) as f32;
                     let weight = d * scale * (i32::from(q) - 32) as f32;
-                    lane_sums[lane] +=
+                    *lane_sum +=
                         buffers.activation[(k_base + element) * buffers.input_stride] * weight;
                 }
             }
@@ -2187,7 +2194,7 @@ pub fn grouped_expert_gemm_selected(
         });
     }
     let active = expert_ids.len() / rows;
-    if expert_ids.len() % rows != 0 || expert_weights.len() % rows != 0 {
+    if !expert_ids.len().is_multiple_of(rows) || !expert_weights.len().is_multiple_of(rows) {
         return Err(KernelBodyError::ShapeMismatch(
             "grouped expert dispatch ids/weights are not a full row width",
         ));
@@ -2341,9 +2348,9 @@ pub fn rms(
         }
         let mean = sumsq / width as f32;
         let scale = 1.0f32 / (mean + epsilon).sqrt();
-        for col in 0..width {
+        for (col, gamma_value) in gamma.iter().take(width).enumerate() {
             let offset = base + col * stride;
-            output[offset] = input[offset] * scale * gamma[col];
+            output[offset] = input[offset] * scale * gamma_value;
         }
     })?;
     Ok(())
@@ -2666,6 +2673,10 @@ pub enum LibraryKernel {
 /// from buffer lengths or entry-name guesses.  Each variant carries the
 /// arguments required by its selected body, so a caller cannot accidentally
 /// route a QKV or residual request through the legacy attention signature.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "dispatch variants carry complete borrowed requests on a hot path; boxing the fused variants would add an allocation to shrink unrelated arms"
+)]
 pub enum LibraryDispatch<'a> {
     /// The fused causal-attention body.
     CausalAttention {

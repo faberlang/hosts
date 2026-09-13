@@ -10,9 +10,8 @@ use std::collections::BTreeSet;
 
 use faber_host_macos_arm64::device_execute::prepare_distributed_image;
 use faber_host_macos_arm64::distributed_translate::{
-    BindPolicy, TranslateError, bind_policy_for_declared_count, bind_translated,
-    bind_translated_with_constraints, oq2_default_headroom_policy_bytes,
-    translate_device_section_bytes,
+    bind_policy_for_declared_count, bind_translated, bind_translated_with_constraints,
+    oq2_default_headroom_policy_bytes, translate_device_section_bytes, BindPolicy, TranslateError,
 };
 use host_coordinator::bound_plan::{BindError, DeclaredPlacementConstraint, LogicalPartitionId};
 use host_coordinator::device_identity::{DeviceHealthGeneration, DeviceOrdinal, PhysicalDeviceId};
@@ -542,7 +541,7 @@ fn eight_rank_bind_count_one_prepares_on_one_physical_cuda_snapshot() {
     assert_eq!(receipt.physical_device_count, 1);
     assert_eq!(receipt.virtual_partition_count, 8);
     assert_eq!(receipt.fixture_identity_class, "virtual");
-    assert_eq!(receipt.hardware_isolation_claimed, false);
+    assert!(!receipt.hardware_isolation_claimed);
     assert_eq!(receipt.bind_shape, "8:1");
     assert!(receipt.communication_graph_edge_count > 0);
     assert_eq!(receipt.transaction_state, "prepared");
@@ -573,6 +572,10 @@ fn eight_rank_bind_count_eight_rejects_topology_mismatch() {
 /// over the bound device's driver-API total exceeds the declaration
 /// (8 GiB < floor(12_343_705_600 × 0.9) = 11_109_335_040).
 #[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "this test pins the fixture declaration below the independently derived OQ-2 policy limit before exercising admission"
+)]
 fn eight_gib_declared_bind_admits_under_policy_limit() {
     assert_eq!(
         oq2_default_headroom_policy_bytes(SNAPSHOT_API_TOTAL_BYTES),
@@ -600,6 +603,10 @@ fn eight_gib_declared_bind_admits_under_policy_limit() {
 /// as its own bind error carrying both byte facts — never the generic
 /// `InvalidPartitionBinding` and never an admit.
 #[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "this test pins the over-budget fixture above the independently derived OQ-2 policy limit before checking its error class"
+)]
 fn over_budget_fixture_rejects_budget_exceeded_class_with_byte_facts() {
     assert!(
         OVER_BUDGET_BYTES > POLICY_LIMIT_BYTES,

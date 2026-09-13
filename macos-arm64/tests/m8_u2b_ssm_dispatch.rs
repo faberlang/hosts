@@ -445,6 +445,10 @@ fn ssm_plan_dispatch_fails_closed_rows() {
 // Metal): prefill and decode arms through the minted family module.
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture builder exposes every independently varied descriptor-slot field and adds no behavioral branching"
+)]
 fn slot(
     id: u32,
     name: &str,

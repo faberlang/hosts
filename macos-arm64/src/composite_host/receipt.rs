@@ -18,6 +18,10 @@ use crate::kernel::library_runtime::FusedLibraryDispatchReceipt;
 /// module hash, selected hardware) plus the program's lifetime regime and the
 /// lifetime-classified buffer sets (S2-4: which buffers are allocated once,
 /// which recycled, which read-then-released).
+#[allow(
+    dead_code,
+    reason = "focused timing-receipt integration tests path-include this production module and intentionally exercise only the timing subset"
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceExecutionReceipt {
     /// Selected backend.
@@ -133,6 +137,10 @@ pub struct DeviceExecutionReceipt {
 /// ordered sequence. Every declared observation (result) is valid at or
 /// after this boundary; the host never claims more than the explicit
 /// synchronization it performed.
+#[allow(
+    dead_code,
+    reason = "focused timing-receipt integration tests path-include this production module and intentionally exercise only the timing subset"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionBoundary {
     /// Completion is guaranteed at the explicit step-boundary sync after
@@ -143,6 +151,10 @@ pub enum CompletionBoundary {
 impl CompletionBoundary {
     /// The stable diagnostic statement of the boundary.
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the path-included timing-receipt test does not render the production completion-boundary diagnostic"
+    )]
     pub fn spelling(self) -> String {
         match self {
             Self::StepSync { after_launch } => format!(
@@ -160,6 +172,10 @@ impl CompletionBoundary {
 /// transfers the end-of-run boundary performed — readbacks only, zero
 /// copy-in (the params are once-init'd at session creation and never
 /// re-copied).
+#[allow(
+    dead_code,
+    reason = "focused timing-receipt integration tests path-include this production module and intentionally exercise only the timing subset"
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndOfRunReadback {
     /// The observed end-of-run values, keyed by buffer id (the faber route
@@ -176,6 +192,10 @@ pub struct EndOfRunReadback {
 /// One declared buffer of the program's logical resource graph (A10): the
 /// identity facts (id, name, role, lifetime) plus the content version the
 /// session executes. Mirrors the schema's `RegistryBuffer` identity.
+#[allow(
+    dead_code,
+    reason = "focused timing-receipt integration tests path-include this production module and intentionally exercise only the timing subset"
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReceiptBuffer {
     /// Program-level buffer identity key.
@@ -196,6 +216,10 @@ pub struct ReceiptBuffer {
 
 /// One declared inter-kernel data-flow edge (A10): a buffer content version
 /// produced by launch `producer` and consumed by launch `consumer`.
+#[allow(
+    dead_code,
+    reason = "focused timing-receipt integration tests path-include this production module and intentionally exercise only the timing subset"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataFlowEdge {
     /// Buffer whose content flows.
@@ -243,6 +267,10 @@ impl KvCacheMeasurement {
 
     /// Mark a value as absent without manufacturing a numeric default.
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the focused timing-receipt test constructs missing spans rather than this production scalar helper"
+    )]
     pub const fn not_measured() -> Self {
         Self::NotMeasured
     }
@@ -356,6 +384,10 @@ impl KvCacheTimingReceipt {
     /// counters set to their measured zero-event value. This is not a
     /// `Default` implementation: callers must opt into the missing receipt.
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the focused timing-receipt test verifies populated fields rather than this production whole-receipt constructor"
+    )]
     pub const fn not_measured() -> Self {
         Self {
             setup_phase: KvCachePhaseTiming::not_measured(),

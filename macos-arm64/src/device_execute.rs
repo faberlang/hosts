@@ -1862,10 +1862,7 @@ pub fn gguf_region_table(
     bytes: &[u8],
     map: &BTreeMap<u32, WeightFileRange>,
 ) -> HostResult<GgufRegionTable> {
-    let data_start = match gguf_data_start(bytes)? {
-        Some(start) => start,
-        None => 0,
-    };
+    let data_start = gguf_data_start(bytes)?.unwrap_or_default();
     let file_len = bytes.len() as u64;
     let mut abs_starts = Vec::with_capacity(map.len());
     let mut abs_ends = Vec::with_capacity(map.len());
@@ -2002,9 +1999,9 @@ fn skip_gguf_value(bytes: &[u8], off: usize, tag: u32) -> HostResult<usize> {
     match tag {
         0 | 1 | 7 => Ok(off + 1),
         2 | 3 => Ok(off + 2),
-        4 | 5 | 6 => Ok(off + 4),
+        4..=6 => Ok(off + 4),
         8 => skip_gguf_string(bytes, off),
-        10 | 11 | 12 => Ok(off + 8),
+        10..=12 => Ok(off + 8),
         9 => {
             let elem = read_u32_at(bytes, off, "GGUF array elem type")?;
             let count = read_u64_at(bytes, off + 4, "GGUF array count")?;
@@ -2054,10 +2051,10 @@ fn retain_mapped_weights(
     let Some(mapped) = mapped else {
         return Ok(());
     };
-    if let Some(runtime) = host.device_mut() {
-        if runtime.supports_mapped_weight_retention() {
-            runtime.retain_mapped_weight_file(mapped.clone())?;
-        }
+    if let Some(runtime) = host.device_mut()
+        && runtime.supports_mapped_weight_retention()
+    {
+        runtime.retain_mapped_weight_file(mapped.clone())?;
     }
     Ok(())
 }

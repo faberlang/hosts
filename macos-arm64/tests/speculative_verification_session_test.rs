@@ -5,8 +5,7 @@
 //! leaves committed state byte-identical; post-dispatch failure poisons
 //! (D4 law, no rollback receipt).
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 use inference_state::{
     CandidateRows, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_STALE,
@@ -195,7 +194,7 @@ fn pre_dispatch_abort_leaves_machine_unchanged_and_reusable() {
 
 #[test]
 fn pre_dispatch_abort_rejects_after_possible_mutation() {
-    let mut state = at_l(16, 5);
+    let state = at_l(16, 5);
     let mut tx = begin_verification(&state, 4);
     tx.record_possible_mutation(FailureStage::Dispatch);
     let err = state

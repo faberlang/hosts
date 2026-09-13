@@ -262,6 +262,10 @@ fn descriptor_dtype(spelling: &str) -> DeviceDataType {
         .unwrap_or_else(|| panic!("unknown GEA1 descriptor dtype {spelling}"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture constructor directly names every independently varied descriptor-slot field"
+)]
 fn descriptor_slot(
     buffer_id: u32,
     name: &str,
@@ -796,7 +800,9 @@ fn output_receipt(run: &KernelRun, e2e_us: u64) -> Value {
 #[ignore = "physical Metal gate; run only with the exact §6 command"]
 fn gea1_real_metal_receipt() {
     let e2e_start = Instant::now();
-    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    // SAFETY: The ignored gate runs this test in isolation before any child is
+    // spawned, so no concurrent thread reads or mutates the process environment.
+    unsafe { std::env::set_var("FABER_PER_OP_TIMING", "1") };
     let workspace = workspace_root();
     let artifact_dir = artifact_root();
     let receipt_path = PathBuf::from(

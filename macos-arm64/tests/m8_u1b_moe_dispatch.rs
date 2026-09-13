@@ -524,6 +524,10 @@ fn plan_path_expert_packed() -> Vec<u8> {
         .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture builder exposes every independently varied descriptor-slot field and adds no behavioral branching"
+)]
 fn slot(
     id: u32,
     name: &str,
@@ -596,7 +600,7 @@ fn plan_path_descriptor(backend: DeviceBackend, module: &[u8]) -> DeviceDescript
                 DeviceBufferLifetime::PerProgram,
                 DeviceBufferInitialization::HostProvided,
                 DeviceDataType::U8,
-                (PLAN_PATH_EXPERTS * 34) as u64,
+                PLAN_PATH_EXPERTS * 34,
             ),
             slot(
                 4,
@@ -663,7 +667,7 @@ fn plan_path_descriptor(backend: DeviceBackend, module: &[u8]) -> DeviceDescript
                 DeviceBufferLifetime::PerProgram,
                 DeviceBufferInitialization::HostProvided,
                 DeviceDataType::U8,
-                (PLAN_PATH_EXPERTS * PLAN_PATH_N * 34) as u64,
+                PLAN_PATH_EXPERTS * PLAN_PATH_N * 34,
             ),
             slot(
                 6,

@@ -36,7 +36,7 @@ pub struct RopeConfig {
 
 impl RopeConfig {
     fn validate(self) -> HostResult<()> {
-        if self.head_dim == 0 || self.head_dim % 2 != 0 {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
             return Err(invalid_args(format!(
                 "RoPE head_dim must be a nonzero even number; got {}",
                 self.head_dim

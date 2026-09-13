@@ -127,12 +127,12 @@ pub fn ssm_family_dispatch(request: SsmFamilyDispatch<'_>) -> Result<(), KernelB
             kernel,
             output,
         } => {
-            if let Some(entry) = library_entry {
-                if entry != "SsmConv1d" {
-                    return Err(KernelBodyError::InvalidBind(
-                        "selection entry disagrees with library_entry SsmConv1d",
-                    ));
-                }
+            if let Some(entry) = library_entry
+                && entry != "SsmConv1d"
+            {
+                return Err(KernelBodyError::InvalidBind(
+                    "selection entry disagrees with library_entry SsmConv1d",
+                ));
             }
             dispatch_ssm_conv1d(SsmConv1dKernel::Causal, bind, input, kernel, output)
         }
@@ -142,12 +142,12 @@ pub fn ssm_family_dispatch(request: SsmFamilyDispatch<'_>) -> Result<(), KernelB
             input,
             output,
         } => {
-            if let Some(entry) = library_entry {
-                if entry != "SsmScan" {
-                    return Err(KernelBodyError::InvalidBind(
-                        "selection entry disagrees with library_entry SsmScan",
-                    ));
-                }
+            if let Some(entry) = library_entry
+                && entry != "SsmScan"
+            {
+                return Err(KernelBodyError::InvalidBind(
+                    "selection entry disagrees with library_entry SsmScan",
+                ));
             }
             dispatch_ssm_scan(SsmScanKernel::Additive, bind, input, output)
         }

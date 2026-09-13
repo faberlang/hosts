@@ -463,6 +463,10 @@ pub trait MetalDriver: Send {
     /// elementwise-add path through this so there is exactly one encode site.
     /// Offset-zero caller path: each buffer binds at its mmap page remainder
     /// (0 for ordinary allocs).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this driver boundary mirrors Metal's explicit module, entry, buffers, 3D grid, and 3D threadgroup shape"
+    )]
     fn launch_kernel(
         &mut self,
         module: u64,
@@ -1380,6 +1384,10 @@ impl FakeMetalDriver {
     /// Simulate the elementwise-add kernel: `out[i] = a[i] + b[i]`. Shared by
     /// the legacy elementwise-add path and the generalized `launch_kernel`
     /// (the emitted kernel is the same add shape), mirroring the CUDA fake.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fake driver mirrors three independently offset Metal buffer bindings so offset behavior remains directly testable"
+    )]
     fn simulate_elementwise_add(
         &mut self,
         module: u64,
@@ -2483,10 +2491,10 @@ impl SystemMetalDriver {
         let mut gpu_start = 0u64;
         let mut cpu_end = 0u64;
         let mut gpu_end = 0u64;
-        if dest.is_some() {
-            if let Some(device) = self.device.as_ref() {
-                device.sample_timestamps(&mut cpu_start, &mut gpu_start);
-            }
+        if dest.is_some()
+            && let Some(device) = self.device.as_ref()
+        {
+            device.sample_timestamps(&mut cpu_start, &mut gpu_start);
         }
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -2498,10 +2506,10 @@ impl SystemMetalDriver {
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(metal_driver("Metal command buffer did not complete"));
         }
-        if dest.is_some() {
-            if let Some(device) = self.device.as_ref() {
-                device.sample_timestamps(&mut cpu_end, &mut gpu_end);
-            }
+        if dest.is_some()
+            && let Some(device) = self.device.as_ref()
+        {
+            device.sample_timestamps(&mut cpu_end, &mut gpu_end);
         }
         if let Some(dest) = dest {
             let timeline = convert_encoder_gpu_timeline(

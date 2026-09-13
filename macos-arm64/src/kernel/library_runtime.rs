@@ -191,6 +191,10 @@ kernel void ResidualRmsNorm(
 /// entries whose device module is materialized here.  Each arm still carries
 /// the complete selector facts so unsupported layouts and uniform drift reach
 /// the existing fail-closed selector before a body reads or writes a buffer.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the runtime dispatch carries complete borrowed fused requests on the launch path; boxing would add allocation and erase the inline boundary"
+)]
 pub enum MetalLibraryDispatch<'a> {
     /// Grouped Q/K/V projection.
     QkvProjection {
@@ -294,7 +298,7 @@ fn dense_storage(
             view.dtype.spelling()
         )));
     }
-    if view.byte_offset % 4 != 0 || view.view_span % 4 != 0 {
+    if !view.byte_offset.is_multiple_of(4) || !view.view_span.is_multiple_of(4) {
         return Err(crate::kernel::HostError::invalid_args(format!(
             "fused library {label} view is not f32 aligned"
         )));
@@ -977,7 +981,7 @@ mod tests {
         let pooled_handle = alloc(&mut runtime, &pooled);
         let skip_handle = alloc(&mut runtime, &skip);
         let gamma_handle = alloc(&mut runtime, &gamma);
-        let output_handle = alloc(&mut runtime, &vec![0.0f32; 4]);
+        let output_handle = alloc(&mut runtime, &[0.0f32; 4]);
         fn view<'a>(
             handle: &'a host_coordinator::DeviceHandle,
             count: u64,
@@ -1028,7 +1032,6 @@ mod tests {
     fn residual_rms_bridge_rejects_foreign_entry() {
         use crate::device_host::DeviceRuntime;
         use crate::metal_host::{FakeMetalDriver, MetalHostSession};
-        use host_coordinator::DeviceHandle;
 
         let mut runtime = DeviceRuntime::Metal(
             MetalHostSession::with_driver(Box::new(FakeMetalDriver::default()))
