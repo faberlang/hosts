@@ -19,11 +19,20 @@ pub trait DeviceSession {
     /// Whether the session was admitted for product execution.
     fn is_admitted(&self) -> bool;
     /// Load a compiled module image (MSL source or PTX).
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot load the module image.
     fn load_module(&mut self, image: &[u8]) -> HostResult<DeviceHandle>;
     /// Allocate a device buffer of the given byte length.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot allocate the requested buffer.
     fn alloc_bytes(&mut self, len_bytes: usize) -> HostResult<DeviceHandle>;
     /// Copy dtype-tagged bytes into a device buffer without changing their
     /// representation.
+    ///
+    /// # Errors
+    /// Returns an error when the handle is invalid or the backend copy fails.
     fn copy_in_bytes(
         &mut self,
         buffer: &DeviceHandle,
@@ -32,6 +41,9 @@ pub trait DeviceSession {
     ) -> HostResult<()>;
     /// Copy f32 values into a device buffer (exact size match required).
     /// This is a compatibility wrapper over [`Self::copy_in_bytes`].
+    ///
+    /// # Errors
+    /// Returns an error when [`Self::copy_in_bytes`] fails.
     fn copy_in_f32(&mut self, buffer: &DeviceHandle, values: &[f32]) -> HostResult<()> {
         let bytes: Vec<u8> = values
             .iter()
@@ -44,6 +56,9 @@ pub trait DeviceSession {
     /// Launch a named kernel entry over device buffers with a 3D grid/block
     /// shape. Metal encodes into the step command buffer (commit+wait at
     /// `sync`); CUDA still synchronizes internally.
+    ///
+    /// # Errors
+    /// Returns an error when the handles, launch shape, or backend launch are invalid.
     fn launch_kernel(
         &mut self,
         module: &DeviceHandle,
@@ -53,9 +68,15 @@ pub trait DeviceSession {
         block: [u32; 3],
     ) -> HostResult<()>;
     /// Explicit device synchronization barrier.
+    ///
+    /// # Errors
+    /// Returns an error when backend synchronization fails.
     fn sync(&mut self) -> HostResult<()>;
     /// Read a device buffer back as dtype-tagged bytes without changing their
     /// representation.
+    ///
+    /// # Errors
+    /// Returns an error when the handle is invalid or the backend readback fails.
     fn readback_bytes(
         &mut self,
         buffer: &DeviceHandle,
@@ -63,6 +84,9 @@ pub trait DeviceSession {
     ) -> HostResult<Vec<u8>>;
     /// Read a device buffer back as f32 values.
     /// This is a compatibility wrapper over [`Self::readback_bytes`].
+    ///
+    /// # Errors
+    /// Returns an error when readback fails or returns a malformed byte length.
     fn readback_f32(&mut self, buffer: &DeviceHandle) -> HostResult<Vec<f32>> {
         let bytes = self.readback_bytes(buffer, DeviceDataType::F32)?;
         if bytes.len() % 4 != 0 {
@@ -76,5 +100,8 @@ pub trait DeviceSession {
             .collect())
     }
     /// Release a handle and its underlying device object.
+    ///
+    /// # Errors
+    /// Returns an error when the handle is invalid or backend release fails.
     fn release(&mut self, handle: &DeviceHandle) -> HostResult<()>;
 }
