@@ -5,8 +5,7 @@
 //! K/V row overlay so that reset/replay compares live bytes while retaining
 //! the physical rows that reset logically retires.
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 use faber_host_macos_arm64::kernel::ssm_conv1d::{
     SsmConv1dBind, SsmConv1dKernel, dispatch_ssm_conv1d,

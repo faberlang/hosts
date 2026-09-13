@@ -1,16 +1,14 @@
 //! KV-D D3: dual invocation programs over shared residency.
 //!
-//! Parent registration is a private `mod invocation_program` in
-//! `composite_host.rs`. This unit cannot edit that file, so the test crate
-//! compiles the module directly. `device_descriptor` is re-exported so the
-//! path-compiled modules can keep `crate::device_descriptor`.
+//! Invocation-program and residency internals remain path-compiled here.
+//! `device_descriptor` is re-exported so those modules can keep
+//! `crate::device_descriptor`; the sequence machine uses the public module.
 
 mod device_descriptor {
     pub use faber_host_macos_arm64::device_descriptor::*;
 }
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 #[path = "../src/composite_host/residency.rs"]
 mod residency;

@@ -1,11 +1,8 @@
 //! KV-D D1: pure model-session state machine.
 //!
-//! Parent registration is a private `mod inference_state` in
-//! `composite_host.rs`. This unit cannot edit that file, so the test crate
-//! compiles the machine directly.
+//! The test exercises the public sequence machine through the host crate.
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 use inference_state::{
     CursorFacts, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_RELEASED,

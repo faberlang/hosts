@@ -1860,17 +1860,13 @@ fn assert_declared_logits_only(
     }
 }
 
+type MappedGea3Program = (DeviceDescriptor, Gea3WindowBindings);
+
 fn map_both(
     envelope: &Gea3ProgramPlanEnvelope,
     artifact_dir: &Path,
     identity: Gea3Identity,
-) -> Result<
-    (
-        (DeviceDescriptor, Gea3WindowBindings),
-        (DeviceDescriptor, Gea3WindowBindings),
-    ),
-    String,
-> {
+) -> Result<(MappedGea3Program, MappedGea3Program), String> {
     let prefill = map_envelope_to_descriptor(
         envelope,
         &envelope.programs.prefill,
@@ -4168,6 +4164,10 @@ fn gea3_parity_timing_companion_optional_emission() {
     );
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the end-to-end harness keeps runtime, both mapped programs, manifest/model inputs, prompt, identity, and optional soak stream explicit"
+)]
 fn gea3_run_physical(
     runtime: &mut DeviceRuntime,
     prefill: (DeviceDescriptor, Gea3WindowBindings),
@@ -5036,6 +5036,10 @@ fn gea3_physical_receipt_run(identity: Gea3Identity) {
 // diagnostic harness only, not a production receipt path.
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the diagnostic harness intentionally exposes both mapped programs and both source plans alongside its runtime and fixture inputs"
+)]
 fn gea3_run_staged_diagnostic(
     runtime: &mut DeviceRuntime,
     prefill: (DeviceDescriptor, Gea3WindowBindings),

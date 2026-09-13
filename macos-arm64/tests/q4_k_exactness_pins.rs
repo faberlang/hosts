@@ -105,10 +105,10 @@ fn independent_dequant_is_bit_exact_against_llama_quantize_f32() {
                 &mut output,
             )
             .expect("Q4_K dequant probe GEMV");
-            for column in 0..COLUMNS {
+            for (column, actual) in output.iter().enumerate() {
                 let reference = f32_le(LLAMA_F32, column * 4864 + block * 256 + element);
                 assert_eq!(
-                    output[column].to_bits(),
+                    actual.to_bits(),
                     reference.to_bits(),
                     "column {} element {}: dequant bits vs llama-quantize F32",
                     FIRST_COLUMN + column,

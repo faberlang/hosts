@@ -60,6 +60,10 @@ impl<'host> PairedProgramSession<'host> {
     /// Prepare both static programs and once-init their shared weights before
     /// the first invocation. Matching PerProgram resources are selected by
     /// the descriptor's carried semantic value identity, never by byte count.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "paired preparation keeps the two descriptors, three identities, and shared resource maps explicit at the session boundary"
+    )]
     pub fn prepare(
         runtime: &'host mut DeviceRuntime,
         prefill: &DeviceDescriptor,

@@ -185,6 +185,10 @@ impl CompositeHostConfig {
 }
 
 /// The device component of the composite host.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the composite host intentionally owns its admitted runtime set inline; boxing would add indirection to every device route solely to shrink CpuOnly"
+)]
 pub enum CompositeDeviceState {
     /// No device session (CPU-only route).
     CpuOnly,
@@ -495,6 +499,10 @@ impl CompositeHost {
     /// Prepare paired prefill and scalar-decode programs over one runtime and
     /// one semantic PerProgram model/cache owner. The returned executor
     /// selects its program explicitly from each v2 invocation mode.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the public paired-session boundary keeps both descriptors, shared resources, and distinct model/session identities explicit"
+    )]
     pub fn prepare_paired_session(
         &mut self,
         prefill: &DeviceDescriptor,

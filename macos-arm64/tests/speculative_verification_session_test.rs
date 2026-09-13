@@ -5,8 +5,7 @@
 //! leaves committed state byte-identical; post-dispatch failure poisons
 //! (D4 law, no rollback receipt).
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 use inference_state::{
     CandidateRows, E_INVALID_ARGS, E_KV_OVERFLOW, E_KV_PHASE, E_KV_POISONED, E_KV_STALE,

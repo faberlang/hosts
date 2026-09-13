@@ -191,6 +191,10 @@ kernel void ResidualRmsNorm(
 /// entries whose device module is materialized here.  Each arm still carries
 /// the complete selector facts so unsupported layouts and uniform drift reach
 /// the existing fail-closed selector before a body reads or writes a buffer.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the runtime dispatch carries complete borrowed fused requests on the launch path; boxing would add allocation and erase the inline boundary"
+)]
 pub enum MetalLibraryDispatch<'a> {
     /// Grouped Q/K/V projection.
     QkvProjection {

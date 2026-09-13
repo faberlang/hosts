@@ -418,7 +418,7 @@ fn grouped_expert_gemm_matches_gqa_shape_analogs_and_accumulates_segments() {
         // weights and each expert intermediate independently of accumulation.
         let one_expert_bind = grouped_expert_bind(fixture, 1);
         let expert_stride = bind.packed_expert_stride_bytes as usize;
-        for expert in 0..GROUPED_EXPERT_COUNT {
+        for (expert, expected_intermediate) in expected_intermediates.iter().enumerate() {
             let start = expert * expert_stride;
             let end = start + expert_stride;
             let mut intermediate = vec![0.0f32; fixture.rows * fixture.columns];
@@ -432,7 +432,7 @@ fn grouped_expert_gemm_matches_gqa_shape_analogs_and_accumulates_segments() {
             )
             .unwrap_or_else(|error| panic!("{} expert {expert}: {error}", fixture.name));
             assert_eq!(
-                intermediate, expected_intermediates[expert],
+                intermediate, *expected_intermediate,
                 "{} expert {expert} intermediate",
                 fixture.name
             );

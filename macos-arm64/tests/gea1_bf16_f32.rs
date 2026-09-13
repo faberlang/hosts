@@ -262,6 +262,10 @@ fn descriptor_dtype(spelling: &str) -> DeviceDataType {
         .unwrap_or_else(|| panic!("unknown GEA1 descriptor dtype {spelling}"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture constructor directly names every independently varied descriptor-slot field"
+)]
 fn descriptor_slot(
     buffer_id: u32,
     name: &str,

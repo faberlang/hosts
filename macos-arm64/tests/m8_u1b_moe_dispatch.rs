@@ -524,6 +524,10 @@ fn plan_path_expert_packed() -> Vec<u8> {
         .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture builder exposes every independently varied descriptor-slot field and adds no behavioral branching"
+)]
 fn slot(
     id: u32,
     name: &str,

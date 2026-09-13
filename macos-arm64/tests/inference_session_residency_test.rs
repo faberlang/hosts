@@ -1,16 +1,14 @@
 //! KV-D D2: shared model/sequence residency.
 //!
-//! Parent registration is a private `mod residency` in `composite_host.rs`.
-//! This unit cannot edit that file, so the test crate compiles the module
-//! directly. `device_descriptor` is re-exported so residency.rs can keep
-//! `crate::device_descriptor` in both compilations.
+//! Residency is private and remains path-compiled here. `device_descriptor` is
+//! re-exported so residency.rs can keep `crate::device_descriptor` in both
+//! compilations; the sequence machine uses the host crate's public module.
 
 mod device_descriptor {
     pub use faber_host_macos_arm64::device_descriptor::*;
 }
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 #[path = "../src/composite_host/residency.rs"]
 mod residency;

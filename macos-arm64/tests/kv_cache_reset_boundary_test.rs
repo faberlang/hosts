@@ -3,15 +3,14 @@
 //! Pure host-level proof over B3 descriptor views, the D1/D4 sequence
 //! machine, and D4 residency identities. No device execution.
 //!
-//! Parent registration is a private `mod` in `composite_host.rs`. This unit
-//! cannot edit that file, so the test crate compiles the modules directly.
+//! Residency remains path-compiled here, while the sequence machine uses the
+//! host crate's public module.
 
 mod device_descriptor {
     pub use faber_host_macos_arm64::device_descriptor::*;
 }
 
-#[path = "../src/composite_host/inference_state.rs"]
-mod inference_state;
+use faber_host_macos_arm64::composite_host::inference_state;
 
 #[path = "../src/composite_host/residency.rs"]
 mod residency;
