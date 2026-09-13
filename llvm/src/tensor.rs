@@ -120,12 +120,11 @@ fn shape_from_array(array: &RuntimeArray) -> Option<Vec<i64>> {
 /// contract requires i64-fit widths).
 fn integer_cell_as_i64(value: RuntimeValue) -> Option<i64> {
     Some(match value {
-        RuntimeValue::I1(value) => i64::from(value),
+        RuntimeValue::I1(value) | RuntimeValue::U8(value) => i64::from(value),
         RuntimeValue::I8(value) => i64::from(value),
         RuntimeValue::I16(value) => i64::from(value),
         RuntimeValue::I32(value) => i64::from(value),
         RuntimeValue::I64(value) => value,
-        RuntimeValue::U8(value) => i64::from(value),
         RuntimeValue::U16(value) => i64::from(value),
         RuntimeValue::U32(value) => i64::from(value),
         RuntimeValue::U64(value) => i64::try_from(value).ok()?,
@@ -143,13 +142,7 @@ fn validate_shape(shape: &[i64]) -> Result<usize, &'static str> {
 }
 
 fn indices_from_array(array: &RuntimeArray) -> Option<Vec<i64>> {
-    shape_from_array(array).and_then(|indices| {
-        if indices.iter().any(|index| *index < 0) {
-            None
-        } else {
-            Some(indices)
-        }
-    })
+    shape_from_array(array).filter(|indices| !indices.iter().any(|index| *index < 0))
 }
 
 fn flat_offset(shape: &[i64], indices: &[i64]) -> Result<usize, &'static str> {
@@ -911,7 +904,7 @@ fn value_as_f64(value: RuntimeValue, kind: FaberRtValueKindV1) -> Option<f64> {
 /// # Safety
 ///
 /// Truncation for f32/f64 → i128 is an acknowledged lattice property:
-/// float values with magnitude beyond i128::MAX or fractional values lose
+/// float values with magnitude beyond `i128::MAX` or fractional values lose
 /// precision. This is consistent with Rust `as` semantics and the
 /// controlled tensor element-width conversion lattice.
 #[allow(clippy::cast_possible_truncation, clippy::match_same_arms)]

@@ -3002,16 +3002,15 @@ fn tensor_host_rejects_kinds_without_arithmetic_dispatch_at_admission() {
         STATUS_OK
     );
     let shape = host_tensor_shape(context, &[1]);
-    let one_i16 = 1_i16;
-    #[allow(clippy::similar_names)]
-    let one_u32 = 1_u32;
+    let one_signed_i16 = 1_i16;
+    let one_unsigned_u32 = 1_u32;
     let one_f16_bits = 0x3c00_u16;
     let one_i1 = 1_u8;
 
     for (kind, value) in [
         (VALUE_KIND_I1, std::ptr::from_ref(&one_i1).cast()),
-        (VALUE_KIND_I16, std::ptr::from_ref(&one_i16).cast()),
-        (VALUE_KIND_U32, std::ptr::from_ref(&one_u32).cast()),
+        (VALUE_KIND_I16, std::ptr::from_ref(&one_signed_i16).cast()),
+        (VALUE_KIND_U32, std::ptr::from_ref(&one_unsigned_u32).cast()),
         (VALUE_KIND_F16, std::ptr::from_ref(&one_f16_bits).cast()),
     ] {
         let flat = unsafe { __faber_rt_v1_array_new(context, kind) };
@@ -3461,14 +3460,16 @@ fn gradient_create_accumulate_read_zero_round_trip() {
     // Read the gradient view and verify data through the repr(C) carrier.
     let view = unsafe { __faber_rt_v1_gradient_read(context, gradient.value) };
     assert_eq!(view.status, STATUS_OK);
-    let view_ptr = view.value.cast::<gradient::GradientViewV1>();
-    let view_ref = unsafe { &*view_ptr };
+    let initial_view_ptr = view.value.cast::<gradient::GradientViewV1>();
+    let initial_view_ref = unsafe { &*initial_view_ptr };
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(view_ref.data, view_ref.len as usize) },
+        unsafe { std::slice::from_raw_parts(initial_view_ref.data, initial_view_ref.len as usize) },
         incoming
     );
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(view_ref.shape, view_ref.rank as usize) },
+        unsafe {
+            std::slice::from_raw_parts(initial_view_ref.shape, initial_view_ref.rank as usize)
+        },
         shape
     );
 
@@ -3490,11 +3491,13 @@ fn gradient_create_accumulate_read_zero_round_trip() {
     // Read again — view should reflect the accumulated values.
     let view2 = unsafe { __faber_rt_v1_gradient_read(context, gradient.value) };
     assert_eq!(view2.status, STATUS_OK);
-    let view2_ptr = view2.value.cast::<gradient::GradientViewV1>();
-    let view2_ref = unsafe { &*view2_ptr };
+    let accumulated_view_ptr = view2.value.cast::<gradient::GradientViewV1>();
+    let accumulated_view_ref = unsafe { &*accumulated_view_ptr };
     let expected: [f32; 6] = [11.0, 22.0, 33.0, 44.0, 55.0, 66.0];
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(view2_ref.data, view2_ref.len as usize) },
+        unsafe {
+            std::slice::from_raw_parts(accumulated_view_ref.data, accumulated_view_ref.len as usize)
+        },
         expected
     );
 
@@ -3507,17 +3510,17 @@ fn gradient_create_accumulate_read_zero_round_trip() {
     // Read after zero — all elements should be 0.0.
     let view3 = unsafe { __faber_rt_v1_gradient_read(context, gradient.value) };
     assert_eq!(view3.status, STATUS_OK);
-    let view3_ptr = view3.value.cast::<gradient::GradientViewV1>();
-    let view3_ref = unsafe { &*view3_ptr };
+    let zeroed_view_ptr = view3.value.cast::<gradient::GradientViewV1>();
+    let zeroed_view_ref = unsafe { &*zeroed_view_ptr };
     let zeros: [f32; 6] = [0.0; 6];
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(view3_ref.data, view3_ref.len as usize) },
+        unsafe { std::slice::from_raw_parts(zeroed_view_ref.data, zeroed_view_ref.len as usize) },
         zeros
     );
 
     // Verify shape is still preserved after zero.
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(view3_ref.shape, view3_ref.rank as usize) },
+        unsafe { std::slice::from_raw_parts(zeroed_view_ref.shape, zeroed_view_ref.rank as usize) },
         shape
     );
 
@@ -4862,6 +4865,9 @@ fn sermo_materialize_i64_or_recovers_on_type_mismatch() {
 fn abi_roundtrip_perf_measurement() {
     use std::time::Instant;
 
+    const N: i64 = 20_000;
+    const HANDLE_COUNT: usize = 2_000;
+
     eprintln!(
         "RuntimeValue size: {} bytes",
         std::mem::size_of::<array::RuntimeValue>()
@@ -4872,9 +4878,6 @@ fn abi_roundtrip_perf_measurement() {
         unsafe { __faber_rt_v1_init(0, ptr::null(), &raw mut context) },
         STATUS_OK
     );
-
-    const N: i64 = 20_000;
-    const HANDLE_COUNT: usize = 2_000;
 
     let array = unsafe { __faber_rt_v1_array_new(context, VALUE_KIND_F32) };
     assert!(array.status.is_ok());

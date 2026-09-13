@@ -359,7 +359,7 @@ pub unsafe extern "C" fn __faber_rt_v1_arguments(
 ) -> crate::abi::FaberRtPtrResultV1 {
     unsafe {
         format::ffi_ptr_result(|| {
-            let Some(runtime) = (unsafe { array::runtime_mut(context) }) else {
+            let Some(runtime) = array::runtime_mut(context) else {
                 return crate::abi::FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
             };
             let mut values = Vec::with_capacity(runtime.arguments.len());
@@ -576,11 +576,7 @@ pub(crate) fn opaque_value_text(runtime: &RuntimeContext, handle: *mut c_void) -
             else {
                 return None;
             };
-            let Some(value) =
-                valor_aggregate::runtime_value_to_valor(runtime, map.value_kind, *value)
-            else {
-                return None;
-            };
+            let value = valor_aggregate::runtime_value_to_valor(runtime, map.value_kind, *value)?;
             entries.insert(key, value);
         }
         let valor = Valor::Tabula(entries);
@@ -929,17 +925,18 @@ pub unsafe extern "C" fn __faber_rt_v1_fatal(
     message: FaberRtSliceV1,
 ) -> ! {
     unsafe {
-        if !context.is_null() && (message.len == 0 || !message.data.is_null()) {
-            if let Ok(len) = usize::try_from(message.len) {
-                let bytes = if len == 0 {
-                    &[]
-                } else {
-                    std::slice::from_raw_parts(message.data, len)
-                };
-                drop(io::stderr().write_all(bytes));
-                drop(io::stderr().write_all(b"\n"));
-                drop(io::stderr().flush());
-            }
+        if !context.is_null()
+            && (message.len == 0 || !message.data.is_null())
+            && let Ok(len) = usize::try_from(message.len)
+        {
+            let bytes = if len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(message.data, len)
+            };
+            drop(io::stderr().write_all(bytes));
+            drop(io::stderr().write_all(b"\n"));
+            drop(io::stderr().flush());
         }
         std::process::abort()
     }

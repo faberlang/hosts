@@ -104,7 +104,7 @@ pub unsafe extern "C" fn __faber_rt_v1_aggregate_set_index_ptr_i64(
         };
         // SAFETY: per the v1 ABI contract, `aggregate` is a live map handle
         // created by this runtime; the handle is a stable box pointer.
-        let Some(map) = (unsafe { (aggregate as *mut RuntimeMap).as_mut() }) else {
+        let Some(map) = (unsafe { aggregate.cast::<RuntimeMap>().as_mut() }) else {
             return;
         };
         if map.key_kind != VALUE_KIND_TEXT || map.value_kind != VALUE_KIND_I64 {

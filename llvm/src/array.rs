@@ -135,8 +135,7 @@ impl RuntimeCells {
             Self::I1(values) | Self::U8(values) => values.len(),
             Self::I8(values) => values.len(),
             Self::I16(values) => values.len(),
-            Self::U16(values) => values.len(),
-            Self::F16(values) => values.len(),
+            Self::U16(values) | Self::F16(values) => values.len(),
             Self::I32(values) => values.len(),
             Self::U32(values) => values.len(),
             Self::F32(values) => values.len(),
@@ -156,8 +155,7 @@ impl RuntimeCells {
             Self::I1(values) | Self::U8(values) => values.reserve(additional),
             Self::I8(values) => values.reserve(additional),
             Self::I16(values) => values.reserve(additional),
-            Self::U16(values) => values.reserve(additional),
-            Self::F16(values) => values.reserve(additional),
+            Self::U16(values) | Self::F16(values) => values.reserve(additional),
             Self::I32(values) => values.reserve(additional),
             Self::U32(values) => values.reserve(additional),
             Self::F32(values) => values.reserve(additional),
@@ -242,16 +240,16 @@ impl RuntimeCells {
 
     pub(super) fn push(&mut self, value: RuntimeValue) -> bool {
         match (self, value) {
-            (Self::I1(values), RuntimeValue::I1(value)) => values.push(value),
+            (Self::I1(values), RuntimeValue::I1(value))
+            | (Self::U8(values), RuntimeValue::U8(value)) => values.push(value),
             (Self::I8(values), RuntimeValue::I8(value)) => values.push(value),
             (Self::I16(values), RuntimeValue::I16(value)) => values.push(value),
             (Self::I32(values), RuntimeValue::I32(value)) => values.push(value),
             (Self::I64(values), RuntimeValue::I64(value)) => values.push(value),
-            (Self::U8(values), RuntimeValue::U8(value)) => values.push(value),
-            (Self::U16(values), RuntimeValue::U16(value)) => values.push(value),
+            (Self::U16(values), RuntimeValue::U16(value))
+            | (Self::F16(values), RuntimeValue::F16(value)) => values.push(value),
             (Self::U32(values), RuntimeValue::U32(value)) => values.push(value),
             (Self::U64(values), RuntimeValue::U64(value)) => values.push(value),
-            (Self::F16(values), RuntimeValue::F16(value)) => values.push(value),
             (Self::F32(values), RuntimeValue::F32(value)) => values.push(value),
             (Self::F64(values), RuntimeValue::F64(value)) => values.push(value),
             (Self::Ptr(values), RuntimeValue::Ptr(value)) => values.push(value),
@@ -301,16 +299,16 @@ impl RuntimeCells {
 
     pub(super) fn contains(&self, value: &RuntimeValue) -> bool {
         match (self, value) {
-            (Self::I1(values), RuntimeValue::I1(value)) => values.contains(value),
+            (Self::I1(values), RuntimeValue::I1(value))
+            | (Self::U8(values), RuntimeValue::U8(value)) => values.contains(value),
             (Self::I8(values), RuntimeValue::I8(value)) => values.contains(value),
             (Self::I16(values), RuntimeValue::I16(value)) => values.contains(value),
             (Self::I32(values), RuntimeValue::I32(value)) => values.contains(value),
             (Self::I64(values), RuntimeValue::I64(value)) => values.contains(value),
-            (Self::U8(values), RuntimeValue::U8(value)) => values.contains(value),
-            (Self::U16(values), RuntimeValue::U16(value)) => values.contains(value),
+            (Self::U16(values), RuntimeValue::U16(value))
+            | (Self::F16(values), RuntimeValue::F16(value)) => values.contains(value),
             (Self::U32(values), RuntimeValue::U32(value)) => values.contains(value),
             (Self::U64(values), RuntimeValue::U64(value)) => values.contains(value),
-            (Self::F16(values), RuntimeValue::F16(value)) => values.contains(value),
             (Self::F32(values), RuntimeValue::F32(value)) => values.contains(value),
             (Self::F64(values), RuntimeValue::F64(value)) => values.contains(value),
             (Self::Ptr(values), RuntimeValue::Ptr(value)) => values.contains(value),
@@ -323,8 +321,7 @@ impl RuntimeCells {
             Self::I1(values) | Self::U8(values) => values.reverse(),
             Self::I8(values) => values.reverse(),
             Self::I16(values) => values.reverse(),
-            Self::U16(values) => values.reverse(),
-            Self::F16(values) => values.reverse(),
+            Self::U16(values) | Self::F16(values) => values.reverse(),
             Self::I32(values) => values.reverse(),
             Self::U32(values) => values.reverse(),
             Self::F32(values) => values.reverse(),
@@ -373,12 +370,13 @@ impl RuntimeCells {
     pub(super) fn extend_from(&mut self, other: &Self) -> bool {
         match (self, other) {
             (Self::I1(dst), Self::I1(src)) | (Self::U8(dst), Self::U8(src)) => {
-                dst.extend_from_slice(src)
+                dst.extend_from_slice(src);
             }
             (Self::I8(dst), Self::I8(src)) => dst.extend_from_slice(src),
             (Self::I16(dst), Self::I16(src)) => dst.extend_from_slice(src),
-            (Self::U16(dst), Self::U16(src)) => dst.extend_from_slice(src),
-            (Self::F16(dst), Self::F16(src)) => dst.extend_from_slice(src),
+            (Self::U16(dst), Self::U16(src)) | (Self::F16(dst), Self::F16(src)) => {
+                dst.extend_from_slice(src);
+            }
             (Self::I32(dst), Self::I32(src)) => dst.extend_from_slice(src),
             (Self::U32(dst), Self::U32(src)) => dst.extend_from_slice(src),
             (Self::F32(dst), Self::F32(src)) => dst.extend_from_slice(src),
@@ -937,16 +935,16 @@ pub(super) unsafe fn read_value(
 #[allow(clippy::similar_names)]
 pub(super) unsafe fn write_value(value: RuntimeValue, output: *mut c_void) -> bool {
     match value {
-        RuntimeValue::I1(value) => unsafe { write_typed(output, value) },
+        RuntimeValue::I1(value) | RuntimeValue::U8(value) => unsafe { write_typed(output, value) },
         RuntimeValue::I8(value) => unsafe { write_typed(output, value) },
         RuntimeValue::I16(value) => unsafe { write_typed(output, value) },
         RuntimeValue::I32(value) => unsafe { write_typed(output, value) },
         RuntimeValue::I64(value) => unsafe { write_typed(output, value) },
-        RuntimeValue::U8(value) => unsafe { write_typed(output, value) },
-        RuntimeValue::U16(value) => unsafe { write_typed(output, value) },
+        RuntimeValue::U16(value) | RuntimeValue::F16(value) => unsafe {
+            write_typed(output, value)
+        },
         RuntimeValue::U32(value) => unsafe { write_typed(output, value) },
         RuntimeValue::U64(value) => unsafe { write_typed(output, value) },
-        RuntimeValue::F16(value) => unsafe { write_typed(output, value) },
         RuntimeValue::F32(value) => unsafe { write_typed(output, value) },
         RuntimeValue::F64(value) => unsafe { write_typed(output, value) },
         RuntimeValue::Ptr(value) => unsafe { write_typed(output, value) },
