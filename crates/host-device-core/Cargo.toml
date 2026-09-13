@@ -6,6 +6,9 @@ description = "Backend-neutral device descriptor, session, and lifecycle primiti
 license = "MIT"
 publish = false
 
+[lints.clippy]
+pedantic = "deny"
+
 [dependencies]
 faber = { path = "../../../faber/runtime/rust" }
 host-coordinator = { path = "../host-coordinator" }

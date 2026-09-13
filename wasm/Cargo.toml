@@ -6,6 +6,9 @@ description = "Portable core-Wasm product host for the Faber faber_rt_v1 surface
 license = "MIT"
 publish = false
 
+[lints.clippy]
+pedantic = "deny"
+
 [dependencies]
 wasmtime = "45"
 # Shared CPU host ABI v1 constants (`VALUE_KIND_*`, symbol rows). Read-only

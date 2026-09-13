@@ -6,6 +6,9 @@ description = "macOS arm64 host runtime prototype for Faber Wasm components"
 license = "MIT"
 publish = false
 
+[lints.clippy]
+pedantic = "deny"
+
 [dependencies]
 faber = { path = "../../faber/runtime/rust" }
 host-coordinator = { path = "../crates/host-coordinator" }
