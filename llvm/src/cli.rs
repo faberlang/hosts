@@ -748,14 +748,16 @@ fn parse_long_option(
             .is_some_and(|long| name == format!("--{long}"))
         {
             apply_option(
-                context,
+                OptionInput {
+                    context,
+                    index,
+                    arguments,
+                },
                 option,
                 option_index,
                 option_entries,
                 name,
                 inline,
-                index,
-                arguments,
             )?;
             return Ok(());
         }
@@ -778,14 +780,16 @@ fn parse_short_option(
             .is_some_and(|short| arg == format!("-{short}"))
         {
             apply_option(
-                context,
+                OptionInput {
+                    context,
+                    index,
+                    arguments,
+                },
                 option,
                 option_index,
                 option_entries,
                 arg,
                 None,
-                index,
-                arguments,
             )?;
             return Ok(());
         }
@@ -793,16 +797,25 @@ fn parse_short_option(
     Err(format!("unknown option '{arg}'"))
 }
 
-fn apply_option(
+struct OptionInput<'a> {
     context: *mut FaberRtContextV1,
+    index: &'a mut usize,
+    arguments: &'a [String],
+}
+
+fn apply_option(
+    input: OptionInput<'_>,
     option: &DescriptorOption,
     option_index: usize,
     option_entries: &mut [CliEntry],
     label: &str,
     inline: Option<String>,
-    index: &mut usize,
-    arguments: &[String],
 ) -> Result<(), String> {
+    let OptionInput {
+        context,
+        index,
+        arguments,
+    } = input;
     if option.flag {
         option_entries[option_index] = CliEntry {
             kind: option.ty,
