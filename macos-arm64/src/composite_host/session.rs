@@ -777,12 +777,12 @@ fn build_fused_qkv_plan(
     // The RoPE tables are whole rows of head_dim/2 elements each — the row
     // count is the producer's axis (seq for prefill, capacity for decode),
     // never the activation row count.
-    if let Some((cos, _)) = cos.zip(sin) {
-        if cos.element_count == 0 || cos.element_count % (head_dim / 2) != 0 {
-            return Err(unresolvable(
-                "rope table shape (element count is not whole head_dim/2 rows)",
-            ));
-        }
+    if let Some((cos, _)) = cos.zip(sin)
+        && (cos.element_count == 0 || cos.element_count % (head_dim / 2) != 0)
+    {
+        return Err(unresolvable(
+            "rope table shape (element count is not whole head_dim/2 rows)",
+        ));
     }
     let biases = [
         fused_slot(slots, |slot| {
@@ -989,21 +989,21 @@ fn finalize_fused_bind(
     // A rows-sized `.k_gemv` activation output carries the width directly;
     // a capacity-sized persistent cache target never does (its element
     // count is `kv_heads * capacity * head_dim`).
-    if !plan.kv_cache_target && plan.outputs[1].element_count % plan.rows == 0 {
+    if !plan.kv_cache_target && plan.outputs[1].element_count.is_multiple_of(plan.rows) {
         candidates.push(plan.outputs[1].element_count / plan.rows);
     }
     if let Some(format) = k_format {
         if let Some(width) = fused_packed_width(plan.weights[1], plan.hidden, format) {
             candidates.push(width);
         }
-    } else if plan.weights[1].element_count % plan.hidden == 0 {
+    } else if plan.weights[1].element_count.is_multiple_of(plan.hidden) {
         candidates.push(plan.weights[1].element_count / plan.hidden);
     }
     for kv_width in candidates {
         if kv_width == 0
             || kv_width % plan.head_dim != 0
-            || plan.q_width % kv_width != 0
-            || plan.outputs[1].element_count % kv_width != 0
+            || !plan.q_width.is_multiple_of(kv_width)
+            || !plan.outputs[1].element_count.is_multiple_of(kv_width)
         {
             continue;
         }
@@ -2387,7 +2387,7 @@ impl<'host> ProgramSession<'host> {
                 .get(&key)
                 .copied()
                 .ok_or_else(|| HostError::internal("session state buffer disappeared"))?;
-            zero_fill_buffer(&mut self.runtime, &handle, meta.byte_length)?;
+            zero_fill_buffer(self.runtime, &handle, meta.byte_length)?;
             cleared += 1;
         }
         Ok(cleared)
@@ -2766,7 +2766,7 @@ impl<'host> ProgramSession<'host> {
             // is reset before it comes live, whether its handle was newly
             // allocated or reused from the pool.
             if meta.initialization == DeviceBufferInitialization::ZeroFill {
-                zero_fill_buffer(&mut self.runtime, &handle, meta.byte_length)?;
+                zero_fill_buffer(self.runtime, &handle, meta.byte_length)?;
             }
             self.inner.buffers.insert(key, handle);
         }
@@ -2887,10 +2887,10 @@ impl<'host> ProgramSession<'host> {
                 first_error.get_or_insert(error);
             }
         }
-        if !self.inner.shared_module {
-            if let Err(error) = self.runtime.release(&self.inner.module_handle) {
-                first_error.get_or_insert(error);
-            }
+        if !self.inner.shared_module
+            && let Err(error) = self.runtime.release(&self.inner.module_handle)
+        {
+            first_error.get_or_insert(error);
         }
         // Shared sibling handles stay mapped on the owner; drop only this
         // program's keys so `session_handle_count()` reports reality.
@@ -3885,7 +3885,7 @@ mod fused_qkv_plan_tests {
         assert_eq!(bind.kv_heads, 2);
         assert_eq!(bind.q_per_kv, 7);
         assert_eq!(bind.kv_output_strides, [8192 * 64, 64, 1]);
-        assert_eq!(bind.rotate_half, false);
+        assert!(!bind.rotate_half);
     }
 
     /// SmolLM2-360M prefill layer-0 fused QKV slots (captured): no biases,
@@ -4464,10 +4464,10 @@ mod fused_rotate_half_probe_tests {
             .load_module(b"qkv-probe-module")
             .expect("module loads");
         let mut buffers = BTreeMap::new();
-        let mut seed = |runtime: &mut DeviceRuntime,
-                        buffers: &mut BTreeMap<BufferKey, DeviceHandle>,
-                        id: u32,
-                        values: &[f32]| {
+        let seed = |runtime: &mut DeviceRuntime,
+                    buffers: &mut BTreeMap<BufferKey, DeviceHandle>,
+                    id: u32,
+                    values: &[f32]| {
             let handle = runtime
                 .alloc_bytes(values.len() * 4)
                 .expect("probe buffer allocates");
@@ -4521,7 +4521,7 @@ mod fused_rotate_half_probe_tests {
                 .collect::<Vec<_>>(),
         );
         seed(&mut runtime, &mut buffers, 6, &cursor);
-        seed(&mut runtime, &mut buffers, 361, &vec![0.0f32; 48]);
+        seed(&mut runtime, &mut buffers, 361, &[0.0f32; 48]);
         seed(&mut runtime, &mut buffers, 7, &vec![0.0f32; 128]);
         seed(&mut runtime, &mut buffers, 8, &vec![0.0f32; 128]);
         let kernel = SessionKernel {
@@ -4597,8 +4597,7 @@ mod fused_rotate_half_probe_tests {
             &BTreeMap::new(),
             &learned,
         )
-        .err()
-        .expect("a zeroed cursor must fail closed before the carrier launch");
+        .expect_err("a zeroed cursor must fail closed before the carrier launch");
         assert!(
             error.message.contains("query_rows"),
             "the error names the unavailable fact: {}",
@@ -4629,8 +4628,7 @@ mod fused_rotate_half_probe_tests {
             &BTreeMap::new(),
             &learned,
         )
-        .err()
-        .expect("a carrier that publishes no Q must fail the probe closed");
+        .expect_err("a carrier that publishes no Q must fail the probe closed");
         assert!(
             error.message.contains("published no Q"),
             "the error states the carrier wrote nothing: {}",
@@ -4663,8 +4661,7 @@ mod fused_rotate_half_probe_tests {
             &BTreeMap::new(),
             &learned,
         )
-        .err()
-        .expect("a skewed carrier Q matches neither candidate");
+        .expect_err("a skewed carrier Q matches neither candidate");
         for fragment in [
             "rotate_half=false max_delta=",
             "rotate_half=true max_delta=",
@@ -4711,18 +4708,19 @@ mod fused_residual_rms_plan_tests {
     /// carrier kernel while the neighboring attn_norm uses 1e-5 — the parse
     /// must bind the ResidualRmsNorm body's own literal.
     fn qwen_module_image() -> Vec<u8> {
-        format!(concat!(
-            "kernel void prefill_blk_0_attn_norm(float) {{\n",
+        concat!(
+            "kernel void prefill_blk_0_attn_norm(float) {\n",
             "    float scale = 1.0 / sqrt(mean + 0.00001f);\n",
-            "}}\n",
-            "kernel void prefill_blk_0_ResidualRmsNorm(float) {{\n",
+            "}\n",
+            "kernel void prefill_blk_0_ResidualRmsNorm(float) {\n",
             "    float mean = sumsq / float(896u);\n",
             "    float scale = 1.0 / sqrt(mean + 0.000001f);\n",
-            "}}\n",
-            "kernel void prefill_blk_0_ffn_gate(float) {{\n",
+            "}\n",
+            "kernel void prefill_blk_0_ffn_gate(float) {\n",
             "    return;\n",
-            "}}\n",
-        ))
+            "}\n",
+        )
+        .to_string()
         .into_bytes()
     }
 

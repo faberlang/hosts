@@ -364,7 +364,7 @@ fn run_abort(plan: BoundDistributedPlan, set: DeviceRuntimeSet, launch: LaunchPr
 #[test]
 fn m1_fake_metal_transaction_commits_with_byte_exact_accounting() {
     let id = PhysicalDeviceId::metal("4278190081");
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::from_members([(id, fake_metal_runtime())]).expect("M=1");
     assert_eq!(set.len(), 1);
     let (staged, published, _) = run_commit(plan, set, fake_program());
@@ -399,7 +399,7 @@ fn m_gt_1_fake_cuda_composition_commits() {
 #[test]
 fn abort_retires_without_publication() {
     let id = PhysicalDeviceId::metal("4278190081");
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::from_members([(id, fake_metal_runtime())]).expect("M=1");
     run_abort(plan, set, fake_program());
 }
@@ -413,7 +413,7 @@ fn live_metal_transaction_or_pending() {
     let devices = enumerate_metal_physical_devices().expect("enum");
     assert_eq!(devices.len(), 1);
     let id = PhysicalDeviceId::metal(&devices[0].registry_id);
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::open_live([id]).expect("live metal set");
     assert_eq!(set.backend(), DeviceBackend::Metal);
     let (staged, published, host_staged) = run_commit(plan, set, live_metal_program());
@@ -431,7 +431,7 @@ fn live_metal_abort_or_pending() {
     }
     let devices = enumerate_metal_physical_devices().expect("enum");
     let id = PhysicalDeviceId::metal(&devices[0].registry_id);
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::open_live([id]).expect("live metal set");
     run_abort(plan, set, live_metal_program());
     eprintln!("MD3H-H2 metal abort receipt: published=0");
@@ -446,7 +446,7 @@ fn live_cuda_transaction_or_pending() {
     let devices = enumerate_cuda_physical_devices().expect("enum");
     assert_eq!(devices.len(), 1);
     let id = PhysicalDeviceId::cuda(&devices[0].pci_uuid, devices[0].driver_uuid.clone());
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::open_live([id]).expect("live cuda set");
     assert_eq!(set.backend(), DeviceBackend::Cuda);
     let (staged, published, host_staged) = run_commit(plan, set, live_cuda_program());
@@ -464,7 +464,7 @@ fn live_cuda_abort_or_pending() {
     }
     let devices = enumerate_cuda_physical_devices().expect("enum");
     let id = PhysicalDeviceId::cuda(&devices[0].pci_uuid, devices[0].driver_uuid.clone());
-    let plan = plan_on(&[id.clone()]);
+    let plan = plan_on(std::slice::from_ref(&id));
     let set = DeviceRuntimeSet::open_live([id]).expect("live cuda set");
     run_abort(plan, set, live_cuda_program());
     eprintln!("MD3H-H2 cuda abort receipt: published=0");

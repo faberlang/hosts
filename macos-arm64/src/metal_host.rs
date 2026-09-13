@@ -2483,10 +2483,10 @@ impl SystemMetalDriver {
         let mut gpu_start = 0u64;
         let mut cpu_end = 0u64;
         let mut gpu_end = 0u64;
-        if dest.is_some() {
-            if let Some(device) = self.device.as_ref() {
-                device.sample_timestamps(&mut cpu_start, &mut gpu_start);
-            }
+        if dest.is_some()
+            && let Some(device) = self.device.as_ref()
+        {
+            device.sample_timestamps(&mut cpu_start, &mut gpu_start);
         }
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -2498,10 +2498,10 @@ impl SystemMetalDriver {
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(metal_driver("Metal command buffer did not complete"));
         }
-        if dest.is_some() {
-            if let Some(device) = self.device.as_ref() {
-                device.sample_timestamps(&mut cpu_end, &mut gpu_end);
-            }
+        if dest.is_some()
+            && let Some(device) = self.device.as_ref()
+        {
+            device.sample_timestamps(&mut cpu_end, &mut gpu_end);
         }
         if let Some(dest) = dest {
             let timeline = convert_encoder_gpu_timeline(

@@ -98,9 +98,7 @@ impl<'host> PairedProgramSession<'host> {
 
         let mut prefill_session =
             ProgramSession::new(runtime, prefill, device_name.clone(), Some(attention_axes))?;
-        if let Err(error) = prefill_session.init_params_with_weight_bytes(weights, byte_weights) {
-            return Err(error);
-        }
+        prefill_session.init_params_with_weight_bytes(weights, byte_weights)?;
         let offer = prefill_session.shared_offer();
         let prefill = prefill_session.into_inner();
 
@@ -386,7 +384,7 @@ impl<'host> PairedProgramSession<'host> {
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        let result = execute_inner(&mut self.runtime, &mut self.prefill, inputs);
+        let result = execute_inner(self.runtime, &mut self.prefill, inputs);
         if result.is_ok() {
             self.prefill_pool_warmed = true;
         }
@@ -397,7 +395,7 @@ impl<'host> PairedProgramSession<'host> {
         &mut self,
         inputs: &BTreeMap<u32, Vec<f32>>,
     ) -> HostResult<DeviceExecutionReceipt> {
-        let result = execute_inner(&mut self.runtime, &mut self.decode, inputs);
+        let result = execute_inner(self.runtime, &mut self.decode, inputs);
         if result.is_ok() {
             self.decode_pool_warmed = true;
         }
@@ -616,7 +614,7 @@ fn per_execution_alloc_count(descriptor: &DeviceDescriptor) -> usize {
 
 impl RopeConfig {
     fn validate_for_pair(self) -> HostResult<()> {
-        if self.head_dim == 0 || self.head_dim % 2 != 0 {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
             return Err(HostError::invalid_args(format!(
                 "RoPE head_dim must be a nonzero even number; got {}",
                 self.head_dim

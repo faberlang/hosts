@@ -115,17 +115,17 @@ impl BindDescriptor {
                 "bind dimensions and strides have different ranks",
             ));
         }
-        if self.dims.iter().any(|dim| *dim == 0) {
+        if self.dims.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero dimension",
             ));
         }
-        if self.strides.iter().any(|stride| *stride == 0) {
+        if self.strides.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "bind descriptor has a zero dispatch axis",
             ));
@@ -311,7 +311,7 @@ impl QuantizedGemvBind {
                 "quantized GEMV has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "quantized GEMV has a zero dispatch axis",
             ));
@@ -468,7 +468,7 @@ impl GroupedExpertGemmBind {
                 "grouped expert GEMM has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "grouped expert GEMM has a zero dispatch axis",
             ));
@@ -687,7 +687,7 @@ impl QkvProjectionBind {
                 "QKV projection layout is not servable",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "QKV projection bind has a zero dispatch axis",
             ));
@@ -1320,7 +1320,7 @@ impl CausalAttentionBind {
                 "causal attention query rows exceed the sequence block",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "causal attention bind has a zero dispatch axis",
             ));
@@ -2187,7 +2187,7 @@ pub fn grouped_expert_gemm_selected(
         });
     }
     let active = expert_ids.len() / rows;
-    if expert_ids.len() % rows != 0 || expert_weights.len() % rows != 0 {
+    if !expert_ids.len().is_multiple_of(rows) || !expert_weights.len().is_multiple_of(rows) {
         return Err(KernelBodyError::ShapeMismatch(
             "grouped expert dispatch ids/weights are not a full row width",
         ));

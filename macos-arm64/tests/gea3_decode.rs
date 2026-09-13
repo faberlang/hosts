@@ -803,7 +803,7 @@ fn admit_chunked_window(
             resource.buffer.name, chunked.block, chunked.row_count
         ));
     }
-    if resource.version.element_count != allocation || allocation % chunk_cells != 0 {
+    if resource.version.element_count != allocation || !allocation.is_multiple_of(chunk_cells) {
         return Err(format!(
             "resource `{}` carries a chunked window (block {} · rows {} = {chunk_cells}) that does not partition its {allocation}-element allocation; the declared geometry must equal the producer's head-major truth (GEA3-U6 num-10)",
             resource.buffer.name, chunked.block, chunked.row_count
@@ -879,7 +879,7 @@ fn admit_sub_window(
                 )
             })?;
         let bounded_prefix = pitch_span < allocation;
-        if allocation % window.row_stride != 0
+        if !allocation.is_multiple_of(window.row_stride)
             || pitch_span > allocation
             || (bounded_prefix && window.row_stride != KV_WIDTH)
         {
@@ -1023,8 +1023,8 @@ fn map_envelope_to_descriptor(
             if let Some(chunked) = resource.version.chunked_window {
                 admit_chunked_window(resource, chunked, allocation)?;
             }
-            if let Some(binding) = admit_sub_window(resource, allocation)? {
-                if windows
+            if let Some(binding) = admit_sub_window(resource, allocation)?
+                && windows
                     .insert(
                         (
                             u32::try_from(kernel_index).expect("kernel index fits u32"),
@@ -1033,12 +1033,11 @@ fn map_envelope_to_descriptor(
                         binding,
                     )
                     .is_some()
-                {
-                    return Err(format!(
-                        "kernel `{}` repeats a window binding at {}",
-                        kernel.entry, resource.binding.binding
-                    ));
-                }
+            {
+                return Err(format!(
+                    "kernel `{}` repeats a window binding at {}",
+                    kernel.entry, resource.binding.binding
+                ));
             }
         }
     }
@@ -3405,10 +3404,10 @@ fn gea3_diagnostic_read_slots(
         .collect()
 }
 
-fn gea3_diagnostic_primary_slot<'a>(
-    kernel: &'a Gea3KernelUnit,
+fn gea3_diagnostic_primary_slot(
+    kernel: &Gea3KernelUnit,
     input: bool,
-) -> Option<&'a Gea3DeviceResource> {
+) -> Option<&Gea3DeviceResource> {
     // Prefer the direct read edge.  A ReadWrite KV arena is a side effect of
     // the K/V launch, not the activation consumed by the entry.  Falling back
     // to ReadWrite keeps the helper useful for entries whose only input is a
@@ -4257,7 +4256,7 @@ fn gea3_run_physical(
         for (key, handle) in &program.buffers {
             let slot = resident_slots
                 .get(key)
-                .ok_or_else(|| "resident slot metadata disappeared")?;
+                .ok_or("resident slot metadata disappeared")?;
             if gea3_canonical_model_name(&slot.buffer_name).is_some() {
                 continue;
             }
@@ -4269,18 +4268,17 @@ fn gea3_run_physical(
                     0
                 });
             }
-            if (slot.lifetime == DeviceBufferLifetime::PerProgram
+            if ((slot.lifetime == DeviceBufferLifetime::PerProgram
                 && slot.initialization == DeviceBufferInitialization::HostProvided)
-                || slot.initialization == DeviceBufferInitialization::ZeroFill
+                || slot.initialization == DeviceBufferInitialization::ZeroFill)
+                && first_zero
             {
-                if first_zero {
-                    let started = Instant::now();
-                    gea3_zero_handle(runtime, handle)?;
-                    if slot.buffer_name.starts_with("blk.") && slot.buffer_name.contains(".kv_") {
-                        kv_zero_us = kv_zero_us.saturating_add(gea3_elapsed_us(started));
-                    } else {
-                        other_zero_fills += 1;
-                    }
+                let started = Instant::now();
+                gea3_zero_handle(runtime, handle)?;
+                if slot.buffer_name.starts_with("blk.") && slot.buffer_name.contains(".kv_") {
+                    kv_zero_us = kv_zero_us.saturating_add(gea3_elapsed_us(started));
+                } else {
+                    other_zero_fills += 1;
                 }
             }
         }
@@ -4699,7 +4697,7 @@ fn gea3_run_physical(
         .skip(1)
         .filter_map(|row| row["timing_us"]["submit_sync_us"].as_u64())
         .collect();
-    let kv_alloc_us = kv_setup_us;
+    let _kv_alloc_us = kv_setup_us;
     // Every statue uses the same receipt schema; a non-frozen statue names
     // its own completed-step basis without changing the timing field shape.
     let step_count_cell = if identity.history_capacity == HISTORY_CAPACITY {

@@ -1854,7 +1854,7 @@ fn oracle_rope_packed(packed: &[f32], width: usize, rope: &[f32]) -> Vec<f32> {
             let cos_t = rope[(row * 32 + pair) * 3 + 1];
             let sin_t = rope[(row * 32 + pair) * 3 + 2];
             let base = row * width + col - within;
-            if within % 2 == 0 {
+            if within.is_multiple_of(2) {
                 let next = packed[base + within + 1];
                 out[base + within] = packed[base + within] * cos_t - next * sin_t;
             } else {
@@ -2178,7 +2178,9 @@ fn gea2_real_host_inputs(
 #[ignore = "physical Metal gate; run only with the exact §6 command pair"]
 fn gea2_real_metal_block_receipt() {
     let e2e_start = Instant::now();
-    std::env::set_var("FABER_PER_OP_TIMING", "1");
+    // SAFETY: The ignored gate runs this test in isolation before any child is
+    // spawned, so no concurrent thread reads or mutates the process environment.
+    unsafe { std::env::set_var("FABER_PER_OP_TIMING", "1") };
     let workspace = workspace_root();
     let receipt_path = PathBuf::from(
         std::env::var_os("GEA2_METAL_RECEIPT")
@@ -3021,15 +3023,15 @@ fn gea2_element_wise_passes(
 fn gea2_amended_block_gate_passes_v5_noise_and_fails_semantic_errors() {
     let expected = [
         -1.049_453_3_f32,
-        2.104_044_0e-5_f32,
+        2.104_044e-5_f32,
         -62.708_534_f32,
         1.0_f32,
         -0.5_f32,
     ];
     let v5_noise = [
         -1.049_453_3_f32,
-        2.080_202_0e-5_f32, // abs 2.384e-7 on a 2.1e-5 element
-        -62.708_584_f32,    // abs 4.959e-5 on a 62.7 element
+        2.080_202e-5_f32, // abs 2.384e-7 on a 2.1e-5 element
+        -62.708_584_f32,  // abs 4.959e-5 on a 62.7 element
         1.0_f32,
         -0.5_f32,
     ];

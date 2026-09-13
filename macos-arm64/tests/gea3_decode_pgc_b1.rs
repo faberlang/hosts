@@ -89,7 +89,7 @@ fn extent_for(entry: &str, plan: &Value) -> u64 {
 
 fn assert_extent_geometry(plan: &Value, manifest: &Value, expected: u64) {
     assert!(expected < FIXED1000_CAPACITY);
-    assert!(expected >= PREFILL_ROWS + 1);
+    assert!(expected > PREFILL_ROWS);
     assert_eq!(plan["kv_geometry"]["capacity"], FIXED1000_CAPACITY);
     assert_eq!(
         plan["kv_geometry"]["declared_history_length"],

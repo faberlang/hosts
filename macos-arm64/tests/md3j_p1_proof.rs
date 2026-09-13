@@ -215,7 +215,7 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
 
     let one_snapshot = host_coordinator::discovery::DeviceDiscoverySnapshot::from_enumerated(
         PROBE_TIME,
-        snapshot.devices().values().next().cloned().into_iter(),
+        snapshot.devices().values().next().cloned(),
     );
     let receipt_81 = prepare_distributed_image(EIGHT_RANK, &one_snapshot, 1)
         .expect("same F1 image prepares as the 8:1 comparison row");

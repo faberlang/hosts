@@ -15,7 +15,7 @@
 //! session admits and encodes the one-row threadgroup shape.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use faber_host_macos_arm64::metal_host::MetalLaunchBinding;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};

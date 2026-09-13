@@ -542,7 +542,7 @@ fn eight_rank_bind_count_one_prepares_on_one_physical_cuda_snapshot() {
     assert_eq!(receipt.physical_device_count, 1);
     assert_eq!(receipt.virtual_partition_count, 8);
     assert_eq!(receipt.fixture_identity_class, "virtual");
-    assert_eq!(receipt.hardware_isolation_claimed, false);
+    assert!(!receipt.hardware_isolation_claimed);
     assert_eq!(receipt.bind_shape, "8:1");
     assert!(receipt.communication_graph_edge_count > 0);
     assert_eq!(receipt.transaction_state, "prepared");

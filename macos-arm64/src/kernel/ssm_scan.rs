@@ -87,7 +87,7 @@ impl SsmScanBind {
                 "SSM scan state layout is not servable",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "SSM scan bind has a zero dispatch axis",
             ));

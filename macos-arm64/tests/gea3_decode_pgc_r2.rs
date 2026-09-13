@@ -167,7 +167,7 @@ fn head_chain_terminal_binding_reads_one_vocab_row_with_c2_next_token() {
     let expected_token = argmax(&expected);
     assert_eq!(expected_token, 42_424);
 
-    let logits_view = TerminalRowBinding::logits();
+    let _logits_view = TerminalRowBinding::logits();
     let hidden_view = TerminalRowBinding::hidden();
 
     let mut runtime = fake_metal_with_entries(&["head_rmsnorm", "lm_head_gemv"]);

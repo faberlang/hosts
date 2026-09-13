@@ -263,7 +263,7 @@ fn qkv_projection_fails_closed_when_rope_table_under_covers_cursor_span() {
     )
     .expect_err("under-covering table must fail closed");
     assert!(
-        matches!(error, KernelBodyError::BufferTooShort { ref buffer, required: 3, actual: 2 } if *buffer == "QKV RoPE table"),
+        matches!(error, KernelBodyError::BufferTooShort { buffer, required: 3, actual: 2 } if buffer == "QKV RoPE table"),
         "unexpected error: {error:?}"
     );
     assert!(q.iter().all(|value| *value == 0.0));

@@ -65,7 +65,7 @@ impl SsmConv1dBind {
                 "SSM conv1d state channel layout is not servable",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "SSM conv1d bind has a zero dispatch axis",
             ));

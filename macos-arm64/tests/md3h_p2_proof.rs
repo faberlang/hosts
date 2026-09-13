@@ -36,7 +36,7 @@ fn pharos_cuda_eight_rank_mechanics_receipt_is_honest() {
     assert_eq!(receipt.physical_device_count, 1);
     assert_eq!(receipt.virtual_partition_count, 8);
     assert_eq!(receipt.fixture_identity_class, "virtual");
-    assert_eq!(receipt.hardware_isolation_claimed, false);
+    assert!(!receipt.hardware_isolation_claimed);
     assert_eq!(receipt.bind_shape, "8:1");
     assert_eq!(receipt.transport_class, "host_staged");
     assert!(receipt.communication_graph_edge_count > 0);

@@ -195,7 +195,7 @@ fn pre_dispatch_abort_leaves_machine_unchanged_and_reusable() {
 
 #[test]
 fn pre_dispatch_abort_rejects_after_possible_mutation() {
-    let mut state = at_l(16, 5);
+    let state = at_l(16, 5);
     let mut tx = begin_verification(&state, 4);
     tx.record_possible_mutation(FailureStage::Dispatch);
     let err = state

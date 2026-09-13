@@ -114,7 +114,6 @@ impl DeviceRuntimeSet {
     }
 
     /// Member identities in stable identity order.
-    #[must_use]
     pub fn ids(&self) -> impl Iterator<Item = &PhysicalDeviceId> {
         self.members.keys()
     }

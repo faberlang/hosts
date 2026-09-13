@@ -107,7 +107,7 @@ impl RouterSelectionBind {
                 "router selection has a zero stride",
             ));
         }
-        if self.grid.iter().any(|axis| *axis == 0) {
+        if self.grid.contains(&0) {
             return Err(KernelBodyError::InvalidBind(
                 "router selection has a zero dispatch axis",
             ));
