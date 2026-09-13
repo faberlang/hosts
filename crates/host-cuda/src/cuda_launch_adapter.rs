@@ -429,6 +429,10 @@ pub fn parse_descriptor(descriptor_json: &[u8]) -> HostResult<NvvmLaunchPlan> {
 }
 
 /// Structural validation of one descriptor kernel entry (fail-closed).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive fail-closed pass cross-checks every field of a single descriptor kernel"
+)]
 fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     if kernel.entry.trim().is_empty() {
         return Err(errors::descriptor(
@@ -867,23 +871,23 @@ fn matmul_grid_consistency(
             "nvvm descriptor plan tiled_matmul (kernel `{entry}`) has a zero tile"
         )));
     }
-    let expected_x_u64 = n.div_ceil(u64::from(tile));
-    let expected_y_u64 = m.div_ceil(u64::from(tile));
-    let expected_x = u32::try_from(expected_x_u64).map_err(|_| {
+    let grid_columns_u64 = n.div_ceil(u64::from(tile));
+    let grid_rows_u64 = m.div_ceil(u64::from(tile));
+    let required_columns = u32::try_from(grid_columns_u64).map_err(|_| {
         errors::descriptor(format!(
-            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid x {expected_x_u64} does not fit u32"
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid x {grid_columns_u64} does not fit u32"
         ))
     })?;
-    let expected_y = u32::try_from(expected_y_u64).map_err(|_| {
+    let required_rows = u32::try_from(grid_rows_u64).map_err(|_| {
         errors::descriptor(format!(
-            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid y {expected_y_u64} does not fit u32"
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid y {grid_rows_u64} does not fit u32"
         ))
     })?;
-    if grid[0] != expected_x || grid[1] != expected_y {
+    if grid[0] != required_columns || grid[1] != required_rows {
         return Err(launch_authority_conflict(
             entry,
             format!(
-                "plan tile grid ({expected_x}, {expected_y}) contradicts launch dispatch ({}, {})",
+                "plan tile grid ({required_columns}, {required_rows}) contradicts launch dispatch ({}, {})",
                 grid[0], grid[1]
             ),
         ));
@@ -918,6 +922,10 @@ fn launch_authority_conflict(entry: &str, detail: impl std::fmt::Display) -> Hos
 ///   contradicts its element count;
 /// - `E_DEVICE_ENTRY_MISMATCH` / session-level failures bubble through
 ///   unchanged.
+#[allow(
+    clippy::too_many_lines,
+    reason = "allocation, launch, readback, and unconditional teardown form one transaction boundary"
+)]
 pub fn execute_launch_plan(
     session: &mut CudaHostSession,
     ptx: &[u8],

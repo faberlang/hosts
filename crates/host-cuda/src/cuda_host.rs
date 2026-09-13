@@ -135,6 +135,10 @@ pub trait CudaDriver: Send {
     /// # Errors
     ///
     /// Returns an error if the CUDA driver operation fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the driver boundary mirrors CUDA's explicit module, buffers, grid, and block launch shape"
+    )]
     fn launch_kernel(
         &mut self,
         module: u64,
@@ -524,9 +528,17 @@ impl CudaHostSession {
     }
 
     /// Control-frame representation of a handle (opaque id only; no payload).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a synthetic handle outside the signed `Numerus` carrier range
+    /// is supplied. Session-issued handles are monotonically allocated from 1
+    /// and cannot exhaust that range within a process lifetime.
     #[must_use]
     pub fn handle_frame_data(id: CudaHandleId) -> Valor {
-        frame_data::tabula([("cuda_handle", Valor::Numerus(id.0 as i64))])
+        let id = i64::try_from(id.0)
+            .expect("CUDA handle IDs must fit the signed Numerus control-frame carrier");
+        frame_data::tabula([("cuda_handle", Valor::Numerus(id))])
     }
 
     fn require_admitted(&self) -> HostResult<()> {
@@ -557,7 +569,9 @@ impl CudaHostSession {
         match self.handles.get(id.0) {
             Some(handle) => match &handle.kind {
                 CudaHandleKind::Buffer { len_bytes } => Ok((handle.backend_token, *len_bytes)),
-                _ => Err(HostError::invalid_args("handle is not a CUDA buffer")),
+                CudaHandleKind::Module => {
+                    Err(HostError::invalid_args("handle is not a CUDA buffer"))
+                }
             },
             None => Err(cuda_invalid_handle(id)),
         }
@@ -825,7 +839,10 @@ fn enumerate_cuda_devices_with_api(
             "cuDeviceGetCount returned a negative device count",
         ));
     }
-    let mut devices = Vec::with_capacity(count as usize);
+    let device_count = usize::try_from(count).map_err(|_| {
+        cuda_unavailable("cuDeviceGetCount returned a count that does not fit host usize")
+    })?;
+    let mut devices = Vec::with_capacity(device_count);
     for ordinal in 0..count {
         devices.push(identify_cuda_device(api, ordinal, smi)?);
     }
@@ -845,7 +862,12 @@ fn identify_cuda_device(
         )));
     }
     let driver_uuid = cuda_device_uuid(api, handle);
-    let smi_row = smi.iter().find(|row| row.index == ordinal as u32);
+    let ordinal_u32 = u32::try_from(ordinal).map_err(|_| {
+        cuda_unavailable(format!(
+            "CUDA ordinal {ordinal} cannot be represented as a device index"
+        ))
+    })?;
+    let smi_row = smi.iter().find(|row| row.index == ordinal_u32);
     let pci_uuid = match smi_row {
         Some(row) => row.uuid.clone(),
         None => match &driver_uuid {
@@ -860,7 +882,7 @@ fn identify_cuda_device(
     Ok(EnumeratedCudaDevice {
         handle,
         facts: CudaPhysicalDevice {
-            ordinal: ordinal as u32,
+            ordinal: ordinal_u32,
             pci_uuid,
             driver_uuid,
             device_model: cuda_device_name(api, handle),
@@ -919,7 +941,8 @@ fn cuda_device_uuid(api: &CudaDriverApi, handle: i32) -> Option<String> {
 
 fn cuda_device_name(api: &CudaDriverApi, handle: i32) -> Option<String> {
     let mut name: [c_char; 256] = [0; 256];
-    let result = unsafe { (api.cu_device_get_name)(name.as_mut_ptr(), name.len() as i32, handle) };
+    let name_capacity = i32::try_from(name.len()).expect("the fixed CUDA name buffer fits i32");
+    let result = unsafe { (api.cu_device_get_name)(name.as_mut_ptr(), name_capacity, handle) };
     if result != CUDA_SUCCESS {
         return None;
     }
@@ -946,8 +969,8 @@ fn cuda_device_total_mem(api: &CudaDriverApi, handle: i32) -> Option<u64> {
 fn cuda_device_attribute(api: &CudaDriverApi, handle: i32, attribute: i32) -> Option<u32> {
     let mut value: i32 = 0;
     let result = unsafe { (api.cu_device_get_attribute)(&raw mut value, attribute, handle) };
-    if result == CUDA_SUCCESS && value >= 0 {
-        Some(value as u32)
+    if result == CUDA_SUCCESS {
+        u32::try_from(value).ok()
     } else {
         None
     }
@@ -991,7 +1014,7 @@ fn format_cuda_uuid(bytes: &[u8; 16]) -> String {
 struct SystemCudaDriver {
     /// Holds the loaded library alive for the driver's lifetime. Never read:
     /// the raw `fn` pointers in `api` stay valid only while this lives.
-    _library: Option<libloading::Library>,
+    library: Option<libloading::Library>,
     /// Resolved Driver API symbols (raw `fn` pointers), present after a
     /// successful `discover`.
     api: Option<CudaDriverApi>,
@@ -1047,7 +1070,7 @@ impl CudaDriver for SystemCudaDriver {
             .first()
             .ok_or_else(|| cuda_unavailable("cuDeviceGetCount returned 0 devices after cuInit"))?;
         self.enumerated_device = Some(first.handle);
-        self._library = Some(library);
+        self.library = Some(library);
         self.api = Some(api);
         Ok(report)
     }
@@ -1146,7 +1169,9 @@ impl CudaDriver for SystemCudaDriver {
         // Route the legacy session path through the generalized launch so the
         // binding has exactly one cuLaunchKernel call site.
         let block_x = 256u32;
-        let grid_x = len.div_ceil(block_x as usize) as u32;
+        let grid_x = u32::try_from(len.div_ceil(block_x as usize)).map_err(|_| {
+            HostError::invalid_args("elementwise add length requires a grid wider than u32")
+        })?;
         self.launch_kernel(
             module,
             ELEMENTWISE_ADD_ENTRY,
@@ -1373,6 +1398,10 @@ const CUDA_ERROR_NOT_FOUND: i32 = 500;
 /// `fn` pointer when the library is loaded; `CudaDriverApi` is therefore
 /// trivially `Send + Sync` and the driver stays boxable behind
 /// `Box<dyn CudaDriver>`.
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field is the raw function pointer for the correspondingly named CUDA Driver API symbol"
+)]
 #[derive(Clone, Copy)]
 struct CudaDriverApi {
     cu_init: unsafe extern "C" fn(u32) -> i32,
@@ -1512,6 +1541,7 @@ impl FakeCudaDriver {
     }
 
     /// Declare a module entry for launch-time entry validation.
+    #[must_use]
     pub fn with_known_entry(mut self, entry: impl Into<String>) -> Self {
         self.known_entries.push(entry.into());
         self
@@ -1670,51 +1700,78 @@ impl FakeCudaDriver {
     fn simulate_matmul(
         &mut self,
         module: u64,
-        a: u64,
-        b: u64,
-        out: u64,
-        m: u64,
-        k: u64,
-        n: u64,
+        buffers: [u64; 3],
+        dimensions: (u64, u64, u64),
     ) -> HostResult<()> {
         if !self.modules.contains_key(&module) {
             return Err(HostError::internal("fake matmul missing module"));
         }
-        let a_bytes = self
+        let [lhs, rhs, output] = buffers;
+        let lhs_bytes = self
             .buffers
-            .get(&a)
-            .ok_or_else(|| HostError::internal("fake matmul missing a"))?
+            .get(&lhs)
+            .ok_or_else(|| HostError::internal("fake matmul missing lhs"))?
             .clone();
-        let b_bytes = self
+        let rhs_bytes = self
             .buffers
-            .get(&b)
-            .ok_or_else(|| HostError::internal("fake matmul missing b"))?
+            .get(&rhs)
+            .ok_or_else(|| HostError::internal("fake matmul missing rhs"))?
             .clone();
-        let out_buf = self
+        let output_buffer = self
             .buffers
-            .get_mut(&out)
-            .ok_or_else(|| HostError::internal("fake matmul missing out"))?;
-        let (m, k, n) = (m as usize, k as usize, n as usize);
-        let (a_len, b_len, out_len) = (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n));
-        let (Some(a_len), Some(b_len), Some(out_len)) = (a_len, b_len, out_len) else {
+            .get_mut(&output)
+            .ok_or_else(|| HostError::internal("fake matmul missing output"))?;
+        let (rows, depth, columns) = dimensions;
+        let (rows, depth, columns) = (
+            usize::try_from(rows),
+            usize::try_from(depth),
+            usize::try_from(columns),
+        );
+        let (Ok(rows), Ok(depth), Ok(columns)) = (rows, depth, columns) else {
+            return Err(HostError::invalid_args(
+                "fake matmul plan dims do not fit host usize",
+            ));
+        };
+        let (lhs_len, rhs_len, output_len) = (
+            rows.checked_mul(depth),
+            depth.checked_mul(columns),
+            rows.checked_mul(columns),
+        );
+        let (Some(lhs_len), Some(rhs_len), Some(output_len)) = (lhs_len, rhs_len, output_len)
+        else {
             return Err(HostError::internal("fake matmul plan dims overflow"));
         };
-        if a_bytes.len() != a_len * 4 || b_bytes.len() != b_len * 4 || out_buf.len() != out_len * 4
+        let element_bytes = std::mem::size_of::<f32>();
+        let (lhs_bytes_len, rhs_bytes_len, output_bytes_len) = (
+            lhs_len.checked_mul(element_bytes),
+            rhs_len.checked_mul(element_bytes),
+            output_len.checked_mul(element_bytes),
+        );
+        let (Some(lhs_bytes_len), Some(rhs_bytes_len), Some(output_bytes_len)) =
+            (lhs_bytes_len, rhs_bytes_len, output_bytes_len)
+        else {
+            return Err(HostError::internal("fake matmul byte lengths overflow"));
+        };
+        if lhs_bytes.len() != lhs_bytes_len
+            || rhs_bytes.len() != rhs_bytes_len
+            || output_buffer.len() != output_bytes_len
         {
             return Err(HostError::invalid_args(
                 "fake matmul buffer sizes contradict the M·K/K·N/M·N plan",
             ));
         }
-        let a_values = f32_bytes_to_values(&a_bytes);
-        let b_values = f32_bytes_to_values(&b_bytes);
-        for ri in 0..m {
-            for ci in 0..n {
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    acc += a_values[ri * k + kk] * b_values[kk * n + ci];
+        let lhs_values = f32_bytes_to_values(&lhs_bytes);
+        let rhs_values = f32_bytes_to_values(&rhs_bytes);
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut accumulator = 0.0f32;
+                for inner in 0..depth {
+                    accumulator +=
+                        lhs_values[row * depth + inner] * rhs_values[inner * columns + column];
                 }
-                let offset = (ri * n + ci) * 4;
-                out_buf[offset..offset + 4].copy_from_slice(&acc.to_le_bytes());
+                let offset = (row * columns + column) * element_bytes;
+                output_buffer[offset..offset + element_bytes]
+                    .copy_from_slice(&accumulator.to_le_bytes());
             }
         }
         Ok(())
@@ -1824,7 +1881,7 @@ impl CudaDriver for FakeCudaDriver {
                     "fake launch_kernel matmul simulation requires exactly 3 buffers (a, b, out)",
                 ));
             }
-            return self.simulate_matmul(module, buffers[0], buffers[1], buffers[2], m, k, n);
+            return self.simulate_matmul(module, [buffers[0], buffers[1], buffers[2]], (m, k, n));
         }
         if entry == b"accumulate" {
             if buffers.len() != 2 {
