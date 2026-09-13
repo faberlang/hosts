@@ -161,7 +161,6 @@ impl DeviceDataType {
     /// The value mirrors the declaration-order discriminant in Radix's
     /// `MirScalarLayout`; this is the sole host-side mapping for the wire
     /// placement dtype.
-
     #[must_use]
     pub fn placement_discriminant(self) -> Option<u32> {
         match self {
@@ -190,15 +189,15 @@ pub enum PackedStorageFormat {
     F16,
     /// Native bfloat16 storage.
     Bf16,
-    /// GGML Q8_0: 32 elements / 34 bytes.
+    /// GGML `Q8_0`: 32 elements / 34 bytes.
     Q8_0,
-    /// GGML Q4_K: 256 elements / 144 bytes.
+    /// GGML `Q4_K`: 256 elements / 144 bytes.
     Q4_K,
-    /// GGML Q5_K: 256 elements / 176 bytes.
+    /// GGML `Q5_K`: 256 elements / 176 bytes.
     Q5_K,
-    /// GGML Q6_K: 256 elements / 210 bytes.
+    /// GGML `Q6_K`: 256 elements / 210 bytes.
     Q6_K,
-    /// GGML Q5_0: 32 elements / 22 bytes.
+    /// GGML `Q5_0`: 32 elements / 22 bytes.
     Q5_0,
     /// MXFP4: 32 elements / 17 bytes.
     MXFP4,
@@ -793,6 +792,209 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[derive(Default)]
+struct DescriptorValidationFacts {
+    identities: Vec<(u32, String, DeviceBufferRole)>,
+    semantic_values: Vec<(u32, u32)>,
+    lifetimes: Vec<(u32, DeviceBufferLifetime)>,
+    initializations: Vec<(u32, DeviceBufferInitialization)>,
+    per_step_inputs: Vec<u32>,
+    per_step_writes: Vec<u32>,
+}
+
+impl DescriptorValidationFacts {
+    fn validate_slot(
+        &mut self,
+        kernel: &DescriptorKernel,
+        slot: &DescriptorBuffer,
+        versions: &[DescriptorBufferVersion],
+        seen_bindings: &mut Vec<u32>,
+    ) -> HostResult<()> {
+        if slot.element_count == 0 {
+            return Err(errors::descriptor(format!(
+                "device descriptor kernel `{}` binds a zero-count buffer `{}`",
+                kernel.entry, slot.buffer_name
+            )));
+        }
+        if slot.version == 0 {
+            return Err(errors::descriptor(format!(
+                "device descriptor kernel `{}` binds buffer `{}` with the reserved zero version",
+                kernel.entry, slot.buffer_name
+            )));
+        }
+        if seen_bindings.contains(&slot.binding) {
+            return Err(errors::abi_mismatch(format!(
+                "device descriptor kernel `{}` binds index {} more than once",
+                kernel.entry, slot.binding
+            )));
+        }
+        seen_bindings.push(slot.binding);
+
+        self.validate_semantic_identity(slot)?;
+        self.validate_buffer_identity(slot)?;
+        self.record_per_step_access(slot);
+        Self::validate_version_metadata(slot, versions)?;
+        self.validate_lifetime(slot)?;
+        self.validate_initialization(slot)?;
+        Ok(())
+    }
+
+    fn validate_semantic_identity(&mut self, slot: &DescriptorBuffer) -> HostResult<()> {
+        // F1: one stable semantic value per buffer id, with no aliasing across ids.
+        if slot.semantic_value == 0 {
+            return Err(errors::descriptor(format!(
+                "device buffer `{}` (id {}) carries the reserved zero semantic value identity",
+                slot.buffer_name, slot.buffer_id
+            )));
+        }
+        if let Some((_, first_semantic)) = self
+            .semantic_values
+            .iter()
+            .find(|(id, _)| *id == slot.buffer_id)
+        {
+            if *first_semantic != slot.semantic_value {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffer `{}` (id {}) is referenced with conflicting semantic value identities {} and {}",
+                    slot.buffer_name, slot.buffer_id, first_semantic, slot.semantic_value
+                )));
+            }
+        } else {
+            if let Some((_, other_id)) = self
+                .semantic_values
+                .iter()
+                .find(|(_, value)| *value == slot.semantic_value)
+            {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffers `{}` (id {}) and id {} alias the same semantic value {}; each value is held by exactly one buffer",
+                    slot.buffer_name, slot.buffer_id, other_id, slot.semantic_value
+                )));
+            }
+            self.semantic_values
+                .push((slot.buffer_id, slot.semantic_value));
+        }
+        Ok(())
+    }
+
+    fn validate_buffer_identity(&mut self, slot: &DescriptorBuffer) -> HostResult<()> {
+        if let Some((_, name, role)) = self
+            .identities
+            .iter()
+            .find(|(id, _, _)| *id == slot.buffer_id)
+        {
+            if role_conflict(*role, slot.role) {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffer `{}` (id {}) is referenced with conflicting roles {} and {}",
+                    slot.buffer_name,
+                    slot.buffer_id,
+                    role.spelling(),
+                    slot.role.spelling()
+                )));
+            }
+            if *name != slot.buffer_name {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffer id {} is referenced with conflicting names `{}` and `{}`",
+                    slot.buffer_id, name, slot.buffer_name
+                )));
+            }
+        } else {
+            self.identities
+                .push((slot.buffer_id, slot.buffer_name.clone(), slot.role));
+        }
+        Ok(())
+    }
+
+    fn record_per_step_access(&mut self, slot: &DescriptorBuffer) {
+        if slot.lifetime == DeviceBufferLifetime::PerStep {
+            let accesses = match slot.role {
+                DeviceBufferRole::Input => &mut self.per_step_inputs,
+                DeviceBufferRole::Output | DeviceBufferRole::InOut => &mut self.per_step_writes,
+            };
+            if !accesses.contains(&slot.buffer_id) {
+                accesses.push(slot.buffer_id);
+            }
+        }
+    }
+
+    fn validate_version_metadata(
+        slot: &DescriptorBuffer,
+        versions: &[DescriptorBufferVersion],
+    ) -> HostResult<()> {
+        let Some(version) = versions
+            .iter()
+            .find(|version| version.buffer_id == slot.buffer_id && version.version == slot.version)
+        else {
+            return Err(errors::descriptor(format!(
+                "device buffer `{}` (id {}) version {} has no keyed metadata",
+                slot.buffer_name, slot.buffer_id, slot.version
+            )));
+        };
+        if version.element_ty != slot.element_ty {
+            return Err(errors::dtype_mismatch(format!(
+                "device buffer `{}` (id {}) version {} is referenced with conflicting element types {} and {}",
+                slot.buffer_name,
+                slot.buffer_id,
+                slot.version,
+                version.element_ty.spelling(),
+                slot.element_ty.spelling()
+            )));
+        }
+        if version.element_count != slot.element_count {
+            return Err(errors::shape_mismatch(format!(
+                "device buffer `{}` (id {}) version {} is referenced with conflicting element counts {} and {}",
+                slot.buffer_name,
+                slot.buffer_id,
+                slot.version,
+                version.element_count,
+                slot.element_count
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_lifetime(&mut self, slot: &DescriptorBuffer) -> HostResult<()> {
+        // S2-4: lifetime is a buffer identity fact across every reference.
+        if let Some((_, first_lifetime)) =
+            self.lifetimes.iter().find(|(id, _)| *id == slot.buffer_id)
+        {
+            if *first_lifetime != slot.lifetime {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffer `{}` (id {}) is referenced with conflicting lifetimes {} and {}",
+                    slot.buffer_name,
+                    slot.buffer_id,
+                    first_lifetime.spelling(),
+                    slot.lifetime.spelling()
+                )));
+            }
+        } else {
+            self.lifetimes.push((slot.buffer_id, slot.lifetime));
+        }
+        Ok(())
+    }
+
+    fn validate_initialization(&mut self, slot: &DescriptorBuffer) -> HostResult<()> {
+        // F5: initialization policy is also a buffer identity fact.
+        if let Some((_, first_init)) = self
+            .initializations
+            .iter()
+            .find(|(id, _)| *id == slot.buffer_id)
+        {
+            if *first_init != slot.initialization {
+                return Err(errors::abi_mismatch(format!(
+                    "device buffer `{}` (id {}) is referenced with conflicting initialization policies {} and {}",
+                    slot.buffer_name,
+                    slot.buffer_id,
+                    first_init.spelling(),
+                    slot.initialization.spelling()
+                )));
+            }
+        } else {
+            self.initializations
+                .push((slot.buffer_id, slot.initialization));
+        }
+        Ok(())
+    }
+}
+
 impl DeviceDescriptor {
     /// Validate the descriptor's consistency rules **before any launch**.
     ///
@@ -819,68 +1021,211 @@ impl DeviceDescriptor {
     /// # Errors
     /// Returns the first typed [`HostError`] the descriptor violates.
     pub fn validate(&self) -> HostResult<()> {
-        if self.module_image.is_empty() {
-            return Err(errors::descriptor(
-                "device descriptor carries an empty module image",
-            ));
-        }
-        if self.kernels.is_empty() {
-            return Err(errors::descriptor("device descriptor declares no kernels"));
-        }
-        if self.launches.is_empty() {
-            return Err(errors::descriptor("device descriptor declares no launches"));
+        let (launch_ids, root_ids) = self.validated_launches_and_roots()?;
+
+        let versions = self.validated_buffer_versions()?;
+
+        self.validate_data_flow_references(&launch_ids, &versions)?;
+
+        let position = self.validated_schedule(&launch_ids, &root_ids)?;
+
+        let facts = self.validated_kernels(&versions)?;
+
+        for id in &facts.per_step_inputs {
+            if facts.per_step_writes.contains(id) {
+                let name = facts
+                    .identities
+                    .iter()
+                    .find(|(buffer_id, _, _)| buffer_id == id)
+                    .map_or("<unknown>", |(_, name, _)| name.as_str());
+                return Err(errors::descriptor(format!(
+                    "device buffer `{name}` (id {id}) is a PerStep input written mid-graph; resident steps copy PerStep inputs once, so a later kernel write would clobber the host value"
+                )));
+            }
         }
 
-        let mut launch_ids: Vec<u32> = Vec::with_capacity(self.launches.len());
-        for launch in &self.launches {
-            if launch.id == 0 {
+        // RepeatingStep once-init contract (S5-U6): a repeating training
+        // step copies its HostProvided params into their PerProgram storage
+        // exactly once at session creation and never re-copies on later
+        // steps — steps copy nothing. A HostProvided buffer outside
+        // per-program storage could never receive its values in step-mode,
+        // so the combination fails closed here, before any launch.
+        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
+            for (id, init) in &facts.initializations {
+                if *init == DeviceBufferInitialization::HostProvided {
+                    let lifetime = facts
+                        .lifetimes
+                        .iter()
+                        .find(|(buffer_id, _)| buffer_id == id)
+                        .map(|(_, lifetime)| *lifetime);
+                    let name = facts
+                        .identities
+                        .iter()
+                        .find(|(buffer_id, _, _)| buffer_id == id)
+                        .map_or("<unknown>", |(_, name, _)| name.as_str());
+                    if lifetime != Some(DeviceBufferLifetime::PerProgram) {
+                        return Err(errors::descriptor(format!(
+                            "RepeatingStep buffer `{name}` (id {id}) is host-provided but has lifetime `{}`; a repeating step once-inits its host-provided params at session creation, which is defined only for per-program storage",
+                            lifetime
+                                .map_or("(no declared lifetime)", DeviceBufferLifetime::spelling)
+                        )));
+                    }
+                }
+            }
+        }
+
+        let result_buffer_ids =
+            self.validated_results(&launch_ids, &position, &facts.lifetimes, &versions)?;
+        self.validate_end_of_run_results(&versions, &result_buffer_ids)?;
+        Ok(())
+    }
+
+    fn validated_kernels(
+        &self,
+        versions: &[DescriptorBufferVersion],
+    ) -> HostResult<DescriptorValidationFacts> {
+        let mut facts = DescriptorValidationFacts::default();
+        for kernel in &self.kernels {
+            if kernel.entry.trim().is_empty() {
                 return Err(errors::descriptor(
-                    "device descriptor has a launch with the reserved zero identity",
+                    "device descriptor has a kernel with an empty entry name",
                 ));
             }
-            if launch_ids.contains(&launch.id) {
+            if kernel.buffers.is_empty() {
                 return Err(errors::descriptor(format!(
-                    "device descriptor repeats launch identity {}",
-                    launch.id
+                    "device descriptor kernel `{}` binds no buffers",
+                    kernel.entry
                 )));
             }
-            if self.kernels.get(launch.kernel_index as usize).is_none() {
+            if kernel.grid.contains(&0) || kernel.block.contains(&0) {
                 return Err(errors::descriptor(format!(
-                    "device descriptor launch {} references unknown kernel index {}",
-                    launch.id, launch.kernel_index
+                    "device descriptor kernel `{}` has a zero grid or block axis",
+                    kernel.entry
                 )));
             }
-            launch_ids.push(launch.id);
+
+            let mut seen_bindings = Vec::new();
+            for slot in &kernel.buffers {
+                facts.validate_slot(kernel, slot, versions, &mut seen_bindings)?;
+            }
+        }
+        Ok(facts)
+    }
+
+    fn validated_schedule(
+        &self,
+        launch_ids: &[u32],
+        root_ids: &[u32],
+    ) -> HostResult<BTreeMap<u32, usize>> {
+        // Carried graph schedule (F3): the launch sequence is the schedule,
+        // and the carried dependency edges must be consistent with it.
+        //
+        // 1. Single definition per value generation: exactly one launch
+        //    produces a given `(buffer, version)`. The wire carries one edge
+        //    per (producer, consumer) pair (DescriptorDataFlow mirrors
+        //    `BufferRegistry::data_flow_pairs`), so a version consumed by
+        //    several launches legitimately repeats the same producer — that
+        //    fan-out is not a second definition. Only a DIFFERENT producer
+        //    for the same `(buffer, version)` is another writer of the same
+        //    generation, which the frozen contract forbids (F2).
+        // 2. Topological consistency: the carried launch order must place
+        //    every consumer launch after all its producers. A cycle or a
+        //    missing/inverted dependency fails validation before launch.
+        // 3. Complete schedule: every launch is reachable from a declared
+        //    root following the dependency edges forward.
+        let mut producers: Vec<((u32, u32), u32)> = Vec::new();
+        for edge in &self.data_flow {
+            if let Some((_, first_producer)) = producers.iter().find(|((buffer_id, version), _)| {
+                *buffer_id == edge.buffer_id && *version == edge.version
+            }) {
+                if *first_producer == edge.producer {
+                    // Fan-out: the same value generation feeds several
+                    // consumers, one carried edge per consumer. The producer
+                    // is unique — admit the repeated edge.
+                    continue;
+                }
+                return Err(errors::descriptor(format!(
+                    "device descriptor defines buffer {} version {} twice (producers {} and {}); one value generation has exactly one producer",
+                    edge.buffer_id, edge.version, first_producer, edge.producer
+                )));
+            }
+            producers.push(((edge.buffer_id, edge.version), edge.producer));
+        }
+        let mut position: BTreeMap<u32, usize> = BTreeMap::new();
+        for (index, launch) in self.launches.iter().enumerate() {
+            position.insert(launch.id, index);
+        }
+        for edge in &self.data_flow {
+            let producer_at = position[&edge.producer];
+            let consumer_at = position[&edge.consumer];
+            if producer_at >= consumer_at {
+                return Err(errors::descriptor(format!(
+                    "device descriptor launch order violates the carried dependency graph: launch {} (producer of buffer {} version {}) is not scheduled before launch {} (its consumer)",
+                    edge.producer, edge.buffer_id, edge.version, edge.consumer
+                )));
+            }
+        }
+        let mut reachable: Vec<u32> = Vec::with_capacity(self.launches.len());
+        let mut stack: Vec<u32> = root_ids.to_vec();
+        while let Some(launch) = stack.pop() {
+            if reachable.contains(&launch) {
+                continue;
+            }
+            reachable.push(launch);
+            for edge in &self.data_flow {
+                if edge.producer == launch && !reachable.contains(&edge.consumer) {
+                    stack.push(edge.consumer);
+                }
+            }
+        }
+        for launch in launch_ids {
+            if !reachable.contains(launch) {
+                return Err(errors::descriptor(format!(
+                    "device descriptor launch {launch} is not reachable from any declared root; the carried graph is incomplete"
+                )));
+            }
         }
 
-        // Declared legal execution roots (F3): non-zero, unique, real launch
-        // ids. The host schedules the validated graph from these facts; an
-        // empty root set would leave the schedule unanchored.
-        let mut root_ids: Vec<u32> = Vec::with_capacity(self.roots.len());
-        for root in &self.roots {
-            if *root == 0 {
+        Ok(position)
+    }
+
+    fn validate_data_flow_references(
+        &self,
+        launch_ids: &[u32],
+        versions: &[DescriptorBufferVersion],
+    ) -> HostResult<()> {
+        for edge in &self.data_flow {
+            if edge.version == 0 || edge.producer == 0 || edge.consumer == 0 {
                 return Err(errors::descriptor(
-                    "device descriptor has a root with the reserved zero identity",
+                    "device descriptor data-flow edge uses a reserved zero identity",
                 ));
             }
-            if root_ids.contains(root) {
+            if edge.producer == edge.consumer {
                 return Err(errors::descriptor(format!(
-                    "device descriptor repeats legal execution root {root}"
+                    "device descriptor data-flow edge for buffer {} version {} is self-referential at launch {}",
+                    edge.buffer_id, edge.version, edge.producer
                 )));
             }
-            if !launch_ids.contains(root) {
+            if !launch_ids.contains(&edge.producer) || !launch_ids.contains(&edge.consumer) {
                 return Err(errors::descriptor(format!(
-                    "device descriptor root {root} names an unknown launch"
+                    "device descriptor data-flow edge for buffer {} version {} references an unknown launch",
+                    edge.buffer_id, edge.version
                 )));
             }
-            root_ids.push(*root);
-        }
-        if root_ids.is_empty() {
-            return Err(errors::descriptor(
-                "device descriptor declares no legal execution roots",
-            ));
+            if !versions.iter().any(|version| {
+                version.buffer_id == edge.buffer_id && version.version == edge.version
+            }) {
+                return Err(errors::descriptor(format!(
+                    "device descriptor data-flow edge references unknown buffer {} version {}",
+                    edge.buffer_id, edge.version
+                )));
+            }
         }
 
+        Ok(())
+    }
+
+    fn validated_buffer_versions(&self) -> HostResult<Vec<DescriptorBufferVersion>> {
         let mut versions: Vec<DescriptorBufferVersion> =
             Vec::with_capacity(self.buffer_versions.len());
         for version in &self.buffer_versions {
@@ -946,337 +1291,82 @@ impl DeviceDescriptor {
             ));
         }
 
-        for edge in &self.data_flow {
-            if edge.version == 0 || edge.producer == 0 || edge.consumer == 0 {
+        Ok(versions)
+    }
+
+    fn validated_launches_and_roots(&self) -> HostResult<(Vec<u32>, Vec<u32>)> {
+        if self.module_image.is_empty() {
+            return Err(errors::descriptor(
+                "device descriptor carries an empty module image",
+            ));
+        }
+        if self.kernels.is_empty() {
+            return Err(errors::descriptor("device descriptor declares no kernels"));
+        }
+        if self.launches.is_empty() {
+            return Err(errors::descriptor("device descriptor declares no launches"));
+        }
+
+        let mut launch_ids: Vec<u32> = Vec::with_capacity(self.launches.len());
+        for launch in &self.launches {
+            if launch.id == 0 {
                 return Err(errors::descriptor(
-                    "device descriptor data-flow edge uses a reserved zero identity",
+                    "device descriptor has a launch with the reserved zero identity",
                 ));
             }
-            if edge.producer == edge.consumer {
+            if launch_ids.contains(&launch.id) {
                 return Err(errors::descriptor(format!(
-                    "device descriptor data-flow edge for buffer {} version {} is self-referential at launch {}",
-                    edge.buffer_id, edge.version, edge.producer
+                    "device descriptor repeats launch identity {}",
+                    launch.id
                 )));
             }
-            if !launch_ids.contains(&edge.producer) || !launch_ids.contains(&edge.consumer) {
+            if self.kernels.get(launch.kernel_index as usize).is_none() {
                 return Err(errors::descriptor(format!(
-                    "device descriptor data-flow edge for buffer {} version {} references an unknown launch",
-                    edge.buffer_id, edge.version
+                    "device descriptor launch {} references unknown kernel index {}",
+                    launch.id, launch.kernel_index
                 )));
             }
-            if !versions.iter().any(|version| {
-                version.buffer_id == edge.buffer_id && version.version == edge.version
-            }) {
-                return Err(errors::descriptor(format!(
-                    "device descriptor data-flow edge references unknown buffer {} version {}",
-                    edge.buffer_id, edge.version
-                )));
-            }
+            launch_ids.push(launch.id);
         }
 
-        // Carried graph schedule (F3): the launch sequence is the schedule,
-        // and the carried dependency edges must be consistent with it.
-        //
-        // 1. Single definition per value generation: exactly one launch
-        //    produces a given `(buffer, version)`. The wire carries one edge
-        //    per (producer, consumer) pair (DescriptorDataFlow mirrors
-        //    `BufferRegistry::data_flow_pairs`), so a version consumed by
-        //    several launches legitimately repeats the same producer — that
-        //    fan-out is not a second definition. Only a DIFFERENT producer
-        //    for the same `(buffer, version)` is another writer of the same
-        //    generation, which the frozen contract forbids (F2).
-        // 2. Topological consistency: the carried launch order must place
-        //    every consumer launch after all its producers. A cycle or a
-        //    missing/inverted dependency fails validation before launch.
-        // 3. Complete schedule: every launch is reachable from a declared
-        //    root following the dependency edges forward.
-        let mut producers: Vec<((u32, u32), u32)> = Vec::new();
-        for edge in &self.data_flow {
-            if let Some((_, first_producer)) = producers.iter().find(|((buffer_id, version), _)| {
-                *buffer_id == edge.buffer_id && *version == edge.version
-            }) {
-                if *first_producer == edge.producer {
-                    // Fan-out: the same value generation feeds several
-                    // consumers, one carried edge per consumer. The producer
-                    // is unique — admit the repeated edge.
-                    continue;
-                }
-                return Err(errors::descriptor(format!(
-                    "device descriptor defines buffer {} version {} twice (producers {} and {}); one value generation has exactly one producer",
-                    edge.buffer_id, edge.version, first_producer, edge.producer
-                )));
-            }
-            producers.push(((edge.buffer_id, edge.version), edge.producer));
-        }
-        let mut position: BTreeMap<u32, usize> = BTreeMap::new();
-        for (index, launch) in self.launches.iter().enumerate() {
-            position.insert(launch.id, index);
-        }
-        for edge in &self.data_flow {
-            let producer_at = position[&edge.producer];
-            let consumer_at = position[&edge.consumer];
-            if producer_at >= consumer_at {
-                return Err(errors::descriptor(format!(
-                    "device descriptor launch order violates the carried dependency graph: launch {} (producer of buffer {} version {}) is not scheduled before launch {} (its consumer)",
-                    edge.producer, edge.buffer_id, edge.version, edge.consumer
-                )));
-            }
-        }
-        let mut reachable: Vec<u32> = Vec::with_capacity(self.launches.len());
-        let mut stack: Vec<u32> = root_ids.clone();
-        while let Some(launch) = stack.pop() {
-            if reachable.contains(&launch) {
-                continue;
-            }
-            reachable.push(launch);
-            for edge in &self.data_flow {
-                if edge.producer == launch && !reachable.contains(&edge.consumer) {
-                    stack.push(edge.consumer);
-                }
-            }
-        }
-        for launch in &launch_ids {
-            if !reachable.contains(launch) {
-                return Err(errors::descriptor(format!(
-                    "device descriptor launch {launch} is not reachable from any declared root; the carried graph is incomplete"
-                )));
-            }
-        }
-
-        let mut identities: Vec<(u32, String, DeviceBufferRole)> = Vec::new();
-        let mut semantic_values: Vec<(u32, u32)> = Vec::new();
-        let mut lifetimes: Vec<(u32, DeviceBufferLifetime)> = Vec::new();
-        let mut initializations: Vec<(u32, DeviceBufferInitialization)> = Vec::new();
-        // Resident steps copy each PerStep input once. A later kernel write
-        // to that same buffer would clobber the host value (the old
-        // per-kernel copy hid this). Admit fails closed.
-        let mut per_step_inputs: Vec<u32> = Vec::new();
-        let mut per_step_writes: Vec<u32> = Vec::new();
-
-        for kernel in &self.kernels {
-            if kernel.entry.trim().is_empty() {
+        // Declared legal execution roots (F3): non-zero, unique, real launch
+        // ids. The host schedules the validated graph from these facts; an
+        // empty root set would leave the schedule unanchored.
+        let mut root_ids: Vec<u32> = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            if *root == 0 {
                 return Err(errors::descriptor(
-                    "device descriptor has a kernel with an empty entry name",
+                    "device descriptor has a root with the reserved zero identity",
                 ));
             }
-            if kernel.buffers.is_empty() {
+            if root_ids.contains(root) {
                 return Err(errors::descriptor(format!(
-                    "device descriptor kernel `{}` binds no buffers",
-                    kernel.entry
+                    "device descriptor repeats legal execution root {root}"
                 )));
             }
-            if kernel.grid.contains(&0) || kernel.block.contains(&0) {
+            if !launch_ids.contains(root) {
                 return Err(errors::descriptor(format!(
-                    "device descriptor kernel `{}` has a zero grid or block axis",
-                    kernel.entry
+                    "device descriptor root {root} names an unknown launch"
                 )));
             }
-
-            let mut seen_bindings: Vec<u32> = Vec::new();
-            for slot in &kernel.buffers {
-                if slot.element_count == 0 {
-                    return Err(errors::descriptor(format!(
-                        "device descriptor kernel `{}` binds a zero-count buffer `{}`",
-                        kernel.entry, slot.buffer_name
-                    )));
-                }
-                if slot.version == 0 {
-                    return Err(errors::descriptor(format!(
-                        "device descriptor kernel `{}` binds buffer `{}` with the reserved zero version",
-                        kernel.entry, slot.buffer_name
-                    )));
-                }
-                if seen_bindings.contains(&slot.binding) {
-                    return Err(errors::abi_mismatch(format!(
-                        "device descriptor kernel `{}` binds index {} more than once",
-                        kernel.entry, slot.binding
-                    )));
-                }
-                seen_bindings.push(slot.binding);
-
-                // F1: the stable semantic value identity. The same buffer id
-                // always holds the same value, and two different buffer ids
-                // never alias one value (two unrelated same-name/same-shape
-                // values are distinct).
-                if slot.semantic_value == 0 {
-                    return Err(errors::descriptor(format!(
-                        "device buffer `{}` (id {}) carries the reserved zero semantic value identity",
-                        slot.buffer_name, slot.buffer_id
-                    )));
-                }
-                if let Some((_, first_semantic)) =
-                    semantic_values.iter().find(|(id, _)| *id == slot.buffer_id)
-                {
-                    if *first_semantic != slot.semantic_value {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting semantic value identities {} and {}",
-                            slot.buffer_name, slot.buffer_id, first_semantic, slot.semantic_value
-                        )));
-                    }
-                } else {
-                    if let Some((_, other_id)) = semantic_values
-                        .iter()
-                        .find(|(_, value)| *value == slot.semantic_value)
-                    {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffers `{}` (id {}) and id {} alias the same semantic value {}; each value is held by exactly one buffer",
-                            slot.buffer_name, slot.buffer_id, other_id, slot.semantic_value
-                        )));
-                    }
-                    semantic_values.push((slot.buffer_id, slot.semantic_value));
-                }
-
-                if let Some((_, name, role)) =
-                    identities.iter().find(|(id, _, _)| *id == slot.buffer_id)
-                {
-                    if role_conflict(*role, slot.role) {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting roles {} and {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            role.spelling(),
-                            slot.role.spelling()
-                        )));
-                    }
-                    if *name != slot.buffer_name {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffer id {} is referenced with conflicting names `{}` and `{}`",
-                            slot.buffer_id, name, slot.buffer_name
-                        )));
-                    }
-                } else {
-                    identities.push((slot.buffer_id, slot.buffer_name.clone(), slot.role));
-                }
-
-                if slot.lifetime == DeviceBufferLifetime::PerStep {
-                    match slot.role {
-                        DeviceBufferRole::Input => {
-                            if !per_step_inputs.contains(&slot.buffer_id) {
-                                per_step_inputs.push(slot.buffer_id);
-                            }
-                        }
-                        DeviceBufferRole::Output | DeviceBufferRole::InOut => {
-                            if !per_step_writes.contains(&slot.buffer_id) {
-                                per_step_writes.push(slot.buffer_id);
-                            }
-                        }
-                    }
-                }
-
-                let Some(version) = versions.iter().find(|version| {
-                    version.buffer_id == slot.buffer_id && version.version == slot.version
-                }) else {
-                    return Err(errors::descriptor(format!(
-                        "device buffer `{}` (id {}) version {} has no keyed metadata",
-                        slot.buffer_name, slot.buffer_id, slot.version
-                    )));
-                };
-                if version.element_ty != slot.element_ty {
-                    return Err(errors::dtype_mismatch(format!(
-                        "device buffer `{}` (id {}) version {} is referenced with conflicting element types {} and {}",
-                        slot.buffer_name,
-                        slot.buffer_id,
-                        slot.version,
-                        version.element_ty.spelling(),
-                        slot.element_ty.spelling()
-                    )));
-                }
-                if version.element_count != slot.element_count {
-                    return Err(errors::shape_mismatch(format!(
-                        "device buffer `{}` (id {}) version {} is referenced with conflicting element counts {} and {}",
-                        slot.buffer_name,
-                        slot.buffer_id,
-                        slot.version,
-                        version.element_count,
-                        slot.element_count
-                    )));
-                }
-
-                // S2-4: a lifetime is a buffer identity fact; two references
-                // to the same id must agree on it (the session's per-class
-                // allocation/release policy is driven by this single fact).
-                if let Some((_, first_lifetime)) =
-                    lifetimes.iter().find(|(id, _)| *id == slot.buffer_id)
-                {
-                    if *first_lifetime != slot.lifetime {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting lifetimes {} and {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            first_lifetime.spelling(),
-                            slot.lifetime.spelling()
-                        )));
-                    }
-                } else {
-                    lifetimes.push((slot.buffer_id, slot.lifetime));
-                }
-
-                // F5: the initialization axis is also a buffer identity fact
-                // — two references to the same id must agree on how its
-                // storage is brought to its first defined state (the
-                // once-init / per-allocation policy is driven by this single
-                // fact).
-                if let Some((_, first_init)) =
-                    initializations.iter().find(|(id, _)| *id == slot.buffer_id)
-                {
-                    if *first_init != slot.initialization {
-                        return Err(errors::abi_mismatch(format!(
-                            "device buffer `{}` (id {}) is referenced with conflicting initialization policies {} and {}",
-                            slot.buffer_name,
-                            slot.buffer_id,
-                            first_init.spelling(),
-                            slot.initialization.spelling()
-                        )));
-                    }
-                } else {
-                    initializations.push((slot.buffer_id, slot.initialization));
-                }
-            }
+            root_ids.push(*root);
+        }
+        if root_ids.is_empty() {
+            return Err(errors::descriptor(
+                "device descriptor declares no legal execution roots",
+            ));
         }
 
-        for id in &per_step_inputs {
-            if per_step_writes.contains(id) {
-                let name = identities
-                    .iter()
-                    .find(|(buffer_id, _, _)| buffer_id == id)
-                    .map(|(_, name, _)| name.as_str())
-                    .unwrap_or("<unknown>");
-                return Err(errors::descriptor(format!(
-                    "device buffer `{name}` (id {id}) is a PerStep input written mid-graph; resident steps copy PerStep inputs once, so a later kernel write would clobber the host value"
-                )));
-            }
-        }
+        Ok((launch_ids, root_ids))
+    }
 
-        // RepeatingStep once-init contract (S5-U6): a repeating training
-        // step copies its HostProvided params into their PerProgram storage
-        // exactly once at session creation and never re-copies on later
-        // steps — steps copy nothing. A HostProvided buffer outside
-        // per-program storage could never receive its values in step-mode,
-        // so the combination fails closed here, before any launch.
-        if self.program_lifetime == DeviceProgramLifetime::RepeatingStep {
-            for (id, init) in &initializations {
-                if *init == DeviceBufferInitialization::HostProvided {
-                    let lifetime = lifetimes
-                        .iter()
-                        .find(|(buffer_id, _)| buffer_id == id)
-                        .map(|(_, lifetime)| *lifetime);
-                    let name = identities
-                        .iter()
-                        .find(|(buffer_id, _, _)| buffer_id == id)
-                        .map(|(_, name, _)| name.as_str())
-                        .unwrap_or("<unknown>");
-                    if lifetime != Some(DeviceBufferLifetime::PerProgram) {
-                        return Err(errors::descriptor(format!(
-                            "RepeatingStep buffer `{name}` (id {id}) is host-provided but has lifetime `{}`; a repeating step once-inits its host-provided params at session creation, which is defined only for per-program storage",
-                            lifetime
-                                .map(DeviceBufferLifetime::spelling)
-                                .unwrap_or("(no declared lifetime)")
-                        )));
-                    }
-                }
-            }
-        }
-
+    fn validated_results(
+        &self,
+        launch_ids: &[u32],
+        position: &BTreeMap<u32, usize>,
+        lifetimes: &[(u32, DeviceBufferLifetime)],
+        versions: &[DescriptorBufferVersion],
+    ) -> HostResult<Vec<u32>> {
         // Observation admission (F6): results are DECLARED observation points.
         // A result must name a buffer the program allocates, with the
         // `ObservationPoint` lifetime — the only class the session reads back
@@ -1349,6 +1439,14 @@ impl DeviceDescriptor {
             }
         }
 
+        Ok(result_buffer_ids)
+    }
+
+    fn validate_end_of_run_results(
+        &self,
+        versions: &[DescriptorBufferVersion],
+        result_buffer_ids: &[u32],
+    ) -> HostResult<()> {
         // End-of-run observation admission (S5A-U1): the DECLARED cadence set
         // — the wire's `EndOfRun` result rows — is read back exactly once
         // after the step loop. Each entry must name a buffer the program
@@ -1510,18 +1608,18 @@ impl DeviceDescriptor {
             push_u32(&mut bytes, slot.lifetime as u32);
             push_u32(&mut bytes, slot.initialization as u32);
         }
-        push_u32(&mut bytes, self.roots.len() as u32);
+        push_len(&mut bytes, self.roots.len());
         for root in &self.roots {
             push_u32(&mut bytes, *root);
         }
-        push_u32(&mut bytes, self.launches.len() as u32);
+        push_len(&mut bytes, self.launches.len());
         for launch in &self.launches {
             push_u32(&mut bytes, launch.id);
             if let Some(kernel) = self.kernels.get(launch.kernel_index as usize) {
                 // Inline the launched kernel's full facts (declaration-order
                 // independent).
                 push_bytes(&mut bytes, kernel.entry.as_bytes());
-                push_u32(&mut bytes, kernel.buffers.len() as u32);
+                push_len(&mut bytes, kernel.buffers.len());
                 // S3-U5 (M07): the per-slot facts are inlined in a
                 // declaration-independent order too — sorted by the total
                 // order (buffer_id, version, binding) — so reordering buffer
@@ -1559,14 +1657,14 @@ impl DeviceDescriptor {
                 }
             }
         }
-        push_u32(&mut bytes, self.data_flow.len() as u32);
+        push_len(&mut bytes, self.data_flow.len());
         for edge in &self.data_flow {
             push_u32(&mut bytes, edge.buffer_id);
             push_u32(&mut bytes, edge.version);
             push_u32(&mut bytes, edge.producer);
             push_u32(&mut bytes, edge.consumer);
         }
-        push_u32(&mut bytes, self.results.len() as u32);
+        push_len(&mut bytes, self.results.len());
         for result in &self.results {
             push_u32(&mut bytes, result.buffer_id);
             push_u32(&mut bytes, result.version);
@@ -1575,7 +1673,7 @@ impl DeviceDescriptor {
         }
         // S5A-U1: the declared end-of-run observations are part of the graph
         // the host executes — the one-shot readback after the step loop.
-        push_u32(&mut bytes, self.end_of_run_results.len() as u32);
+        push_len(&mut bytes, self.end_of_run_results.len());
         for end_of_run in &self.end_of_run_results {
             push_u32(&mut bytes, end_of_run.buffer_id);
             push_u32(&mut bytes, end_of_run.version);
@@ -1586,7 +1684,7 @@ impl DeviceDescriptor {
 
 /// Distinct domain tag for the KV storage/binding plan. Cursor values are
 /// never part of this stream.
-const HOST_KV_STORAGE_DOMAIN_TAG: &str = "faber.host-kv-storage.v1";
+const HOST_KV_STORAGE_DOMAIN_TAG: &str = "faber.host-kv-storage.v2";
 
 impl KvCacheDescriptor {
     /// Validate allocation/view/binding consistency **before any launch**.
@@ -1598,35 +1696,7 @@ impl KvCacheDescriptor {
     /// # Errors
     /// Returns the first typed [`HostError`] the plan violates.
     pub fn validate(&self) -> HostResult<()> {
-        let mut allocations: Vec<DescriptorAllocation> = Vec::with_capacity(self.allocations.len());
-        for allocation in &self.allocations {
-            if allocation.buffer_id == 0 {
-                return Err(errors::descriptor(
-                    "device descriptor allocation uses the reserved zero buffer identity",
-                ));
-            }
-            if allocation.capacity_bytes == 0 {
-                return Err(errors::descriptor(format!(
-                    "device descriptor allocation {} has a zero byte capacity",
-                    allocation.buffer_id
-                )));
-            }
-            if allocations
-                .iter()
-                .any(|first| first.buffer_id == allocation.buffer_id)
-            {
-                return Err(errors::descriptor(format!(
-                    "device descriptor repeats allocation identity {}",
-                    allocation.buffer_id
-                )));
-            }
-            allocations.push(*allocation);
-        }
-        if allocations.is_empty() {
-            return Err(errors::descriptor(
-                "device descriptor declares no allocations",
-            ));
-        }
+        let allocations = self.validated_allocations()?;
 
         for view in &self.views {
             if view.logical_dims.is_empty() || view.logical_dims.len() != view.strides.len() {
@@ -1635,9 +1705,7 @@ impl KvCacheDescriptor {
                     view.allocation_id
                 )));
             }
-            if view.logical_dims.iter().any(|dim| *dim == 0)
-                || view.strides.iter().any(|stride| *stride == 0)
-            {
+            if view.logical_dims.contains(&0) || view.strides.contains(&0) {
                 return Err(errors::descriptor(format!(
                     "device descriptor view on allocation {} has a zero dim or stride",
                     view.allocation_id
@@ -1711,6 +1779,39 @@ impl KvCacheDescriptor {
         Ok(())
     }
 
+    fn validated_allocations(&self) -> HostResult<Vec<DescriptorAllocation>> {
+        let mut allocations = Vec::with_capacity(self.allocations.len());
+        for allocation in &self.allocations {
+            if allocation.buffer_id == 0 {
+                return Err(errors::descriptor(
+                    "device descriptor allocation uses the reserved zero buffer identity",
+                ));
+            }
+            if allocation.capacity_bytes == 0 {
+                return Err(errors::descriptor(format!(
+                    "device descriptor allocation {} has a zero byte capacity",
+                    allocation.buffer_id
+                )));
+            }
+            if allocations
+                .iter()
+                .any(|first: &DescriptorAllocation| first.buffer_id == allocation.buffer_id)
+            {
+                return Err(errors::descriptor(format!(
+                    "device descriptor repeats allocation identity {}",
+                    allocation.buffer_id
+                )));
+            }
+            allocations.push(*allocation);
+        }
+        if allocations.is_empty() {
+            return Err(errors::descriptor(
+                "device descriptor declares no allocations",
+            ));
+        }
+        Ok(allocations)
+    }
+
     /// Launch records in declared binding order, with indices preserved.
     #[must_use]
     pub fn launch_records(&self) -> &[DescriptorLaunchBinding] {
@@ -1729,7 +1830,7 @@ impl KvCacheDescriptor {
         push_bytes(&mut bytes, HOST_KV_STORAGE_DOMAIN_TAG.as_bytes());
         let mut allocations: Vec<&DescriptorAllocation> = self.allocations.iter().collect();
         allocations.sort_by_key(|allocation| allocation.buffer_id);
-        push_u32(&mut bytes, allocations.len() as u32);
+        push_len(&mut bytes, allocations.len());
         for allocation in allocations {
             push_u32(&mut bytes, allocation.buffer_id);
             push_u32(&mut bytes, allocation.dtype as u32);
@@ -1752,14 +1853,14 @@ impl KvCacheDescriptor {
                     right.logical_dims.as_slice(),
                 ))
         });
-        push_u32(&mut bytes, views.len() as u32);
+        push_len(&mut bytes, views.len());
         for view in views {
             push_u32(&mut bytes, view.allocation_id);
-            push_u32(&mut bytes, view.logical_dims.len() as u32);
+            push_len(&mut bytes, view.logical_dims.len());
             for dim in &view.logical_dims {
                 bytes.extend_from_slice(&dim.to_le_bytes());
             }
-            push_u32(&mut bytes, view.strides.len() as u32);
+            push_len(&mut bytes, view.strides.len());
             for stride in &view.strides {
                 bytes.extend_from_slice(&stride.to_le_bytes());
             }
@@ -1769,7 +1870,7 @@ impl KvCacheDescriptor {
         // Launch bindings hash in declared order: the launch record is the
         // declaration. Binding expressions (index, offset, span, source tag)
         // join the identity; current cursor values do not.
-        push_u32(&mut bytes, self.launch_bindings.len() as u32);
+        push_len(&mut bytes, self.launch_bindings.len());
         for binding in &self.launch_bindings {
             push_u32(&mut bytes, binding.handle);
             push_u32(&mut bytes, binding.binding_index);
@@ -1791,7 +1892,7 @@ impl KvCacheDescriptor {
 /// consume the radix digest as the run/session identity is a recorded
 /// contract change; a translation facade preserving both identities is
 /// forbidden.
-pub const HOST_PROGRAM_GRAPH_DOMAIN_TAG: &str = "faber.host-program-graph.v1";
+pub const HOST_PROGRAM_GRAPH_DOMAIN_TAG: &str = "faber.host-program-graph.v2";
 
 /// SHA-256 (FIPS 180-4) of `bytes` as the lowercase 64-hex digest body —
 /// the hashing substrate of the re-domained program-graph receipt
@@ -1808,20 +1909,83 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The SHA-256 initial hash state (FIPS 180-4 §5.3.3).
 const SHA256_INITIAL_STATE: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
 ];
 
 /// The SHA-256 round constants (FIPS 180-4 §4.2.2): the first 32 bits of the
 /// fractional parts of the cube roots of the first 64 primes.
 const SHA256_ROUND_CONSTANTS: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
 ];
 
 /// SHA-256 (FIPS 180-4) digest of `bytes` as the 32-byte big-endian state.
@@ -1839,54 +2003,69 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 
     let mut state = SHA256_INITIAL_STATE;
     for block in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let mut message_schedule = [0u32; 64];
+        for (index, word) in block.chunks_exact(4).enumerate() {
+            message_schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
-        for i in 16..64 {
-            let sigma0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let sigma1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
+        for index in 16..64 {
+            let sigma0 = message_schedule[index - 15].rotate_right(7)
+                ^ message_schedule[index - 15].rotate_right(18)
+                ^ (message_schedule[index - 15] >> 3);
+            let sigma1 = message_schedule[index - 2].rotate_right(17)
+                ^ message_schedule[index - 2].rotate_right(19)
+                ^ (message_schedule[index - 2] >> 10);
+            message_schedule[index] = message_schedule[index - 16]
                 .wrapping_add(sigma0)
-                .wrapping_add(w[i - 7])
+                .wrapping_add(message_schedule[index - 7])
                 .wrapping_add(sigma1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for (i, constant) in SHA256_ROUND_CONSTANTS.iter().enumerate() {
-            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
+        let [
+            mut working_a,
+            mut working_b,
+            mut working_c,
+            mut working_d,
+            mut working_e,
+            mut working_f,
+            mut working_g,
+            mut working_h,
+        ] = state;
+        for (index, constant) in SHA256_ROUND_CONSTANTS.iter().enumerate() {
+            let sum1 =
+                working_e.rotate_right(6) ^ working_e.rotate_right(11) ^ working_e.rotate_right(25);
+            let ch = (working_e & working_f) ^ ((!working_e) & working_g);
+            let temp1 = working_h
                 .wrapping_add(sum1)
                 .wrapping_add(ch)
                 .wrapping_add(*constant)
-                .wrapping_add(w[i]);
-            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
+                .wrapping_add(message_schedule[index]);
+            let sum0 =
+                working_a.rotate_right(2) ^ working_a.rotate_right(13) ^ working_a.rotate_right(22);
+            let maj = (working_a & working_b) ^ (working_a & working_c) ^ (working_b & working_c);
             let temp2 = sum0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
+            working_h = working_g;
+            working_g = working_f;
+            working_f = working_e;
+            working_e = working_d.wrapping_add(temp1);
+            working_d = working_c;
+            working_c = working_b;
+            working_b = working_a;
+            working_a = temp1.wrapping_add(temp2);
         }
         state = [
-            state[0].wrapping_add(a),
-            state[1].wrapping_add(b),
-            state[2].wrapping_add(c),
-            state[3].wrapping_add(d),
-            state[4].wrapping_add(e),
-            state[5].wrapping_add(f),
-            state[6].wrapping_add(g),
-            state[7].wrapping_add(h),
+            state[0].wrapping_add(working_a),
+            state[1].wrapping_add(working_b),
+            state[2].wrapping_add(working_c),
+            state[3].wrapping_add(working_d),
+            state[4].wrapping_add(working_e),
+            state[5].wrapping_add(working_f),
+            state[6].wrapping_add(working_g),
+            state[7].wrapping_add(working_h),
         ];
     }
 
     let mut digest = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        let start = i * 4;
+    for (index, word) in state.iter().enumerate() {
+        let start = index * 4;
         digest[start..start + 4].copy_from_slice(&word.to_be_bytes());
     }
     digest
@@ -1909,9 +2088,16 @@ fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Append a collection length without narrowing the host pointer width.
+fn push_len(bytes: &mut Vec<u8>, value: usize) {
+    let value = u64::try_from(value)
+        .expect("Rust target pointer widths are no wider than the canonical u64 length field");
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
 /// Append a length-prefixed byte slice to the canonical byte stream.
 fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) {
-    push_u32(bytes, value.len() as u32);
+    push_len(bytes, value.len());
     bytes.extend_from_slice(value);
 }
 

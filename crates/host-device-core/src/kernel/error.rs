@@ -31,6 +31,7 @@ impl HostError {
         Self::new("E_TIMEOUT", message, true)
     }
 
+    #[must_use]
     pub fn cancelled() -> Self {
         Self::new("E_CANCELLED", "operation cancelled", false)
     }
@@ -43,6 +44,7 @@ impl HostError {
         Self::new("E_NO_ROUTE", message, false)
     }
 
+    #[must_use]
     pub fn to_data(&self) -> Valor {
         frame_data::tabula([
             ("code", Valor::Textus(self.code.clone())),

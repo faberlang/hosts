@@ -10,14 +10,17 @@ use faber::{FromValor, Valor};
 
 use crate::kernel::{HostError, HostResult};
 
+#[must_use]
 pub fn empty() -> Valor {
     Valor::Tabula(BTreeMap::new())
 }
 
+#[must_use]
 pub fn is_empty_tabula(data: &Valor) -> bool {
     matches!(data, Valor::Tabula(tab) if tab.is_empty())
 }
 
+#[must_use]
 pub fn is_empty(data: &Valor) -> bool {
     matches!(data, Valor::Nihil) || is_empty_tabula(data)
 }
@@ -31,6 +34,10 @@ pub fn tabula(fields: impl IntoIterator<Item = (impl Into<String>, impl Into<Val
     )
 }
 
+/// Returns the positional argument or named field.
+///
+/// # Errors
+/// Returns an error when the requested argument is absent.
 pub fn positional_or_field<'a>(data: &'a Valor, index: usize, key: &str) -> HostResult<&'a Valor> {
     match data {
         Valor::Tabula(tab) => tab
@@ -46,6 +53,10 @@ pub fn positional_or_field<'a>(data: &'a Valor, index: usize, key: &str) -> Host
     }
 }
 
+/// Returns a named field from tabular frame data.
+///
+/// # Errors
+/// Returns an error when `data` is not tabular or the field is absent.
 pub fn field<'a>(data: &'a Valor, key: &str) -> HostResult<&'a Valor> {
     let Valor::Tabula(tab) = data else {
         return Err(HostError::invalid_args("frame data must be a tabula"));
@@ -54,35 +65,55 @@ pub fn field<'a>(data: &'a Valor, key: &str) -> HostResult<&'a Valor> {
         .ok_or_else(|| HostError::invalid_args(format!("missing {key}")))
 }
 
+/// Returns a string positional argument or named field.
+///
+/// # Errors
+/// Returns an error when the argument is absent or is not a string.
 pub fn string_arg(data: &Valor, index: usize, key: &str) -> HostResult<String> {
     let value = positional_or_field(data, index, key)?;
     String::from_valor(value)
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be a string")))
 }
 
+/// Returns a named string field.
+///
+/// # Errors
+/// Returns an error when the field is absent or is not a string.
 pub fn string_field(data: &Valor, key: &str) -> HostResult<String> {
     let value = field(data, key)?;
     String::from_valor(value)
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be a string")))
 }
 
+/// Returns an integer positional argument or named field.
+///
+/// # Errors
+/// Returns an error when the argument is absent or is not an integer.
 pub fn i64_arg(data: &Valor, index: usize, key: &str) -> HostResult<i64> {
     let value = positional_or_field(data, index, key)?;
     i64::from_valor(value)
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be an integer")))
 }
 
+/// Returns a named integer field.
+///
+/// # Errors
+/// Returns an error when the field is absent or is not an integer.
 pub fn i64_field(data: &Valor, key: &str) -> HostResult<i64> {
     let value = field(data, key)?;
     i64::from_valor(value)
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be an integer")))
 }
 
+/// Returns a string-list positional argument or named field.
+///
+/// # Errors
+/// Returns an error when the argument is absent or is not a string list.
 pub fn string_list_arg(data: &Valor, index: usize, key: &str) -> HostResult<Vec<String>> {
-    if index == 0 {
-        if let Some(items) = Vec::<String>::from_valor(data) {
-            return Ok(items);
-        }
+    if index == 0
+        && let Some(items) = Vec::<String>::from_valor(data)
+    {
+        return Ok(items);
     }
 
     let value = positional_or_field(data, index, key)?;
@@ -90,16 +121,28 @@ pub fn string_list_arg(data: &Valor, index: usize, key: &str) -> HostResult<Vec<
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be a list of strings")))
 }
 
+/// Returns a named boolean field.
+///
+/// # Errors
+/// Returns an error when the field is absent or is not a boolean.
 pub fn bool_field(data: &Valor, key: &str) -> HostResult<bool> {
     let value = field(data, key)?;
     bool::from_valor(value)
         .ok_or_else(|| HostError::invalid_args(format!("{key} must be a boolean")))
 }
 
+/// Returns a byte-array positional argument or named field.
+///
+/// # Errors
+/// Returns an error when the argument is absent or cannot be decoded as bytes.
 pub fn bytes_arg(data: &Valor, index: usize, key: &str) -> HostResult<Vec<u8>> {
     bytes_from_valor(positional_or_field(data, index, key)?, key)
 }
 
+/// Returns a named byte-array field.
+///
+/// # Errors
+/// Returns an error when the field is absent or cannot be decoded as bytes.
 pub fn bytes_field(data: &Valor, key: &str) -> HostResult<Vec<u8>> {
     let value = field(data, key)?;
     bytes_from_valor(value, key)
@@ -110,7 +153,10 @@ fn bytes_from_valor(value: &Valor, key: &str) -> HostResult<Vec<u8>> {
         Valor::Lista(items) => items
             .iter()
             .map(|item| match item {
-                Valor::Numerus(byte) if (0..=u8::MAX as i64).contains(byte) => Ok(*byte as u8),
+                Valor::Numerus(byte) if (0..=i64::from(u8::MAX)).contains(byte) => {
+                    Ok(u8::try_from(*byte)
+                        .expect("the byte range guard proves the value fits in u8"))
+                }
                 _ => Err(HostError::invalid_args(format!("{key} must contain bytes"))),
             })
             .collect(),
@@ -121,14 +167,17 @@ fn bytes_from_valor(value: &Valor, key: &str) -> HostResult<Vec<u8>> {
     }
 }
 
+#[must_use]
 pub fn single_text(value: String) -> Valor {
     Valor::Textus(value)
 }
 
+#[must_use]
 pub fn single_bool(value: bool) -> Valor {
     Valor::Bivalens(value)
 }
 
+#[must_use]
 pub fn single_bytes(value: Vec<u8>) -> Valor {
     Valor::Octeti(value)
 }
