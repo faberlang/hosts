@@ -22,7 +22,7 @@
 //! 4. **Copy in host inputs** — `input` / `extra-input` buffers receive the
 //!    host f32 values keyed by binding slot; a missing or wrong-sized input
 //!    fails closed with `E_DEVICE_SHAPE_MISMATCH`. `accumulation` buffers are
-//!    zero-filled at allocation (the host ZeroFill convention; the v2 sidecar
+//!    zero-filled at allocation (the host `ZeroFill` convention; the v2 sidecar
 //!    carries no initialization axis).
 //! 5. **Launch** — exactly one `launch_kernel_3d` call with the descriptor's
 //!    plan-driven grid/block. The plan facts (`tiled_matmul` `m/k/n`/`tile`
@@ -429,6 +429,10 @@ pub fn parse_descriptor(descriptor_json: &[u8]) -> HostResult<NvvmLaunchPlan> {
 }
 
 /// Structural validation of one descriptor kernel entry (fail-closed).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive fail-closed pass cross-checks every field of a single descriptor kernel"
+)]
 fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     if kernel.entry.trim().is_empty() {
         return Err(errors::descriptor(
@@ -563,13 +567,13 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
             )));
         }
     }
-    if let Some(first_input) = buffers.iter().find(|buffer| buffer.role.is_input()) {
-        if kernel.element_count != first_input.element_count {
-            return Err(errors::shape_mismatch(format!(
-                "nvvm descriptor kernel `{}` records kernel element_count {} but its first input buffer (binding {}) declares {}",
-                kernel.entry, kernel.element_count, first_input.binding, first_input.element_count
-            )));
-        }
+    if let Some(first_input) = buffers.iter().find(|buffer| buffer.role.is_input())
+        && kernel.element_count != first_input.element_count
+    {
+        return Err(errors::shape_mismatch(format!(
+            "nvvm descriptor kernel `{}` records kernel element_count {} but its first input buffer (binding {}) declares {}",
+            kernel.entry, kernel.element_count, first_input.binding, first_input.element_count
+        )));
     }
 
     // Launch geometry: dispatch (grid) + workgroup (block). Every axis must
@@ -610,10 +614,10 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     if let Some(plan) = &kernel.plan {
         match plan.kind.as_str() {
             "tiled_matmul" => {
-                validate_tiled_matmul_plan(plan, &buffers, &grid, &block, &kernel.entry)?
+                validate_tiled_matmul_plan(plan, &buffers, &grid, &block, &kernel.entry)?;
             }
             "tree_reduction" => {
-                validate_tree_reduction_plan(plan, &buffers, &grid, &block, &kernel.entry)?
+                validate_tree_reduction_plan(plan, &buffers, &grid, &block, &kernel.entry)?;
             }
             _ => {}
         }
@@ -748,7 +752,7 @@ fn validate_tree_reduction_plan(
         ))
     })?;
     match plan.op.as_deref() {
-        Some("sum") | Some("mean") => {}
+        Some("sum" | "mean") => {}
         Some(op) => {
             return Err(errors::descriptor(format!(
                 "nvvm descriptor plan tree_reduction (kernel `{entry}`) declares unknown op `{op}`"
@@ -829,27 +833,27 @@ fn plan_workgroup_consistency(
     block: &[u32; 3],
     entry: &str,
 ) -> HostResult<()> {
-    if let Some(workgroup_x) = plan.workgroup_x {
-        if workgroup_x != block[0] {
-            return Err(launch_authority_conflict(
-                entry,
-                format!(
-                    "plan workgroup_x {workgroup_x} contradicts launch workgroup x {}",
-                    block[0]
-                ),
-            ));
-        }
+    if let Some(workgroup_x) = plan.workgroup_x
+        && workgroup_x != block[0]
+    {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan workgroup_x {workgroup_x} contradicts launch workgroup x {}",
+                block[0]
+            ),
+        ));
     }
-    if let Some(workgroup_y) = plan.workgroup_y {
-        if workgroup_y != block[1] {
-            return Err(launch_authority_conflict(
-                entry,
-                format!(
-                    "plan workgroup_y {workgroup_y} contradicts launch workgroup y {}",
-                    block[1]
-                ),
-            ));
-        }
+    if let Some(workgroup_y) = plan.workgroup_y
+        && workgroup_y != block[1]
+    {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan workgroup_y {workgroup_y} contradicts launch workgroup y {}",
+                block[1]
+            ),
+        ));
     }
     Ok(())
 }
@@ -867,23 +871,23 @@ fn matmul_grid_consistency(
             "nvvm descriptor plan tiled_matmul (kernel `{entry}`) has a zero tile"
         )));
     }
-    let expected_x_u64 = n.div_ceil(u64::from(tile));
-    let expected_y_u64 = m.div_ceil(u64::from(tile));
-    let expected_x = u32::try_from(expected_x_u64).map_err(|_| {
+    let grid_columns_u64 = n.div_ceil(u64::from(tile));
+    let grid_rows_u64 = m.div_ceil(u64::from(tile));
+    let required_columns = u32::try_from(grid_columns_u64).map_err(|_| {
         errors::descriptor(format!(
-            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid x {expected_x_u64} does not fit u32"
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid x {grid_columns_u64} does not fit u32"
         ))
     })?;
-    let expected_y = u32::try_from(expected_y_u64).map_err(|_| {
+    let required_rows = u32::try_from(grid_rows_u64).map_err(|_| {
         errors::descriptor(format!(
-            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid y {expected_y_u64} does not fit u32"
+            "nvvm descriptor plan tiled_matmul (kernel `{entry}`) derived grid y {grid_rows_u64} does not fit u32"
         ))
     })?;
-    if grid[0] != expected_x || grid[1] != expected_y {
+    if grid[0] != required_columns || grid[1] != required_rows {
         return Err(launch_authority_conflict(
             entry,
             format!(
-                "plan tile grid ({expected_x}, {expected_y}) contradicts launch dispatch ({}, {})",
+                "plan tile grid ({required_columns}, {required_rows}) contradicts launch dispatch ({}, {})",
                 grid[0], grid[1]
             ),
         ));
@@ -918,6 +922,10 @@ fn launch_authority_conflict(entry: &str, detail: impl std::fmt::Display) -> Hos
 ///   contradicts its element count;
 /// - `E_DEVICE_ENTRY_MISMATCH` / session-level failures bubble through
 ///   unchanged.
+#[allow(
+    clippy::too_many_lines,
+    reason = "allocation, launch, readback, and unconditional teardown form one transaction boundary"
+)]
 pub fn execute_launch_plan(
     session: &mut CudaHostSession,
     ptx: &[u8],

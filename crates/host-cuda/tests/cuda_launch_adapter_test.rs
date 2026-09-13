@@ -90,7 +90,7 @@ fn parse_rejects_wrong_schema_version() {
         parse_descriptor(descriptor).expect_err("v1 sidecar must fail closed on schema version");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("schema_version 1"), "{}", err.message);
-    assert!(err.message.contains("3"), "{}", err.message);
+    assert!(err.message.contains('3'), "{}", err.message);
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn execute_launches_matmul_and_matches_oracle() {
     assert_eq!(output, &RUNG0_ORACLE.to_vec());
     let oracle = receipt.oracle.expect("oracle check recorded");
     assert!(oracle.matched);
-    assert_eq!(oracle.max_abs_delta, 0.0);
+    assert_eq!(oracle.max_abs_delta.to_bits(), 0.0f64.to_bits());
 
     // The module is session-owned: it remains live after the launch and is
     // released at the explicit session teardown boundary.
