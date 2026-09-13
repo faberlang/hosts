@@ -126,7 +126,7 @@ fn read_literal_rows(
     Ok(rows)
 }
 
-fn read_payload<'a>(data: &'a [u8], offset: usize) -> Result<&'a [u8], RunOutcome> {
+fn read_payload(data: &[u8], offset: usize) -> Result<&[u8], RunOutcome> {
     let start = usize::try_from(read_i32_le(data, offset)?).expect("non-negative row offset");
     let length = usize::try_from(read_i32_le(data, offset + 4)?).expect("non-negative row length");
     let end = start
