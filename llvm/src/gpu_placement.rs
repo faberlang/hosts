@@ -73,8 +73,7 @@ pub unsafe extern "C" fn __faber_gpu_v1_copy_in(
             buffers.insert(logical_id, buffer);
             STATUS_OK
         }) {
-            Ok(status) => status,
-            Err(status) => status,
+            Ok(status) | Err(status) => status,
         }
     })
 }
@@ -115,8 +114,7 @@ pub unsafe extern "C" fn __faber_gpu_v1_readback(
             }
             None => STATUS_INVALID_ARGUMENT,
         }) {
-            Ok(status) => status,
-            Err(status) => status,
+            Ok(status) | Err(status) => status,
         }
     })
 }

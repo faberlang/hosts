@@ -51,7 +51,7 @@ fn find_sermo_mut(runtime: &mut RuntimeContext, handle: *mut c_void) -> Option<&
         .map(super::StableBox::as_mut)
 }
 
-/// `ad 'route'(payload)` — open a sermo stream (SermoOpen).
+/// `ad 'route'(payload)` — open a sermo stream (`SermoOpen`).
 ///
 /// Creates the `frame::Sermo` for `route`, installs `payload` as the opener
 /// (the first request frame's data), and returns an opaque arena-owned stream

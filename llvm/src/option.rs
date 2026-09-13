@@ -401,7 +401,7 @@ fn raw_option_value(option: *mut c_void, kind: FaberRtValueKindV1) -> Option<Run
         VALUE_KIND_U8 => RuntimeValue::U8(bits as u8),
         VALUE_KIND_U16 => RuntimeValue::U16(bits as u16),
         VALUE_KIND_U32 => RuntimeValue::U32(bits as u32),
-        VALUE_KIND_U64 => RuntimeValue::U64(bits as u64),
+        VALUE_KIND_U64 => RuntimeValue::U64(bits),
         VALUE_KIND_F16 => RuntimeValue::F16(bits as u16),
         VALUE_KIND_F32 => RuntimeValue::F32(f32::from_bits(bits as u32)),
         VALUE_KIND_F64 => RuntimeValue::F64(f64::from_bits(bits)),

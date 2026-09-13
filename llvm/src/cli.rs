@@ -62,7 +62,7 @@ enum DescriptorExit {
     None,
     Fixed(i64),
     Binding(String),
-    /// EXIT_FIELD policy. Only the `field` half carries runtime behavior on
+    /// `EXIT_FIELD` policy. Only the `field` half carries runtime behavior on
     /// this host; the decoder still consumes the `object` half (v1 byte
     /// contract) but does not retain it.
     Field {
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_parse(
                 Ok(decoded) => decoded,
                 Err(reason) => cli_parse_exit(format!("invalid CLI descriptor: {reason}")),
             };
-            let Some(runtime) = (unsafe { runtime_mut(context) }) else {
+            let Some(runtime) = runtime_mut(context) else {
                 return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
             };
             let arguments = runtime
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_table(context: *mut FaberRtContextV1)
     runtime
         .cli_table
         .as_ref()
-        .map_or(std::ptr::null_mut(), |table| table.handle())
+        .map_or(std::ptr::null_mut(), super::StableBox::handle)
 }
 
 /// Selected command index (subcommand mode), or -1 (single-command).
@@ -245,11 +245,10 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_exit_code(context: *mut FaberRtContex
         return 0;
     };
     match &table.exit {
-        DescriptorExit::None => 0,
         DescriptorExit::Fixed(code) => *code,
         DescriptorExit::Binding(binding) => table_entry_by_binding(table, binding).unwrap_or(0),
         DescriptorExit::Field { field } => table_entry_by_binding(table, field).unwrap_or(0),
-        DescriptorExit::Unsupported => 0,
+        DescriptorExit::None | DescriptorExit::Unsupported => 0,
     }
 }
 
@@ -360,11 +359,7 @@ pub unsafe extern "C" fn __faber_rt_v1_cli_field_i1(
     }
 }
 
-fn find_entry<'a>(
-    runtime: &'a RuntimeContext,
-    table: *mut c_void,
-    index: i64,
-) -> Option<&'a CliEntry> {
+fn find_entry(runtime: &RuntimeContext, table: *mut c_void, index: i64) -> Option<&CliEntry> {
     let stored = runtime.cli_table.as_ref()?;
     if stored.handle() != table {
         return None;
@@ -698,7 +693,7 @@ fn default_value_entry(
             carrier: false,
             value: CliPayload::Handle(octeti_handle(context, value.as_bytes())),
         },
-        (_, DescriptorDefault::Text(value)) | (_, DescriptorDefault::Expr(value)) => CliEntry {
+        (_, DescriptorDefault::Text(value) | DescriptorDefault::Expr(value)) => CliEntry {
             kind: ty,
             carrier: false,
             value: CliPayload::Handle(text_handle(context, value)),
@@ -753,14 +748,16 @@ fn parse_long_option(
             .is_some_and(|long| name == format!("--{long}"))
         {
             apply_option(
-                context,
+                OptionInput {
+                    context,
+                    index,
+                    arguments,
+                },
                 option,
                 option_index,
                 option_entries,
-                &name,
+                name,
                 inline,
-                index,
-                arguments,
             )?;
             return Ok(());
         }
@@ -783,14 +780,16 @@ fn parse_short_option(
             .is_some_and(|short| arg == format!("-{short}"))
         {
             apply_option(
-                context,
+                OptionInput {
+                    context,
+                    index,
+                    arguments,
+                },
                 option,
                 option_index,
                 option_entries,
                 arg,
                 None,
-                index,
-                arguments,
             )?;
             return Ok(());
         }
@@ -798,16 +797,25 @@ fn parse_short_option(
     Err(format!("unknown option '{arg}'"))
 }
 
-fn apply_option(
+struct OptionInput<'a> {
     context: *mut FaberRtContextV1,
+    index: &'a mut usize,
+    arguments: &'a [String],
+}
+
+fn apply_option(
+    input: OptionInput<'_>,
     option: &DescriptorOption,
     option_index: usize,
     option_entries: &mut [CliEntry],
     label: &str,
     inline: Option<String>,
-    index: &mut usize,
-    arguments: &[String],
 ) -> Result<(), String> {
+    let OptionInput {
+        context,
+        index,
+        arguments,
+    } = input;
     if option.flag {
         option_entries[option_index] = CliEntry {
             kind: option.ty,
@@ -816,15 +824,14 @@ fn apply_option(
         };
         return Ok(());
     }
-    let raw = match inline {
-        Some(value) => value,
-        None => {
-            *index += 1;
-            arguments
-                .get(*index)
-                .cloned()
-                .ok_or_else(|| format!("missing value for {label}"))?
-        }
+    let raw = if let Some(value) = inline {
+        value
+    } else {
+        *index += 1;
+        arguments
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| format!("missing value for {label}"))?
     };
     option_entries[option_index] = parse_option_value(context, option, &raw)?;
     Ok(())
@@ -893,10 +900,8 @@ fn assign_operands(
         };
         entries.push(entry_from_payload(context, operand.ty, value));
     }
-    if !has_rest {
-        if let Some(extra) = positional_iter.next() {
-            return Err(format!("unexpected operand '{extra}'"));
-        }
+    if !has_rest && let Some(extra) = positional_iter.next() {
+        return Err(format!("unexpected operand '{extra}'"));
     }
     Ok(entries)
 }
@@ -944,27 +949,24 @@ fn list_value_entry(
     let Some(runtime) = (unsafe { runtime_mut(context) }) else {
         return Err(String::new());
     };
-    let (kind, runtime_values) = match ty {
-        T_LISTA_NUMERUS => {
-            let values = values
-                .into_iter()
-                .map(|value| match value {
-                    CliPayload::Integer(value) => RuntimeValue::I64(value),
-                    _ => RuntimeValue::I64(0),
-                })
-                .collect();
-            (VALUE_KIND_I64, values)
-        }
-        _ => {
-            let values = values
-                .into_iter()
-                .map(|value| match value {
-                    CliPayload::Handle(handle) => RuntimeValue::Ptr(handle),
-                    _ => RuntimeValue::Ptr(std::ptr::null_mut()),
-                })
-                .collect();
-            (VALUE_KIND_PTR, values)
-        }
+    let (kind, runtime_values) = if ty == T_LISTA_NUMERUS {
+        let values = values
+            .into_iter()
+            .map(|value| match value {
+                CliPayload::Integer(value) => RuntimeValue::I64(value),
+                _ => RuntimeValue::I64(0),
+            })
+            .collect();
+        (VALUE_KIND_I64, values)
+    } else {
+        let values = values
+            .into_iter()
+            .map(|value| match value {
+                CliPayload::Handle(handle) => RuntimeValue::Ptr(handle),
+                _ => RuntimeValue::Ptr(std::ptr::null_mut()),
+            })
+            .collect();
+        (VALUE_KIND_PTR, values)
     };
     let result = store_array(runtime, kind, runtime_values);
     if result.status.is_ok() {

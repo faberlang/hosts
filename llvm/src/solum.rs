@@ -34,7 +34,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_read_lines(
     let Some(path) = text_value(path) else {
         return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return FaberRtPtrResultV1::failure(STATUS_IO_ERROR);
     };
     if context.is_null() {
@@ -42,7 +42,7 @@ pub unsafe extern "C" fn __faber_rt_v1_solum_read_lines(
     }
     let runtime = unsafe { &mut *context.cast::<RuntimeContext>() };
     let mut values = Vec::new();
-    for line in content.lines() {
+    for line in contents.lines() {
         let result = store_text(context, line.to_owned());
         if result.status != STATUS_OK {
             return result;
