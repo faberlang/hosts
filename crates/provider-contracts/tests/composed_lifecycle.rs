@@ -1,5 +1,5 @@
 use faber::Valor;
-use host_kernel::{Kernel, parse_manifest};
+use host_kernel::{parse_manifest, Kernel};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -669,5 +669,7 @@ fn composed_kernel_registers_unique_provider_identities_and_routes() {
     }
 
     assert_eq!(admitted_routes.len(), 81);
-    std::env::remove_var(format!("FABER_PROVIDER_CONTRACTS_{}", std::process::id()));
+    // SAFETY: this test owns its process environment and removes its unique variable
+    // after completing every provider dispatch that can read it.
+    unsafe { std::env::remove_var(format!("FABER_PROVIDER_CONTRACTS_{}", std::process::id())) };
 }
