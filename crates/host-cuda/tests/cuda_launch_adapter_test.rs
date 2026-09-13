@@ -90,7 +90,7 @@ fn parse_rejects_wrong_schema_version() {
         parse_descriptor(descriptor).expect_err("v1 sidecar must fail closed on schema version");
     assert_eq!(err.code, E_DEVICE_DESCRIPTOR);
     assert!(err.message.contains("schema_version 1"), "{}", err.message);
-    assert!(err.message.contains("3"), "{}", err.message);
+    assert!(err.message.contains('3'), "{}", err.message);
 }
 
 #[test]

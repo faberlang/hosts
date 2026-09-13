@@ -22,7 +22,7 @@
 //! 4. **Copy in host inputs** — `input` / `extra-input` buffers receive the
 //!    host f32 values keyed by binding slot; a missing or wrong-sized input
 //!    fails closed with `E_DEVICE_SHAPE_MISMATCH`. `accumulation` buffers are
-//!    zero-filled at allocation (the host ZeroFill convention; the v2 sidecar
+//!    zero-filled at allocation (the host `ZeroFill` convention; the v2 sidecar
 //!    carries no initialization axis).
 //! 5. **Launch** — exactly one `launch_kernel_3d` call with the descriptor's
 //!    plan-driven grid/block. The plan facts (`tiled_matmul` `m/k/n`/`tile`
@@ -563,13 +563,13 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
             )));
         }
     }
-    if let Some(first_input) = buffers.iter().find(|buffer| buffer.role.is_input()) {
-        if kernel.element_count != first_input.element_count {
-            return Err(errors::shape_mismatch(format!(
-                "nvvm descriptor kernel `{}` records kernel element_count {} but its first input buffer (binding {}) declares {}",
-                kernel.entry, kernel.element_count, first_input.binding, first_input.element_count
-            )));
-        }
+    if let Some(first_input) = buffers.iter().find(|buffer| buffer.role.is_input())
+        && kernel.element_count != first_input.element_count
+    {
+        return Err(errors::shape_mismatch(format!(
+            "nvvm descriptor kernel `{}` records kernel element_count {} but its first input buffer (binding {}) declares {}",
+            kernel.entry, kernel.element_count, first_input.binding, first_input.element_count
+        )));
     }
 
     // Launch geometry: dispatch (grid) + workgroup (block). Every axis must
@@ -610,10 +610,10 @@ fn validate_kernel(kernel: &NvvmKernelJson) -> HostResult<NvvmLaunchPlan> {
     if let Some(plan) = &kernel.plan {
         match plan.kind.as_str() {
             "tiled_matmul" => {
-                validate_tiled_matmul_plan(plan, &buffers, &grid, &block, &kernel.entry)?
+                validate_tiled_matmul_plan(plan, &buffers, &grid, &block, &kernel.entry)?;
             }
             "tree_reduction" => {
-                validate_tree_reduction_plan(plan, &buffers, &grid, &block, &kernel.entry)?
+                validate_tree_reduction_plan(plan, &buffers, &grid, &block, &kernel.entry)?;
             }
             _ => {}
         }
@@ -748,7 +748,7 @@ fn validate_tree_reduction_plan(
         ))
     })?;
     match plan.op.as_deref() {
-        Some("sum") | Some("mean") => {}
+        Some("sum" | "mean") => {}
         Some(op) => {
             return Err(errors::descriptor(format!(
                 "nvvm descriptor plan tree_reduction (kernel `{entry}`) declares unknown op `{op}`"
@@ -829,27 +829,27 @@ fn plan_workgroup_consistency(
     block: &[u32; 3],
     entry: &str,
 ) -> HostResult<()> {
-    if let Some(workgroup_x) = plan.workgroup_x {
-        if workgroup_x != block[0] {
-            return Err(launch_authority_conflict(
-                entry,
-                format!(
-                    "plan workgroup_x {workgroup_x} contradicts launch workgroup x {}",
-                    block[0]
-                ),
-            ));
-        }
+    if let Some(workgroup_x) = plan.workgroup_x
+        && workgroup_x != block[0]
+    {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan workgroup_x {workgroup_x} contradicts launch workgroup x {}",
+                block[0]
+            ),
+        ));
     }
-    if let Some(workgroup_y) = plan.workgroup_y {
-        if workgroup_y != block[1] {
-            return Err(launch_authority_conflict(
-                entry,
-                format!(
-                    "plan workgroup_y {workgroup_y} contradicts launch workgroup y {}",
-                    block[1]
-                ),
-            ));
-        }
+    if let Some(workgroup_y) = plan.workgroup_y
+        && workgroup_y != block[1]
+    {
+        return Err(launch_authority_conflict(
+            entry,
+            format!(
+                "plan workgroup_y {workgroup_y} contradicts launch workgroup y {}",
+                block[1]
+            ),
+        ));
     }
     Ok(())
 }

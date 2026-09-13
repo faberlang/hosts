@@ -4,7 +4,7 @@
 //! # How to compile and run the CUDA proof
 //!
 //! The proof runs end-to-end on a machine with an NVIDIA GPU and the CUDA
-//! Driver API (e.g. pharos: RTX 5070, sm_120, driver 595.71.05,
+//! Driver API (e.g. pharos: RTX 5070, `sm_120`, driver 595.71.05,
 //! `libcuda.so.1` at `/lib/x86_64-linux-gnu/libcuda.so.1`). It requires three
 //! artifacts: the PTX file (compiler-emitted LLVM IR lowered through an
 //! NVPTX backend), the kernel descriptor JSON sidecar, and this test binary
@@ -139,19 +139,17 @@ struct ProofAxis {
 
 #[test]
 fn cuda_driver_api_proof() {
-    let ptx_path = match std::env::var("CUDA_PROOF_PTX") {
-        Ok(path) => path,
-        Err(_) => {
-            println!("SKIP: CUDA_PROOF_PTX not set — CUDA proof not requested");
-            return;
-        }
+    let ptx_path = if let Ok(path) = std::env::var("CUDA_PROOF_PTX") {
+        path
+    } else {
+        println!("SKIP: CUDA_PROOF_PTX not set — CUDA proof not requested");
+        return;
     };
-    let descriptor_path = match std::env::var("CUDA_PROOF_DESCRIPTOR") {
-        Ok(path) => path,
-        Err(_) => {
-            println!("SKIP: CUDA_PROOF_DESCRIPTOR not set — CUDA proof not requested");
-            return;
-        }
+    let descriptor_path = if let Ok(path) = std::env::var("CUDA_PROOF_DESCRIPTOR") {
+        path
+    } else {
+        println!("SKIP: CUDA_PROOF_DESCRIPTOR not set — CUDA proof not requested");
+        return;
     };
 
     let ptx = std::fs::read(&ptx_path)
