@@ -8,6 +8,9 @@ license = "MIT"
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[lints.clippy]
+pedantic = "deny"
+
 [dependencies]
 faber = { path = "../../faber/runtime/rust" }
 # S3-U3 re-point (faber-target-runtime inventory §3.4): the C ABI symbol/layout
