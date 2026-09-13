@@ -3745,8 +3745,7 @@ fn bind_tensor_slice(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
                     "tensor_slice bounds out of range",
                 ));
             }
-            let row_stride = tensor_shape_element_count(rest).unwrap_or(1);
-            let row_len = usize::try_from(row_stride).expect("row stride fits usize");
+            let row_len = tensor_shape_element_count(rest).unwrap_or(1);
             let take = usize::try_from(end - start).expect("slice width fits usize");
             let mut sliced = Vec::with_capacity(take * row_len);
             for row in start..end {
