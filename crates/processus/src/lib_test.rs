@@ -72,7 +72,9 @@ fn environment_mutation_round_trip_uses_textus_carriers() {
         reply.contents.as_slice(),
         [ProviderContent::Item(Valor::Textus(value))] if value == "salve"
     ));
-    std::env::remove_var(name);
+    // SAFETY: this test owns its process environment and removes its unique variable
+    // after its only provider calls that can read it.
+    unsafe { std::env::remove_var(name) };
 }
 
 #[test]
