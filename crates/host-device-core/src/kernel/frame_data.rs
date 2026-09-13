@@ -153,7 +153,10 @@ fn bytes_from_valor(value: &Valor, key: &str) -> HostResult<Vec<u8>> {
         Valor::Lista(items) => items
             .iter()
             .map(|item| match item {
-                Valor::Numerus(byte) if (0..=i64::from(u8::MAX)).contains(byte) => Ok(*byte as u8),
+                Valor::Numerus(byte) if (0..=i64::from(u8::MAX)).contains(byte) => {
+                    Ok(u8::try_from(*byte)
+                        .expect("the byte range guard proves the value fits in u8"))
+                }
                 _ => Err(HostError::invalid_args(format!("{key} must contain bytes"))),
             })
             .collect(),
