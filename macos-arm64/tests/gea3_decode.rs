@@ -2659,6 +2659,106 @@ fn gea3_git_revision(path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+fn gea3_collect_content_files(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
+    let path = root.join(relative);
+    let file_type = fs::symlink_metadata(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .file_type();
+    if file_type.is_symlink() {
+        panic!(
+            "content identity does not admit symlink input {}",
+            path.display()
+        );
+    }
+    if file_type.is_file() {
+        files.push(relative.to_owned());
+        return;
+    }
+    assert!(
+        file_type.is_dir(),
+        "content identity input is not a file or directory: {}",
+        path.display()
+    );
+    let mut entries: Vec<_> = fs::read_dir(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .map(|entry| entry.unwrap_or_else(|error| panic!("read {}: {error}", path.display())))
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let child = relative.join(entry.file_name());
+        gea3_collect_content_files(root, &child, files);
+    }
+}
+
+/// Hash the relative names and bytes of the source/build inputs used by a
+/// GEA3 invocation.  This deliberately matches the Radix live comparator.
+fn gea3_content_identity(root: &Path, roots: &[&str]) -> String {
+    let mut files = Vec::new();
+    for relative in roots {
+        gea3_collect_content_files(root, Path::new(relative), &mut files);
+    }
+    files.sort();
+    let mut stream = Vec::new();
+    for relative in files {
+        let name = relative.to_string_lossy();
+        let bytes = fs::read(root.join(&relative))
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.join(&relative).display()));
+        stream.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        stream.extend_from_slice(name.as_bytes());
+        stream.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        stream.extend_from_slice(&bytes);
+    }
+    sha256_hex(&stream)
+}
+
+fn gea3_binary_identity(path: &Path) -> String {
+    sha256_hex(&fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())))
+}
+
+fn gea3_canonical_env_path(name: &str) -> PathBuf {
+    let raw = std::env::var_os(name).unwrap_or_else(|| panic!("{name} must identify a live input"));
+    PathBuf::from(raw)
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize {name}: {error}"))
+}
+
+fn gea3_live_content_identities(workspace: &Path, artifact_dir: &Path) -> Value {
+    let artifact_dir = artifact_dir
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize {}: {error}", artifact_dir.display()));
+    let device_binary = std::env::current_exe()
+        .unwrap_or_else(|error| panic!("identify device receipt executable: {error}"))
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize device receipt executable: {error}"));
+    let comparator_binary = gea3_canonical_env_path("GEA3_NUM8_COMPARATOR_BINARY");
+    json!({
+        "radix": {
+            "inputs_sha256": gea3_content_identity(&workspace.join("radix"), &["Cargo.toml", "Cargo.lock", "crates"]),
+        },
+        "hosts": {
+            "inputs_sha256": gea3_content_identity(
+                &workspace.join("hosts"),
+                &["Cargo.toml", "Cargo.lock", "crates", "macos-arm64"],
+            ),
+        },
+        "gradus": {
+            "inputs_sha256": gea3_content_identity(&workspace.join("gradus"), &["faber.toml", "cista.toml", "src"]),
+        },
+        "artifacts": {
+            "path": artifact_dir.display().to_string(),
+            "sha256": gea3_content_identity(&artifact_dir, &[""]),
+        },
+        "device_binary": {
+            "path": device_binary.display().to_string(),
+            "sha256": gea3_binary_identity(&device_binary),
+        },
+        "comparator_binary": {
+            "path": comparator_binary.display().to_string(),
+            "sha256": gea3_binary_identity(&comparator_binary),
+        },
+    })
+}
+
 fn gea3_emitted_buffer_arity(module_image: &[u8], entry: &str) -> Option<usize> {
     let source = std::str::from_utf8(module_image).ok()?;
     let marker = format!("kernel void {entry}(");
@@ -4868,6 +4968,7 @@ fn gea3_physical_receipt_run(identity: Gea3Identity) {
             "radix": gea3_git_revision(&workspace.join("radix")),
             "hosts": gea3_git_revision(&workspace.join("hosts")),
         },
+        "content_identities": gea3_live_content_identities(&workspace, &artifact_dir),
         "physical_device": {
             "backend": "Metal",
             "ordinal": device.ordinal,
