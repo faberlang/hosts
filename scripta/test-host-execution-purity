@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # HEP-2 proof: new target source fails, and a removed debt row lowers the ledger.
+# Fixture proofs run first; the live-tree green check runs last so a red tree
+# cannot mask the fixture results.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHECK="$ROOT/scripta/check-host-execution-purity"
 FIXTURES="$ROOT/scripta/fixtures/host-execution-purity"
-
-"$CHECK"
 
 set +e
 red_output="$("$CHECK" \
@@ -37,4 +37,28 @@ if [[ "$retired_output" != *"debt-count=1"* || "$retired_output" != *"(lower fro
   exit 1
 fi
 
-printf '%s\n' "host-execution-purity test: red fixture and debt reduction green"
+"$CHECK" \
+  --fixture \
+  --root "$FIXTURES/known-debt-vocabulary" \
+  --ledger "$FIXTURES/known-debt-vocabulary-ledger.toml" >/dev/null
+
+set +e
+red_vocab_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/unledgered-vocabulary" \
+  --ledger "$FIXTURES/unledgered-vocabulary-ledger.toml" 2>&1)"
+red_vocab_status=$?
+set -e
+if [[ "$red_vocab_status" -eq 0 ]]; then
+  printf '%s\n' "host-execution-purity test: unledgered vocabulary fixture passed" >&2
+  exit 1
+fi
+if [[ "$red_vocab_output" != *"new model or descriptor reconstruction"* ]]; then
+  printf '%s\n' "host-execution-purity test: unledgered fixture failed for the wrong reason" >&2
+  printf '%s\n' "$red_vocab_output" >&2
+  exit 1
+fi
+
+"$CHECK"
+
+printf '%s\n' "host-execution-purity test: red fixture, debt reduction, vocabulary narrowing, and live tree green"
