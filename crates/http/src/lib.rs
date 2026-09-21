@@ -27,6 +27,13 @@ pub(crate) const MAX_CONFIGURED_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_BACKLOG: i32 = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Short magnitude: the window an incomplete request header/body read may span.
+const DEFAULT_HEADER_BODY_DEADLINE: Duration = Duration::from_secs(5);
+/// Generous magnitude: the window a parked idle keep-alive connection may
+/// rest between requests. One short window for the whole connection is the
+/// wrong shape — it reaps idle keep-alive connections between requests.
+const DEFAULT_IDLE_DEADLINE: Duration = Duration::from_secs(75);
+const MAX_CONFIGURED_DEADLINE_MS: u64 = 86_400_000;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_ID_PREFIX: &str = "http-";
@@ -52,6 +59,7 @@ struct HttpState {
 struct ListenerState {
     listener: TcpListener,
     max_body_bytes: usize,
+    read_deadlines: ReadDeadlines,
     stopped: AtomicBool,
 }
 
@@ -66,12 +74,34 @@ struct Connection {
     stream: TcpStream,
     leftover: Vec<u8>,
     phase: Phase,
+    /// When the connection was last parked awaiting its next request.
+    idle_since: Instant,
+    /// When the incomplete header/body currently in flight began.
+    read_started: Option<Instant>,
 }
 
 enum Phase {
     Idle,
     Pending { request_id: String },
     Streaming { request_id: String, writer: i64 },
+}
+
+/// One deadline mechanism, two magnitudes: the short `header_body` window
+/// bounds an incomplete request read; the generous `idle` window bounds a
+/// parked keep-alive connection between requests.
+#[derive(Clone, Copy)]
+struct ReadDeadlines {
+    header_body: Duration,
+    idle: Duration,
+}
+
+impl Default for ReadDeadlines {
+    fn default() -> Self {
+        Self {
+            header_body: DEFAULT_HEADER_BODY_DEADLINE,
+            idle: DEFAULT_IDLE_DEADLINE,
+        }
+    }
 }
 
 struct RequestParts {
@@ -89,10 +119,23 @@ struct ParsedHeaders {
     content_length: usize,
 }
 
+impl ReadDeadlines {
+    /// Whether the connection's current window closed at `now`: the short
+    /// header/body window while a partial request is in flight, otherwise
+    /// the generous idle window since it was parked.
+    fn expired(&self, connection: &Connection, now: Instant) -> bool {
+        match connection.read_started {
+            Some(started) => now >= started + self.header_body,
+            None => now >= connection.idle_since + self.idle,
+        }
+    }
+}
+
 enum PollRead {
     Ready(RequestParts),
     Idle,
     Closed,
+    Expired,
 }
 
 impl Http {
@@ -171,28 +214,48 @@ impl Provider for Http {
 impl Http {
     fn listen(&self, opener: &Valor) -> HostResult<ProviderReply> {
         let values = list_args(opener, "http:listen")?;
-        if !(1..=3).contains(&values.len()) {
+        if !(1..=5).contains(&values.len()) {
             return Err(HostError::invalid_args(
-                "http:listen requires [port], [port, max_body_bytes], or [port, max_body_bytes, bind_host]",
+                "http:listen requires [port], [port, max_body_bytes], [port, max_body_bytes, bind_host], [port, max_body_bytes, bind_host, header_body_deadline_ms], or [port, max_body_bytes, bind_host, header_body_deadline_ms, idle_deadline_ms]",
             ));
         }
         let port = integer_arg(&values[0], "port")?;
         let port = u16::try_from(port)
             .map_err(|_| HostError::invalid_args("http:listen port must be between 0 and 65535"))?;
-        let (max_body_bytes, bind_host) = match values.len() {
-            1 => (DEFAULT_MAX_BODY_BYTES, DEFAULT_BIND_HOST.to_owned()),
+        let (max_body_bytes, bind_host, read_deadlines) = match values.len() {
+            1 => (
+                DEFAULT_MAX_BODY_BYTES,
+                DEFAULT_BIND_HOST.to_owned(),
+                ReadDeadlines::default(),
+            ),
             2 => match &values[1] {
-                Valor::Textus(host) | Valor::Instans(host) => {
-                    (DEFAULT_MAX_BODY_BYTES, parse_bind_host(host)?)
-                }
+                Valor::Textus(host) | Valor::Instans(host) => (
+                    DEFAULT_MAX_BODY_BYTES,
+                    parse_bind_host(host)?,
+                    ReadDeadlines::default(),
+                ),
                 other => (
                     bounded_body_size(integer_arg(other, "max_body_bytes")?)?,
                     DEFAULT_BIND_HOST.to_owned(),
+                    ReadDeadlines::default(),
                 ),
             },
+            3 => (
+                bounded_body_size(integer_arg(&values[1], "max_body_bytes")?)?,
+                parse_bind_host(&text_arg(&values[2], "bind_host")?)?,
+                ReadDeadlines::default(),
+            ),
             _ => (
                 bounded_body_size(integer_arg(&values[1], "max_body_bytes")?)?,
                 parse_bind_host(&text_arg(&values[2], "bind_host")?)?,
+                ReadDeadlines {
+                    header_body: deadline_arg(
+                        values.get(3),
+                        "header_body_deadline_ms",
+                        DEFAULT_HEADER_BODY_DEADLINE,
+                    )?,
+                    idle: deadline_arg(values.get(4), "idle_deadline_ms", DEFAULT_IDLE_DEADLINE)?,
+                },
             ),
         };
         let listener = TcpListener::bind((bind_host.as_str(), port))
@@ -204,6 +267,7 @@ impl Http {
         let state = Arc::new(ListenerState {
             listener,
             max_body_bytes,
+            read_deadlines,
             stopped: AtomicBool::new(false),
         });
         let handle = self.state.next_listener.fetch_add(1, Ordering::SeqCst);
@@ -232,8 +296,14 @@ impl Http {
             }
             match listener.listener.accept() {
                 Ok((stream, _peer)) => {
-                    let request = self.admit_connection(handle, stream, &listener, context)?;
-                    return Ok(ProviderReply::item(request));
+                    // A deadline-reaped admission returns None; the loop goes
+                    // back to serving other clients.
+                    if let Some(request) =
+                        self.admit_connection(handle, stream, &listener, context)?
+                    {
+                        return Ok(ProviderReply::item(request));
+                    }
+                    continue;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(POLL_INTERVAL);
@@ -251,7 +321,7 @@ impl Http {
         stream: TcpStream,
         listener: &ListenerState,
         context: &DispatchContext,
-    ) -> HostResult<Valor> {
+    ) -> HostResult<Option<Valor>> {
         let closer = stream
             .try_clone()
             .map_err(|error| HostError::internal(format!("http:accept clone failed: {error}")))?;
@@ -259,14 +329,21 @@ impl Http {
             stream,
             leftover: Vec::new(),
             phase: Phase::Idle,
+            idle_since: Instant::now(),
+            read_started: None,
         };
-        let parts = read_request(
+        let Some(parts) = read_request(
             &mut connection,
             listener.max_body_bytes,
+            listener.read_deadlines,
             &listener.stopped,
             context,
             &self.state.next_request,
-        )?;
+        )?
+        else {
+            close_socket(&closer, &mut connection.stream);
+            return Ok(None);
+        };
         if listener.stopped.load(Ordering::SeqCst) {
             return Err(HostError::invalid_args("http:accept listener is stopped"));
         }
@@ -291,7 +368,7 @@ impl Http {
             let mut requests = lock(&self.state.requests, "http requests")?;
             requests.insert(request_id, connection_id);
         }
-        Ok(request_carrier(&parts, connection_id))
+        Ok(Some(request_carrier(&parts, connection_id)))
     }
 
     fn poll_idle_connection(
@@ -318,14 +395,23 @@ impl Http {
                 if !matches!(connection.phase, Phase::Idle) {
                     continue;
                 }
-                poll_request(
+                let outcome = poll_request(
                     &mut connection,
                     listener.max_body_bytes,
                     &listener.stopped,
                     context,
                     &self.state.next_request,
                     false,
-                )?
+                    None,
+                )?;
+                if matches!(outcome, PollRead::Idle | PollRead::Closed)
+                    && listener.read_deadlines.expired(&connection, Instant::now())
+                {
+                    close_socket(&slot.closer, &mut connection.stream);
+                    PollRead::Closed
+                } else {
+                    outcome
+                }
             };
             match outcome {
                 PollRead::Ready(parts) => {
@@ -341,7 +427,7 @@ impl Http {
                     return Ok(Some(request_carrier(&parts, slot.id)));
                 }
                 PollRead::Closed => closed.push(slot.id),
-                PollRead::Idle => {}
+                PollRead::Idle | PollRead::Expired => {}
             }
         }
         for connection_id in closed {
@@ -377,8 +463,7 @@ impl Http {
         connection.phase = Phase::Idle;
         let write_result =
             write_oneshot(&mut connection.stream, status, &request_id, &headers, &body);
-        let _ = slot.closer.shutdown(Shutdown::Both);
-        let _ = connection.stream.shutdown(Shutdown::Both);
+        close_socket(&slot.closer, &mut connection.stream);
         write_result?;
         Ok(ProviderReply::vacuum())
     }
@@ -411,8 +496,7 @@ impl Http {
             }
             let head = format_chunked_open(status, &request_id, &headers);
             if let Err(error) = write_blocking(&mut connection.stream, &head) {
-                let _ = slot.closer.shutdown(Shutdown::Both);
-                let _ = connection.stream.shutdown(Shutdown::Both);
+                close_socket(&slot.closer, &mut connection.stream);
                 drop(connection);
                 self.drop_connection(connection_id)?;
                 return Err(error);
@@ -497,12 +581,12 @@ impl Http {
             )?;
             if keep_alive {
                 connection.phase = Phase::Idle;
+                connection.idle_since = Instant::now();
                 connection.stream.set_nonblocking(true).map_err(|error| {
                     HostError::internal(format!("http:respond_finish setup failed: {error}"))
                 })?;
             } else {
-                let _ = slot.closer.shutdown(Shutdown::Both);
-                let _ = connection.stream.shutdown(Shutdown::Both);
+                close_socket(&slot.closer, &mut connection.stream);
                 drop(connection);
                 self.drop_connection(slot.id)?;
             }
@@ -704,10 +788,12 @@ impl RequestParts {
 fn read_request(
     connection: &mut Connection,
     max_body_bytes: usize,
+    deadlines: ReadDeadlines,
     stopped: &AtomicBool,
     context: &DispatchContext,
     next_request: &AtomicU64,
-) -> HostResult<RequestParts> {
+) -> HostResult<Option<RequestParts>> {
+    let deadline = Instant::now() + deadlines.header_body;
     loop {
         match poll_request(
             connection,
@@ -716,10 +802,12 @@ fn read_request(
             context,
             next_request,
             true,
+            Some(deadline),
         )? {
-            PollRead::Ready(parts) => return Ok(parts),
+            PollRead::Ready(parts) => return Ok(Some(parts)),
+            PollRead::Expired => return Ok(None),
             PollRead::Idle => {
-                check_read_state(stopped, context)?;
+                check_read_state(stopped, context, None)?;
                 thread::sleep(POLL_INTERVAL);
             }
             PollRead::Closed => {
@@ -738,6 +826,7 @@ fn poll_request(
     context: &DispatchContext,
     next_request: &AtomicU64,
     block: bool,
+    deadline: Option<Instant>,
 ) -> HostResult<PollRead> {
     connection
         .stream
@@ -761,6 +850,8 @@ fn poll_request(
             if connection.leftover.len() >= needed {
                 let body = connection.leftover[body_start..needed].to_vec();
                 connection.leftover.drain(..needed);
+                connection.idle_since = Instant::now();
+                connection.read_started = (!connection.leftover.is_empty()).then(Instant::now);
                 let id = format!(
                     "{REQUEST_ID_PREFIX}{}",
                     next_request.fetch_add(1, Ordering::SeqCst)
@@ -784,10 +875,17 @@ fn poll_request(
                     "http:accept request ended before headers",
                 ));
             }
-            Ok(count) => connection.leftover.extend_from_slice(&chunk[..count]),
+            Ok(count) => {
+                if connection.read_started.is_none() {
+                    connection.read_started = Some(Instant::now());
+                }
+                connection.leftover.extend_from_slice(&chunk[..count]);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if block {
-                    check_read_state(stopped, context)?;
+                    if check_read_state(stopped, context, deadline)? == ReadState::Expired {
+                        return Ok(PollRead::Expired);
+                    }
                     thread::sleep(POLL_INTERVAL);
                     continue;
                 }
@@ -803,14 +901,29 @@ fn poll_request(
     }
 }
 
-fn check_read_state(stopped: &AtomicBool, context: &DispatchContext) -> HostResult<()> {
+/// Per-iteration read state. `Expired` means the caller's deadline window
+/// closed and the connection must be dropped.
+#[derive(PartialEq, Eq)]
+enum ReadState {
+    Continue,
+    Expired,
+}
+
+fn check_read_state(
+    stopped: &AtomicBool,
+    context: &DispatchContext,
+    deadline: Option<Instant>,
+) -> HostResult<ReadState> {
     if context.cancellation.is_cancelled() {
         return Err(HostError::cancelled());
     }
     if stopped.load(Ordering::SeqCst) {
         return Err(HostError::invalid_args("http:accept listener is stopped"));
     }
-    Ok(())
+    if deadline.is_some_and(|at| Instant::now() >= at) {
+        return Ok(ReadState::Expired);
+    }
+    Ok(ReadState::Continue)
 }
 
 fn parse_headers(bytes: &[u8]) -> HostResult<ParsedHeaders> {
@@ -992,6 +1105,12 @@ fn write_oneshot(
     write_blocking(stream, &format_response(status, request_id, headers, body))
 }
 
+/// Best-effort close of both halves of a connection socket.
+fn close_socket(closer: &TcpStream, stream: &mut TcpStream) {
+    drop(closer.shutdown(Shutdown::Both));
+    drop(stream.shutdown(Shutdown::Both));
+}
+
 fn write_blocking(stream: &mut TcpStream, bytes: &[u8]) -> HostResult<()> {
     stream
         .set_nonblocking(false)
@@ -1100,6 +1219,21 @@ fn bounded_body_size(value: i64) -> HostResult<usize> {
         )));
     }
     Ok(value)
+}
+
+fn deadline_arg(value: Option<&Valor>, name: &str, default: Duration) -> HostResult<Duration> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let millis = integer_arg(value, name)?;
+    let millis = u64::try_from(millis)
+        .map_err(|_| HostError::invalid_args(format!("http:listen {name} must be positive")))?;
+    if millis > MAX_CONFIGURED_DEADLINE_MS {
+        return Err(HostError::invalid_args(format!(
+            "http:listen {name} must be at most {MAX_CONFIGURED_DEADLINE_MS} milliseconds"
+        )));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn parse_bind_host(host: &str) -> HostResult<String> {
