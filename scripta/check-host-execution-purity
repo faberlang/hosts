@@ -268,20 +268,100 @@ def added_lines(root: Path, baseline: str, files: list[Path], fixture: bool) -> 
     return output
 
 
-def check_added_source(lines: list[AddedLine]) -> list[str]:
+def _closing_quote(text: str, start: int) -> int | None:
+    i = start
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i
+        i += 1
+    return None
+
+
+def strip_rust_string_literals(text: str) -> str:
+    """Blank the contents of single-line Rust string literals.
+
+    Handles "…", b"…", r"…", and r#"…"# with backslash escapes. Line-local:
+    a literal with no closer on the line leaves the remainder untouched, so a
+    stray quote can only over-flag, never hide a violation.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith('b"', i):
+            end = _closing_quote(text, i + 2)
+            if end is None:
+                out.append(text[i:])
+                break
+            out.append('b""')
+            i = end + 1
+        elif text.startswith('r"', i) or text.startswith('r#', i):
+            hashes = 0
+            j = i + 1
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j >= n or text[j] != '"':
+                out.append(text[i])
+                i += 1
+                continue
+            closer = '"' + "#" * hashes
+            end = text.find(closer, j + 1)
+            if end < 0:
+                out.append(text[i:])
+                break
+            out.append(f'r{"#" * hashes}""')
+            i = end + len(closer)
+        elif text[i] == '"':
+            end = _closing_quote(text, i + 1)
+            if end is None:
+                out.append(text[i:])
+                break
+            out.append('""')
+            i = end + 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def check_added_source(lines: list[AddedLine], entries: list[Entry]) -> list[str]:
+    """Flag semantic-debt vocabulary growth on lines added since the baseline.
+
+    Two narrowings keep recorded or non-semantic text out of the growth
+    signal: model vocabulary is matched with string-literal contents blanked
+    (bare `GGUF`/`Gguf` cannot match `GGUF_MAX_...`-style identifiers — `_` is
+    a word character — so in code it only appears as prose or magic bytes
+    inside a literal), and a match whose token is already a debt row at the
+    same path is recorded debt, not new debt. Target-source matching stays on
+    the raw line because embedded MSL/WGSL lives inside string literals.
+    """
     violations: list[str] = []
+    ledgered = {(entry.relative_path, entry.symbol) for entry in entries}
     categories = (
-        ("unallowlisted target-source literal", TARGET_SOURCE),
-        ("new operation/model vocabulary", OPERATION_VOCABULARY),
-        ("new semantic CPU fallback or numerical fake", FALLBACK_VOCABULARY),
-        ("new model or descriptor reconstruction", MODEL_VOCABULARY),
+        ("unallowlisted target-source literal", TARGET_SOURCE, False),
+        ("new operation/model vocabulary", OPERATION_VOCABULARY, False),
+        ("new semantic CPU fallback or numerical fake", FALLBACK_VOCABULARY, False),
+        ("new model or descriptor reconstruction", MODEL_VOCABULARY, True),
     )
     for line in lines:
-        for label, pattern in categories:
-            if pattern.search(line.text):
-                violations.append(
-                    f"{label}: {line.relative_path}:{line.number}: {line.text.strip()}"
-                )
+        for label, pattern, strip_literals in categories:
+            text = (
+                strip_rust_string_literals(line.text) if strip_literals else line.text
+            )
+            tokens = [match.group(0) for match in pattern.finditer(text)]
+            fresh = [
+                token for token in tokens if (line.relative_path, token) not in ledgered
+            ]
+            if not fresh:
+                continue
+            violations.append(
+                f"{label}: {line.relative_path}:{line.number}: {line.text.strip()}"
+            )
     return violations
 
 
@@ -313,7 +393,9 @@ def main() -> None:
                 f"ledger count {previous_count}"
             )
 
-    violations = check_added_source(added_lines(root, baseline, files, args.fixture))
+    violations = check_added_source(
+        added_lines(root, baseline, files, args.fixture), entries
+    )
     violations.extend(check_dependencies(root))
     if violations:
         for violation in violations:

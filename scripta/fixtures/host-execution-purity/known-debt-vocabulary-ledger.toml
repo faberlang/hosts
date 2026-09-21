@@ -1,0 +1,9 @@
+version = 1
+baseline_commit = "e8fee5b2da972cceb956633cbf13a47349bea46e"
+ceiling = 1
+
+[[entry]]
+id = "fixture-gguf-input"
+class = "model-reconstruction"
+path = "walker.rs"
+symbol = "inputs_from_gguf"
