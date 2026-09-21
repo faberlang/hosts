@@ -548,6 +548,7 @@ fn slot(
         binding,
         element_ty: dtype,
         element_count: count,
+        shape: None,
         version: 1,
     }
 }
@@ -566,6 +567,7 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
                 version: slot.version,
                 element_ty: slot.element_ty,
                 element_count: slot.element_count,
+                shape: None,
             });
         }
     }

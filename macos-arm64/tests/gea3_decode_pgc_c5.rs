@@ -75,6 +75,7 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
                 version: slot.version,
                 element_ty: slot.element_ty,
                 element_count: slot.element_count,
+                shape: None,
             });
         }
     }
@@ -99,6 +100,7 @@ fn slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: ELEMENTS,
+        shape: None,
         version: 1,
     }
 }

@@ -48,6 +48,7 @@ fn slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count,
+        shape: None,
         version: 1,
     }
 }
@@ -66,6 +67,7 @@ fn buffer_versions(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVersion>
                 version: buffer.version,
                 element_ty: buffer.element_ty,
                 element_count: buffer.element_count,
+                shape: None,
             });
         }
     }

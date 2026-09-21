@@ -100,6 +100,7 @@ fn add_slot_version(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
+        shape: None,
         version,
     }
 }
@@ -151,6 +152,7 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
                 version: slot.version,
                 element_ty: slot.element_ty,
                 element_count: slot.element_count,
+                shape: None,
             });
         }
     }
@@ -920,6 +922,7 @@ fn same_buffer_versions_bind_by_key_across_launches() {
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             })
     );
     assert!(
@@ -930,6 +933,7 @@ fn same_buffer_versions_bind_by_key_across_launches() {
                 version: 2,
                 element_ty: DeviceDataType::F32,
                 element_count: 4,
+                shape: None,
             })
     );
 }
@@ -959,6 +963,7 @@ fn impossible_version_metadata_fails_before_module_or_driver_launch() {
         version: 1,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
     });
 
     let err = host
@@ -1016,6 +1021,7 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
         version: 2,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
     });
 
     descriptor
@@ -1046,6 +1052,7 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             })
     );
     assert!(
@@ -1056,6 +1063,7 @@ fn descriptor_preserves_repeated_launches_and_version_chain() {
                 version: 2,
                 element_ty: DeviceDataType::F32,
                 element_count: 4,
+                shape: None,
             })
     );
     assert_eq!(descriptor.data_flow.len(), 2);
@@ -1116,6 +1124,7 @@ fn conflicting_version_metadata_fails_closed() {
         version: 1,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
     });
     let err = descriptor
         .validate()
@@ -2432,6 +2441,7 @@ fn kernel_init_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 2,
+        shape: None,
         version: 1,
     }
 }
@@ -2469,6 +2479,7 @@ fn host_provided_param_slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
+        shape: None,
         version: 1,
     }
 }
@@ -2872,6 +2883,7 @@ fn step_final_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 2,
+        shape: None,
         version: 1,
     }
 }
@@ -3998,6 +4010,7 @@ fn accumulation_slot(id: u32, name: &str, binding: u32, count: u64) -> Descripto
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
+        shape: None,
         version: 1,
     }
 }

@@ -2409,6 +2409,10 @@ struct WireBuffer {
     binding: u32,
     element_ty: String,
     element_count: u64,
+    // Carried parameter shape vector (wire v12). Absent rows read as
+    // `None` — never reconstructed from `element_count`.
+    #[serde(default)]
+    shape: Option<Vec<u64>>,
     version: u32,
 }
 
@@ -2424,6 +2428,10 @@ struct WireBufferVersion {
     version: u32,
     element_ty: String,
     element_count: u64,
+    // Carried parameter shape vector (wire v12). Absent rows read as
+    // `None` — never reconstructed from `element_count`.
+    #[serde(default)]
+    shape: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2478,6 +2486,7 @@ impl WireDescriptor {
                     version: version.version,
                     element_ty: version.element_ty.spelling().to_owned(),
                     element_count: version.element_count,
+                    shape: version.shape.clone(),
                 })
                 .collect(),
             program_lifetime: descriptor.program_lifetime.spelling().to_owned(),
@@ -2548,6 +2557,7 @@ impl WireDescriptor {
                 version: version.version,
                 element_ty,
                 element_count: version.element_count,
+                shape: version.shape,
             });
         }
         Ok(DeviceDescriptor {
@@ -2609,6 +2619,7 @@ impl WireBuffer {
             binding: slot.binding,
             element_ty: slot.element_ty.spelling().to_owned(),
             element_count: slot.element_count,
+            shape: slot.shape.clone(),
             version: slot.version,
         }
     }
@@ -2643,6 +2654,7 @@ impl WireBuffer {
             binding: self.binding,
             element_ty: parse_dtype(&self.element_ty)?,
             element_count: self.element_count,
+            shape: self.shape,
             version: self.version,
         })
     }

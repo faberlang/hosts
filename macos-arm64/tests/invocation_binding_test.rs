@@ -30,6 +30,7 @@ fn input(id: u32, name: &str, element_count: u64) -> DescriptorBuffer {
         binding: id,
         element_ty: DeviceDataType::F32,
         element_count,
+        shape: None,
         version: 1,
     }
 }
@@ -61,6 +62,7 @@ fn descriptor(prompt_count: u64, rope_count: u64, prefix_count: Option<u64>) -> 
             version: 1,
             element_ty: DeviceDataType::F32,
             element_count: prompt_count,
+            shape: None,
         }],
         program_lifetime: DeviceProgramLifetime::RepeatingStep,
         data_flow: vec![],

@@ -504,6 +504,13 @@ pub struct DescriptorBuffer {
     pub element_ty: DeviceDataType,
     /// Element count of this buffer version.
     pub element_count: u64,
+    /// Carried parameter shape vector (`[dim, …]`) for tensor buffers —
+    /// read verbatim from the wire, never reconstructed from
+    /// `element_count` (`[48,4]` and `[4,48]` share one count). `None`
+    /// when the row declares no tensor shape. Byte length stays
+    /// count-based: packed weight regions diverge from the logical
+    /// tensor product.
+    pub shape: Option<Vec<u64>>,
     /// Content version of this buffer shape (the wire's carried
     /// `BufferVersion.version` — R2: the host consumes the version fact; it
     /// never re-derives or hardcodes `1`).
@@ -600,7 +607,7 @@ pub struct DescriptorEndOfRunResult {
 ///
 /// The key is `(buffer_id, version)`, not just `buffer_id`: a buffer identity
 /// can carry multiple shape snapshots over a complete program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorBufferVersion {
     /// Program-level buffer identity key.
     pub buffer_id: u32,
@@ -610,6 +617,10 @@ pub struct DescriptorBufferVersion {
     pub element_ty: DeviceDataType,
     /// Element count of this version's shape.
     pub element_count: u64,
+    /// Carried parameter shape vector (`[dim, …]`) for tensor rows — read
+    /// verbatim from the wire, never reconstructed from `element_count`.
+    /// `None` when the row declares no tensor shape.
+    pub shape: Option<Vec<u64>>,
 }
 
 /// One persistent allocation: buffer identity, dtype, capacity bytes,
@@ -948,6 +959,16 @@ impl DescriptorValidationFacts {
                 slot.element_count
             )));
         }
+        if version.shape != slot.shape {
+            return Err(errors::shape_mismatch(format!(
+                "device buffer `{}` (id {}) version {} is referenced with conflicting shapes {:?} and {:?}",
+                slot.buffer_name,
+                slot.buffer_id,
+                slot.version,
+                version.shape,
+                slot.shape
+            )));
+        }
         Ok(())
     }
 
@@ -1278,12 +1299,21 @@ impl DeviceDescriptor {
                         version.element_count
                     )));
                 }
+                if first.shape != version.shape {
+                    return Err(errors::shape_mismatch(format!(
+                        "device buffer {} version {} carries conflicting shapes {:?} and {:?}",
+                        version.buffer_id,
+                        version.version,
+                        first.shape,
+                        version.shape
+                    )));
+                }
                 return Err(errors::descriptor(format!(
                     "device descriptor repeats buffer {} version {} metadata",
                     version.buffer_id, version.version
                 )));
             }
-            versions.push(*version);
+            versions.push(version.clone());
         }
         if versions.is_empty() {
             return Err(errors::descriptor(

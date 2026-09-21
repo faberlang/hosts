@@ -153,6 +153,7 @@ fn slot(id: u32, name: &str, role: DeviceBufferRole, binding: u32) -> Descriptor
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 2,
+        shape: None,
         version: 1,
     }
 }
@@ -180,12 +181,14 @@ fn base_device_descriptor() -> DeviceDescriptor {
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             },
             DescriptorBufferVersion {
                 buffer_id: 2,
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             },
         ],
         program_lifetime: DeviceProgramLifetime::SingleRun,

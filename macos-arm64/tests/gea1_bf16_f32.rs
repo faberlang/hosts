@@ -286,6 +286,7 @@ fn descriptor_slot(
         binding,
         element_ty,
         element_count,
+        shape: None,
         version: 1,
     }
 }
@@ -349,6 +350,7 @@ fn host_descriptor(dtype: DeviceDataType, entry: &str, module_image: &[u8]) -> D
                 version: slot.version,
                 element_ty: slot.element_ty,
                 element_count: slot.element_count,
+                shape: None,
             })
             .collect(),
         kernels,

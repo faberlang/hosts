@@ -637,6 +637,7 @@ fn map_envelope_to_descriptor(
                 binding: resource.binding.binding,
                 element_ty,
                 element_count: full_count,
+                shape: None,
                 version: resource.version.version,
             });
         }
@@ -658,6 +659,7 @@ fn map_envelope_to_descriptor(
                 version,
                 element_ty,
                 element_count,
+                shape: None,
             },
         )
         .collect();

@@ -59,6 +59,7 @@ fn add_slot(
         binding,
         element_ty: DeviceDataType::F32,
         element_count: count,
+        shape: None,
         version: 1,
     }
 }
@@ -83,18 +84,21 @@ fn elementwise_add_descriptor() -> DeviceDescriptor {
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             },
             DescriptorBufferVersion {
                 buffer_id: 2,
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             },
             DescriptorBufferVersion {
                 buffer_id: 3,
                 version: 1,
                 element_ty: DeviceDataType::F32,
                 element_count: 2,
+                shape: None,
             },
         ],
         kernels,

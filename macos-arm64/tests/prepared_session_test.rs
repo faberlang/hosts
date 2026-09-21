@@ -139,6 +139,7 @@ fn weights_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
         version: 1,
     }
 }
@@ -156,6 +157,7 @@ fn token_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
         version: 1,
     }
 }
@@ -172,6 +174,7 @@ fn kernel_init_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
         version: 1,
     }
 }
@@ -190,6 +193,7 @@ fn accumulation_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
         version: 1,
     }
 }
@@ -207,6 +211,7 @@ fn logits_slot(id: u32, name: &str, binding: u32) -> DescriptorBuffer {
         binding,
         element_ty: DeviceDataType::F32,
         element_count: 4,
+        shape: None,
         version: 1,
     }
 }
@@ -225,6 +230,7 @@ fn buffer_versions_for(kernels: &[DescriptorKernel]) -> Vec<DescriptorBufferVers
                 version: slot.version,
                 element_ty: slot.element_ty,
                 element_count: slot.element_count,
+                shape: None,
             });
         }
     }
