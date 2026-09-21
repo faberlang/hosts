@@ -131,11 +131,58 @@ fn read_text(opener: &Valor, target: Option<&str>) -> HostResult<ProviderReply> 
     Ok(ProviderReply::item(Valor::Textus(text)))
 }
 
+/// Read file for `solum:hauri`.
+///
+/// Accepts `[via]` or `[via, max]` (the http arg-ladder shape). With `max`,
+/// the file is stat-ed before it is read whole and rejected when larger than
+/// the ceiling; the read bytes are checked again, so a file that grows
+/// between the stat and the read is still refused.
 fn read_bytes(opener: &Valor) -> HostResult<ProviderReply> {
     let path = string_arg(opener, 0, "via")?;
+    let max = optional_byte_ceiling(opener, 1, "max")?;
+    if let Some(max) = max {
+        let size = fs::metadata(&path)
+            .map_err(|error| HostError::internal(format!("solum:hauri failed: {error}")))?
+            .len();
+        reject_over_ceiling("solum:hauri", size, max)?;
+    }
     let bytes = fs::read(&path)
         .map_err(|error| HostError::internal(format!("solum:hauri failed: {error}")))?;
+    if let Some(max) = max {
+        reject_over_ceiling("solum:hauri", u64::try_from(bytes.len()).unwrap_or(u64::MAX), max)?;
+    }
     Ok(ProviderReply::byte(bytes))
+}
+
+fn reject_over_ceiling(route: &str, size: u64, ceiling: u64) -> HostResult<()> {
+    if size > ceiling {
+        return Err(HostError::invalid_args(format!(
+            "{route} via is {size} bytes, exceeding the supplied {ceiling}-byte ceiling"
+        )));
+    }
+    Ok(())
+}
+
+fn optional_byte_ceiling(value: &Valor, index: usize, name: &str) -> HostResult<Option<u64>> {
+    let Some(value) = optional_positional(value, index) else {
+        return Ok(None);
+    };
+    match value {
+        Valor::Numerus(number) => {
+            let ceiling = u64::try_from(*number)
+                .map_err(|_| HostError::invalid_args(format!("{name} must be non-negative")))?;
+            Ok(Some(ceiling))
+        }
+        _ => Err(HostError::invalid_args(format!("{name} must be an integer"))),
+    }
+}
+
+fn optional_positional(value: &Valor, index: usize) -> Option<&Valor> {
+    match value {
+        Valor::Lista(values) => values.get(index),
+        value if index == 0 => Some(value),
+        _ => None,
+    }
 }
 
 /// SHA-256 of the file at `via`, streamed so large artifacts are not loaded whole.

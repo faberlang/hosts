@@ -229,6 +229,86 @@ fn partem_and_inveni_reject_over_limit_ranges_before_allocation() {
 }
 
 #[test]
+fn hauri_optional_max_caps_file_size_before_and_after_read() {
+    let provider = Solum::new().expect("provider");
+    let path = std::env::temp_dir().join(format!("faber-public-solum-hauri-max-{}", std::process::id()));
+    std::fs::write(&path, b"0123456789").expect("fixture");
+    let path_s = path.to_string_lossy().into_owned();
+
+    let bare = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "hauri-bare".into(),
+                route: "solum:hauri".into(),
+                opener: Valor::Textus(path_s.clone()),
+                target: None,
+            },
+            &context(),
+        )
+        .expect("bare hauri keeps single-arg behavior");
+    assert!(
+        matches!(bare.contents.as_slice(), [ProviderContent::Byte(bytes)] if bytes == b"0123456789")
+    );
+
+    let under = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "hauri-under".into(),
+                route: "solum:hauri".into(),
+                opener: Valor::Lista(vec![
+                    Valor::Textus(path_s.clone()),
+                    Valor::Numerus(10),
+                ]),
+                target: None,
+            },
+            &context(),
+        )
+        .expect("at-ceiling hauri reads");
+    assert!(
+        matches!(under.contents.as_slice(), [ProviderContent::Byte(bytes)] if bytes == b"0123456789")
+    );
+
+    let error = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "hauri-over".into(),
+                route: "solum:hauri".into(),
+                opener: Valor::Lista(vec![
+                    Valor::Textus(path_s.clone()),
+                    Valor::Numerus(9),
+                ]),
+                target: None,
+            },
+            &context(),
+        )
+        .expect_err("over-ceiling file must be rejected");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(error.message.contains("solum:hauri"));
+    assert!(error.message.contains("10"));
+    assert!(error.message.contains('9'));
+
+    let error = provider
+        .dispatch(
+            &RequestFrame {
+                conversation_id: "hauri-negative".into(),
+                route: "solum:hauri".into(),
+                opener: Valor::Lista(vec![
+                    Valor::Textus(path_s.clone()),
+                    Valor::Numerus(-1),
+                ]),
+                target: None,
+            },
+            &context(),
+        )
+        .expect_err("negative max must be invalid");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(error.message.contains("max"));
+    assert!(error.message.contains("non-negative"));
+
+    std::fs::remove_file(path).expect("cleanup");
+}
+
+#[test]
 fn lege_is_textus_only_and_rejects_list_or_byte_targets() {
     let provider = Solum::new().expect("provider");
     let path = std::env::temp_dir().join(format!("faber-public-solum-lege-{}", std::process::id()));
