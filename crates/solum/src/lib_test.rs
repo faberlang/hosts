@@ -231,7 +231,10 @@ fn partem_and_inveni_reject_over_limit_ranges_before_allocation() {
 #[test]
 fn hauri_optional_max_caps_file_size_before_and_after_read() {
     let provider = Solum::new().expect("provider");
-    let path = std::env::temp_dir().join(format!("faber-public-solum-hauri-max-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "faber-public-solum-hauri-max-{}",
+        std::process::id()
+    ));
     std::fs::write(&path, b"0123456789").expect("fixture");
     let path_s = path.to_string_lossy().into_owned();
 
@@ -255,10 +258,7 @@ fn hauri_optional_max_caps_file_size_before_and_after_read() {
             &RequestFrame {
                 conversation_id: "hauri-under".into(),
                 route: "solum:hauri".into(),
-                opener: Valor::Lista(vec![
-                    Valor::Textus(path_s.clone()),
-                    Valor::Numerus(10),
-                ]),
+                opener: Valor::Lista(vec![Valor::Textus(path_s.clone()), Valor::Numerus(10)]),
                 target: None,
             },
             &context(),
@@ -273,10 +273,7 @@ fn hauri_optional_max_caps_file_size_before_and_after_read() {
             &RequestFrame {
                 conversation_id: "hauri-over".into(),
                 route: "solum:hauri".into(),
-                opener: Valor::Lista(vec![
-                    Valor::Textus(path_s.clone()),
-                    Valor::Numerus(9),
-                ]),
+                opener: Valor::Lista(vec![Valor::Textus(path_s.clone()), Valor::Numerus(9)]),
                 target: None,
             },
             &context(),
@@ -292,10 +289,7 @@ fn hauri_optional_max_caps_file_size_before_and_after_read() {
             &RequestFrame {
                 conversation_id: "hauri-negative".into(),
                 route: "solum:hauri".into(),
-                opener: Valor::Lista(vec![
-                    Valor::Textus(path_s.clone()),
-                    Valor::Numerus(-1),
-                ]),
+                opener: Valor::Lista(vec![Valor::Textus(path_s.clone()), Valor::Numerus(-1)]),
                 target: None,
             },
             &context(),
