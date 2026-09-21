@@ -962,11 +962,7 @@ impl DescriptorValidationFacts {
         if version.shape != slot.shape {
             return Err(errors::shape_mismatch(format!(
                 "device buffer `{}` (id {}) version {} is referenced with conflicting shapes {:?} and {:?}",
-                slot.buffer_name,
-                slot.buffer_id,
-                slot.version,
-                version.shape,
-                slot.shape
+                slot.buffer_name, slot.buffer_id, slot.version, version.shape, slot.shape
             )));
         }
         Ok(())
@@ -1302,10 +1298,7 @@ impl DeviceDescriptor {
                 if first.shape != version.shape {
                     return Err(errors::shape_mismatch(format!(
                         "device buffer {} version {} carries conflicting shapes {:?} and {:?}",
-                        version.buffer_id,
-                        version.version,
-                        first.shape,
-                        version.shape
+                        version.buffer_id, version.version, first.shape, version.shape
                     )));
                 }
                 return Err(errors::descriptor(format!(
