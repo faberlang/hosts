@@ -209,6 +209,7 @@ enum OpenerContract {
     ListaTextus,
     ListaNumerus,
     ListaValor,
+    TextusOrListaValor,
     Valor,
 }
 
@@ -223,6 +224,7 @@ impl OpenerContract {
             "lista<textus>" => Some(Self::ListaTextus),
             "lista<numerus>" => Some(Self::ListaNumerus),
             "lista<valor>" => Some(Self::ListaValor),
+            "textus ∪ lista<valor>" => Some(Self::TextusOrListaValor),
             "valor" => Some(Self::Valor),
             _ => None,
         }
@@ -622,6 +624,11 @@ fn validate_request_contract(
             Valor::Lista(items) if items.iter().all(|item| matches!(item, Valor::Numerus(_)))
         ),
         OpenerContract::ListaValor => matches!(&request.opener, Valor::Lista(_)),
+        // Arg-ladder union: a bare textus path or a packed list whose
+        // positions the provider fail-closes (string_arg et al.).
+        OpenerContract::TextusOrListaValor => {
+            matches!(&request.opener, Valor::Textus(_) | Valor::Lista(_))
+        }
         OpenerContract::Valor => true,
     };
     if valid {

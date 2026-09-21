@@ -18,7 +18,8 @@ Provider coverage can rely on host-kernel admission being fail-closed:
   prefixes, the verb must be non-empty, and routes must be unique;
 - every call must declare one accepted opener contract: `vacuum`,
   `sponte<numerus>`, `textus`, `numerus`, `octeti`, `lista<textus>`,
-  `lista<numerus>`, `lista<valor>`, or `valor`;
+  `lista<numerus>`, `lista<valor>`, `textus ∪ lista<valor>` (bare textus or
+  packed arg-ladder list), or `valor`;
 - every call must declare one accepted result contract: `vacuum`, `textus`,
   `numerus`, `fractus`, `bivalens`, `octeti`, `instans<ns>`, `lista<textus>`,
   `valor`, `bytes`, `lista-valor`, or `bulk-valor`;
