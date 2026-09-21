@@ -44,6 +44,7 @@ Sibling path deps (not in this repo):
 
 ```bash
 # From this repo root
+./scripta/stage1                       # static gate: rustfmt check + execution-purity ratchet
 cargo test --workspace
 cargo test -p faber-host-macos-arm64
 cargo run -p faber-host-macos-arm64 -- manifest

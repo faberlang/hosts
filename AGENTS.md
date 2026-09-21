@@ -56,6 +56,7 @@ or descriptor fact is an upstream failure and must fail closed here.
 ## Validation
 
 ```bash
+./scripta/stage1                       # static gate: rustfmt check + execution-purity ratchet
 cargo test --workspace
 cargo test -p faber-host-macos-arm64
 ./scripta/webgpu-browser-proof check   # optional; needs node + sibling faber/radix/triga

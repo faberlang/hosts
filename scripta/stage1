@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# hosts stage-1 entry point: the repo's static gate.
+#
+# 1. rustfmt check over tracked workspace-member Rust sources
+# 2. host execution-purity ratchet (no-growth vs the frozen HEP-1 baseline)
+#
+# Fixture-level proof of the purity checker lives in
+# scripta/test-host-execution-purity. This repo has no ladder yet; this file
+# is its stage 1.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+# rustfmt runs directly on tracked sources: `cargo fmt --all` would load the
+# sibling faber/radix path deps, which worktree lanes do not carry. Fixtures
+# under scripta/ are checker proof data, not member source.
+member_rs="$(git ls-files '*.rs' | grep -E '^(crates|llvm|macos-arm64|wasm)/' || true)"
+if [[ -z "$member_rs" ]]; then
+  echo "stage1: no tracked workspace-member Rust sources found" >&2
+  exit 1
+fi
+printf '%s\n' "$member_rs" | tr '\n' '\0' | xargs -0 rustfmt --edition 2024 --check
+echo "stage1: rustfmt check passed"
+
+./scripta/check-host-execution-purity
+echo "stage1: host-execution-purity passed"
