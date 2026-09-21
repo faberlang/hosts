@@ -661,6 +661,48 @@ fn solum_lege_textus_opener_and_result_contract_are_supported() {
 }
 
 #[test]
+fn textus_union_lista_valor_contract_accepts_textus_and_ladder_list_but_rejects_bare_scalars() {
+    let mut provider = TestProvider::new("solum", "solum:hauri")
+        .with_reply(ProviderReply::item(Valor::Textus("body".to_owned())));
+    provider.registration.manifest.calls[0].opener = "textus ∪ lista<valor>".to_owned();
+    provider.registration.manifest.calls[0].result = "textus".to_owned();
+    let mut kernel = Kernel::new();
+    kernel
+        .register(Arc::new(provider))
+        .expect("register union opener contract");
+
+    for opener in [
+        Valor::Textus("data.bin".to_owned()),
+        Valor::Lista(vec![
+            Valor::Textus("data.bin".to_owned()),
+            Valor::Numerus(64),
+        ]),
+    ] {
+        assert_eq!(
+            kernel
+                .dispatch(&request_with_opener("solum:hauri", opener), &context())
+                .expect("union opener admits bare textus and the packed arg ladder"),
+            ProviderReply::item(Valor::Textus("body".to_owned()))
+        );
+    }
+
+    let error = kernel
+        .dispatch(
+            &request_with_opener("solum:hauri", Valor::Numerus(64)),
+            &context(),
+        )
+        .expect_err("bare non-text opener must not satisfy the union contract");
+    assert_eq!(error.code, "E_INVALID_ARGS");
+    assert!(
+        error
+            .message
+            .contains("does not match declared opener contract"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[test]
 fn dispatch_rejects_request_opener_that_violates_manifest_contract() {
     let mut provider = TestProvider::new("solum", "solum:lege")
         .with_reply(ProviderReply::item(Valor::Textus("body".to_owned())));

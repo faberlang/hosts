@@ -5,9 +5,9 @@
   "prefixes": ["solum"],
   "calls": [
     {"route": "solum:lege", "summary": "Read a file as text.", "opener": "textus", "result": "textus"},
-    {"route": "solum:hauri", "summary": "Read a file as bytes; an optional max arg caps the accepted size, checked before the file is read.", "opener": "valor", "result": "octeti"},
+    {"route": "solum:hauri", "summary": "Read a file as bytes; an optional max arg caps the accepted size, checked before the file is read.", "opener": "textus ∪ lista<valor>", "result": "octeti"},
     {"route": "solum:digestio", "summary": "SHA-256 digest of a file as 64 lowercase hex digits.", "opener": "textus", "result": "textus"},
-    {"route": "solum:hauriet", "summary": "Read a file as bytes asynchronously; an optional max arg caps the accepted size, checked before the file is read.", "opener": "valor", "result": "octeti"},
+    {"route": "solum:hauriet", "summary": "Read a file as bytes asynchronously; an optional max arg caps the accepted size, checked before the file is read.", "opener": "textus ∪ lista<valor>", "result": "octeti"},
     {"route": "solum:partem", "summary": "Read a bounded byte range.", "opener": "lista<valor>", "result": "octeti"},
     {"route": "solum:inveni", "summary": "Find a text pattern in a bounded range.", "opener": "lista<valor>", "result": "numerus"},
     {"route": "solum:carpe", "summary": "Read a file as text lines.", "opener": "textus", "result": "lista<textus>"},
