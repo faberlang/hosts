@@ -37,6 +37,28 @@ fn listen(provider: &Http, port: i64) -> i64 {
     *handle
 }
 
+fn listen_with_deadlines(provider: &Http, port: i64, header_body_ms: i64, idle_ms: i64) -> i64 {
+    let reply = provider
+        .dispatch(
+            &request(
+                "http:listen",
+                Valor::Lista(vec![
+                    Valor::Numerus(port),
+                    Valor::Numerus(i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("body bound")),
+                    Valor::Textus("127.0.0.1".into()),
+                    Valor::Numerus(header_body_ms),
+                    Valor::Numerus(idle_ms),
+                ]),
+            ),
+            &context(),
+        )
+        .expect("listen with deadlines");
+    let [ProviderContent::Item(Valor::Numerus(handle))] = reply.contents.as_slice() else {
+        panic!("http:listen must return one numerus handle");
+    };
+    *handle
+}
+
 fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("reserve loopback port")
@@ -689,6 +711,99 @@ fn keep_alive_reuses_one_connection_for_two_requests() {
     provider
         .dispatch(&request("http:stop", Valor::Numerus(handle)), &context())
         .expect("stop keep-alive listener");
+}
+
+#[test]
+fn incomplete_headers_are_dropped_at_the_deadline_and_the_next_client_is_served() {
+    let provider = Arc::new(Http::new().expect("provider"));
+    let port = free_port();
+    let handle = listen_with_deadlines(&provider, i64::from(port), 250, 700);
+    let mut slow = TcpStream::connect(("127.0.0.1", port)).expect("connect slow client");
+    slow.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("write incomplete headers");
+
+    // Past the 250 ms header/body window the slow client must be dropped and
+    // the same accept loop must go on to serve the next client.
+    thread::sleep(Duration::from_millis(400));
+    let mut next = Wire::connect(port);
+    next.send_get("/next");
+    let reply = accept_bounded(&provider, handle).expect("listener must serve the next client");
+    assert_eq!(text_field(request_table(&reply), "path"), "/next");
+
+    slow.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("slow read timeout");
+    let mut buf = [0_u8; 8];
+    let read = slow.read(&mut buf).expect("slow client read");
+    assert_eq!(
+        read, 0,
+        "incomplete-header client must be dropped at the deadline"
+    );
+
+    provider
+        .dispatch(&request("http:stop", Valor::Numerus(handle)), &context())
+        .expect("stop slow-header listener");
+}
+
+#[test]
+fn idle_keep_alive_connection_survives_short_window_and_closes_after_generous_window() {
+    let provider = Arc::new(Http::new().expect("provider"));
+    let port = free_port();
+    let handle = listen_with_deadlines(&provider, i64::from(port), 250, 700);
+    let mut client = Wire::connect(port);
+
+    client.send_get("/one");
+    let (first_id, first_connection) = accept_one(&provider, handle);
+    let writer = respond_open(
+        &provider,
+        &first_id,
+        200,
+        headers(&[("content-type", "text/plain")]),
+    );
+    respond_chunk(&provider, writer, b"one").expect("keep-alive chunk one");
+    respond_finish(&provider, writer, true).expect("keep-alive finish");
+    assert!(client.read_headers().starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(client.read_chunked_body(), b"one");
+
+    // 400 ms parked: past the 250 ms header/body window, inside the 700 ms
+    // idle window. The connection must still be alive and reusable.
+    thread::sleep(Duration::from_millis(400));
+    client.send_get("/two");
+    let (second_id, second_connection) = accept_one(&provider, handle);
+    assert_eq!(
+        first_connection, second_connection,
+        "parked keep-alive connection must survive the short header/body window"
+    );
+    assert_ne!(first_id, second_id);
+    let writer = respond_open(
+        &provider,
+        &second_id,
+        200,
+        headers(&[("content-type", "text/plain")]),
+    );
+    respond_chunk(&provider, writer, b"two").expect("keep-alive chunk two");
+    respond_finish(&provider, writer, true).expect("keep-alive finish two");
+    assert!(client.read_headers().starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(client.read_chunked_body(), b"two");
+
+    // A spinning accept loop is the reaper: the parked connection must close
+    // only after the generous 700 ms idle window, not at the short one.
+    let error = accept_bounded(&provider, handle)
+        .expect_err("bounded accept must end cancelled with no third client");
+    assert_eq!(error.code, "E_CANCELLED");
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("idle read timeout");
+    let mut buf = [0_u8; 8];
+    match client.stream.read(&mut buf) {
+        Ok(0) => {}
+        Ok(count) => panic!("idle connection received {count} unexpected bytes"),
+        Err(error) => panic!("idle connection must close after the generous window: {error}"),
+    }
+
+    provider
+        .dispatch(&request("http:stop", Valor::Numerus(handle)), &context())
+        .expect("stop idle-deadline listener");
 }
 
 #[test]
