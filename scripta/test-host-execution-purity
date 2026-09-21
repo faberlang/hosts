@@ -59,6 +59,51 @@ if [[ "$red_vocab_output" != *"new model or descriptor reconstruction"* ]]; then
   exit 1
 fi
 
+# Baseline-token exemption, both directions: the same token passes in the path
+# where it exists at the frozen baseline and fails in a path where it does not.
+set +e
+no_baseline_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/baseline-token-vocabulary" \
+  --ledger "$FIXTURES/baseline-token-vocabulary-ledger.toml" 2>&1)"
+no_baseline_status=$?
+set -e
+if [[ "$no_baseline_status" -eq 0 ]]; then
+  printf '%s\n' "host-execution-purity test: baseline-token fixture passed without a baseline" >&2
+  exit 1
+fi
+if [[ "$no_baseline_output" != *"new operation/model vocabulary"* ]]; then
+  printf '%s\n' "host-execution-purity test: no-baseline fixture failed for the wrong reason" >&2
+  printf '%s\n' "$no_baseline_output" >&2
+  exit 1
+fi
+
+"$CHECK" \
+  --fixture \
+  --root "$FIXTURES/baseline-token-vocabulary" \
+  --ledger "$FIXTURES/baseline-token-vocabulary-ledger.toml" \
+  --baseline-dir "$FIXTURES/baseline-token-vocabulary-baseline" >/dev/null
+
+set +e
+new_path_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/baseline-token-new-path" \
+  --ledger "$FIXTURES/baseline-token-new-path-ledger.toml" \
+  --baseline-dir "$FIXTURES/baseline-token-new-path-baseline" 2>&1)"
+new_path_status=$?
+set -e
+if [[ "$new_path_status" -eq 0 ]]; then
+  printf '%s\n' "host-execution-purity test: baseline-token new-path fixture passed" >&2
+  exit 1
+fi
+if [[ "$new_path_output" != *"new operation/model vocabulary"* ]] \
+  || [[ "$new_path_output" != *"caller.rs"* ]] \
+  || [[ "$new_path_output" == *"driver.rs"* ]]; then
+  printf '%s\n' "host-execution-purity test: new-path fixture failed for the wrong reason" >&2
+  printf '%s\n' "$new_path_output" >&2
+  exit 1
+fi
+
 "$CHECK"
 
-printf '%s\n' "host-execution-purity test: red fixture, debt reduction, vocabulary narrowing, and live tree green"
+printf '%s\n' "host-execution-purity test: red fixture, debt reduction, vocabulary narrowing, baseline-token exemption, and live tree green"

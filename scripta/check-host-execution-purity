@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,13 @@ def parse_args() -> argparse.Namespace:
         "--fixture",
         action="store_true",
         help="scan an arbitrary fixture tree as entirely newly-added source",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        type=Path,
+        help="with --fixture: mirror of the fixture root holding each source "
+        "path's frozen-baseline content; a path absent here was absent at "
+        "baseline",
     )
     return parser.parse_args()
 
@@ -268,6 +276,64 @@ def added_lines(root: Path, baseline: str, files: list[Path], fixture: bool) -> 
     return output
 
 
+def make_baseline_blobs(
+    root: Path, baseline: str, baseline_dir: Path | None, fixture: bool
+) -> Callable[[Path], str]:
+    """Resolve a relative source path to its frozen-baseline blob text.
+
+    Empty text means the path was absent at baseline, so nothing in it can be
+    exempt. Live trees read blobs from git; fixture trees read a mirror
+    directory passed with --baseline-dir. Membership comes from the baseline
+    tree listing, so an unreadable blob of a present path fails loudly instead
+    of silently disabling the exemption.
+    """
+    cache: dict[Path, str] = {}
+    present: set[str] | None = None
+
+    def blob(relative_path: Path) -> str:
+        if relative_path in cache:
+            return cache[relative_path]
+        if fixture:
+            source = baseline_dir / relative_path if baseline_dir else None
+            text = ""
+            if source is not None and source.is_file():
+                try:
+                    text = source.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    fail(f"baseline copy is not text: {source}")
+            cache[relative_path] = text
+            return text
+        nonlocal present
+        if present is None:
+            listing = subprocess.run(
+                ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", baseline],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if listing.returncode:
+                fail(f"cannot list the frozen baseline tree: {listing.stderr.strip()}")
+            present = set(listing.stdout.split("\0"))
+        if relative_path.as_posix() not in present:
+            cache[relative_path] = ""
+            return ""
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f"{baseline}:{relative_path.as_posix()}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            fail(
+                f"cannot read the baseline blob of {relative_path}: "
+                f"{result.stderr.strip()}"
+            )
+        cache[relative_path] = result.stdout
+        return result.stdout
+
+    return blob
+
+
 def _closing_quote(text: str, start: int) -> int | None:
     i = start
     n = len(text)
@@ -329,16 +395,31 @@ def strip_rust_string_literals(text: str) -> str:
     return "".join(out)
 
 
-def check_added_source(lines: list[AddedLine], entries: list[Entry]) -> list[str]:
+def check_added_source(
+    lines: list[AddedLine],
+    entries: list[Entry],
+    baseline_blob: Callable[[Path], str],
+) -> list[str]:
     """Flag semantic-debt vocabulary growth on lines added since the baseline.
 
-    Two narrowings keep recorded or non-semantic text out of the growth
+    Three narrowings keep recorded or non-semantic text out of the growth
     signal: model vocabulary is matched with string-literal contents blanked
     (bare `GGUF`/`Gguf` cannot match `GGUF_MAX_...`-style identifiers — `_` is
     a word character — so in code it only appears as prose or magic bytes
-    inside a literal), and a match whose token is already a debt row at the
-    same path is recorded debt, not new debt. Target-source matching stays on
-    the raw line because embedded MSL/WGSL lives inside string literals.
+    inside a literal); a match whose token is already a debt row at the same
+    path is recorded debt, not new debt; and (ruling 2026-09-21, head-cto,
+    task 109f30ac) a match whose exact token appears in the same path's blob
+    at the frozen baseline is baseline debt re-flagged by a post-baseline line
+    rewrite (the ssm.rs let-chain reformat, the simulate_matmul argument-shape
+    refactor), not new debt.
+
+    Accepted weakening of that baseline-token exemption: a NEW call site of a
+    baseline token inside a baseline file is not caught — growth signal
+    remains for new vocabulary, new families, and new paths. The exemption is
+    invalid if a ledgered fake or CPU body gains a production-reachable
+    constructor (its containment is structural today: test-only driver
+    injection). Target-source matching stays on the raw line because embedded
+    MSL/WGSL lives inside string literals.
     """
     violations: list[str] = []
     ledgered = {(entry.relative_path, entry.symbol) for entry in entries}
@@ -357,6 +438,9 @@ def check_added_source(lines: list[AddedLine], entries: list[Entry]) -> list[str
             fresh = [
                 token for token in tokens if (line.relative_path, token) not in ledgered
             ]
+            if fresh:
+                baseline = baseline_blob(line.relative_path)
+                fresh = [token for token in fresh if token not in baseline]
             if not fresh:
                 continue
             violations.append(
@@ -377,6 +461,8 @@ def check_dependencies(root: Path) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    if args.baseline_dir is not None and not args.fixture:
+        fail("--baseline-dir is only valid with --fixture")
     root = args.root.resolve()
     ledger = args.ledger.resolve()
     baseline, ceiling, entries = read_ledger(ledger)
@@ -394,7 +480,9 @@ def main() -> None:
             )
 
     violations = check_added_source(
-        added_lines(root, baseline, files, args.fixture), entries
+        added_lines(root, baseline, files, args.fixture),
+        entries,
+        make_baseline_blobs(root, baseline, args.baseline_dir, args.fixture),
     )
     violations.extend(check_dependencies(root))
     if violations:
