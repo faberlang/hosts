@@ -958,6 +958,65 @@ fn listen_two_arg_text_is_bind_host() {
 }
 
 #[test]
+fn deadlines_refuse_zero_and_keep_intended_magnitudes() {
+    let knobs: [(&str, Duration, u64); 2] = [
+        ("header_body_deadline_ms", DEFAULT_HEADER_BODY_DEADLINE, 250),
+        ("idle_deadline_ms", DEFAULT_IDLE_DEADLINE, 700),
+    ];
+    for (name, default, magnitude_ms) in knobs {
+        let zero =
+            deadline_arg(Some(&Valor::Numerus(0)), name, default).expect_err("zero deadline");
+        assert_eq!(zero.code, "E_INVALID_ARGS");
+        assert_eq!(
+            zero.message,
+            format!("http:listen {name} must be positive"),
+            "{name}: zero must hit the positivity diagnostic"
+        );
+
+        let magnitude = deadline_arg(
+            Some(&Valor::Numerus(
+                i64::try_from(magnitude_ms).expect("magnitude"),
+            )),
+            name,
+            default,
+        )
+        .expect("intended magnitude parameterizes");
+        assert_eq!(magnitude, Duration::from_millis(magnitude_ms));
+    }
+
+    let provider = Http::new().expect("provider");
+    let opener = |header_body_ms, idle_ms| {
+        request(
+            "http:listen",
+            Valor::Lista(vec![
+                Valor::Numerus(i64::from(free_port())),
+                Valor::Numerus(i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("body bound")),
+                Valor::Textus("127.0.0.1".into()),
+                Valor::Numerus(header_body_ms),
+                Valor::Numerus(idle_ms),
+            ]),
+        )
+    };
+    let zero_header_body = provider
+        .dispatch(&opener(0, 700), &context())
+        .expect_err("zero header_body_deadline_ms");
+    assert_eq!(zero_header_body.code, "E_INVALID_ARGS");
+    assert_eq!(
+        zero_header_body.message,
+        "http:listen header_body_deadline_ms must be positive"
+    );
+
+    let zero_idle = provider
+        .dispatch(&opener(250, 0), &context())
+        .expect_err("zero idle_deadline_ms");
+    assert_eq!(zero_idle.code, "E_INVALID_ARGS");
+    assert_eq!(
+        zero_idle.message,
+        "http:listen idle_deadline_ms must be positive"
+    );
+}
+
+#[test]
 fn accept_backlog_is_bounded() {
     assert_eq!(ACCEPT_BACKLOG, 32);
 }

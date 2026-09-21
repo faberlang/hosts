@@ -1226,6 +1226,11 @@ fn deadline_arg(value: Option<&Valor>, name: &str, default: Duration) -> HostRes
         return Ok(default);
     };
     let millis = integer_arg(value, name)?;
+    if millis <= 0 {
+        return Err(HostError::invalid_args(format!(
+            "http:listen {name} must be positive"
+        )));
+    }
     let millis = u64::try_from(millis)
         .map_err(|_| HostError::invalid_args(format!("http:listen {name} must be positive")))?;
     if millis > MAX_CONFIGURED_DEADLINE_MS {
