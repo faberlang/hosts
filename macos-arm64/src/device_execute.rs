@@ -1693,6 +1693,7 @@ fn packed_format_for_range(
     }
     let n_tensors = read_u64_at(bytes, 8, "GGUF tensor count")?;
     let n_kv = read_u64_at(bytes, 16, "GGUF metadata count")?;
+    check_gguf_counts(n_kv, n_tensors)?;
     if n_tensors == 0 {
         return Ok(None);
     }
@@ -1932,6 +1933,29 @@ pub fn inputs_from_mapped_gguf(
     Ok(inputs)
 }
 
+/// Metadata-walker ceilings, mirroring the gradus bounds (`KV_LIMIT` /
+/// `TENSOR_LIMIT` = 4096, metadata array nesting depth 64). The header table is
+/// walked before the data region; the ceilings keep a hostile declared count
+/// from driving an unbounded loop or allocation. Gradus records that these
+/// ceilings admit every inventoried local model.
+const GGUF_MAX_METADATA_ENTRIES: u64 = 4096;
+const GGUF_MAX_TENSORS: u64 = 4096;
+const GGUF_MAX_METADATA_DEPTH: usize = 64;
+
+fn check_gguf_counts(n_kv: u64, n_tensors: u64) -> HostResult<()> {
+    if n_kv > GGUF_MAX_METADATA_ENTRIES {
+        return Err(HostError::invalid_args(format!(
+            "device-execute GGUF metadata count {n_kv} exceeds the bounded ceiling {GGUF_MAX_METADATA_ENTRIES}"
+        )));
+    }
+    if n_tensors > GGUF_MAX_TENSORS {
+        return Err(HostError::invalid_args(format!(
+            "device-execute GGUF tensor count {n_tensors} exceeds the bounded ceiling {GGUF_MAX_TENSORS}"
+        )));
+    }
+    Ok(())
+}
+
 fn gguf_data_start(bytes: &[u8]) -> HostResult<Option<u64>> {
     if bytes.len() < 24 || &bytes[..4] != b"GGUF" {
         return Ok(None);
@@ -1944,6 +1968,7 @@ fn gguf_data_start(bytes: &[u8]) -> HostResult<Option<u64>> {
     }
     let n_tensors = read_u64_at(bytes, 8, "GGUF tensor count")?;
     let n_kv = read_u64_at(bytes, 16, "GGUF metadata count")?;
+    check_gguf_counts(n_kv, n_tensors)?;
     let mut off = 24usize;
     for _ in 0..n_kv {
         off = skip_gguf_kv(bytes, off)?;
@@ -1978,7 +2003,7 @@ fn skip_gguf_string(bytes: &[u8], off: usize) -> HostResult<usize> {
 fn skip_gguf_kv(bytes: &[u8], off: usize) -> HostResult<usize> {
     let after_key = skip_gguf_string(bytes, off)?;
     let tag = read_u32_at(bytes, after_key, "GGUF metadata type")?;
-    skip_gguf_value(bytes, after_key + 4, tag)
+    skip_gguf_value(bytes, after_key + 4, tag, 0)
 }
 
 fn skip_gguf_tensor_info(bytes: &[u8], off: usize) -> HostResult<usize> {
@@ -1995,7 +2020,16 @@ fn skip_gguf_tensor_info(bytes: &[u8], off: usize) -> HostResult<usize> {
     Ok(next + 8)
 }
 
-fn skip_gguf_value(bytes: &[u8], off: usize, tag: u32) -> HostResult<usize> {
+/// Skip one metadata value from its wire offset. Arrays recurse over their
+/// declared element type; `depth` is the current array nesting level and is
+/// rejected past the gradus-bounded ceiling so a hostile chain cannot drive
+/// unbounded recursion.
+fn skip_gguf_value(bytes: &[u8], off: usize, tag: u32, depth: usize) -> HostResult<usize> {
+    if depth > GGUF_MAX_METADATA_DEPTH {
+        return Err(HostError::invalid_args(
+            "device-execute GGUF metadata array nesting exceeds the bounded depth",
+        ));
+    }
     match tag {
         0 | 1 | 7 => Ok(off + 1),
         2 | 3 => Ok(off + 2),
@@ -2007,7 +2041,7 @@ fn skip_gguf_value(bytes: &[u8], off: usize, tag: u32) -> HostResult<usize> {
             let count = read_u64_at(bytes, off + 4, "GGUF array count")?;
             let mut next = off + 12;
             for _ in 0..count {
-                next = skip_gguf_value(bytes, next, elem)?;
+                next = skip_gguf_value(bytes, next, elem, depth + 1)?;
             }
             Ok(next)
         }
@@ -2796,6 +2830,122 @@ mod tests {
             inputs.byte_map()[&7].packed_format,
             Some(PackedStorageFormat::Q8_0)
         );
+    }
+
+    fn gguf_header(n_kv: u64, n_tensors: u64) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&n_tensors.to_le_bytes());
+        bytes.extend_from_slice(&n_kv.to_le_bytes());
+        bytes
+    }
+
+    fn push_scalar_kv(bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    fn push_tensor_info(bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&32u64.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+    }
+
+    /// One metadata entry whose value nests `levels` arrays; the deepest
+    /// array sits at nesting depth `levels - 1`.
+    fn push_nested_array_kv(bytes: &mut Vec<u8>, levels: usize) {
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        for level in 0..levels {
+            let leaf = level + 1 == levels;
+            let elem: u32 = if leaf { 4 } else { 9 };
+            let count: u64 = if leaf { 0 } else { 1 };
+            bytes.extend_from_slice(&elem.to_le_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+        }
+    }
+
+    fn align32(len: usize) -> usize {
+        len.div_ceil(32) * 32
+    }
+
+    #[test]
+    fn gguf_metadata_array_nesting_is_depth_bounded() {
+        let mut bounded = gguf_header(1, 0);
+        push_nested_array_kv(&mut bounded, 65);
+        bounded.resize(align32(bounded.len()), 0);
+        gguf_region_table(&bounded, &BTreeMap::new()).expect("depth 64 metadata parses");
+
+        let mut too_deep = gguf_header(1, 0);
+        push_nested_array_kv(&mut too_deep, 66);
+        too_deep.resize(align32(too_deep.len()), 0);
+        assert!(
+            gguf_region_table(&too_deep, &BTreeMap::new()).is_err(),
+            "metadata array nesting past depth 64 must be rejected, not recursed"
+        );
+    }
+
+    #[test]
+    fn gguf_walker_rejects_counts_above_the_bounded_ceiling() {
+        // Every declared entry is present on the wire, so an unbounded walker
+        // would parse the header and admit it; rejection proves the ceiling
+        // fires before the count loops iterate or the fact vector allocates.
+        let mut kv_over = gguf_header(4097, 0);
+        for _ in 0..4097 {
+            push_scalar_kv(&mut kv_over);
+        }
+        kv_over.resize(align32(kv_over.len()), 0);
+        assert!(
+            gguf_region_table(&kv_over, &BTreeMap::new()).is_err(),
+            "declared metadata count over 4096 must be rejected"
+        );
+
+        let mut tensors_over = gguf_header(0, 4097);
+        for _ in 0..4097 {
+            push_tensor_info(&mut tensors_over);
+        }
+        let data_start = align32(tensors_over.len());
+        tensors_over.resize(data_start + 34, 0);
+        assert!(
+            gguf_region_table(&tensors_over, &BTreeMap::new()).is_err(),
+            "declared tensor count over 4096 must be rejected"
+        );
+        let map = BTreeMap::from([(
+            7u32,
+            WeightFileRange {
+                offset: data_start as u64,
+                len: 34,
+                elems: 9,
+            },
+        )]);
+        assert!(
+            inputs_from_gguf(&tensors_over, &map).is_err(),
+            "declared tensor count over 4096 must be rejected before tensor facts are allocated"
+        );
+    }
+
+    #[test]
+    fn gguf_walker_admits_a_bounded_header() {
+        let mut bytes = gguf_header(2, 1);
+        push_scalar_kv(&mut bytes);
+        push_scalar_kv(&mut bytes);
+        push_tensor_info(&mut bytes);
+        let data_start = align32(bytes.len());
+        bytes.resize(data_start + 34, 0);
+        let table = gguf_region_table(&bytes, &BTreeMap::new()).expect("bounded header parses");
+        assert_eq!(table.data_start, data_start as u64);
+        let map = BTreeMap::from([(
+            7u32,
+            WeightFileRange {
+                offset: data_start as u64,
+                len: 34,
+                elems: 9,
+            },
+        )]);
+        inputs_from_gguf(&bytes, &map).expect("bounded tensor facts admitted");
     }
 
     #[test]
