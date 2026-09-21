@@ -334,6 +334,20 @@ def make_baseline_blobs(
     return blob
 
 
+def baseline_has_token(baseline: str, token: str) -> bool:
+    """True when the baseline blob carries this exact token, not a longer word.
+
+    The delimiter is identifier scope, not a bare substring: a baseline
+    `SsmConv1dKernel` must not exempt a new bare `Ssm`. Both sides of the
+    comparison come from `\\w`-based vocabulary patterns, so identifier
+    characters are the only boundary that matters.
+    """
+    if not baseline:
+        return False
+    pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
+    return re.search(pattern, baseline) is not None
+
+
 def _closing_quote(text: str, start: int) -> int | None:
     i = start
     n = len(text)
@@ -411,7 +425,8 @@ def check_added_source(
     task 109f30ac) a match whose exact token appears in the same path's blob
     at the frozen baseline is baseline debt re-flagged by a post-baseline line
     rewrite (the ssm.rs let-chain reformat, the simulate_matmul argument-shape
-    refactor), not new debt.
+    refactor), not new debt. "Exact token" is identifier-delimited, not a
+    substring: a baseline `SsmConv1dKernel` does not exempt a new bare `Ssm`.
 
     Accepted weakening of that baseline-token exemption: a NEW call site of a
     baseline token inside a baseline file is not caught — growth signal
@@ -440,7 +455,9 @@ def check_added_source(
             ]
             if fresh:
                 baseline = baseline_blob(line.relative_path)
-                fresh = [token for token in fresh if token not in baseline]
+                fresh = [
+                    token for token in fresh if not baseline_has_token(baseline, token)
+                ]
             if not fresh:
                 continue
             violations.append(

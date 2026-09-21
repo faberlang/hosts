@@ -104,6 +104,27 @@ if [[ "$new_path_output" != *"new operation/model vocabulary"* ]] \
   exit 1
 fi
 
+# The exemption is identifier-delimited: a baseline `SsmConv1dKernel` does not
+# exempt a new bare `Ssm`, so the exact-token rule is not a substring rule.
+set +e
+substring_output="$("$CHECK" \
+  --fixture \
+  --root "$FIXTURES/baseline-token-substring" \
+  --ledger "$FIXTURES/baseline-token-substring-ledger.toml" \
+  --baseline-dir "$FIXTURES/baseline-token-substring-baseline" 2>&1)"
+substring_status=$?
+set -e
+if [[ "$substring_status" -eq 0 ]]; then
+  printf '%s\n' "host-execution-purity test: substring-only baseline token was exempted" >&2
+  exit 1
+fi
+if [[ "$substring_output" != *"new operation/model vocabulary"* ]] \
+  || [[ "$substring_output" != *"driver.rs:2:"* ]]; then
+  printf '%s\n' "host-execution-purity test: substring fixture failed for the wrong reason" >&2
+  printf '%s\n' "$substring_output" >&2
+  exit 1
+fi
+
 "$CHECK"
 
-printf '%s\n' "host-execution-purity test: red fixture, debt reduction, vocabulary narrowing, baseline-token exemption, and live tree green"
+printf '%s\n' "host-execution-purity test: red fixture, debt reduction, vocabulary narrowing, baseline-token exemption, exact-token delimiting, and live tree green"

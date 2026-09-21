@@ -1,0 +1,9 @@
+version = 1
+baseline_commit = "e8fee5b2da972cceb956633cbf13a47349bea46e"
+ceiling = 1
+
+[[entry]]
+id = "fixture-entry-guard"
+class = "operation-dispatch"
+path = "driver.rs"
+symbol = "family_label"
