@@ -8,7 +8,7 @@ use host_kernel::{
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -58,7 +58,6 @@ impl Provider for Processus {
             "processus:exsequi" | "processus:exsequetur" => execute_shell(&request.opener, context),
             "processus:dimitte" => spawn_detached(&request.opener),
             "processus:lege" => read_env(&request.opener),
-            "processus:scribe" => write_env(&request.opener),
             "processus:sedes" => current_dir(),
             "processus:muta" => set_current_dir(&request.opener),
             "processus:identitas" => Ok(ProviderReply::item(Valor::Numerus(i64::from(
@@ -308,41 +307,14 @@ fn spawn_detached(opener: &Valor) -> HostResult<ProviderReply> {
     Ok(ProviderReply::item(Valor::Numerus(i64::from(child.id()))))
 }
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn environment_lock() -> HostResult<MutexGuard<'static, ()>> {
-    ENV_LOCK
-        .lock()
-        .map_err(|_error| HostError::internal("processus environment lock poisoned"))
-}
-
 fn read_env(opener: &Valor) -> HostResult<ProviderReply> {
     let name = string_arg(opener, 0, "nomen")?;
-    let _guard = environment_lock()?;
     match std::env::var(&name) {
         Ok(value) => Ok(ProviderReply::item(Valor::Textus(value))),
         Err(_) => Err(HostError::internal(format!(
             "processus:lege: environment variable `{name}` is not set"
         ))),
     }
-}
-
-fn write_env(opener: &Valor) -> HostResult<ProviderReply> {
-    let values = string_list_arg(opener, 0, "args")?;
-    let [name, value] = values.as_slice() else {
-        return Err(HostError::invalid_args(
-            "processus:scribe requires [nomen, valor]",
-        ));
-    };
-    if name.is_empty() || name.contains('=') || name.contains('\0') {
-        return Err(HostError::invalid_args(
-            "processus:scribe nomen must be non-empty and contain neither `=` nor NUL",
-        ));
-    }
-    let _guard = environment_lock()?;
-    // SAFETY: environment_lock serializes all environment mutation across threads.
-    unsafe { std::env::set_var(name, value) };
-    Ok(ProviderReply::vacuum())
 }
 
 fn current_dir() -> HostResult<ProviderReply> {

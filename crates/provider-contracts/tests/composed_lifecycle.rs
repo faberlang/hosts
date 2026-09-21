@@ -119,7 +119,6 @@ const PROCESSUS_ROUTES: &[&str] = &[
     "processus:exsequetur",
     "processus:dimitte",
     "processus:lege",
-    "processus:scribe",
     "processus:sedes",
     "processus:muta",
     "processus:identitas",
@@ -238,7 +237,7 @@ fn provider_cases() -> [ProviderCase; 5] {
             register: processus::register,
             provider: processus_provider,
             public_routes: PROCESSUS_ROUTES,
-            excluded_routes: &["processus:exi"],
+            excluded_routes: &["processus:exi", "processus:scribe"],
         },
         ProviderCase {
             name: "solum",
@@ -314,10 +313,6 @@ fn public_fixture(route: &str, workspace: &mut TestWorkspace) -> DispatchFixture
             Valor::Textus("true".to_owned()),
         ])),
         "processus:lege" => DispatchFixture::new(Valor::Textus("PATH".to_owned())),
-        "processus:scribe" => DispatchFixture::new(Valor::Lista(vec![
-            Valor::Textus(format!("FABER_PROVIDER_CONTRACTS_{}", std::process::id())),
-            Valor::Textus("ok".to_owned()),
-        ])),
         "processus:sedes" | "processus:identitas" | "processus:argumenta" => {
             DispatchFixture::new(Valor::Nihil)
         }
@@ -425,6 +420,10 @@ fn public_fixture(route: &str, workspace: &mut TestWorkspace) -> DispatchFixture
 fn excluded_fixture(route: &str) -> DispatchFixture {
     match route {
         "consolum:fundet" => DispatchFixture::new(Valor::Octeti(Vec::new())),
+        "processus:scribe" => DispatchFixture::new(Valor::Lista(vec![
+            Valor::Textus("nomen".to_owned()),
+            Valor::Textus("valor".to_owned()),
+        ])),
         "processus:exi" | "tempus:expectet" => DispatchFixture::new(Valor::Numerus(0)),
         "solum:fundet" => DispatchFixture::new(Valor::Lista(vec![
             Valor::Textus("ignored".to_owned()),
@@ -668,8 +667,5 @@ fn composed_kernel_registers_unique_provider_identities_and_routes() {
         }
     }
 
-    assert_eq!(admitted_routes.len(), 81);
-    // SAFETY: this test owns its process environment and removes its unique variable
-    // after completing every provider dispatch that can read it.
-    unsafe { std::env::remove_var(format!("FABER_PROVIDER_CONTRACTS_{}", std::process::id())) };
+    assert_eq!(admitted_routes.len(), 80);
 }

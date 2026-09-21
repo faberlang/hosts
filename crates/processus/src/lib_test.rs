@@ -7,8 +7,11 @@ fn manifest_registers_all_process_routes() {
     let mut kernel = Kernel::new();
     register(&mut kernel).expect("register processus");
     let calls = &kernel.manifest().providers[0].calls;
-    assert_eq!(calls.len(), 10);
-    assert!(calls.iter().any(|call| call.route == "processus:scribe"));
+    assert_eq!(calls.len(), 9);
+    assert!(
+        calls.iter().all(|call| call.route != "processus:scribe"),
+        "processus:scribe is retired (ON-H1a) and must stay unmanifested"
+    );
     assert!(
         calls.iter().all(|call| call.route != "processus:exi"),
         "processus:exi must stay unmanifested until host exit has a protocol-visible terminal response"
@@ -34,47 +37,6 @@ fn unsafe_unmanifested_routes_are_not_dispatchable_through_provider() {
         .expect_err("unsafe route must be rejected as an ordinary host error");
 
     assert_eq!(error.code, "E_NO_ROUTE");
-}
-
-#[test]
-fn environment_mutation_round_trip_uses_textus_carriers() {
-    let provider = Processus::new().expect("provider");
-    let name = format!("FABER_PROCESSUS_TEST_{}", std::process::id());
-    let context = DispatchContext {
-        cancellation: host_kernel::CancellationProbe::new(|| false),
-    };
-    provider
-        .dispatch(
-            &RequestFrame {
-                conversation_id: "scribe".into(),
-                route: "processus:scribe".into(),
-                opener: Valor::Lista(vec![
-                    Valor::Textus(name.clone()),
-                    Valor::Textus("salve".into()),
-                ]),
-                target: None,
-            },
-            &context,
-        )
-        .expect("environment write");
-    let reply = provider
-        .dispatch(
-            &RequestFrame {
-                conversation_id: "lege".into(),
-                route: "processus:lege".into(),
-                opener: Valor::Textus(name.clone()),
-                target: None,
-            },
-            &context,
-        )
-        .expect("environment read");
-    assert!(matches!(
-        reply.contents.as_slice(),
-        [ProviderContent::Item(Valor::Textus(value))] if value == "salve"
-    ));
-    // SAFETY: this test owns its process environment and removes its unique variable
-    // after its only provider calls that can read it.
-    unsafe { std::env::remove_var(name) };
 }
 
 #[test]
@@ -233,16 +195,16 @@ fn captura_empty_args_list_rejected() {
 }
 
 #[test]
-fn scribe_rejects_empty_env_name() {
+fn scribe_route_is_retired_and_rejected() {
     let provider = Processus::new().expect("provider");
     let error = provider
         .dispatch(
             &RequestFrame {
-                conversation_id: "scribe-empty".into(),
+                conversation_id: "scribe-retired".into(),
                 route: "processus:scribe".into(),
                 opener: Valor::Lista(vec![
-                    Valor::Textus(String::new()),
-                    Valor::Textus("val".into()),
+                    Valor::Textus("nomen".into()),
+                    Valor::Textus("valor".into()),
                 ]),
                 target: None,
             },
@@ -250,6 +212,6 @@ fn scribe_rejects_empty_env_name() {
                 cancellation: host_kernel::CancellationProbe::new(|| false),
             },
         )
-        .expect_err("empty env name must fail");
-    assert_eq!(error.code, "E_INVALID_ARGS");
+        .expect_err("retired route must fail");
+    assert_eq!(error.code, "E_NO_ROUTE");
 }

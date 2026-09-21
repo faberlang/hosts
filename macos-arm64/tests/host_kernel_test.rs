@@ -263,7 +263,6 @@ fn manifest_lists_current_stdlib_sync_routes() {
         "solum:temporarium",
         "processus:exsequi",
         "processus:lege",
-        "processus:scribe",
         "processus:sedes",
         "processus:muta",
         "processus:identitas",
@@ -763,32 +762,6 @@ fn attaches_sermo_to_solum_lege_conversation() {
     );
 
     std::fs::remove_file(file).expect("cleanup solum fixture");
-}
-
-#[test]
-fn processus_scribe_and_lege_round_trips_env_var() {
-    let kernel = HostKernel::new();
-    let name = format!("FABER_HOST_TEST_{}", std::process::id());
-
-    let write = kernel.route(&Frame::request_with(
-        "processus:scribe",
-        Valor::Lista(vec![
-            Valor::Textus(name.clone()),
-            Valor::Textus("salve".into()),
-        ]),
-    ));
-    assert_eq!(write.status, Status::Done);
-
-    let read = kernel.route(&Frame::request_with(
-        "processus:lege",
-        Valor::Textus(name.clone()),
-    ));
-    assert_eq!(read.data, Valor::Textus("salve".into()));
-
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::remove_var(name);
-    }
 }
 
 #[test]
