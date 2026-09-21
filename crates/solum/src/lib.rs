@@ -149,7 +149,11 @@ fn read_bytes(opener: &Valor) -> HostResult<ProviderReply> {
     let bytes = fs::read(&path)
         .map_err(|error| HostError::internal(format!("solum:hauri failed: {error}")))?;
     if let Some(max) = max {
-        reject_over_ceiling("solum:hauri", u64::try_from(bytes.len()).unwrap_or(u64::MAX), max)?;
+        reject_over_ceiling(
+            "solum:hauri",
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            max,
+        )?;
     }
     Ok(ProviderReply::byte(bytes))
 }
@@ -173,7 +177,9 @@ fn optional_byte_ceiling(value: &Valor, index: usize, name: &str) -> HostResult<
                 .map_err(|_| HostError::invalid_args(format!("{name} must be non-negative")))?;
             Ok(Some(ceiling))
         }
-        _ => Err(HostError::invalid_args(format!("{name} must be an integer"))),
+        _ => Err(HostError::invalid_args(format!(
+            "{name} must be an integer"
+        ))),
     }
 }
 
