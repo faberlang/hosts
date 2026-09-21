@@ -464,8 +464,77 @@ fn bounded_read_size(value: i64) -> HostResult<usize> {
     Ok(value)
 }
 
+/// Redirect hops the client follows before failing. Matches the ureq default
+/// this client used to inherit (`redirects: 5`).
+const MAX_REDIRECTS: usize = 5;
+
+/// Caller headers that may be replayed to a different origin on a redirect: the
+/// CORS-safelisted request headers plus `user-agent`. Every other caller header
+/// is treated as a possible credential (`x-api-key`, `x-auth-token`, …) and is
+/// dropped once the origin changes.
+///
+/// This is the narrow rule chosen by the `http-redirect-headers` unit, which
+/// found the repo states no cross-origin header policy. ureq's own redirect
+/// handling strips only `authorization`, `cookie` and `content-length`, so
+/// without this list a custom credential reaches whatever host a `Location`
+/// names. Narrow it never; widen it only against a stated policy.
+const REDIRECT_SAFE_HEADERS: [&str; 6] = [
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "content-language",
+    "content-type",
+    "user-agent",
+];
+
+#[derive(PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+fn origin_of(url: &ureq::RequestUrl) -> Origin {
+    Origin {
+        scheme: url.scheme().to_ascii_lowercase(),
+        host: url.host().to_ascii_lowercase(),
+        port: url.as_url().port_or_known_default(),
+    }
+}
+
+fn is_redirect_safe_header(name: &str) -> bool {
+    REDIRECT_SAFE_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// The method to use on the next hop, or `None` when this status ends the
+/// chain. Mirrors the rules ureq applied before this client owned the loop.
+fn redirect_method(status: u16, method: &str) -> Option<&str> {
+    match status {
+        301 | 302 | 303 => Some(match method {
+            "GET" | "HEAD" => method,
+            _ => "GET",
+        }),
+        307 | 308 if matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE") => Some(method),
+        _ => None,
+    }
+}
+
+fn redirect_target(current: &ureq::RequestUrl, location: &str) -> Result<String, String> {
+    current
+        .as_url()
+        .join(location)
+        .map_err(|error| format!("http redirect location is invalid: {error}"))
+        .map(|url| url.to_string())
+}
+
 fn build_agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(timeout).build()
+    // Redirects are followed by `send_request`, which applies
+    // `REDIRECT_SAFE_HEADERS` per hop; ureq's own redirect handling cannot drop
+    // a caller header other than `authorization`, `cookie` and `content-length`.
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build()
 }
 
 fn send_request(
@@ -475,18 +544,52 @@ fn send_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<ureq::Response, String> {
-    let mut request = agent.request(method, url);
-    for (name, value) in headers {
-        request = request.set(name, value);
-    }
-    let result = if body.is_empty() {
-        request.call()
-    } else {
-        request.send_bytes(body)
-    };
-    match result {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(error) => Err(format!("http request failed: {error}")),
+    let mut method = method.to_owned();
+    let mut target = url.to_owned();
+    let mut headers = headers.to_vec();
+    let mut body = body.to_vec();
+    let mut origin: Option<Origin> = None;
+    let mut hops = 0_usize;
+    loop {
+        let mut request = agent.request(&method, &target);
+        let current = request
+            .request_url()
+            .map_err(|error| format!("http request failed: {error}"))?;
+        let current_origin = origin_of(&current);
+        if origin
+            .as_ref()
+            .is_some_and(|previous| previous != &current_origin)
+        {
+            headers.retain(|(name, _)| is_redirect_safe_header(name));
+        }
+        for (name, value) in &headers {
+            request = request.set(name, value);
+        }
+        let result = if body.is_empty() {
+            request.call()
+        } else {
+            request.send_bytes(&body)
+        };
+        let response = match result {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => return Err(format!("http request failed: {error}")),
+        };
+        let Some(next_method) = redirect_method(response.status(), &method) else {
+            return Ok(response);
+        };
+        let Some(location) = response.header("location") else {
+            return Ok(response);
+        };
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Err(format!(
+                "http request failed: reached max redirects ({MAX_REDIRECTS})"
+            ));
+        }
+        target = redirect_target(&current, location)?;
+        method = next_method.to_owned();
+        body.clear();
+        origin = Some(current_origin);
     }
 }
 

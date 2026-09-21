@@ -1178,6 +1178,95 @@ impl Drop for EchoFixture {
     }
 }
 
+/// A second origin that answers `/hop` with a 302 to a configurable `Location`
+/// and serves every other path as the echo fixture does, so a test can watch
+/// which headers the client re-sends on the hop after a redirect.
+struct RedirectFixture {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RedirectFixture {
+    fn spawn(location: String) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind redirect fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("redirect fixture nonblocking");
+        let port = listener.local_addr().expect("redirect fixture addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            loop {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let conn_stop = Arc::clone(&thread_stop);
+                        let conn_location = location.clone();
+                        thread::spawn(move || {
+                            serve_redirect_connection(stream, &conn_location, &conn_stop);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+}
+
+impl Drop for RedirectFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_redirect_connection(mut stream: TcpStream, location: &str, stop: &AtomicBool) {
+    stream
+        .set_nonblocking(false)
+        .expect("redirect connection blocking");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("redirect read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("redirect write timeout");
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some((method, path, headers, body)) = read_fixture_request(&mut stream) else {
+            return;
+        };
+        let response = if path.starts_with("/hop") {
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n"
+            )
+        } else {
+            echo_response(&method, &path, &headers, &body)
+        };
+        if stream.write_all(response.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
 fn serve_echo_connection(mut stream: TcpStream, stop: &AtomicBool) {
     stream
         .set_nonblocking(false)
@@ -1195,20 +1284,35 @@ fn serve_echo_connection(mut stream: TcpStream, stop: &AtomicBool) {
         let Some((method, path, headers, body)) = read_fixture_request(&mut stream) else {
             return;
         };
-        let reply = format!("{method} {path} {}", String::from_utf8_lossy(&body));
-        let extra = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-test"))
-            .map(|(_, value)| format!("x-echo-test: {value}\r\n"))
-            .unwrap_or_default();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: keep-alive\r\n{extra}\r\n{reply}",
-            reply.len()
-        );
+        let response = echo_response(&method, &path, &headers, &body);
         if stream.write_all(response.as_bytes()).is_err() {
             return;
         }
     }
+}
+
+fn echo_response(method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> String {
+    let reply = format!("{method} {path} {}", String::from_utf8_lossy(body));
+    let extra = echo_headers(headers);
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: keep-alive\r\n{extra}\r\n{reply}",
+        reply.len()
+    )
+}
+
+/// Echo every received header back as `x-echo-<name>` with a leading `x-`
+/// stripped, so `x-test: yes` comes back as `x-echo-test: yes` and
+/// `x-api-key: k` as `x-echo-api-key: k`: the reply names exactly which headers
+/// the client put on the wire for that hop.
+fn echo_headers(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            let echo = name.strip_prefix("x-").unwrap_or(&name);
+            format!("x-echo-{echo}: {value}\r\n")
+        })
+        .collect()
 }
 
 type FixtureRequest = (String, String, Vec<(String, String)>, Vec<u8>);
@@ -1407,6 +1511,84 @@ fn client_verbs_round_trip_against_local_fixture() {
     assert_eq!(
         client_header(&request_reply, "x-echo-test").as_deref(),
         Some("generic")
+    );
+}
+
+#[test]
+fn cross_origin_redirect_drops_credential_headers() {
+    let target = EchoFixture::spawn();
+    let redirect = RedirectFixture::spawn(target.url("/target"));
+    let provider = Http::new().expect("provider");
+
+    let reply = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:get",
+            vec![
+                Valor::Textus(redirect.url("/hop")),
+                headers(&[("x-api-key", "sekrit"), ("accept", "application/json")]),
+            ],
+        )
+        .expect("http:get across a cross-origin redirect"),
+    );
+
+    assert_eq!(client_status(&reply), 200);
+    assert_eq!(client_body(&reply), b"GET /target ");
+    assert_eq!(
+        client_header(&reply, "x-echo-api-key"),
+        None,
+        "a credential header must not follow a redirect to another origin"
+    );
+    assert_eq!(
+        client_header(&reply, "x-echo-accept").as_deref(),
+        Some("application/json"),
+        "safe headers must survive the origin change"
+    );
+}
+
+#[test]
+fn same_origin_redirect_keeps_credential_headers() {
+    let redirect = RedirectFixture::spawn("/target".to_owned());
+    let provider = Http::new().expect("provider");
+
+    let reply = client_reply_table(
+        &dispatch_list(
+            &provider,
+            "http:get",
+            vec![
+                Valor::Textus(redirect.url("/hop")),
+                headers(&[("x-api-key", "sekrit")]),
+            ],
+        )
+        .expect("http:get across a same-origin redirect"),
+    );
+
+    assert_eq!(client_status(&reply), 200);
+    assert_eq!(client_body(&reply), b"GET /target ");
+    assert_eq!(
+        client_header(&reply, "x-echo-api-key").as_deref(),
+        Some("sekrit"),
+        "a same-origin redirect must keep caller headers"
+    );
+}
+
+#[test]
+fn redirect_chain_is_bounded() {
+    let redirect = RedirectFixture::spawn("/hop".to_owned());
+    let provider = Http::new().expect("provider");
+
+    let error = dispatch_list(
+        &provider,
+        "http:get",
+        vec![Valor::Textus(redirect.url("/hop"))],
+    )
+    .expect_err("an endless redirect chain must fail instead of looping");
+
+    assert_eq!(error.code, "E_INTERNAL");
+    assert!(
+        error.message.contains("max redirects"),
+        "unexpected message {}",
+        error.message
     );
 }
 
