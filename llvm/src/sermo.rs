@@ -6,7 +6,7 @@
 //! meus/tuus handles, recv/drain). `SermoOpen` returns an opaque
 //! arena-owned stream handle (`frame::Sermo`); the materialization rows drain
 //! the inbound frame stream to a carrier (`↦ textus`, `↦ valor`); the `_or`
-//! row is the `⇥`-style recovery — a scalar materialization that substitutes
+//! row is the `⊥`-style recovery — a scalar materialization that substitutes
 //! the fallback on a missing or wrong-typed payload instead of aborting (P6
 //! per-carrier `_or` precedent). The route's host dispatch starts on first
 //! consumption (builtin `runtime:*` routes and the registered host dispatch).
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sermo_materialize_valor(
     })
 }
 
-/// `sermo ↦ i64 ⇥ fallback` — scalar materialization with `_or` recovery.
+/// `sermo ↦ i64 ⊥ fallback` — scalar materialization with `_or` recovery.
 ///
 /// Extracts an `i64` from the stream; on a missing or wrong-typed payload the
 /// `fallback` substitutes instead of aborting (P6 recovery precedent). The

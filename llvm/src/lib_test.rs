@@ -1646,7 +1646,7 @@ fn valor_genus_defaulted_extraction_matches_valor_genus_fixture() {
     // (`regio = "Roma"`), and a mandatory instant (`born`); the payload
     // omits `aetas`/`regio` and carries an extra ignored key. The
     // `valor_get_genus` row must keep pre-seeded output slots on
-    // DEFAULTABLE-policy missing keys, fail the whole extraction (the `⇥`
+    // DEFAULTABLE-policy missing keys, fail the whole extraction (the `⊥`
     // recovery latch) on a MANDATORY-policy missing key, and ignore keys
     // outside the descriptor table.
     let mut context = ptr::null_mut();
@@ -1766,7 +1766,7 @@ fn valor_genus_defaulted_extraction_matches_valor_genus_fixture() {
     );
 
     // `stale ↦ Persona` failure: `{"nomen": "Livia"}` lacks the mandatory
-    // `born` key, so the whole extraction fails (the `⇥` recovery latch).
+    // `born` key, so the whole extraction fails (the `⊥` recovery latch).
     let livia_value = FaberRtSliceV1::from_static(b"Livia");
     let livia_handle = ptr::from_ref(&livia_value).cast_mut().cast::<c_void>();
     let stale_names = [ptr::from_ref(&nomen_text)];
@@ -4847,7 +4847,7 @@ fn sermo_materialize_i64_or_recovers_on_type_mismatch() {
     };
     assert!(opened.status.is_ok());
 
-    // ad/sermo-recovery.fab shape: `ad 'runtime:echo'(payload) ↦ i64 ⇥ 0` —
+    // ad/sermo-recovery.fab shape: `ad 'runtime:echo'(payload) ↦ i64 ⊥ 0` —
     // the echo returns textus, the scalar extraction fails, and the `_or`
     // fallback substitutes instead of aborting (convert_2_aggregate_i64_to_i64).
     let result = unsafe { __faber_rt_v1_sermo_materialize_i64_or(context, opened.value, 0) };
