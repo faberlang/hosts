@@ -100,3 +100,65 @@ fn binary_body_corpus_octeti_is_preserved() {
     let response = Replicatio::new(200, bytes.clone(), HashMap::new());
     assert_eq!(response.corpus_octeti(), bytes);
 }
+
+fn request_url(url: &str) -> ureq::RequestUrl {
+    build_agent(DEFAULT_AGENT_TIMEOUT)
+        .request("GET", url)
+        .request_url()
+        .expect("request url")
+}
+
+#[test]
+fn https_to_http_redirect_is_refused() {
+    for location in [
+        "http://example.test/next",
+        "HTTP://example.test/",
+        "http://other.test/next",
+    ] {
+        let error = redirect_target(&request_url("https://example.test/start"), location)
+            .expect_err(location);
+        assert!(
+            error.contains("scheme downgrade"),
+            "unexpected message {error}"
+        );
+    }
+}
+
+#[test]
+fn scheme_upgrade_and_same_scheme_redirects_are_followed() {
+    for (base, location, expected) in [
+        (
+            "http://example.test/a",
+            "https://example.test/b",
+            "https://example.test/b",
+        ),
+        (
+            "https://example.test/a",
+            "https://other.test/b",
+            "https://other.test/b",
+        ),
+        (
+            "http://example.test/a",
+            "http://other.test/b",
+            "http://other.test/b",
+        ),
+        ("https://example.test/a", "/b", "https://example.test/b"),
+    ] {
+        assert_eq!(
+            redirect_target(&request_url(base), location).as_deref(),
+            Ok(expected),
+            "{base} -> {location}"
+        );
+    }
+}
+
+#[test]
+fn redirect_method_rules_are_unchanged() {
+    assert_eq!(redirect_method(301, "POST"), Some("GET"));
+    assert_eq!(redirect_method(302, "PUT"), Some("GET"));
+    assert_eq!(redirect_method(303, "PATCH"), Some("GET"));
+    assert_eq!(redirect_method(307, "POST"), None);
+    assert_eq!(redirect_method(308, "POST"), None);
+    assert_eq!(redirect_method(307, "GET"), Some("GET"));
+    assert_eq!(redirect_method(308, "OPTIONS"), Some("OPTIONS"));
+}

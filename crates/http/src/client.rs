@@ -519,12 +519,46 @@ fn redirect_method(status: u16, method: &str) -> Option<&str> {
     }
 }
 
+/// Why a redirect hop was not followed.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectError {
+    /// The hop would move the request from `https` to `http`, putting the body
+    /// and any retained headers into cleartext. Never followed.
+    SchemeDowngrade {
+        from: String,
+        to: String,
+    },
+    InvalidLocation(String),
+}
+
+impl std::fmt::Display for RedirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemeDowngrade { from, to } => write!(
+                f,
+                "http redirect refused: scheme downgrade from {from} to {to}"
+            ),
+            Self::InvalidLocation(error) => {
+                write!(f, "http redirect location is invalid: {error}")
+            }
+        }
+    }
+}
+
 fn redirect_target(current: &ureq::RequestUrl, location: &str) -> Result<String, String> {
-    current
+    let next = current
         .as_url()
         .join(location)
-        .map_err(|error| format!("http redirect location is invalid: {error}"))
-        .map(|url| url.to_string())
+        .map_err(|error| RedirectError::InvalidLocation(error.to_string()).to_string())?;
+    let (from, to) = (current.scheme(), next.scheme());
+    if from.eq_ignore_ascii_case("https") && to.eq_ignore_ascii_case("http") {
+        return Err(RedirectError::SchemeDowngrade {
+            from: from.to_ascii_lowercase(),
+            to: to.to_ascii_lowercase(),
+        }
+        .to_string());
+    }
+    Ok(next.to_string())
 }
 
 fn build_agent(timeout: Duration) -> ureq::Agent {
