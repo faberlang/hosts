@@ -1,6 +1,6 @@
 # GOAL: md3i-inference-token-commit — bind execution transactions to inference token/sequence commit
 
-**Status**: planned — lowered 2026-08-22 ([`md3i-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3i-delivery.md)); ready for unit tasking (entry gate met: MD3H archived `7014785`, Gradus PML5 decode/KV semantics structural-tier delivered, hosts D1–D7 session/KV facts live)
+**Status**: done — superseded by gpu-reset (`radix/docs/factory/gpu-reset/CAMPAIGN.md`, 2026-09-29); archived by gpu-reset S0. Prior state: planned — lowered 2026-08-22 ([`md3i-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3i-delivery.md)); ready for unit tasking (entry gate met: MD3H archived `7014785`, Gradus PML5 decode/KV semantics structural-tier delivered, hosts D1–D7 session/KV facts live)
 **Created**: 2026-08-22
 **Campaign:** `gpu-inference-multi-device` (radix: [`docs/factory/gpu-inference-multi-device/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-inference-multi-device/CAMPAIGN.md))
 **Source:** CAMPAIGN.md §MD3I + the 2026-08-21 amendment (MD3I follows MD3H); lowered spec [`md3i-delivery.md`](../../../../radix/docs/factory/gpu-inference-multi-device/md3i-delivery.md); frozen session facts [`gi4-contract.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-contract.md) §1–§6; ownership amendment [`gi4-ownership-amendment.md`](../../../../radix/docs/factory/gpu-inference-gguf/gi4-ownership-amendment.md)
