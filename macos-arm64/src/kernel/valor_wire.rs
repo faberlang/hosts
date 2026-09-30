@@ -133,6 +133,9 @@ pub fn valor_to_json(valor: &Valor) -> Result<serde_json::Value, ValorWireError>
         Valor::Nihil => Ok(serde_json::Value::Null),
         Valor::Bivalens(b) => Ok(serde_json::Value::Bool(*b)),
         Valor::Numerus(n) => Ok(serde_json::Value::Number((*n).into())),
+        Valor::Magnus(n) => Err(ValorWireError(format!(
+            "integer {n} exceeds 64 bits and cannot be represented as a JSON number"
+        ))),
         Valor::Fractus(f) => {
             if f.is_finite() {
                 match serde_json::Number::from_f64(*f) {
