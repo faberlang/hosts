@@ -25,16 +25,16 @@ importa ex "norma:tensor" privata tensor
 # This is honest device execution per the delivery spec — the kernel
 # compiles through `.faber → MIR → LLVM IR → native code`, and the
 # runtime FFI call is the standard JIT ABI pattern.
-functio multiplica_per_duo(lista<fractus<f32>> data) → lista<fractus<f32>> {
-    fixum tensor<fractus<f32>, [4]> input ← tensor.structa<tensor<fractus<f32>, [4]>>(data)
-    fixum tensor<fractus<f32>, [4]> output ← tensor.applicata(input, functio(x) { redde x * 2.0 })
+functio multiplica_per_duo(lista<f32> data) → lista<f32> {
+    fixum tensor<f32, [4]> input ← tensor.structa<tensor<f32, [4]>>(data)
+    fixum tensor<f32, [4]> output ← tensor.applicata(input, functio(x) { redde x * 2.0 })
     redde tensor.planata(output)
 }
 
 probandum "multiply-by-two correctness" tag "spine-08" {
     proba "elementwise multiply-by-2 on [1.0, 2.0, 3.0, 4.0]" {
-        fixum lista<fractus<f32>> input ← [1.0, 2.0, 3.0, 4.0]
-        fixum lista<fractus<f32>> output ← multiplica_per_duo(input)
+        fixum lista<f32> input ← [1.0, 2.0, 3.0, 4.0]
+        fixum lista<f32> output ← multiplica_per_duo(input)
         adfirma output.longitudo() ≡ 4
         adfirma output.accipe(0) vel -1.0 ≡ 2.0
         adfirma output.accipe(1) vel -1.0 ≡ 4.0
