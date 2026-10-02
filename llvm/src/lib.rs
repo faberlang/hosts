@@ -256,6 +256,11 @@ struct RuntimeContext {
     gradients: Vec<StableBox<gradient::GradientStorage>>,
     gradient_views: Vec<StableBox<gradient::GradientViewV1>>,
     regexes: Vec<StableBox<faber::Regex>>,
+    regex_by_handle: HashMap<usize, usize>,
+    /// Match values produced by `find` and `find_all`; arena-owned like every
+    /// other handle, looked up by handle address.
+    matches: Vec<StableBox<faber::Match>>,
+    match_by_handle: HashMap<usize, usize>,
     intervals: Vec<StableBox<faber::Intervallum<i64>>>,
     union_boxes: Vec<StableBox<*mut std::ffi::c_void>>,
     sermos: Vec<StableBox<faber::frame::Sermo>>,
@@ -313,6 +318,9 @@ pub unsafe extern "C" fn __faber_rt_v1_init(
                 gradients: Vec::new(),
                 gradient_views: Vec::new(),
                 regexes: Vec::new(),
+                regex_by_handle: HashMap::new(),
+                matches: Vec::new(),
+                match_by_handle: HashMap::new(),
                 intervals: Vec::new(),
                 union_boxes: Vec::new(),
                 sermos: Vec::new(),
