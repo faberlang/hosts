@@ -2,8 +2,9 @@
 //!
 //! Construction validates and compiles through `faber::Regex::new` (RD-9): a
 //! pattern outside the dialect is the host's typed failure
-//! (`STATUS_INVALID_ARGUMENT`, null handle), the way the other failable
-//! `from_text` rows report.
+//! (`STATUS_INVALID_ARGUMENT`) whose value is the arena text handle of the
+//! rejection payload (a stable construct id, `": "`, then detail), so a
+//! `cape` arm can read the id the way the runner and Rust targets do.
 
 use super::RuntimeContext;
 use super::format::{store_text, text_value};
@@ -22,9 +23,20 @@ fn runtime(context: *mut FaberRtContextV1) -> Option<&'static mut RuntimeContext
     (!context.is_null()).then(|| unsafe { &mut *context.cast::<RuntimeContext>() })
 }
 
-fn store_regex(runtime: &mut RuntimeContext, pattern: &str) -> FaberRtPtrResultV1 {
-    let Ok(value) = Regex::new(pattern) else {
-        return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+fn store_regex(
+    context: *mut FaberRtContextV1,
+    runtime: &mut RuntimeContext,
+    pattern: &str,
+) -> FaberRtPtrResultV1 {
+    let value = match Regex::new(pattern) {
+        Ok(value) => value,
+        Err(error) => {
+            let payload = store_text(context, error.to_string());
+            return FaberRtPtrResultV1 {
+                status: STATUS_INVALID_ARGUMENT,
+                value: payload.value,
+            };
+        }
     };
     let boxed = super::StableBox::new(value);
     let handle = boxed.handle();
@@ -50,7 +62,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_text(
         let (Some(runtime), Some(text)) = (runtime(context), text_value(value)) else {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
-        store_regex(runtime, &text)
+        store_regex(context, runtime, &text)
     })
 }
 
@@ -72,7 +84,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_ascii(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
         let text = String::from_utf8_lossy(bytes).into_owned();
-        store_regex(runtime, &text)
+        store_regex(context, runtime, &text)
     })
 }
 
@@ -131,7 +143,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_literal_1_ptr_to_ptr(
         }
         let bytes = unsafe { CStr::from_ptr(descriptor.pattern) }.to_bytes();
         let text = String::from_utf8_lossy(bytes).into_owned();
-        store_regex(runtime, &text)
+        store_regex(context, runtime, &text)
     })
 }
 
