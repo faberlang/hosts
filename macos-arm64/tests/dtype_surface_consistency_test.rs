@@ -113,7 +113,7 @@ fn dtype_surface_flags_map_to_device_data_type_spellings() {
     );
     assert_eq!(
         DeviceDataType::BF16.placement_discriminant(),
-        None,
-        "BF16 is slotless pending radix placement-debt-audit F2 (MirScalarLayout has no BF16 variant; F2 owns the discriminant)",
+        Some(11),
+        "BF16 is named on the placement ABI",
     );
 }
