@@ -1291,6 +1291,8 @@ impl FakeMetalDriver {
         // output.
         ("prefill_gemm_o", &[4]),
         ("prefill_gemm_kv", &[5]),
+        ("prefill_gemm_gate_up", &[5]),
+        ("prefill_gemm_down", &[5]),
         ("prefill_mlp", &[8]),
         ("prefill_rope_q", &[4]),
         ("prefill_rope_k", &[4]),
