@@ -1,6 +1,9 @@
-//! Arena-owned regex pattern carriers for the LLVM host ABI (Stage 4Z).
+//! Arena-owned regex carriers for the LLVM host ABI (Stage 4Z).
 //!
-//! v1 constructs a pattern carrier only — no engine compile/validation.
+//! Construction validates and compiles through `faber::Regex::new` (RD-9): a
+//! pattern outside the dialect is the host's typed failure
+//! (`STATUS_INVALID_ARGUMENT`, null handle), the way the other failable
+//! `from_text` rows report.
 
 use super::RuntimeContext;
 use super::format::{store_text, text_value};
@@ -19,7 +22,10 @@ fn runtime(context: *mut FaberRtContextV1) -> Option<&'static mut RuntimeContext
     (!context.is_null()).then(|| unsafe { &mut *context.cast::<RuntimeContext>() })
 }
 
-fn store_regex(runtime: &mut RuntimeContext, value: Regex) -> FaberRtPtrResultV1 {
+fn store_regex(runtime: &mut RuntimeContext, pattern: &str) -> FaberRtPtrResultV1 {
+    let Ok(value) = Regex::new(pattern) else {
+        return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
+    };
     let boxed = super::StableBox::new(value);
     let handle = boxed.handle();
     runtime.regexes.push(boxed);
@@ -34,7 +40,7 @@ fn find_regex(runtime: &RuntimeContext, handle: *mut c_void) -> Option<&Regex> {
         .map(super::StableBox::as_ref)
 }
 
-/// `textus ↦ regex` — preserve pattern text without engine validation.
+/// `textus ↦ regex` — validate and compile the pattern.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __faber_rt_v1_regex_from_text(
     context: *mut FaberRtContextV1,
@@ -44,7 +50,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_text(
         let (Some(runtime), Some(text)) = (runtime(context), text_value(value)) else {
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
-        store_regex(runtime, Regex::new(&text))
+        store_regex(runtime, &text)
     })
 }
 
@@ -66,7 +72,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_from_ascii(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         }
         let text = String::from_utf8_lossy(bytes).into_owned();
-        store_regex(runtime, Regex::new(&text))
+        store_regex(runtime, &text)
     })
 }
 
@@ -98,8 +104,8 @@ pub struct RegexLiteralDescriptorV1 {
 
 /// Construct a regex carrier from a static regex literal descriptor.
 ///
-/// The literal path (`"…" ↦ regex` on a literal) preserves the pattern text
-/// without engine validation, mirroring [`__faber_rt_v1_regex_from_text`]; the
+/// The literal path validates and compiles the pattern like
+/// [`__faber_rt_v1_regex_from_text`]; the
 /// descriptor carries the pattern bytes (and optional flags text) emitted as
 /// static globals by the compiler.
 ///
@@ -125,6 +131,10 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_literal_1_ptr_to_ptr(
         }
         let bytes = unsafe { CStr::from_ptr(descriptor.pattern) }.to_bytes();
         let text = String::from_utf8_lossy(bytes).into_owned();
-        store_regex(runtime, Regex::new(&text))
+        store_regex(runtime, &text)
     })
 }
+
+#[cfg(test)]
+#[path = "regex_rt_test.rs"]
+mod tests;

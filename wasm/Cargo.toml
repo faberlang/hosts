@@ -11,6 +11,9 @@ pedantic = "deny"
 
 [dependencies]
 wasmtime = "45"
+# Regex conversion rows validate and compile through the shared runtime
+# carrier (`faber::Regex::new`), the same engine the LLVM host links.
+faber = { path = "../../faber/runtime/rust" }
 # Shared CPU host ABI v1 constants (`VALUE_KIND_*`, symbol rows). Read-only
 # surface; the W13 wasm host interprets the emitter's kind-coded collection
 # elements with the same semantic identities the LLVM host uses.

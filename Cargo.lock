@@ -488,6 +488,7 @@ name = "faber"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -532,6 +533,7 @@ dependencies = [
 name = "faber-host-wasm"
 version = "0.1.0"
 dependencies = [
+ "faber",
  "radix-host-abi",
  "wasmtime",
  "wat",

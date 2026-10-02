@@ -550,9 +550,16 @@ impl HostState {
         self.alloc_dynamic(DynamicValue::Text(text))
     }
 
-    /// Allocate one dynamic regex (conversion result) and return its handle.
-    pub(crate) fn alloc_regex(&mut self, pattern: String, flags: Option<String>) -> i32 {
-        self.alloc_dynamic(DynamicValue::Regex(RegexValue { pattern, flags }))
+    /// Validate and allocate one dynamic regex (conversion result) and return
+    /// its handle. A pattern outside the dialect fails with the construct-id
+    /// payload (`faber::Regex::new`, RD-9) and allocates nothing.
+    pub(crate) fn alloc_regex(
+        &mut self,
+        pattern: String,
+        flags: Option<String>,
+    ) -> Result<i32, faber::RegexError> {
+        faber::Regex::new(&pattern)?;
+        Ok(self.alloc_dynamic(DynamicValue::Regex(RegexValue { pattern, flags })))
     }
 
     /// Resolve a text handle: an interned text row through the row map, else
@@ -2122,8 +2129,10 @@ fn bind_text_replace(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Err
 
 /// `regex_from_text`/`regex_from_ascii` construct a regex carrier from one
 /// text handle (the `textus ↦ regex` / `ascii ↦ regex` conversio the emitter
-/// does not constant-fold). The returned handle resolves through the regex
-/// arena when a later op renders it.
+/// does not constant-fold). The pattern is validated and compiled at the
+/// conversion; a rejected pattern is the host's typed failure carrying the
+/// construct-id payload. The returned handle resolves through the regex arena
+/// when a later op renders it.
 fn bind_regex_from_text(
     linker: &mut Linker<HostState>,
     field: &'static str,
@@ -2140,7 +2149,13 @@ fn bind_regex_from_text(
                     format!("`{field}` received an unknown text handle"),
                 ));
             };
-            Ok(caller.data_mut().alloc_regex(pattern, None))
+            match caller.data_mut().alloc_regex(pattern, None) {
+                Ok(handle) => Ok(handle),
+                Err(error) => Err(typed_unsupported(
+                    &mut caller,
+                    format!("`{field}` rejected the pattern: {error}"),
+                )),
+            }
         },
     )?;
     Ok(())
