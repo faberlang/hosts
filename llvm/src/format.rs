@@ -6,7 +6,7 @@ use crate::abi::{
     FaberRtPtrResultV1, FaberRtSliceV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK,
     STATUS_PANIC, STATUS_UNSUPPORTED,
 };
-use faber::{display_bivalens, display_fractus};
+use faber::display;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -24,7 +24,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_i1(
     format_scalar_values(
         context,
         template,
-        &[display_bivalens(value != 0).to_owned()],
+        &[display::bivalens(value != 0).to_owned()],
     )
 }
 
@@ -69,13 +69,13 @@ pub unsafe extern "C" fn __faber_rt_v1_format_f64(
     value: f64,
 ) -> FaberRtPtrResultV1 {
     // Scalar float display parity with the Rust oracle: integral floats keep
-    // the `.0` decimal marker (display_fractus), matching `__faber_rt_v1_text_f64`.
-    format_scalar_values(context, template, &[display_fractus(value)])
+    // the `.0` decimal marker (display::fractus), matching `__faber_rt_v1_text_f64`.
+    format_scalar_values(context, template, &[display::fractus(value)])
 }
 
 /// L28 (ab91f49f, W16): render a template with one f32 scalar value.
 ///
-/// `display_fractus` keeps the f32 precision (`0.1f32` renders `0.1`, NOT the
+/// `display::fractus` keeps the f32 precision (`0.1f32` renders `0.1`, NOT the
 /// widened `0.10000000149011612` an f64 carrier would produce). This is the
 /// f32 display ABI the grouped multi-arg nota path needs so `fractus<f32>`
 /// scribe args join like the HIR-Rust lane.
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_f32(
     template: FaberRtSliceV1,
     value: f32,
 ) -> FaberRtPtrResultV1 {
-    format_scalar_values(context, template, &[display_fractus(value)])
+    format_scalar_values(context, template, &[display::fractus(value)])
 }
 
 #[unsafe(no_mangle)]
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn __faber_rt_v1_format_text_i64_i1(
         &[
             text,
             integer.to_string(),
-            display_bivalens(boolean != 0).to_owned(),
+            display::bivalens(boolean != 0).to_owned(),
         ],
     )
 }
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn __faber_rt_v1_text_f64(
     context: *mut FaberRtContextV1,
     value: f64,
 ) -> FaberRtPtrResultV1 {
-    ffi_ptr_result(|| store_text(context, display_fractus(value)))
+    ffi_ptr_result(|| store_text(context, display::fractus(value)))
 }
 
 #[unsafe(no_mangle)]
