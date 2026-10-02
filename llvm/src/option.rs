@@ -7,7 +7,7 @@ use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
 };
-use faber::{display_bivalens, display_fractus};
+use faber::display;
 use radix_host_abi::{
     FaberRtValueKindV1, VALUE_KIND_F16, VALUE_KIND_F32, VALUE_KIND_F64, VALUE_KIND_I1,
     VALUE_KIND_I8, VALUE_KIND_I16, VALUE_KIND_I32, VALUE_KIND_I64, VALUE_KIND_PTR, VALUE_KIND_TEXT,
@@ -304,7 +304,7 @@ fn render_option_payload(
     value: &RuntimeValue,
 ) -> Option<String> {
     let text = match (kind, value) {
-        (VALUE_KIND_I1, RuntimeValue::I1(value)) => display_bivalens(*value != 0).to_owned(),
+        (VALUE_KIND_I1, RuntimeValue::I1(value)) => display::bivalens(*value != 0).to_owned(),
         (VALUE_KIND_I8, RuntimeValue::I8(value)) => format!("{value}"),
         (VALUE_KIND_I16, RuntimeValue::I16(value)) => format!("{value}"),
         (VALUE_KIND_I32, RuntimeValue::I32(value)) => format!("{value}"),
@@ -313,8 +313,8 @@ fn render_option_payload(
         (VALUE_KIND_U16, RuntimeValue::U16(value)) => format!("{value}"),
         (VALUE_KIND_U32, RuntimeValue::U32(value)) => format!("{value}"),
         (VALUE_KIND_U64, RuntimeValue::U64(value)) => format!("{value}"),
-        (VALUE_KIND_F32, RuntimeValue::F32(value)) => display_fractus(*value),
-        (VALUE_KIND_F64, RuntimeValue::F64(value)) => display_fractus(*value),
+        (VALUE_KIND_F32, RuntimeValue::F32(value)) => display::fractus(*value),
+        (VALUE_KIND_F64, RuntimeValue::F64(value)) => display::fractus(*value),
         (VALUE_KIND_TEXT, RuntimeValue::Ptr(value)) => render_text_payload(runtime, *value)?,
         (VALUE_KIND_PTR, RuntimeValue::Ptr(value)) => {
             // A `ptr`-kind option may carry a textus payload: the array-option
@@ -343,9 +343,9 @@ fn render_raw_option_payload(
     let bits = option as usize as u64;
     let text = match kind {
         VALUE_KIND_I64 => format!("{}", bits as i64),
-        VALUE_KIND_I1 => display_bivalens(bits != 0).to_owned(),
-        VALUE_KIND_F32 => display_fractus(f32::from_bits(bits as u32)),
-        VALUE_KIND_F64 => display_fractus(f64::from_bits(bits)),
+        VALUE_KIND_I1 => display::bivalens(bits != 0).to_owned(),
+        VALUE_KIND_F32 => display::fractus(f32::from_bits(bits as u32)),
+        VALUE_KIND_F64 => display::fractus(f64::from_bits(bits)),
         // Text payloads may be arena text handles or compiler-owned literal
         // slice descriptors (the `nota_text` pattern); the pointer is only
         // dereferenced through those two known layouts.

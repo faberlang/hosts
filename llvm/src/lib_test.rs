@@ -509,7 +509,7 @@ fn format_single_substitution_scalars_renders_correct_text() {
 /// L28 (ab91f49f, W16): the f32 format carrier keeps the f32 precision —
 /// `0.1f32` renders `0.1`, NOT the `0.10000000149011612` an f64-widened
 /// carrier would produce — and integral f32s keep the `.0` decimal marker
-/// (`display_fractus` semantics, matching the HIR-Rust lane).
+/// (`display::fractus` semantics, matching the HIR-Rust lane).
 #[test]
 fn format_f32_keeps_f32_precision_and_decimal_marker() {
     let mut context = ptr::null_mut();
@@ -4174,7 +4174,7 @@ fn opaque_nota_renders_lista_textus_and_octeti_in_rust_debug_shape() {
 
 /// L10 (fa1a5d8c): numeric `lista` elements render in the Rust oracle's Debug
 /// shape (`[1.0, 4.0, 9.0, 16.0]` / `[2, 3]`), and a `valor` renders via the
-/// oracle's `display_valor` (`42`, `{"alpha": 10}`) with octeti payloads
+/// oracle's `display::valor` (`42`, `{"alpha": 10}`) with octeti payloads
 /// rendering as byte lists (`[222, 173]`, the oracle's `bytes ↦ valor` Lista
 /// Debug shape).
 #[test]
@@ -4231,7 +4231,7 @@ fn opaque_nota_renders_numeric_lista_and_valor_in_rust_debug_shape() {
         Some("[222, 173]".to_owned())
     );
 
-    // valor tabula renders display_valor's map shape.
+    // valor tabula renders display::valor's map shape.
     let mut tabula = std::collections::BTreeMap::new();
     tabula.insert("alpha".to_owned(), faber::Valor::Numerus(10));
     let tabula_valor = convert::store_valor(context, faber::Valor::Tabula(tabula));

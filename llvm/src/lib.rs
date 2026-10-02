@@ -62,7 +62,7 @@ use convert::{
     __faber_rt_v1_valor_i1, __faber_rt_v1_valor_i64, __faber_rt_v1_valor_nihil,
     __faber_rt_v1_valor_text,
 };
-use faber::{Valor, display_bivalens, display_fractus};
+use faber::{Valor, display};
 #[cfg(test)]
 use format::{
     __faber_rt_v1_format_1_ptr_to_ptr, __faber_rt_v1_format_f32, __faber_rt_v1_format_f64,
@@ -569,9 +569,9 @@ pub(crate) fn opaque_value_text(runtime: &RuntimeContext, handle: *mut c_void) -
             // `bytes ↦ valor` boxes the payload; the Rust oracle renders the
             // equivalent `Valor::Lista` of numeri as the byte-list Debug shape,
             // so an octeti payload renders `[222, 173]` rather than
-            // `display_valor`'s `<n bytes>` placeholder.
+            // `display::valor`'s `<n bytes>` placeholder.
             Valor::Octeti(bytes) => format!("{bytes:?}"),
-            other => faber::display_valor(other),
+            other => display::valor(other),
         });
     }
     if let Some(map) = collection_map::find_map(runtime, handle) {
@@ -645,8 +645,12 @@ fn opaque_element_text(
         (radix_host_abi::VALUE_KIND_U64, array::RuntimeValue::U64(value)) => {
             format!("{value}")
         }
-        (radix_host_abi::VALUE_KIND_F32, array::RuntimeValue::F32(value)) => display_fractus(value),
-        (radix_host_abi::VALUE_KIND_F64, array::RuntimeValue::F64(value)) => display_fractus(value),
+        (radix_host_abi::VALUE_KIND_F32, array::RuntimeValue::F32(value)) => {
+            display::fractus(value)
+        }
+        (radix_host_abi::VALUE_KIND_F64, array::RuntimeValue::F64(value)) => {
+            display::fractus(value)
+        }
         _ => return None,
     })
 }
@@ -758,7 +762,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i1(
     context: *mut FaberRtContextV1,
     value: u8,
 ) -> FaberRtStatusV1 {
-    write_diagnostic(context, false, display_bivalens(value != 0))
+    write_diagnostic(context, false, display::bivalens(value != 0))
 }
 
 /// Report an f32 `nota` value.
@@ -771,7 +775,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f32(
     context: *mut FaberRtContextV1,
     value: f32,
 ) -> FaberRtStatusV1 {
-    write_diagnostic(context, false, display_fractus(value))
+    write_diagnostic(context, false, display::fractus(value))
 }
 
 /// Report an f64 `nota` value.
@@ -784,7 +788,7 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_f64(
     context: *mut FaberRtContextV1,
     value: f64,
 ) -> FaberRtStatusV1 {
-    write_diagnostic(context, false, display_fractus(value))
+    write_diagnostic(context, false, display::fractus(value))
 }
 
 /// Report an i8 `nota` value.
