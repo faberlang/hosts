@@ -182,11 +182,26 @@ pub(crate) const V1_TEXT_FIELDS: &[&str] = &[
 
 /// W12 regex conversion surface: the closed-set v1 rows the radix Wasm
 /// emitter emits for `textus ↦ regex` / `ascii ↦ regex` (constant-folding
-/// emits regex literals through the literal table instead). Both rows carry
-/// one text handle in and one regex aggregate handle out.
+/// emits regex literals through the literal table instead), then the regex
+/// operation rows (RX-10e): `matches`, `find` and the match accessors,
+/// `find_all`, `split`, literal and closure `replace`, and `escape`. The
+/// carriers are opaque handles; the engine is `faber::regex` (the native
+/// `regex` crate, RD-8), so the host owns no pattern parser or matcher.
 pub(crate) const V1_REGEX_FIELDS: &[&str] = &[
     "__faber_rt_v1_regex_from_text",
     "__faber_rt_v1_regex_from_ascii",
+    "__faber_rt_v1_regex_matches",
+    "__faber_rt_v1_regex_find",
+    "__faber_rt_v1_regex_find_all",
+    "__faber_rt_v1_regex_split",
+    "__faber_rt_v1_regex_replace",
+    "__faber_rt_v1_regex_replace_each",
+    "__faber_rt_v1_text_escape",
+    "__faber_rt_v1_match_text",
+    "__faber_rt_v1_match_start",
+    "__faber_rt_v1_match_end",
+    "__faber_rt_v1_match_group",
+    "__faber_rt_v1_match_named",
 ];
 
 /// W13 collection surface: the closed-set v1 rows the radix Wasm emitter now
@@ -332,6 +347,10 @@ pub(crate) struct RegexValue {
     /// (matching the shared oracle).
     #[allow(dead_code)]
     pub(crate) flags: Option<String>,
+    /// The program, compiled once when the value is created. `None` only for
+    /// an interned literal row whose pattern the dialect rejects: an
+    /// operation on it is a typed failure, never a silent miss.
+    pub(crate) compiled: Option<faber::Regex>,
 }
 
 /// A host-allocated dynamic value (format results, conversion results, and
@@ -342,6 +361,8 @@ pub(crate) struct RegexValue {
 enum DynamicValue {
     Text(String),
     Regex(RegexValue),
+    /// One regex match (the `find` / `find_all` carrier; RD-3: internal type).
+    Match(faber::Match),
     Collection {
         index: usize,
     },
@@ -501,6 +522,7 @@ impl HostState {
                     let handle =
                         i32::try_from(self.regex_arena.len()).expect("regex arena handle fits i32");
                     self.regex_arena.push(RegexValue {
+                        compiled: faber::Regex::new(&pattern).ok(),
                         pattern: pattern.clone(),
                         flags: flags.clone(),
                     });
@@ -558,8 +580,25 @@ impl HostState {
         pattern: String,
         flags: Option<String>,
     ) -> Result<i32, faber::RegexError> {
-        faber::Regex::new(&pattern)?;
-        Ok(self.alloc_dynamic(DynamicValue::Regex(RegexValue { pattern, flags })))
+        let compiled = Some(faber::Regex::new(&pattern)?);
+        Ok(self.alloc_dynamic(DynamicValue::Regex(RegexValue {
+            pattern,
+            flags,
+            compiled,
+        })))
+    }
+
+    /// Allocate one regex match and return its handle.
+    pub(crate) fn alloc_match(&mut self, found: faber::Match) -> i32 {
+        self.alloc_dynamic(DynamicValue::Match(found))
+    }
+
+    /// Resolve a regex match handle.
+    pub(crate) fn resolve_match(&self, handle: i32) -> Option<&faber::Match> {
+        match self.dynamic.get(&handle) {
+            Some(DynamicValue::Match(found)) => Some(found),
+            _ => None,
+        }
     }
 
     /// Resolve a text handle: an interned text row through the row map, else
@@ -1183,6 +1222,23 @@ pub(crate) fn link_v1_imports(
     // W12 regex conversion rows.
     bind_regex_from_text(linker, "__faber_rt_v1_regex_from_text")?;
     bind_regex_from_text(linker, "__faber_rt_v1_regex_from_ascii")?;
+    // RX-10e regex operation rows over `faber::regex`.
+    bind_regex_matches(linker)?;
+    bind_regex_find(linker)?;
+    bind_regex_find_all(linker)?;
+    bind_regex_split(linker)?;
+    bind_regex_replace(linker)?;
+    bind_regex_replace_each(linker)?;
+    bind_text_escape(linker)?;
+    bind_match_text(linker)?;
+    bind_match_offset(
+        linker,
+        "__faber_rt_v1_match_start",
+        faber::regex::match_start,
+    )?;
+    bind_match_offset(linker, "__faber_rt_v1_match_end", faber::regex::match_end)?;
+    bind_match_group(linker)?;
+    bind_match_named(linker)?;
     // W13 scalar display rows.
     bind_assert(linker, "__faber_rt_v1_assert")?;
     bind_assert_message(linker)?;
@@ -2156,6 +2212,332 @@ fn bind_regex_from_text(
                     format!("`{field}` rejected the pattern: {error}"),
                 )),
             }
+        },
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RX-10e regex operation rows
+// ---------------------------------------------------------------------------
+//
+// Every row is a thin binding over `faber::regex` (the native `regex` crate,
+// RD-8): the host resolves the handles, calls the library function, and
+// allocates the result. Offsets are code points (the library maps them once
+// per call). A `find` or group result is an option handle: an i32-carrying
+// payload null-encodes (the payload handle is the option handle, 0 is none).
+
+/// Resolve a regex handle to its compiled program, or the typed failure.
+fn regex_program(
+    caller: &mut wasmtime::Caller<'_, HostState>,
+    field: &str,
+    handle: i32,
+) -> Result<faber::Regex, wasmtime::Error> {
+    let value = caller.data().resolve_regex(handle).cloned();
+    match value {
+        Some(RegexValue {
+            compiled: Some(program),
+            ..
+        }) => Ok(program),
+        Some(RegexValue { pattern, .. }) => Err(typed_unsupported(
+            caller,
+            format!("`{field}` regex literal {pattern:?} is outside the dialect"),
+        )),
+        None => Err(typed_unsupported(
+            caller,
+            format!("`{field}` received an unknown regex handle"),
+        )),
+    }
+}
+
+/// Resolve a text handle to an owned string, or the typed failure.
+fn text_arg(
+    caller: &mut wasmtime::Caller<'_, HostState>,
+    field: &str,
+    handle: i32,
+) -> Result<String, wasmtime::Error> {
+    match caller.data().resolve_text(handle).map(str::to_owned) {
+        Some(text) => Ok(text),
+        None => Err(typed_unsupported(
+            caller,
+            format!("`{field}` received an unknown text handle"),
+        )),
+    }
+}
+
+/// Resolve a match handle to an owned match, or the typed failure.
+fn match_arg(
+    caller: &mut wasmtime::Caller<'_, HostState>,
+    field: &str,
+    handle: i32,
+) -> Result<faber::Match, wasmtime::Error> {
+    match caller.data().resolve_match(handle).cloned() {
+        Some(found) => Ok(found),
+        None => Err(typed_unsupported(
+            caller,
+            format!("`{field}` received an unknown match handle"),
+        )),
+    }
+}
+
+/// Encode an optional text as the null-encoded option handle.
+fn optional_text_handle(state: &mut HostState, text: Option<String>) -> i32 {
+    let payload = text.map(|text| RuntimeValue::Handle(state.alloc_text(text)));
+    state.option_result(VALUE_KIND_TEXT, payload)
+}
+
+/// `regex_matches (param i32 i32) (result i32)`: regex, text -> bivalens.
+fn bind_regex_matches(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_matches";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            Ok(i32::from(faber::regex::matches(&program, &text)))
+        },
+    )?;
+    Ok(())
+}
+
+/// `regex_find (param i32 i32) (result i32)`: regex, text -> `match ∪ none`.
+fn bind_regex_find(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_find";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            let state = caller.data_mut();
+            let payload = faber::regex::find(&program, &text)
+                .map(|found| RuntimeValue::Handle(state.alloc_match(found)));
+            Ok(state.option_result(VALUE_KIND_PTR, payload))
+        },
+    )?;
+    Ok(())
+}
+
+/// `regex_find_all (param i32 i32) (result i32)`: regex, text -> `lista` of
+/// match handles.
+fn bind_regex_find_all(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_find_all";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            let state = caller.data_mut();
+            let handles = faber::regex::find_all(&program, &text)
+                .into_iter()
+                .map(|found| RuntimeValue::Handle(state.alloc_match(found)))
+                .collect();
+            Ok(state.alloc_collection(false, VALUE_KIND_PTR, handles))
+        },
+    )?;
+    Ok(())
+}
+
+/// `regex_split (param i32 i32) (result i32)`: regex, text -> `lista` of
+/// text handles.
+fn bind_regex_split(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_split";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            let state = caller.data_mut();
+            let pieces = faber::regex::split(&program, &text)
+                .into_iter()
+                .map(|piece| RuntimeValue::Handle(state.alloc_text(piece)))
+                .collect();
+            Ok(state.alloc_collection(false, VALUE_KIND_TEXT, pieces))
+        },
+    )?;
+    Ok(())
+}
+
+/// `regex_replace (param i32 i32 i32) (result i32)`: regex, text,
+/// replacement (taken literally) -> text.
+fn bind_regex_replace(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_replace";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32,
+              replacement: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            let replacement = text_arg(&mut caller, FIELD, replacement)?;
+            let replaced = faber::regex::replace(&program, &text, &replacement);
+            Ok(caller.data_mut().alloc_text(replaced))
+        },
+    )?;
+    Ok(())
+}
+
+/// `regex_replace_each (param i32 i32 i32) (result i32)`: regex, text,
+/// `lista` of replacement texts -> text. The lowered closure form runs the
+/// closure once per match of the `find_all` iteration; the i-th result
+/// replaces the i-th match, literally.
+fn bind_regex_replace_each(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_regex_replace_each";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              regex: i32,
+              text: i32,
+              replacements: i32|
+              -> Result<i32, wasmtime::Error> {
+            let program = regex_program(&mut caller, FIELD, regex)?;
+            let text = text_arg(&mut caller, FIELD, text)?;
+            let handles = caller.data().find_collection(replacements).map(|list| {
+                list.values
+                    .iter()
+                    .map(|value| match value {
+                        RuntimeValue::Handle(handle) => Some(*handle),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<i32>>>()
+            });
+            let Some(Some(handles)) = handles else {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("`{FIELD}` replacements are not a lista of text handles"),
+                ));
+            };
+            let mut pieces = Vec::with_capacity(handles.len());
+            for handle in handles {
+                pieces.push(text_arg(&mut caller, FIELD, handle)?);
+            }
+            let next = std::cell::Cell::new(0usize);
+            let replaced = faber::regex::replace_with(&program, &text, |_| {
+                let index = next.get();
+                next.set(index + 1);
+                pieces.get(index).cloned().unwrap_or_default()
+            });
+            if next.get() != pieces.len() {
+                return Err(typed_unsupported(
+                    &mut caller,
+                    format!("`{FIELD}` replacement count does not match the matches"),
+                ));
+            }
+            Ok(caller.data_mut().alloc_text(replaced))
+        },
+    )?;
+    Ok(())
+}
+
+/// `text_escape (param i32) (result i32)`: text -> a pattern text matching it
+/// literally.
+fn bind_text_escape(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_text_escape";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              text: i32|
+              -> Result<i32, wasmtime::Error> {
+            let text = text_arg(&mut caller, FIELD, text)?;
+            Ok(caller.data_mut().alloc_text(faber::regex::escape(&text)))
+        },
+    )?;
+    Ok(())
+}
+
+/// `match_text (param i32) (result i32)`: match -> the matched text.
+fn bind_match_text(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_match_text";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              found: i32|
+              -> Result<i32, wasmtime::Error> {
+            let found = match_arg(&mut caller, FIELD, found)?;
+            Ok(caller
+                .data_mut()
+                .alloc_text(faber::regex::match_text(&found)))
+        },
+    )?;
+    Ok(())
+}
+
+/// `match_start` / `match_end (param i32) (result i64)`: match -> code-point
+/// offset (half-open).
+fn bind_match_offset(
+    linker: &mut Linker<HostState>,
+    field: &'static str,
+    offset: fn(&faber::Match) -> i64,
+) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        field,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              found: i32|
+              -> Result<i64, wasmtime::Error> {
+            let found = match_arg(&mut caller, field, found)?;
+            Ok(offset(&found))
+        },
+    )?;
+    Ok(())
+}
+
+/// `match_group (param i32 i64) (result i32)`: match, group index ->
+/// `textus ∪ none` (none past the last group or for a group that did not
+/// take part).
+fn bind_match_group(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_match_group";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              found: i32,
+              index: i64|
+              -> Result<i32, wasmtime::Error> {
+            let found = match_arg(&mut caller, FIELD, found)?;
+            let group = faber::regex::match_group(&found, index);
+            Ok(optional_text_handle(caller.data_mut(), group))
+        },
+    )?;
+    Ok(())
+}
+
+/// `match_named (param i32 i32) (result i32)`: match, group name ->
+/// `textus ∪ none`.
+fn bind_match_named(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    const FIELD: &str = "__faber_rt_v1_match_named";
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        FIELD,
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              found: i32,
+              name: i32|
+              -> Result<i32, wasmtime::Error> {
+            let found = match_arg(&mut caller, FIELD, found)?;
+            let name = text_arg(&mut caller, FIELD, name)?;
+            let group = faber::regex::match_named(&found, &name);
+            Ok(optional_text_handle(caller.data_mut(), group))
         },
     )?;
     Ok(())
