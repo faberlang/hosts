@@ -541,7 +541,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_f32(&result))
+            Some(from_tensor_f32(&result).ok()?)
         }
         radix_host_abi::VALUE_KIND_F64 => {
             let lhs = to_tensor_f64(left)?;
@@ -552,7 +552,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_f64(&result))
+            Some(from_tensor_f64(&result).ok()?)
         }
         radix_host_abi::VALUE_KIND_I64 => {
             let lhs = to_tensor_i64(left)?;
@@ -563,7 +563,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_i64(&result))
+            Some(from_tensor_i64(&result).ok()?)
         }
         radix_host_abi::VALUE_KIND_I32 => {
             let lhs = to_tensor_i32(left)?;
@@ -574,7 +574,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_i32(&result))
+            Some(from_tensor_i32(&result).ok()?)
         }
         radix_host_abi::VALUE_KIND_U8 => {
             let lhs = to_tensor_u8(left)?;
@@ -585,7 +585,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_u8(&result))
+            Some(from_tensor_u8(&result).ok()?)
         }
         radix_host_abi::VALUE_KIND_U16 => {
             let lhs = to_tensor_u16(left)?;
@@ -596,7 +596,7 @@ fn apply_binary(
                 BinaryOp::Mul => lhs.multiplica(&rhs).ok()?,
                 BinaryOp::MatMul => lhs.matmul(&rhs).ok()?,
             };
-            Some(from_tensor_u16(&result))
+            Some(from_tensor_u16(&result).ok()?)
         }
         _ => None,
     }
@@ -606,48 +606,48 @@ fn to_tensor_f32(tensor: &RuntimeTensor) -> Option<Tensor<f32>> {
     Tensor::structa(tensor.data.as_f32()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_f32(tensor: &Tensor<f32>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::F32(tensor.planata()))
+fn from_tensor_f32(tensor: &Tensor<f32>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::F32(tensor.planata()?)))
 }
 
 fn to_tensor_f64(tensor: &RuntimeTensor) -> Option<Tensor<f64>> {
     Tensor::structa(tensor.data.as_f64()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_f64(tensor: &Tensor<f64>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::F64(tensor.planata()))
+fn from_tensor_f64(tensor: &Tensor<f64>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::F64(tensor.planata()?)))
 }
 
 fn to_tensor_i64(tensor: &RuntimeTensor) -> Option<Tensor<i64>> {
     Tensor::structa(tensor.data.as_i64()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_i64(tensor: &Tensor<i64>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::I64(tensor.planata()))
+fn from_tensor_i64(tensor: &Tensor<i64>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::I64(tensor.planata()?)))
 }
 
 fn to_tensor_i32(tensor: &RuntimeTensor) -> Option<Tensor<i32>> {
     Tensor::structa(tensor.data.as_i32()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_i32(tensor: &Tensor<i32>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::I32(tensor.planata()))
+fn from_tensor_i32(tensor: &Tensor<i32>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::I32(tensor.planata()?)))
 }
 
 fn to_tensor_u8(tensor: &RuntimeTensor) -> Option<Tensor<u8>> {
     Tensor::structa(tensor.data.as_u8()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_u8(tensor: &Tensor<u8>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::U8(tensor.planata()))
+fn from_tensor_u8(tensor: &Tensor<u8>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::U8(tensor.planata()?)))
 }
 
 fn to_tensor_u16(tensor: &RuntimeTensor) -> Option<Tensor<u16>> {
     Tensor::structa(tensor.data.as_u16()?.to_vec(), &tensor.shape).ok()
 }
 
-fn from_tensor_u16(tensor: &Tensor<u16>) -> (Vec<i64>, RuntimeCells) {
-    (tensor.magnitudines(), RuntimeCells::U16(tensor.planata()))
+fn from_tensor_u16(tensor: &Tensor<u16>) -> Result<(Vec<i64>, RuntimeCells), &'static str> {
+    Ok((tensor.magnitudines(), RuntimeCells::U16(tensor.planata()?)))
 }
 
 /// Elementwise add with broadcast.
@@ -745,12 +745,24 @@ pub unsafe extern "C" fn __faber_rt_v1_tensor_mean(
 
 fn tensor_sum_value(tensor: &RuntimeTensor) -> Option<RuntimeValue> {
     match tensor.kind {
-        radix_host_abi::VALUE_KIND_F32 => Some(RuntimeValue::F32(to_tensor_f32(tensor)?.summa())),
-        radix_host_abi::VALUE_KIND_F64 => Some(RuntimeValue::F64(to_tensor_f64(tensor)?.summa())),
-        radix_host_abi::VALUE_KIND_I64 => Some(RuntimeValue::I64(to_tensor_i64(tensor)?.summa())),
-        radix_host_abi::VALUE_KIND_I32 => Some(RuntimeValue::I32(to_tensor_i32(tensor)?.summa())),
-        radix_host_abi::VALUE_KIND_U8 => Some(RuntimeValue::U8(to_tensor_u8(tensor)?.summa())),
-        radix_host_abi::VALUE_KIND_U16 => Some(RuntimeValue::U16(to_tensor_u16(tensor)?.summa())),
+        radix_host_abi::VALUE_KIND_F32 => {
+            Some(RuntimeValue::F32(to_tensor_f32(tensor)?.summa().ok()?))
+        }
+        radix_host_abi::VALUE_KIND_F64 => {
+            Some(RuntimeValue::F64(to_tensor_f64(tensor)?.summa().ok()?))
+        }
+        radix_host_abi::VALUE_KIND_I64 => {
+            Some(RuntimeValue::I64(to_tensor_i64(tensor)?.summa().ok()?))
+        }
+        radix_host_abi::VALUE_KIND_I32 => {
+            Some(RuntimeValue::I32(to_tensor_i32(tensor)?.summa().ok()?))
+        }
+        radix_host_abi::VALUE_KIND_U8 => {
+            Some(RuntimeValue::U8(to_tensor_u8(tensor)?.summa().ok()?))
+        }
+        radix_host_abi::VALUE_KIND_U16 => {
+            Some(RuntimeValue::U16(to_tensor_u16(tensor)?.summa().ok()?))
+        }
         _ => None,
     }
 }
@@ -765,7 +777,7 @@ fn tensor_mean_value(tensor: &RuntimeTensor) -> Option<RuntimeValue> {
     }
     match tensor.kind {
         radix_host_abi::VALUE_KIND_F32 => {
-            let sum = to_tensor_f32(tensor)?.summa();
+            let sum = to_tensor_f32(tensor)?.summa().ok()?;
             // SAFETY: casting f64 → f32 truncates the mean result to f32
             // range. This is the element-width contract for the f32 lattice.
             #[allow(clippy::cast_possible_truncation)]
@@ -773,7 +785,7 @@ fn tensor_mean_value(tensor: &RuntimeTensor) -> Option<RuntimeValue> {
             Some(RuntimeValue::F32(value))
         }
         radix_host_abi::VALUE_KIND_F64 => {
-            let sum = to_tensor_f64(tensor)?.summa();
+            let sum = to_tensor_f64(tensor)?.summa().ok()?;
             Some(RuntimeValue::F64(sum / n))
         }
         // Integer mean promotes to f64 carrier storage as f64 RuntimeValue is
@@ -943,3 +955,7 @@ pub(super) fn tensor_to_runtime_values(
 ) -> Option<(Vec<i64>, Vec<RuntimeValue>)> {
     Some((tensor.shape.clone(), tensor.data.to_values()))
 }
+
+#[cfg(test)]
+#[path = "tensor_test.rs"]
+mod tests;

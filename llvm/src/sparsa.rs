@@ -283,33 +283,49 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_densify(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         let densified = match sparse {
-            RuntimeSparse::F32(value) => value.densata().ok().map(|dense| {
-                (
+            RuntimeSparse::F32(value) => value.densata().ok().and_then(|dense| {
+                let data = match dense.planata() {
+                    Ok(data) => data,
+                    Err(_) => return None,
+                };
+                Some((
                     VALUE_KIND_F32,
                     dense.magnitudines(),
-                    dense.planata().into_iter().map(RuntimeValue::F32).collect(),
-                )
+                    data.into_iter().map(RuntimeValue::F32).collect(),
+                ))
             }),
-            RuntimeSparse::F64(value) => value.densata().ok().map(|dense| {
-                (
+            RuntimeSparse::F64(value) => value.densata().ok().and_then(|dense| {
+                let data = match dense.planata() {
+                    Ok(data) => data,
+                    Err(_) => return None,
+                };
+                Some((
                     VALUE_KIND_F64,
                     dense.magnitudines(),
-                    dense.planata().into_iter().map(RuntimeValue::F64).collect(),
-                )
+                    data.into_iter().map(RuntimeValue::F64).collect(),
+                ))
             }),
-            RuntimeSparse::I32(value) => value.densata().ok().map(|dense| {
-                (
+            RuntimeSparse::I32(value) => value.densata().ok().and_then(|dense| {
+                let data = match dense.planata() {
+                    Ok(data) => data,
+                    Err(_) => return None,
+                };
+                Some((
                     VALUE_KIND_I32,
                     dense.magnitudines(),
-                    dense.planata().into_iter().map(RuntimeValue::I32).collect(),
-                )
+                    data.into_iter().map(RuntimeValue::I32).collect(),
+                ))
             }),
-            RuntimeSparse::I64(value) => value.densata().ok().map(|dense| {
-                (
+            RuntimeSparse::I64(value) => value.densata().ok().and_then(|dense| {
+                let data = match dense.planata() {
+                    Ok(data) => data,
+                    Err(_) => return None,
+                };
+                Some((
                     VALUE_KIND_I64,
                     dense.magnitudines(),
-                    dense.planata().into_iter().map(RuntimeValue::I64).collect(),
-                )
+                    data.into_iter().map(RuntimeValue::I64).collect(),
+                ))
             }),
         };
         let Some((kind, shape, data)) = densified else {
@@ -339,7 +355,7 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
             return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         let sparse = match kind {
-            VALUE_KIND_F32 => match values
+            VALUE_KIND_F32 => values
                 .iter()
                 .map(|value| match value {
                     RuntimeValue::F32(value) => Some(*value),
@@ -347,11 +363,11 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
                 })
                 .collect::<Option<Vec<_>>>()
                 .and_then(|data| Tensor::structa(data, &shape).ok())
-            {
-                Some(dense) => RuntimeSparse::F32(Sparsa::from_tensor(&dense)),
-                None => return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT),
-            },
-            VALUE_KIND_F64 => match values
+                .and_then(|dense| match Sparsa::from_tensor(&dense) {
+                    Ok(sparse) => Some(RuntimeSparse::F32(sparse)),
+                    Err(_) => None,
+                }),
+            VALUE_KIND_F64 => values
                 .iter()
                 .map(|value| match value {
                     RuntimeValue::F64(value) => Some(*value),
@@ -359,11 +375,11 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
                 })
                 .collect::<Option<Vec<_>>>()
                 .and_then(|data| Tensor::structa(data, &shape).ok())
-            {
-                Some(dense) => RuntimeSparse::F64(Sparsa::from_tensor(&dense)),
-                None => return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT),
-            },
-            VALUE_KIND_I32 => match values
+                .and_then(|dense| match Sparsa::from_tensor(&dense) {
+                    Ok(sparse) => Some(RuntimeSparse::F64(sparse)),
+                    Err(_) => None,
+                }),
+            VALUE_KIND_I32 => values
                 .iter()
                 .map(|value| match value {
                     RuntimeValue::I32(value) => Some(*value),
@@ -371,11 +387,11 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
                 })
                 .collect::<Option<Vec<_>>>()
                 .and_then(|data| Tensor::structa(data, &shape).ok())
-            {
-                Some(dense) => RuntimeSparse::I32(Sparsa::from_tensor(&dense)),
-                None => return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT),
-            },
-            VALUE_KIND_I64 => match values
+                .and_then(|dense| match Sparsa::from_tensor(&dense) {
+                    Ok(sparse) => Some(RuntimeSparse::I32(sparse)),
+                    Err(_) => None,
+                }),
+            VALUE_KIND_I64 => values
                 .iter()
                 .map(|value| match value {
                     RuntimeValue::I64(value) => Some(*value),
@@ -383,11 +399,14 @@ pub unsafe extern "C" fn __faber_rt_v1_sparse_from_tensor(
                 })
                 .collect::<Option<Vec<_>>>()
                 .and_then(|data| Tensor::structa(data, &shape).ok())
-            {
-                Some(dense) => RuntimeSparse::I64(Sparsa::from_tensor(&dense)),
-                None => return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT),
-            },
-            _ => return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT),
+                .and_then(|dense| match Sparsa::from_tensor(&dense) {
+                    Ok(sparse) => Some(RuntimeSparse::I64(sparse)),
+                    Err(_) => None,
+                }),
+            _ => None,
+        };
+        let Some(sparse) = sparse else {
+            return FaberRtPtrResultV1::failure(STATUS_INVALID_ARGUMENT);
         };
         store_sparse(runtime, sparse)
     })
