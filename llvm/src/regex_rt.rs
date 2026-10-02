@@ -369,7 +369,7 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_replace_each(
 ///
 /// `context` must be live and `text` a readable `textus` carrier.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_escape(
+pub unsafe extern "C" fn __faber_rt_v1_text_escape(
     context: *mut FaberRtContextV1,
     text: *const FaberRtSliceV1,
 ) -> FaberRtPtrResultV1 {
@@ -401,7 +401,7 @@ fn with_match(
 ///
 /// `context` must be live and `found` a match handle from this runtime.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_match_text(
+pub unsafe extern "C" fn __faber_rt_v1_match_text(
     context: *mut FaberRtContextV1,
     found: *mut c_void,
 ) -> FaberRtPtrResultV1 {
@@ -432,9 +432,9 @@ fn match_offset(
 ///
 /// # Safety
 ///
-/// As [`__faber_rt_v1_regex_match_text`]; `out` is a writable `i64`.
+/// As [`__faber_rt_v1_match_text`]; `out` is a writable `i64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_match_start(
+pub unsafe extern "C" fn __faber_rt_v1_match_start(
     context: *mut FaberRtContextV1,
     found: *mut c_void,
     out: *mut i64,
@@ -446,9 +446,9 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_match_start(
 ///
 /// # Safety
 ///
-/// As [`__faber_rt_v1_regex_match_start`].
+/// As [`__faber_rt_v1_match_start`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_match_end(
+pub unsafe extern "C" fn __faber_rt_v1_match_end(
     context: *mut FaberRtContextV1,
     found: *mut c_void,
     out: *mut i64,
@@ -460,9 +460,9 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_match_end(
 ///
 /// # Safety
 ///
-/// As [`__faber_rt_v1_regex_match_text`].
+/// As [`__faber_rt_v1_match_text`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_match_group(
+pub unsafe extern "C" fn __faber_rt_v1_match_group(
     context: *mut FaberRtContextV1,
     found: *mut c_void,
     index: i64,
@@ -476,9 +476,9 @@ pub unsafe extern "C" fn __faber_rt_v1_regex_match_group(
 ///
 /// # Safety
 ///
-/// As [`__faber_rt_v1_regex_match_text`]; `name` is a readable `textus`.
+/// As [`__faber_rt_v1_match_text`]; `name` is a readable `textus`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __faber_rt_v1_regex_match_named(
+pub unsafe extern "C" fn __faber_rt_v1_match_named(
     context: *mut FaberRtContextV1,
     found: *mut c_void,
     name: *const FaberRtSliceV1,

@@ -106,22 +106,22 @@ fn find_reads_code_point_offsets_groups_and_names() {
     let found = unsafe { __faber_rt_v1_regex_find(context, pair, &raw const haystack) };
     assert_eq!(found.status, STATUS_OK);
     assert_eq!(
-        read(unsafe { __faber_rt_v1_regex_match_text(context, found.value) }.value),
+        read(unsafe { __faber_rt_v1_match_text(context, found.value) }.value),
         "ab="
     );
     let (mut start, mut end) = (0i64, 0i64);
     unsafe {
         assert_eq!(
-            __faber_rt_v1_regex_match_start(context, found.value, &raw mut start),
+            __faber_rt_v1_match_start(context, found.value, &raw mut start),
             STATUS_OK
         );
         assert_eq!(
-            __faber_rt_v1_regex_match_end(context, found.value, &raw mut end),
+            __faber_rt_v1_match_end(context, found.value, &raw mut end),
             STATUS_OK
         );
     }
     assert_eq!((start, end), (3, 6));
-    let group = |index| unsafe { __faber_rt_v1_regex_match_group(context, found.value, index) };
+    let group = |index| unsafe { __faber_rt_v1_match_group(context, found.value, index) };
     assert_eq!(read(group(0).value), "ab=");
     assert_eq!(read(group(1).value), "ab");
     // a group that did not take part, and an index past the last group
@@ -130,10 +130,10 @@ fn find_reads_code_point_offsets_groups_and_names() {
     assert!(group(9).value.is_null());
     assert!(group(-1).value.is_null());
     let key = text(b"key");
-    let named = unsafe { __faber_rt_v1_regex_match_named(context, found.value, &raw const key) };
+    let named = unsafe { __faber_rt_v1_match_named(context, found.value, &raw const key) };
     assert_eq!(read(named.value), "ab");
     let nope = text(b"nope");
-    let unknown = unsafe { __faber_rt_v1_regex_match_named(context, found.value, &raw const nope) };
+    let unknown = unsafe { __faber_rt_v1_match_named(context, found.value, &raw const nope) };
     assert!(unknown.value.is_null());
     unsafe { __faber_rt_v1_shutdown(context) };
 }
@@ -165,8 +165,8 @@ fn find_all_skips_an_empty_match_that_abuts_the_previous_one() {
         };
         let (mut start, mut end) = (0i64, 0i64);
         unsafe {
-            __faber_rt_v1_regex_match_start(context, handle, &raw mut start);
-            __faber_rt_v1_regex_match_end(context, handle, &raw mut end);
+            __faber_rt_v1_match_start(context, handle, &raw mut start);
+            __faber_rt_v1_match_end(context, handle, &raw mut end);
         }
         spans.push((start, end));
     }
@@ -215,7 +215,7 @@ fn split_replace_and_replace_each_run_one_iteration() {
 fn escape_backslashes_the_metacharacters_only() {
     let context = context();
     let input = text("a.b*(c) \u{e9}".as_bytes());
-    let escaped = unsafe { __faber_rt_v1_regex_escape(context, &raw const input) };
+    let escaped = unsafe { __faber_rt_v1_text_escape(context, &raw const input) };
     assert_eq!(read(escaped.value), "a\\.b\\*\\(c\\) \u{e9}");
     unsafe { __faber_rt_v1_shutdown(context) };
 }
@@ -228,7 +228,7 @@ fn operations_reject_an_unknown_handle() {
     let found = unsafe { __faber_rt_v1_regex_find(context, bogus, &raw const haystack) };
     assert_eq!(found.status, STATUS_INVALID_ARGUMENT);
     let mut start = 0i64;
-    let status = unsafe { __faber_rt_v1_regex_match_start(context, bogus, &raw mut start) };
+    let status = unsafe { __faber_rt_v1_match_start(context, bogus, &raw mut start) };
     assert_eq!(status, STATUS_INVALID_ARGUMENT);
     unsafe { __faber_rt_v1_shutdown(context) };
 }
