@@ -113,6 +113,7 @@ fn row_work_census(kernels: &[&Value]) -> RowWorkCensus {
 }
 
 #[test]
+#[ignore = "requires exported GEA3 artifacts via GEA3_ARTIFACT_DIR"]
 fn gea3_pgc_b2_decode_t1_entries_dispatch_the_one_row_workgroup() {
     let plan: Value = serde_json::from_slice(
         &fs::read(gea3_artifact_dir().join(PLAN_MEMBER)).expect("read GEA3 program plan"),
@@ -169,6 +170,7 @@ fn gea3_pgc_b2_decode_t1_entries_dispatch_the_one_row_workgroup() {
 }
 
 #[test]
+#[ignore = "requires exported GEA3 artifacts via GEA3_ARTIFACT_DIR"]
 fn gea3_pgc_b2_decode_row_work_census_counts_useful_versus_dispatched() {
     let plan: Value = serde_json::from_slice(
         &fs::read(gea3_artifact_dir().join(PLAN_MEMBER)).expect("read GEA3 program plan"),
