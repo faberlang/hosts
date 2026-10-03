@@ -196,6 +196,7 @@ fn execute_bucket(root: &Path, expected_extent: u64) -> usize {
 }
 
 #[test]
+#[ignore = "requires exported PGC-B1 artifacts via GEA3_PGC_B1_ARTIFACT_DIR"]
 fn gea3_decode_pgc_b1_dispatches_early_and_late_work_buckets() {
     assert!(LATE_EXTENT >= PREFILL_ROWS + FIXED1000_STEPS as u64);
     let root = artifact_root();

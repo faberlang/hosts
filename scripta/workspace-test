@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Hosts workspace test gate. Run from any directory; tests cover every workspace member.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+cargo test --workspace --no-fail-fast
