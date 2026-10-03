@@ -20,7 +20,10 @@ const BUDGETS: Budgets = Budgets {
     todo: 0,
     unimplemented: 0,
     let_underscore: 0,
-    inline_test_modules: 0,
+    // Ratchet ruling (2026-10-03): 8 is the measured baseline of inline
+    // #[cfg(test)] mod bodies under src/. This budget may only decrease;
+    // never raise it silently.
+    inline_test_modules: 8,
     test_attr_in_production: 0,
 };
 
