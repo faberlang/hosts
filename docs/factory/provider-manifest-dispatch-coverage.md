@@ -23,7 +23,7 @@ claims still require downstream package/export/run evidence outside this repo.
 | --- | --- | ---: | --- | --- | --- |
 | `aleator` | `crates/aleator/src/manifest.json` | 5 | All manifest routes handled by `Aleator::dispatch`: `fractum`, `sortire`, `octetos`, `uuid`, `semina`. `aleator:octetos` rejects requests above the provider-local 1 MiB byte allocation cap before allocating. | `manifest_registers_all_canonical_routes`; seeded integer/bytes reply-shape test; `octetos` zero/negative/over-limit bounds test. | Covered locally. |
 | `consolum` | `crates/consolum/src/manifest.json` | 16 | All manifest routes handled by `Consolum::dispatch`; sync/async pairs share local handlers where appropriate. `consolum:hauri`/`hauriet` reject requests above the provider-local 1 MiB stdin buffer cap before allocating. | Manifest canonical-route/legacy-alias test; terminal predicate shape; opener decoding; stdin read zero/negative/over-limit bounds test; Unix cancellation tests. | Covered locally. |
-| `processus` | `crates/processus/src/manifest.json` | 9 | All manifest routes handled by `Processus::dispatch`: shell, capture, detached spawn, env read, cwd, pid, args. `processus:exi` is intentionally unmanifested and rejected until host exit has a protocol-visible terminal response. `processus:scribe` is intentionally unmanifested and rejected until process-wide environment mutation has a safe serialization policy. | Manifest route count and `exi`/`scribe` exclusion; capture shape; shell stdout; cancellation and descendant termination tests. | Covered locally. |
+| `processus` | `crates/processus/src/manifest.json` | 9 | All manifest routes handled by `Processus::dispatch`: shell, capture, detached spawn, env read, cwd, pid, args. `processus:exi` is intentionally unmanifested and rejected until host exit has a protocol-visible terminal response. `processus:scribe` is retired (ON-H1a) and stays unmanifested and rejected. | Manifest route count and `exi`/`scribe` exclusion; capture shape; shell stdout; cancellation and descendant termination tests. | Covered locally. |
 | `solum` | `crates/solum/src/manifest.json` | 45 | All manifest routes handled by `Solum::dispatch`; `solum:lege` is text-only, while `solum:carpe` carries list-of-text line reads and `solum:hauri`/`solum:hauriet` carry byte reads. `solum:partem` and `solum:inveni` reject bounded ranges above the provider-local 1 MiB allocation cap before allocating. Path helpers and filesystem operations are included. | Manifest canonical-route/legacy-alias test; mode/symlink; range/read/find zero/negative/over-limit bounds; kernel-level read-route contract split; delete/touch error propagation. | Covered locally. |
 | `tempus` | `crates/tempus/src/manifest.json` | 4 | All manifest routes handled by `Tempus::dispatch`: `nunc`, `monotonicum`, `activum`, `dormiet`. | Manifest legacy-alias test; sleep/cancellation; clock scalar shape; invalid duration test. | Covered locally. |
 
@@ -42,9 +42,8 @@ These are intentionally not support claims from this repository:
 
 - Legacy aliases are not manifest routes: `consolum:fundet`, `solum:fundet`,
   `solum:leget`, and `tempus:expectet` remain omitted by tests.
-- `processus:scribe` is not a manifest route: native provider dispatch can run
-  concurrently, and request-scoped host calls must not mutate process-global
-  environment state until a process-wide exclusion policy exists.
+- `processus:scribe` is retired (ON-H1a) and is not a manifest route:
+  process-global environment mutation is not a supported provider surface.
 - Norma source routes that still defer through `mori` are outside this provider
   coverage packet until their manifests, dispatch, and run evidence land.
 - No provider manifest exists here for deferred families such as `arca`,
