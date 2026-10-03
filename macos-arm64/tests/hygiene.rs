@@ -25,6 +25,13 @@ const BUDGETS: Budgets = Budgets {
     // Ratchet ruling (2026-10-03): 8 is the measured baseline of inline
     // #[cfg(test)] mod bodies under src/. This budget may only decrease;
     // never raise it silently.
+    // Correction to 7fa245d's subject: eight module bodies moved out of six
+    // production files. The scanner's observed inline-module count went 8 -> 0;
+    // its observed count of production files containing #[test] went 6 -> 0.
+    // Neither ceiling changed: inline modules stayed at 8, and #[test] stayed
+    // at 0. The claimed "budget 6 -> 0" was a count/ceiling mix-up, not a
+    // ratchet reduction. This correction leaves the ceilings unchanged rather
+    // than changing an assertion to make the historical claim appear true.
     inline_test_modules: 8,
     test_attr_in_production: 0,
 };
