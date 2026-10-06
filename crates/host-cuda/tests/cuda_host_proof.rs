@@ -28,43 +28,23 @@
 //!    If `metal_host.rs` has unconditional `use metal::*`, those must be
 //!    cfg-gated too.
 //!
-//! ## Option A — Split build (recommended for single-GPU setups)
-//!
-//! Emit and lower on a machine with LLVM, run the proof on the GPU machine:
+//! ## Pipeline (GPU machine has everything)
 //!
 //! ```sh
-//! # Step 1: Emit .ll + descriptor (build machine with Rust + radix)
 //! cd /path/to/faberlang/radix
-//! cargo build -p radix --bin radix
 //! ./target/debug/radix emit -t llvm-text \
-//!   --cuda-descriptor /tmp/addita.json \
-//!   corpus/cuda/addita-proof.fab > /tmp/addita.ll
-//!
-//! # Step 2: Lower to PTX (build machine with LLVM NVPTX backend)
-//! clang --target=nvptx64-nvidia-cuda -S -O1 --cuda-feature=+ptx87 \
-//!   -o /tmp/addita.ptx /tmp/addita.ll
-//! # Or: llc -mtriple=nvptx64-nvidia-cuda -mattr=+ptx87 -o /tmp/addita.ptx /tmp/addita.ll
-//!
-//! # Step 3: Copy artifacts to the GPU machine
-//! scp /tmp/addita.ptx /tmp/addita.json pharos:/tmp/
-//!
-//! # Step 4: Build and run the proof (GPU machine)
+//!   --cuda-descriptor /tmp/cuda-g6/<name>.descriptor.json \
+//!   corpus/cuda/<name>.fab > /tmp/cuda-g6/<name>.ll
+//! llc -march=nvptx64 -mcpu=sm_80 -mattr=+ptx87 \
+//!   /tmp/cuda-g6/<name>.ll -o /tmp/cuda-g6/<name>.ptx
 //! cd /path/to/faberlang/hosts
+//! CUDA_PROOF_PTX=/tmp/cuda-g6/<name>.ptx \
+//! CUDA_PROOF_DESCRIPTOR=/tmp/cuda-g6/<name>.descriptor.json \
 //! cargo test -p host-cuda --test cuda_host_proof -- --nocapture
 //! ```
 //!
-//! ## Option B — Full script (GPU machine has everything)
-//!
-//! Run the entire pipeline in one shot:
-//!
-//! ```sh
-//! cd /path/to/faberlang/hosts
-//! ./scripta/cuda-tier-f-proof
-//! ```
-//!
-//! The script builds radix, emits, lowers, builds the host proof, and runs it.
-//! Exit codes: 0 = PASS, 1 = FAIL, 2 = G3 not attempted (no NVPTX backend),
-//! 3 = config error.
+//! `./scripta/cuda-tier-f-proof` (radix repo) drives the whole pipeline for
+//! the `addita` proof row.
 //!
 //! ## Anti-false-green contract
 //!
@@ -75,25 +55,39 @@
 //! `try_open` failure (dlopen/`cuInit` → `E_CUDA_UNAVAILABLE`; later driver
 //! failures → `E_CUDA_DRIVER`).
 //!
-//! The descriptor is the NVVM sidecar (`schema_version` tracks
-//! `NVVM_DESCRIPTOR_SCHEMA_VERSION`, currently 3, target `llvm-nvvm`):
-//! a single `addita` kernel, f32, 4-byte, N elements, 2 input buffers /
-//! 1 output buffer, zero accumulation buffers, per-buffer roles/bindings/
-//! shapes, and explicit `launch` geometry. The G3 launch recipe stays
-//! grid `ceil(N / 256)`, block 256 (independent of the sidecar's workgroup).
+//! ## Descriptor-driven multi-kernel proof
+//!
+//! The harness iterates EVERY kernel the descriptor carries (the corpus
+//! proof files may hold several `@ kernel` functions — the glyph elementwise
+//! proof carries rank-1 and rank-2 hadamard). Each kernel is launched with
+//! its own descriptor launch geometry (recipes are load-bearing: the tiled
+//! matmul needs its `(8, 8, 1)` workgroup over the `(2, 2, 1)` tile grid)
+//! and checked against a per-element host oracle.
+//!
+//! The oracle comes from the descriptor's own typed facts: a recipe kernel's
+//! `plan` (`tiled_matmul` / `tree_reduction` / `transpose`) fully determines
+//! the reference computation, so no kernel-entry keying is needed there.
+//! Elementwise kernels carry no plan fact (the descriptor records none), so
+//! the fixture table below pins the corpus semantics per entry — the same
+//! way the original single-kernel proof pinned `out[i] = a[i] + b[i]` for
+//! `addita`. This is test-fixture oracle pinning only: the compiler and the
+//! host never key device behavior on entry names. An entry outside the
+//! table fails closed (`FAIL: no pinned oracle`), never silently passes.
 
-use host_cuda::{CudaHostSession, NVVM_DESCRIPTOR_SCHEMA_VERSION, NVVM_DESCRIPTOR_TARGET};
+use host_cuda::{
+    CudaHandleId, CudaHostSession, NVVM_DESCRIPTOR_SCHEMA_VERSION, NVVM_DESCRIPTOR_TARGET,
+};
 use serde::Deserialize;
 
 /// Sentinel bit pattern: every output byte is 0xFE. Prefilled into the output
 /// buffer so a no-write or wrong-buffer bug is a hard mismatch, not a false
 /// green.
 const SENTINEL_BITS: u32 = 0xFEFE_FEFE;
-const BLOCK_X: u32 = 256;
-/// Pinned tolerance: `|actual − expected| ≤ 1e-6 * max(1, |expected|)`. Exact
-/// IEEE equality is expected for a single correctly-rounded f32 add; this is a
-/// backstop, not a relaxation.
-const TOLERANCE: f32 = 1e-6;
+/// Pinned tolerance: `|actual − expected| ≤ TOLERANCE * max(1, |expected|)`.
+/// Every oracle input is a small exact integer, so exact-integer results
+/// (add, mul, matmul MACs, chunk sums, transpose copies) must match to the
+/// backstop only; the composed silu polynomial exp is accurate far inside it.
+const TOLERANCE: f32 = 1e-5;
 
 #[derive(Deserialize)]
 struct ProofDescriptor {
@@ -107,13 +101,25 @@ struct ProofKernel {
     entry: String,
     element_type: String,
     element_byte_width: u32,
-    element_count: u64,
     element_counts: Vec<u64>,
     input_buffers: usize,
     output_buffers: usize,
     accumulation_buffers: usize,
     buffers: Vec<ProofBuffer>,
     launch: ProofLaunch,
+    plan: Option<ProofPlan>,
+}
+
+#[derive(Deserialize)]
+struct ProofPlan {
+    kind: String,
+    m: Option<u64>,
+    k: Option<u64>,
+    n: Option<u64>,
+    workgroup_x: Option<u32>,
+    op: Option<String>,
+    length: Option<u64>,
+    partials: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -137,22 +143,403 @@ struct ProofAxis {
     z: u64,
 }
 
-fn exact_f32_sequence_value(index: usize, multiplier: usize, addend: usize) -> f32 {
-    let integer = index
-        .checked_mul(multiplier)
-        .and_then(|value| value.checked_add(addend))
-        .expect("FAIL: proof input sequence overflows host usize");
-    assert!(
-        integer <= 1 << f32::MANTISSA_DIGITS,
-        "FAIL: proof input sequence exceeds f32's exact integer range"
-    );
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "the preceding bound proves this integer is exactly representable as f32"
-    )]
-    {
-        integer as f32
+/// One pinned f32 input sequence: `(i * multiplier + addend) % bound + 1`.
+/// The bound keeps every product the oracles form inside f32's exact-integer
+/// range, so correctly-rounded device arithmetic matches the host reference
+/// exactly and `TOLERANCE` stays a backstop, not a relaxation.
+fn bounded_f32_sequence(len: usize, multiplier: usize, addend: usize, bound: usize) -> Vec<f32> {
+    let values: Vec<usize> = (0..len)
+        .map(|index| (index * multiplier + addend) % bound + 1)
+        .collect();
+    values
+        .into_iter()
+        .map(|value| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "the bound keeps every value a small exact integer"
+            )]
+            {
+                value as f32
+            }
+        })
+        .collect()
+}
+
+/// The pinned addita law (the original G3 goal input): `a[i] = i*3 + 1`,
+/// `b[i] = i*7`. Exact for the proof sizes (the sequence assert below
+/// guards the f32 exact-integer range).
+fn pinned_sequence(len: usize, multiplier: usize, addend: usize) -> Vec<f32> {
+    (0..len)
+        .map(|index| {
+            let integer = index
+                .checked_mul(multiplier)
+                .and_then(|value| value.checked_add(addend))
+                .expect("FAIL: proof input sequence overflows host usize");
+            assert!(
+                integer <= 1 << f32::MANTISSA_DIGITS,
+                "FAIL: proof input sequence exceeds f32's exact integer range"
+            );
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "the preceding bound proves this integer is exactly representable as f32"
+            )]
+            {
+                integer as f32
+            }
+        })
+        .collect()
+}
+
+/// The host oracle for one kernel: deterministic input fills per buffer and
+/// the expected output per output buffer.
+struct KernelOracle {
+    inputs: Vec<Vec<f32>>,
+    expected_outputs: Vec<Vec<f32>>,
+    label: &'static str,
+}
+
+/// The oracle for a recipe kernel, derived from the descriptor's own plan
+/// facts. Missing plan facts fail closed.
+fn plan_oracle(kernel: &ProofKernel) -> Result<KernelOracle, String> {
+    let plan = kernel
+        .plan
+        .as_ref()
+        .ok_or_else(|| "recipe kernel carries no plan fact".to_owned())?;
+    let input_counts: Vec<u64> = kernel
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.role == "input" || buffer.role == "extra-input")
+        .map(|buffer| buffer.element_count)
+        .collect();
+    match plan.kind.as_str() {
+        "tiled_matmul" => {
+            let m = plan.m.ok_or("tiled_matmul plan fact m missing")?;
+            let k = plan.k.ok_or("tiled_matmul plan fact k missing")?;
+            let n = plan.n.ok_or("tiled_matmul plan fact n missing")?;
+            if input_counts.len() != 2
+                || input_counts[0] != m * k
+                || input_counts[1] != k * n
+                || kernel.output_buffers != 1
+                || kernel.buffers.last().map(|b| b.element_count) != Some(m * n)
+            {
+                return Err("tiled_matmul buffer counts contradict the plan M·K/K·N/M·N".to_owned());
+            }
+            let a = pinned_sequence(input_counts[0] as usize, 3, 1);
+            let b = pinned_sequence(input_counts[1] as usize, 7, 0);
+            let mut expected = vec![0.0f32; (m * n) as usize];
+            for i in 0..m as usize {
+                for j in 0..n as usize {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k as usize {
+                        acc += a[i * k as usize + kk] * b[kk * n as usize + j];
+                    }
+                    expected[i * n as usize + j] = acc;
+                }
+            }
+            Ok(KernelOracle {
+                inputs: vec![a, b],
+                expected_outputs: vec![expected],
+                label: "tiled_matmul",
+            })
+        }
+        "tree_reduction" => {
+            let length = plan
+                .length
+                .ok_or("tree_reduction plan fact length missing")?;
+            let partials = plan
+                .partials
+                .ok_or("tree_reduction plan fact partials missing")?;
+            if input_counts.len() != 1
+                || input_counts[0] != length
+                || kernel.output_buffers != 1
+                || kernel.buffers.last().map(|b| b.element_count) != Some(partials)
+                || partials == 0
+                || length < partials
+            {
+                return Err(
+                    "tree_reduction buffer counts contradict the plan length/partials".to_owned(),
+                );
+            }
+            let a = pinned_sequence(length as usize, 3, 1);
+            // The body's grid-stride law: workgroup w reduces its contiguous
+            // leading chunk `[w·chunk, (w+1)·chunk)` (chunk = length /
+            // partials, workgroup_x lanes striding by workgroup_x · partials).
+            let chunk = (length / partials) as usize;
+            let expected = (0..partials as usize)
+                .map(|w| a[w * chunk..(w + 1) * chunk].iter().sum::<f32>())
+                .collect();
+            Ok(KernelOracle {
+                inputs: vec![a],
+                expected_outputs: vec![expected],
+                label: "tree_reduction",
+            })
+        }
+        "transpose" => {
+            let m = plan.m.ok_or("transpose plan fact m missing")?;
+            let n = plan.n.ok_or("transpose plan fact n missing")?;
+            if input_counts.len() != 1
+                || input_counts[0] != m * n
+                || kernel.output_buffers != 1
+                || kernel.buffers.last().map(|b| b.element_count) != Some(m * n)
+            {
+                return Err("transpose buffer counts contradict the plan M·N".to_owned());
+            }
+            let input = pinned_sequence((m * n) as usize, 3, 1);
+            let mut expected = vec![0.0f32; (m * n) as usize];
+            for i in 0..m as usize {
+                for j in 0..n as usize {
+                    expected[j * m as usize + i] = input[i * n as usize + j];
+                }
+            }
+            Ok(KernelOracle {
+                inputs: vec![input],
+                expected_outputs: vec![expected],
+                label: "transpose",
+            })
+        }
+        other => Err(format!("descriptor plan kind {other} has no proof oracle")),
     }
+}
+
+/// The pinned corpus oracle for a plan-less (elementwise) kernel. Keyed by
+/// entry — see the module doc: fixture pinning only, never device behavior.
+fn elementwise_oracle(kernel: &ProofKernel) -> Result<KernelOracle, String> {
+    let input_counts: Vec<u64> = kernel
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.role == "input" || buffer.role == "extra-input")
+        .map(|buffer| buffer.element_count)
+        .collect();
+    let equal_counts = kernel.output_buffers == 1
+        && !input_counts.is_empty()
+        && input_counts.iter().all(|count| {
+            *count == input_counts[0]
+                && Some(*count) == kernel.buffers.last().map(|b| b.element_count)
+        });
+    match kernel.entry.as_str() {
+        // addita-proof: the original pinned G3 law `out[i] = a[i] + b[i]`
+        // over `a[i] = i*3+1`, `b[i] = i*7`.
+        "addita" if equal_counts && input_counts.len() == 2 => {
+            let n = input_counts[0] as usize;
+            let a = pinned_sequence(n, 3, 1);
+            let b = pinned_sequence(n, 7, 0);
+            let expected = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+            Ok(KernelOracle {
+                inputs: vec![a, b],
+                expected_outputs: vec![expected],
+                label: "elementwise add (pinned addita law)",
+            })
+        }
+        // glyph-elementwise-proof: rank-1 and rank-2 hadamard products.
+        // The bounded law keeps products inside f32's exact-integer range.
+        "hadamard" | "hadamard_rank2" if equal_counts && input_counts.len() == 2 => {
+            let n = input_counts[0] as usize;
+            let a = bounded_f32_sequence(n, 3, 1, 16);
+            let b = bounded_f32_sequence(n, 7, 0, 16);
+            let expected = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+            Ok(KernelOracle {
+                inputs: vec![a, b],
+                expected_outputs: vec![expected],
+                label: "elementwise mul (hadamard)",
+            })
+        }
+        // silu-proof: the composed activation x/(1+exp(−x)).
+        "silu" if equal_counts && input_counts.len() == 1 => {
+            let n = input_counts[0] as usize;
+            let x = pinned_sequence(n, 3, 1);
+            let expected = x
+                .iter()
+                .map(|value| value / (1.0 + (-value).exp()))
+                .collect();
+            Ok(KernelOracle {
+                inputs: vec![x],
+                expected_outputs: vec![expected],
+                label: "elementwise silu (composed)",
+            })
+        }
+        _ => Err(format!(
+            "no pinned oracle for kernel entry `{}` ({} inputs, {} output, plan {:?}) — \
+             extend the elementwise fixture table",
+            kernel.entry,
+            input_counts.len(),
+            kernel.output_buffers,
+            kernel.plan.as_ref().map(|plan| plan.kind.as_str()),
+        )),
+    }
+}
+
+fn assert_common_kernel_facts(kernel: &ProofKernel) {
+    assert_eq!(
+        kernel.element_type, "f32",
+        "FAIL: proof fixture element type {}",
+        kernel.element_type
+    );
+    assert_eq!(
+        kernel.element_byte_width, 4,
+        "FAIL: proof fixture element byte width {}",
+        kernel.element_byte_width
+    );
+    assert_eq!(
+        kernel.accumulation_buffers, 0,
+        "FAIL: proof fixture accumulation_buffers {}",
+        kernel.accumulation_buffers
+    );
+    let expected_buffer_count =
+        kernel.input_buffers + kernel.output_buffers + kernel.accumulation_buffers;
+    assert_eq!(
+        kernel.buffers.len(),
+        expected_buffer_count,
+        "FAIL: kernel {} buffers.len() {} != input+output+accumulation {}",
+        kernel.entry,
+        kernel.buffers.len(),
+        expected_buffer_count
+    );
+    assert_eq!(
+        kernel.element_counts.len(),
+        kernel.buffers.len(),
+        "FAIL: kernel {} element_counts.len() {} != buffers.len() {}",
+        kernel.entry,
+        kernel.element_counts.len(),
+        kernel.buffers.len()
+    );
+    // The launch passes device buffers positionally in binding order; the
+    // descriptor must carry the identity binding map.
+    for (index, buffer) in kernel.buffers.iter().enumerate() {
+        assert_eq!(
+            buffer.binding, index as u32,
+            "FAIL: kernel {} buffer position {index} carries binding {} (identity order required)",
+            kernel.entry, buffer.binding
+        );
+        assert_eq!(
+            kernel.element_counts[index], buffer.element_count,
+            "FAIL: kernel {} element_counts[{index}] {} != buffer binding {} count {}",
+            kernel.entry, kernel.element_counts[index], buffer.binding, buffer.element_count
+        );
+        let shape_product = buffer.shape.iter().product::<u64>();
+        assert_eq!(
+            shape_product, buffer.element_count,
+            "FAIL: kernel {} buffer binding {} shape {:?} product {shape_product} != element_count {}",
+            kernel.entry, buffer.binding, buffer.shape, buffer.element_count
+        );
+        assert!(
+            buffer.element_count > 0,
+            "FAIL: kernel {} buffer binding {} is empty",
+            kernel.entry,
+            buffer.binding
+        );
+    }
+    for (label, axis) in [
+        ("workgroup", &kernel.launch.workgroup),
+        ("dispatch", &kernel.launch.dispatch),
+    ] {
+        assert!(
+            axis.x > 0 && axis.y > 0 && axis.z > 0,
+            "FAIL: kernel {} launch.{label} has a zero axis ({}, {}, {})",
+            kernel.entry,
+            axis.x,
+            axis.y,
+            axis.z
+        );
+        assert!(
+            u32::try_from(axis.x).is_ok()
+                && u32::try_from(axis.y).is_ok()
+                && u32::try_from(axis.z).is_ok(),
+            "FAIL: kernel {} launch.{label} axis does not fit u32 ({}, {}, {})",
+            kernel.entry,
+            axis.x,
+            axis.y,
+            axis.z
+        );
+    }
+}
+
+fn launch_oracle(
+    session: &mut CudaHostSession,
+    module: CudaHandleId,
+    kernel: &ProofKernel,
+    oracle: &KernelOracle,
+) -> Result<(), String> {
+    let mut handles = Vec::with_capacity(kernel.buffers.len());
+    for (index, buffer) in kernel.buffers.iter().enumerate() {
+        let bytes = buffer.element_count as usize * std::mem::size_of::<f32>();
+        let handle = session
+            .alloc_bytes(bytes)
+            .map_err(|error| format!("alloc buffer {}: {}", buffer.binding, error.message))?;
+        if let Some(values) = oracle.inputs.get(index) {
+            session
+                .copy_in_f32(handle, values)
+                .map_err(|error| format!("copy buffer {}: {}", buffer.binding, error.message))?;
+        } else {
+            // Output destination: sentinel prefill so a no-write or
+            // wrong-buffer bug is a hard mismatch, not a false green.
+            let prefill = vec![f32::from_bits(SENTINEL_BITS); buffer.element_count as usize];
+            session.copy_in_f32(handle, &prefill).map_err(|error| {
+                format!("sentinel prefill {}: {}", buffer.binding, error.message)
+            })?;
+        }
+        handles.push(handle);
+    }
+    let launch = &kernel.launch;
+    let grid_x = u32::try_from(launch.dispatch.x).map_err(|_| "dispatch.x does not fit u32")?;
+    let grid_y = u32::try_from(launch.dispatch.y).map_err(|_| "dispatch.y does not fit u32")?;
+    let grid_z = u32::try_from(launch.dispatch.z).map_err(|_| "dispatch.z does not fit u32")?;
+    let block_x = u32::try_from(launch.workgroup.x).map_err(|_| "workgroup.x does not fit u32")?;
+    let block_y = u32::try_from(launch.workgroup.y).map_err(|_| "workgroup.y does not fit u32")?;
+    let block_z = u32::try_from(launch.workgroup.z).map_err(|_| "workgroup.z does not fit u32")?;
+    session
+        .launch_kernel_3d(
+            module,
+            &kernel.entry,
+            &handles,
+            grid_x,
+            grid_y,
+            grid_z,
+            block_x,
+            block_y,
+            block_z,
+        )
+        .map_err(|error| format!("launch_kernel: {}", error.message))?;
+
+    for (index, buffer) in kernel.buffers.iter().enumerate() {
+        let is_output = buffer.role == "output" || buffer.role == "extra-output";
+        let output_slot = index.wrapping_sub(oracle.inputs.len());
+        if !is_output || output_slot >= oracle.expected_outputs.len() {
+            continue;
+        }
+        let expected = &oracle.expected_outputs[output_slot];
+        let values = session
+            .readback_f32(handles[index])
+            .map_err(|error| format!("readback buffer {}: {}", buffer.binding, error.message))?;
+        assert!(
+            values.iter().all(|value| value.to_bits() != SENTINEL_BITS),
+            "FAIL: kernel {} output buffer {} not fully overwritten (0xFE sentinel still present)",
+            kernel.entry,
+            buffer.binding
+        );
+        assert_eq!(
+            values.len(),
+            expected.len(),
+            "FAIL: kernel {} output length {} != expected {}",
+            kernel.entry,
+            values.len(),
+            expected.len()
+        );
+        for (i, (actual, expected)) in values.iter().zip(expected).enumerate() {
+            let tolerance = TOLERANCE * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "FAIL: kernel {} ({}) element {i}: |{actual} − {expected}| > {tolerance}",
+                kernel.entry,
+                oracle.label
+            );
+        }
+    }
+    for handle in handles {
+        session
+            .release(handle)
+            .map_err(|error| format!("release buffer: {}", error.message))?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -188,122 +575,10 @@ fn cuda_driver_api_proof() {
         "FAIL: descriptor target {}",
         descriptor.target
     );
-    assert_eq!(
-        descriptor.kernels.len(),
-        1,
-        "FAIL: proof expects exactly one kernel, got {}",
-        descriptor.kernels.len()
+    assert!(
+        !descriptor.kernels.is_empty(),
+        "FAIL: descriptor carries no kernels"
     );
-    let kernel = &descriptor.kernels[0];
-    assert_eq!(
-        kernel.element_type, "f32",
-        "FAIL: proof fixture element type {}",
-        kernel.element_type
-    );
-    assert_eq!(
-        kernel.element_byte_width, 4,
-        "FAIL: proof fixture element byte width {}",
-        kernel.element_byte_width
-    );
-    assert_eq!(
-        kernel.input_buffers, 2,
-        "FAIL: proof fixture input_buffers {}",
-        kernel.input_buffers
-    );
-    assert_eq!(
-        kernel.output_buffers, 1,
-        "FAIL: proof fixture output_buffers {}",
-        kernel.output_buffers
-    );
-    assert_eq!(
-        kernel.accumulation_buffers, 0,
-        "FAIL: proof fixture accumulation_buffers {}",
-        kernel.accumulation_buffers
-    );
-    let expected_buffer_count =
-        kernel.input_buffers + kernel.output_buffers + kernel.accumulation_buffers;
-    assert_eq!(
-        kernel.buffers.len(),
-        expected_buffer_count,
-        "FAIL: proof fixture buffers.len() {} != input+output+accumulation {}",
-        kernel.buffers.len(),
-        expected_buffer_count
-    );
-    assert_eq!(
-        kernel.element_counts.len(),
-        kernel.buffers.len(),
-        "FAIL: proof fixture element_counts.len() {} != buffers.len() {}",
-        kernel.element_counts.len(),
-        kernel.buffers.len()
-    );
-    let roles: Vec<&str> = kernel
-        .buffers
-        .iter()
-        .map(|buffer| buffer.role.as_str())
-        .collect();
-    assert_eq!(
-        roles,
-        ["input", "extra-input", "output"],
-        "FAIL: proof fixture buffer roles {roles:?}"
-    );
-    let bindings: Vec<u32> = kernel.buffers.iter().map(|buffer| buffer.binding).collect();
-    assert_eq!(
-        bindings,
-        [0, 1, 2],
-        "FAIL: proof fixture buffer bindings {bindings:?}"
-    );
-    for (index, buffer) in kernel.buffers.iter().enumerate() {
-        assert_eq!(
-            kernel.element_counts[index], buffer.element_count,
-            "FAIL: proof fixture element_counts[{index}] {} != buffer binding {} count {}",
-            kernel.element_counts[index], buffer.binding, buffer.element_count
-        );
-        assert_eq!(
-            buffer.shape.len(),
-            1,
-            "FAIL: proof fixture buffer binding {} shape rank {}",
-            buffer.binding,
-            buffer.shape.len()
-        );
-        assert_eq!(
-            buffer.shape[0], buffer.element_count,
-            "FAIL: proof fixture buffer binding {} shape {:?} != element_count {}",
-            buffer.binding, buffer.shape, buffer.element_count
-        );
-        assert_eq!(
-            buffer.element_count, kernel.element_count,
-            "FAIL: proof fixture buffer binding {} element_count {} != kernel element_count {}",
-            buffer.binding, buffer.element_count, kernel.element_count
-        );
-    }
-    for (label, axis) in [
-        ("workgroup", &kernel.launch.workgroup),
-        ("dispatch", &kernel.launch.dispatch),
-    ] {
-        assert!(
-            axis.x > 0 && axis.y > 0 && axis.z > 0,
-            "FAIL: proof fixture launch.{label} has a zero axis ({}, {}, {})",
-            axis.x,
-            axis.y,
-            axis.z
-        );
-        assert!(
-            u32::try_from(axis.x).is_ok()
-                && u32::try_from(axis.y).is_ok()
-                && u32::try_from(axis.z).is_ok(),
-            "FAIL: proof fixture launch.{label} axis does not fit u32 ({}, {}, {})",
-            axis.x,
-            axis.y,
-            axis.z
-        );
-    }
-
-    let n = usize::try_from(kernel.element_count)
-        .expect("FAIL: proof element_count does not fit host usize");
-    assert!(n > 0, "FAIL: proof element_count must be positive");
-    let bytes = n
-        .checked_mul(std::mem::size_of::<f32>())
-        .expect("FAIL: proof byte length overflows host usize");
 
     // Env vars set ⇒ try_open failure is a loud FAIL, never a silent skip.
     let mut session = CudaHostSession::try_open().unwrap_or_else(|error| {
@@ -312,80 +587,41 @@ fn cuda_driver_api_proof() {
             error.code, error.message
         )
     });
-
     let module = session
         .load_module(&ptx)
         .unwrap_or_else(|error| panic!("FAIL: load_module: {}", error.message));
-    let a = session
-        .alloc_bytes(bytes)
-        .unwrap_or_else(|error| panic!("FAIL: alloc a: {}", error.message));
-    let b = session
-        .alloc_bytes(bytes)
-        .unwrap_or_else(|error| panic!("FAIL: alloc b: {}", error.message));
-    let out = session
-        .alloc_bytes(bytes)
-        .unwrap_or_else(|error| panic!("FAIL: alloc out: {}", error.message));
 
-    // Deterministic inputs (pinned by the goal): a[i] = i*3 + 1, b[i] = i*7.
-    let input_a: Vec<f32> = (0..n)
-        .map(|index| exact_f32_sequence_value(index, 3, 1))
-        .collect();
-    let input_b: Vec<f32> = (0..n)
-        .map(|index| exact_f32_sequence_value(index, 7, 0))
-        .collect();
-    session
-        .copy_in_f32(a, &input_a)
-        .unwrap_or_else(|error| panic!("FAIL: copy a: {}", error.message));
-    session
-        .copy_in_f32(b, &input_b)
-        .unwrap_or_else(|error| panic!("FAIL: copy b: {}", error.message));
-
-    // Sentinel discipline: prefill the output destination with 0xFE bytes and
-    // require the kernel to overwrite them.
-    let sentinel = f32::from_bits(SENTINEL_BITS);
-    let prefill = vec![sentinel; n];
-    session
-        .copy_in_f32(out, &prefill)
-        .unwrap_or_else(|error| panic!("FAIL: sentinel prefill: {}", error.message));
-
-    let grid_x =
-        u32::try_from(n.div_ceil(BLOCK_X as usize)).expect("FAIL: proof grid x does not fit u32");
-    session
-        .launch_kernel(module, &kernel.entry, &[a, b, out], grid_x, BLOCK_X)
-        .unwrap_or_else(|error| panic!("FAIL: launch_kernel: {}", error.message));
-
-    let values = session
-        .readback_f32(out)
-        .unwrap_or_else(|error| panic!("FAIL: readback: {}", error.message));
-
-    // The 0xFE sentinel must be gone — a no-write kernel cannot look green.
-    assert!(
-        !values.iter().any(|value| value.to_bits() == SENTINEL_BITS),
-        "FAIL: output destination not overwritten (0xFE sentinel still present)"
-    );
-
-    // Rust reference: out[i] = a[i] + b[i].
-    let expected: Vec<f32> = input_a
-        .iter()
-        .zip(&input_b)
-        .map(|(left, right)| left + right)
-        .collect();
-    assert_eq!(
-        values.len(),
-        expected.len(),
-        "FAIL: result length {} != {}",
-        values.len(),
-        expected.len()
-    );
-    for (i, (actual, expected)) in values.iter().zip(&expected).enumerate() {
-        let tolerance = TOLERANCE * expected.abs().max(1.0);
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "FAIL: element {i}: |{actual} − {expected}| > {tolerance}"
+    for kernel in &descriptor.kernels {
+        assert_common_kernel_facts(kernel);
+        let oracle = if kernel.plan.is_some() {
+            plan_oracle(kernel)
+        } else {
+            elementwise_oracle(kernel)
+        }
+        .unwrap_or_else(|error| panic!("FAIL: kernel {} oracle: {error}", kernel.entry));
+        launch_oracle(&mut session, module, kernel, &oracle)
+            .unwrap_or_else(|error| panic!("FAIL: kernel {}: {error}", kernel.entry));
+        println!(
+            "PASS: kernel {} — {} (grid {}×{}×{}, block {}×{}×{})",
+            kernel.entry,
+            if kernel.plan.is_some() {
+                format!(
+                    "plan {:?}",
+                    kernel.plan.as_ref().map(|plan| plan.kind.clone())
+                )
+            } else {
+                "pinned elementwise oracle".to_owned()
+            },
+            kernel.launch.dispatch.x,
+            kernel.launch.dispatch.y,
+            kernel.launch.dispatch.z,
+            kernel.launch.workgroup.x,
+            kernel.launch.workgroup.y,
+            kernel.launch.workgroup.z,
         );
     }
     println!(
-        "PASS: CUDA proof — entry {} over {n} f32 elements (grid_x={grid_x}, block_x={BLOCK_X}) matched the Rust reference",
-        kernel.entry
+        "PASS: CUDA proof — {} kernel(s) matched their host oracles",
+        descriptor.kernels.len()
     );
 }
