@@ -3985,10 +3985,14 @@ fn bind_tensor_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                 typed_unsupported(&mut caller, "tensor_set index must be a lista of dims")
             })?;
             let Some(offset) = tensor_flat_offset(&shape, &index) else {
-                // Out-of-bounds set mirrors the oracle's no-op (the Rust
-                // runtime latches an error; the display rows read the
-                // original value).
-                return Ok(());
+                // K11: the index form is fatal on every target
+                // (`runner_tensor_ponde_invalid_index`). The checked method
+                // form never reaches this import with a bad index: its helper
+                // branches to `ReturnError` first.
+                return Err(typed_unsupported(
+                    &mut caller,
+                    "tensor ponde invalid index",
+                ));
             };
             let converted = tensor_value_from_carrier(
                 &TensorValue {
