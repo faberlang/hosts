@@ -11,7 +11,7 @@ pub mod composite_host;
 pub use host_cuda as cuda_host;
 pub use host_cuda as cuda_launch_adapter;
 pub use host_device_core::device_descriptor;
-pub mod device_execute;
+pub mod invocation_facts;
 pub mod device_host;
 pub use host_device_core::device_registry;
 pub mod device_runtime_set;

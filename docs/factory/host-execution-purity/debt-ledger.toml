@@ -147,30 +147,6 @@ path = "webgpu-browser/public/src/backend/webgpu-runtime.js"
 symbol = "accumulateGradient"
 
 [[entry]]
-id = "rope-fact-inference"
-class = "model-reconstruction"
-path = "macos-arm64/src/device_execute.rs"
-symbol = "infer_rope_theta"
-
-[[entry]]
-id = "gguf-input-inference"
-class = "model-reconstruction"
-path = "macos-arm64/src/device_execute.rs"
-symbol = "inputs_from_gguf"
-
-[[entry]]
-id = "gguf-tensor-facts"
-class = "model-reconstruction"
-path = "macos-arm64/src/device_execute.rs"
-symbol = "GgufTensorFact"
-
-[[entry]]
-id = "packed-range-inference"
-class = "model-reconstruction"
-path = "macos-arm64/src/device_execute.rs"
-symbol = "packed_format_for_range"
-
-[[entry]]
 id = "coordinator-repack-policy"
 class = "model-reconstruction"
 path = "crates/host-coordinator/src/repack_plan.rs"

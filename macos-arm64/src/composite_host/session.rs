@@ -3194,7 +3194,7 @@ impl<'host> PreparedResidentSession<'host> {
     /// Prepare a resident session while preserving packed weight bytes all the
     /// way into the private ProgramSession buffers. This convenience keeps the
     /// existing CompositeHost f32 API intact for ordinary callers while the
-    /// device-execute weight path uses the neutral byte surface.
+    /// weight upload path uses the neutral byte surface.
     pub fn prepare_with_weight_bytes(
         host: &'host mut super::CompositeHost,
         descriptor: &DeviceDescriptor,

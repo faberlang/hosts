@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use faber_host_macos_arm64::device_execute::prepare_distributed_image;
+use faber_host_macos_arm64::invocation_facts::prepare_distributed_image;
 use faber_host_macos_arm64::distributed_translate::{
     BindPolicy, TranslateError, bind_policy_for_declared_count, bind_translated,
     bind_translated_with_constraints, oq2_default_headroom_policy_bytes,

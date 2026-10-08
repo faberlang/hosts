@@ -27,6 +27,6 @@ close.
 | `wait` | `not_measured` | fused with Metal submit; independent seam deferred |
 | `unattributed` | `not_measured` | no residual subtraction |
 
-The focused `device_execute` unit test proves JSON projection of the new field
+A focused unit test proved JSON projection of the new field
 and preserves the explicit zero compatibility value for the fused wait wire
 field. The zero wire value is not promoted to a measured wait claim.

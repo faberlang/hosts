@@ -9,7 +9,7 @@ use faber_host_macos_arm64::device_descriptor::{
     DeviceBufferLifetime, DeviceBufferRole, DeviceDataType, DeviceDescriptor,
     DeviceProgramLifetime,
 };
-use faber_host_macos_arm64::device_execute::{
+use faber_host_macos_arm64::invocation_facts::{
     DeviceExecuteInvocation, DeviceExecuteInvocationMode,
 };
 use host_coordinator::DeviceBackend;

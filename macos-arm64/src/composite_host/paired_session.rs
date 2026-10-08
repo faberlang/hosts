@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::composite_host::invocation_binding::{RopeConfig, project_invocation_bindings};
 use crate::device_descriptor::{DeviceBufferLifetime, DeviceDescriptor, DeviceProgramLifetime};
-use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
+use crate::invocation_facts::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
 use crate::device_host::{DeviceRuntime, DeviceSession};
 use crate::device_registry::DriverCounters;
 use crate::kernel::{HostError, HostResult};

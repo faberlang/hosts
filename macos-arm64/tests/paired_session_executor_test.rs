@@ -15,8 +15,8 @@ use faber_host_macos_arm64::device_descriptor::{
     DescriptorResult, DeviceBufferInitialization, DeviceBufferLifetime, DeviceBufferRole,
     DeviceDataType, DeviceDescriptor, DeviceProgramLifetime,
 };
-use faber_host_macos_arm64::device_execute::{
-    DeviceExecuteInvocation, DeviceExecuteInvocationMode, DeviceExecuteLifecycle,
+use faber_host_macos_arm64::invocation_facts::{
+    DeviceExecuteInvocation, DeviceExecuteInvocationMode,
 };
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::{FakeMetalDriver, MetalHostSession};
@@ -802,19 +802,6 @@ fn paired_lifecycle_receipt_is_counter_derived() {
     assert_eq!(pair.driver_counters().uploads, 1);
     assert_eq!(pair.weight_uploads(), 1);
     assert_eq!(pair.reset_cleared(), 3);
-
-    let wire = serde_json::to_value(DeviceExecuteLifecycle {
-        prepares: 1,
-        reuses: pair.reuses(),
-        resets: pair.resets(),
-        weight_uploads: pair.weight_uploads(),
-        live_handles: pair.live_handles(),
-        ..DeviceExecuteLifecycle::default()
-    })
-    .expect("encode v2 lifecycle");
-    assert_eq!(wire["weight_uploads"], 1);
-    assert_eq!(wire["module_reloads"], 0);
-    assert_eq!(wire["per_program_reallocs"], 0);
 
     pair.teardown().expect("release");
     assert_eq!(host.device().expect("runtime").live_handle_count(), 0);

@@ -4,8 +4,8 @@
 //! Ingests an admitted FMIR device-section postcard (MD3H-F1 built artifacts)
 //! and produces [`TransactionOperation`] / [`TransactionCommitBoundary`]
 //! mirrors with deterministic canonical bytes. Bind policy maps the translated
-//! virtual partitions onto a discovery snapshot. The `device-execute` CLI
-//! carries the image plus a declared bind count (OQ-5).
+//! virtual partitions onto a discovery snapshot. The distributed-image prepare
+//! takes the image plus a declared bind count (OQ-5).
 //!
 //! ## OQ-2 — translation dependency route
 //!

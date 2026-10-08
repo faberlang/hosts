@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::device_descriptor::{DeviceBufferRole, DeviceDataType, DeviceDescriptor};
-use crate::device_execute::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
+use crate::invocation_facts::{DeviceExecuteInvocation, DeviceExecuteInvocationMode};
 use crate::kernel::{HostError, HostResult};
 
 /// Dense descriptor input name for the token row.

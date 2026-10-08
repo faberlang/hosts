@@ -6,7 +6,7 @@
 //! a bind that claims one physical device per rank. It does not attempt the
 //! eight-physical-device hardware row.
 
-use faber_host_macos_arm64::device_execute::prepare_distributed_image;
+use faber_host_macos_arm64::invocation_facts::prepare_distributed_image;
 use faber_host_macos_arm64::{discover_cuda_snapshot, probe_cuda_environment};
 
 const EIGHT_RANK: &[u8] = include_bytes!("fixtures/md3h/eight-rank.postcard");

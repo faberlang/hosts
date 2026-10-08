@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use faber_host_macos_arm64::device_execute::prepare_distributed_image;
+use faber_host_macos_arm64::invocation_facts::prepare_distributed_image;
 use faber_host_macos_arm64::device_host::DeviceRuntime;
 use faber_host_macos_arm64::distributed_translate::{
     bind_policy_for_declared_count, bind_translated, oq2_default_headroom_policy_bytes,
@@ -317,7 +317,7 @@ fn runpod_cuda_eight_on_two_receipt_is_honest() {
 }
 
 fn snapshot_mapping_rows(
-    _receipt: &faber_host_macos_arm64::device_execute::DistributedPrepareReceipt,
+    _receipt: &faber_host_macos_arm64::invocation_facts::DistributedPrepareReceipt,
     _ids: &[PhysicalDeviceId],
     translated: &faber_host_macos_arm64::distributed_translate::TranslatedDistributedPlan,
     snapshot: &host_coordinator::discovery::DeviceDiscoverySnapshot,
