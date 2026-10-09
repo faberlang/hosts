@@ -2,7 +2,10 @@
 
 use super::array::{RuntimeValue, read_value, valid_kind, write_value};
 use super::format::{find_text, text_value};
-use super::{RuntimeContext, opaque_value_text, unsupported_opaque_diagnostic, write_diagnostic};
+use super::{
+    RuntimeContext, display_tokens, opaque_value_text, unsupported_opaque_diagnostic,
+    write_diagnostic,
+};
 use crate::abi::FaberRtContextV1;
 use crate::abi::{
     FaberRtPtrResultV1, FaberRtStatusV1, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC,
@@ -276,24 +279,33 @@ fn diagnostic_option(
         return STATUS_INVALID_ARGUMENT;
     }
     let runtime = unsafe { &*context.cast::<RuntimeContext>() };
-    if option.is_null() {
-        return write_diagnostic(context, stderr, "nihil");
-    }
-    if let Some(boxed) = find_option(runtime, option) {
-        let Some(value) = &boxed.value else {
-            return write_diagnostic(context, stderr, "nihil");
-        };
-        let Some(text) = render_option_payload(runtime, boxed.kind, value) else {
-            return unsupported_opaque_diagnostic(context);
-        };
-        return write_diagnostic(context, stderr, text);
-    }
-    // Raw null-encoded option: the pointer is the payload (bits for scalar
-    // payloads, the payload handle for `ptr` payloads).
-    let Some(text) = render_raw_option_payload(runtime, option, kind) else {
+    let Some(text) = option_diagnostic_text(runtime, option, kind) else {
         return unsupported_opaque_diagnostic(context);
     };
     write_diagnostic(context, stderr, text)
+}
+
+/// The text of an option diagnostic: the module's `none` word for the null
+/// handle or an empty box, otherwise the rendered payload. `None` for an
+/// opaque payload the host cannot display.
+pub(super) fn option_diagnostic_text(
+    runtime: &RuntimeContext,
+    option: *mut c_void,
+    kind: FaberRtValueKindV1,
+) -> Option<String> {
+    let none = display_tokens::of(runtime).none.to_owned();
+    if option.is_null() {
+        return Some(none);
+    }
+    if let Some(boxed) = find_option(runtime, option) {
+        let Some(value) = &boxed.value else {
+            return Some(none);
+        };
+        return render_option_payload(runtime, boxed.kind, value);
+    }
+    // Raw null-encoded option: the pointer is the payload (bits for scalar
+    // payloads, the payload handle for `ptr` payloads).
+    render_raw_option_payload(runtime, option, kind)
 }
 
 /// Render an arena-boxed option payload (the `Some` case of
@@ -304,7 +316,9 @@ fn render_option_payload(
     value: &RuntimeValue,
 ) -> Option<String> {
     let text = match (kind, value) {
-        (VALUE_KIND_I1, RuntimeValue::I1(value)) => display::bivalens(*value != 0).to_owned(),
+        (VALUE_KIND_I1, RuntimeValue::I1(value)) => {
+            display::bivalens_with(*value != 0, &display_tokens::of(runtime)).to_owned()
+        }
         (VALUE_KIND_I8, RuntimeValue::I8(value)) => format!("{value}"),
         (VALUE_KIND_I16, RuntimeValue::I16(value)) => format!("{value}"),
         (VALUE_KIND_I32, RuntimeValue::I32(value)) => format!("{value}"),
@@ -343,7 +357,7 @@ fn render_raw_option_payload(
     let bits = option as usize as u64;
     let text = match kind {
         VALUE_KIND_I64 => format!("{}", bits as i64),
-        VALUE_KIND_I1 => display::bivalens(bits != 0).to_owned(),
+        VALUE_KIND_I1 => display::bivalens_with(bits != 0, &display_tokens::of(runtime)).to_owned(),
         VALUE_KIND_F32 => display::fractus(f32::from_bits(bits as u32)),
         VALUE_KIND_F64 => display::fractus(f64::from_bits(bits)),
         // Text payloads may be arena text handles or compiler-owned literal

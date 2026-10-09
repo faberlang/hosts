@@ -4,6 +4,7 @@ mod array_numeric;
 mod cli;
 mod collection_map;
 mod convert;
+mod display_tokens;
 mod failable;
 mod format;
 mod gpu_placement;
@@ -264,6 +265,9 @@ struct RuntimeContext {
     intervals: Vec<StableBox<faber::Intervallum<i64>>>,
     union_boxes: Vec<StableBox<*mut std::ffi::c_void>>,
     sermos: Vec<StableBox<faber::frame::Sermo>>,
+    /// Module display tokens set by `__faber_rt_v1_set_display_tokens`;
+    /// `None` (entry never called) prints the Latin words as before.
+    display_tokens: Option<faber::display::DisplayTokens>,
 }
 
 /// Initialize one process-lifetime LLVM host context.
@@ -324,6 +328,7 @@ pub unsafe extern "C" fn __faber_rt_v1_init(
                 intervals: Vec::new(),
                 union_boxes: Vec::new(),
                 sermos: Vec::new(),
+                display_tokens: None,
             });
             *out_context = Box::into_raw(context).cast();
             STATUS_OK
@@ -571,7 +576,7 @@ pub(crate) fn opaque_value_text(runtime: &RuntimeContext, handle: *mut c_void) -
             // so an octeti payload renders `[222, 173]` rather than
             // `display::valor`'s `<n bytes>` placeholder.
             Valor::Octeti(bytes) => format!("{bytes:?}"),
-            other => display::valor(other),
+            other => display::valor_with(other, &display_tokens::of(runtime)),
         });
     }
     if let Some(map) = collection_map::find_map(runtime, handle) {
@@ -619,7 +624,10 @@ fn opaque_element_text(
             format!("{:?}", payload?)
         }
         (radix_host_abi::VALUE_KIND_I1, array::RuntimeValue::I1(value)) => {
-            format!("{:?}", value != 0)
+            match runtime.display_tokens {
+                Some(tokens) => display::bivalens_with(value != 0, &tokens).to_owned(),
+                None => format!("{:?}", value != 0),
+            }
         }
         (radix_host_abi::VALUE_KIND_I8, array::RuntimeValue::I8(value)) => {
             format!("{value}")
@@ -762,7 +770,11 @@ pub unsafe extern "C" fn __faber_rt_v1_diagnostic_nota_i1(
     context: *mut FaberRtContextV1,
     value: u8,
 ) -> FaberRtStatusV1 {
-    write_diagnostic(context, false, display::bivalens(value != 0))
+    write_diagnostic(
+        context,
+        false,
+        display::bivalens_with(value != 0, &display_tokens::of_context(context)),
+    )
 }
 
 /// Report an f32 `nota` value.

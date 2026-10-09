@@ -5029,3 +5029,154 @@ fn abi_roundtrip_perf_measurement() {
 
     unsafe { __faber_rt_v1_shutdown(context) };
 }
+
+// Module display tokens (need 694b33ce, U8c): the entry
+// `__faber_rt_v1_set_display_tokens` hands the host the module's words; an
+// untouched host keeps printing Latin.
+
+fn init_context() -> *mut FaberRtContextV1 {
+    let mut context = ptr::null_mut();
+    let status = unsafe { __faber_rt_v1_init(0, ptr::null(), &raw mut context) };
+    assert_eq!(status, STATUS_OK);
+    context
+}
+
+fn set_english_tokens(context: *mut FaberRtContextV1) {
+    let true_word = FaberRtSliceV1::from_static(b"true");
+    let false_word = FaberRtSliceV1::from_static(b"false");
+    let none_word = FaberRtSliceV1::from_static(b"none");
+    let tuple_word = FaberRtSliceV1::from_static(b"tuple");
+    let status = unsafe {
+        display_tokens::__faber_rt_v1_set_display_tokens(
+            context,
+            &raw const true_word,
+            &raw const false_word,
+            &raw const none_word,
+            &raw const tuple_word,
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+}
+
+fn option_text(
+    context: *mut FaberRtContextV1,
+    option: *mut c_void,
+    kind: radix_host_abi::FaberRtValueKindV1,
+) -> Option<String> {
+    let runtime = unsafe { &*context.cast::<RuntimeContext>() };
+    option::option_diagnostic_text(runtime, option, kind)
+}
+
+fn opaque_text(context: *mut FaberRtContextV1, handle: *mut c_void) -> Option<String> {
+    let runtime = unsafe { &*context.cast::<RuntimeContext>() };
+    opaque_value_text(runtime, handle)
+}
+
+fn formatted_text(context: *mut FaberRtContextV1, result: FaberRtPtrResultV1) -> String {
+    assert!(result.status.is_ok());
+    let runtime = unsafe { &*context.cast::<RuntimeContext>() };
+    format::find_text(runtime, result.value)
+        .expect("formatted text handle")
+        .value
+        .clone()
+}
+
+#[test]
+fn default_tokens_stay_latin() {
+    let context = init_context();
+    let present = 1usize as *mut c_void;
+    assert_eq!(
+        option_text(context, ptr::null_mut(), radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("nihil")
+    );
+    assert_eq!(
+        option_text(context, present, radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("verum")
+    );
+    let boolean = unsafe { __faber_rt_v1_valor_i1(context, 1) };
+    assert_eq!(
+        opaque_text(context, boolean.value).as_deref(),
+        Some("verum")
+    );
+    let nihil = unsafe { __faber_rt_v1_valor_nihil(context) };
+    assert_eq!(opaque_text(context, nihil.value).as_deref(), Some("nihil"));
+    let template = FaberRtSliceV1::from_static("§".as_bytes());
+    let formatted = unsafe { __faber_rt_v1_format_i1(context, template, 0) };
+    assert_eq!(formatted_text(context, formatted), "falsum");
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
+
+#[test]
+fn english_tokens_print_none_and_option_bool() {
+    let context = init_context();
+    set_english_tokens(context);
+    let present = 1usize as *mut c_void;
+    assert_eq!(
+        option_text(context, ptr::null_mut(), radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("none")
+    );
+    assert_eq!(
+        option_text(context, present, radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("true")
+    );
+    // An arena option box holding a bool, and an empty box.
+    let off: u8 = 0;
+    let boxed = unsafe {
+        option::__faber_rt_v1_option_some(
+            context,
+            radix_host_abi::VALUE_KIND_I1,
+            (&raw const off).cast(),
+        )
+    };
+    assert!(boxed.status.is_ok());
+    assert_eq!(
+        option_text(context, boxed.value, radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("false")
+    );
+    let empty =
+        unsafe { option::__faber_rt_v1_option_none(context, radix_host_abi::VALUE_KIND_I1) };
+    assert_eq!(
+        option_text(context, empty.value, radix_host_abi::VALUE_KIND_I1).as_deref(),
+        Some("none")
+    );
+    // A bool element of a list renders the module words.
+    let array = unsafe { __faber_rt_v1_array_new(context, radix_host_abi::VALUE_KIND_I1) };
+    assert!(array.status.is_ok());
+    let flag: u8 = 1;
+    let pushed = unsafe {
+        __faber_rt_v1_array_push(
+            context,
+            array.value,
+            radix_host_abi::VALUE_KIND_I1,
+            (&raw const flag).cast(),
+        )
+    };
+    assert_eq!(pushed, STATUS_OK);
+    assert_eq!(opaque_text(context, array.value).as_deref(), Some("[true]"));
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
+
+#[test]
+fn english_tokens_print_valor_bool_and_none() {
+    let context = init_context();
+    set_english_tokens(context);
+    let boolean = unsafe { __faber_rt_v1_valor_i1(context, 1) };
+    assert_eq!(opaque_text(context, boolean.value).as_deref(), Some("true"));
+    let nihil = unsafe { __faber_rt_v1_valor_nihil(context) };
+    assert_eq!(opaque_text(context, nihil.value).as_deref(), Some("none"));
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
+
+/// The single-bool format path of a non-Latin function: the emitted program
+/// passes the selected word's text descriptor to `__faber_rt_v1_format_text`
+/// with a one-placeholder template. The host formats a text argument into the
+/// placeholder, so the bool word lands in the template unchanged.
+#[test]
+fn format_text_formats_a_selected_bool_word() {
+    let context = init_context();
+    let word = FaberRtSliceV1::from_static(b"true");
+    let template = FaberRtSliceV1::from_static("flag=§".as_bytes());
+    let formatted = unsafe { __faber_rt_v1_format_text(context, template, &raw const word) };
+    assert_eq!(formatted_text(context, formatted), "flag=true");
+    unsafe { __faber_rt_v1_shutdown(context) };
+}
