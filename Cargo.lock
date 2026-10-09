@@ -1310,6 +1310,7 @@ dependencies = [
  "radix-diagnostics",
  "radix-hir",
  "radix-lexer",
+ "radix-runtime-contract",
  "radix-target",
  "radix-types",
  "rustc-hash",
@@ -1359,6 +1360,7 @@ dependencies = [
  "radix-diagnostics",
  "radix-hir",
  "radix-lexer",
+ "radix-runtime-contract",
  "radix-syntax",
  "radix-types",
  "rustc-hash",
@@ -1390,6 +1392,10 @@ dependencies = [
  "radix-types",
  "rustc-hash",
 ]
+
+[[package]]
+name = "radix-runtime-contract"
+version = "0.84.0"
 
 [[package]]
 name = "radix-syntax"

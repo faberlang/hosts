@@ -264,6 +264,7 @@ pub(crate) const V1_SCALAR_FIELDS: &[&str] = &[
     "__faber_rt_v1_text_parse_float",
     "__faber_rt_v1_text_parse_float_or",
     "__faber_rt_v1_read_line_0_to_ptr",
+    "__faber_rt_v1_set_display_tokens",
 ];
 
 /// W14 tensor surface: the closed-set v1 rows the radix Wasm emitter now
@@ -378,6 +379,19 @@ enum DynamicValue {
     },
 }
 
+/// The module's display words (need 694b33ce): the four text words a module
+/// declares through `set_display_tokens`. Absent (the import was never
+/// called) the host prints exactly its built-in per-site words.
+#[derive(Debug, Clone)]
+pub(crate) struct DisplayWords {
+    pub(crate) true_: String,
+    pub(crate) false_: String,
+    pub(crate) none: String,
+    /// Held for the module's declared set; the host renders no tuple form yet.
+    #[allow(dead_code)]
+    pub(crate) tuple: String,
+}
+
 /// Per-run host state: captured stdout/stderr, capture bound, the typed
 /// unsupported-symbol record for admitted-but-unfinished behavior, the W12
 /// typed arenas of interned literals, the W13 collection/map/option arenas,
@@ -409,6 +423,9 @@ pub(crate) struct HostState {
     /// per active materialization; the bound cede (yield) rows append to the
     /// active buffer, and popping it yields the materialized `lista<T>`.
     pub(crate) cursor_yields: Vec<CursorYieldBuffer>,
+    /// Module display words set by `set_display_tokens`; `None` keeps today's
+    /// per-site words.
+    display_words: Option<DisplayWords>,
     /// Dynamic-handle allocator: starts after the last declared row.
     next_dynamic: i32,
     /// Host-allocated dynamic values by handle.
@@ -431,6 +448,7 @@ impl HostState {
             options: Vec::new(),
             tensors: Vec::new(),
             cursor_yields: Vec::new(),
+            display_words: None,
             next_dynamic: 0,
             dynamic: HashMap::new(),
         }
@@ -788,16 +806,33 @@ impl HostState {
         }
     }
 
+    /// The word for a bool at one print site: the module's declared word when
+    /// `set_display_tokens` ran, else the site's built-in pair.
+    fn bool_word(&self, value: bool, built_in: (&'static str, &'static str)) -> String {
+        match (&self.display_words, value) {
+            (Some(words), true) => words.true_.clone(),
+            (Some(words), false) => words.false_.clone(),
+            (None, true) => built_in.0.to_owned(),
+            (None, false) => built_in.1.to_owned(),
+        }
+    }
+
+    /// The word for an absent option (`nihil` until the module declares one).
+    fn none_word(&self) -> String {
+        match &self.display_words {
+            Some(words) => words.none.clone(),
+            None => "nihil".to_owned(),
+        }
+    }
+
     /// Render one collection element in the Rust-oracle Debug shape. Text
     /// elements quote (`"prima"`, matching `Vec<String>` Debug), bivalens
     /// elements render `true`/`false`, and nested aggregate handles resolve
     /// recursively.
     fn render_element(&self, kind: u32, value: RuntimeValue) -> Option<String> {
         Some(match (kind, value) {
-            (VALUE_KIND_I1, RuntimeValue::I1(value)) => {
-                format!("{value}")
-            }
-            (_, RuntimeValue::I1(value)) => format!("{value}"),
+            (VALUE_KIND_I1, RuntimeValue::I1(value)) => self.bool_word(value, ("true", "false")),
+            (_, RuntimeValue::I1(value)) => self.bool_word(value, ("true", "false")),
             (_, RuntimeValue::I32(value)) => format!("{value}"),
             (_, RuntimeValue::I64(value)) => format!("{value}"),
             (_, RuntimeValue::F64(value)) => display_fractus(value),
@@ -930,11 +965,11 @@ impl HostState {
         if let Some(option) = self.find_option(handle) {
             return match option.payload {
                 Some(payload) => self.render_option_payload(option.kind, payload),
-                None => Some("nihil".to_owned()),
+                None => Some(self.none_word()),
             };
         }
         if handle == 0 {
-            return Some("nihil".to_owned());
+            return Some(self.none_word());
         }
         None
     }
@@ -944,13 +979,7 @@ impl HostState {
     /// recursively (the L10 opaque display contract).
     fn render_option_payload(&self, kind: u32, payload: RuntimeValue) -> Option<String> {
         Some(match (kind, payload) {
-            (VALUE_KIND_I1, RuntimeValue::I1(value)) => {
-                if value {
-                    "verum".to_owned()
-                } else {
-                    "falsum".to_owned()
-                }
-            }
+            (VALUE_KIND_I1, RuntimeValue::I1(value)) => self.bool_word(value, ("verum", "falsum")),
             (VALUE_KIND_I32, RuntimeValue::I32(value)) => format!("{value}"),
             (VALUE_KIND_I64, RuntimeValue::I64(value)) => format!("{value}"),
             (VALUE_KIND_F64, RuntimeValue::F64(value)) => display_fractus(value),
@@ -1252,6 +1281,7 @@ pub(crate) fn link_v1_imports(
     bind_text_parse_float(linker)?;
     bind_text_parse_float_or(linker)?;
     bind_read_line(linker)?;
+    bind_set_display_tokens(linker)?;
     // W13 collection display rows.
     bind_array_new(linker)?;
     bind_array_push(linker)?;
@@ -1678,11 +1708,8 @@ fn bind_format_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
               template: i32,
               value: i32|
               -> Result<i32, wasmtime::Error> {
-            format_result(
-                &mut caller,
-                template,
-                vec![display_bivalens(value).to_owned()],
-            )
+            let word = display_bivalens(caller.data(), value);
+            format_result(&mut caller, template, vec![word])
         },
     )?;
     Ok(())
@@ -1888,15 +1915,8 @@ fn bind_format_text_i64_i1(linker: &mut Linker<HostState>) -> Result<(), wasmtim
                     format!("format text arg handle {text}: unknown text handle"),
                 ));
             };
-            format_result(
-                &mut caller,
-                template,
-                vec![
-                    text,
-                    integer.to_string(),
-                    display_bivalens(boolean).to_owned(),
-                ],
-            )
+            let word = display_bivalens(caller.data(), boolean);
+            format_result(&mut caller, template, vec![text, integer.to_string(), word])
         },
     )?;
     Ok(())
@@ -1927,8 +1947,8 @@ fn bind_format_1_ptr_to_ptr(linker: &mut Linker<HostState>) -> Result<(), wasmti
     Ok(())
 }
 
-fn display_bivalens(value: i32) -> &'static str {
-    if value != 0 { "verum" } else { "falsum" }
+fn display_bivalens(state: &HostState, value: i32) -> String {
+    state.bool_word(value != 0, ("verum", "falsum"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3468,9 +3488,8 @@ fn bind_scalar_i1(
         WASM_IMPORT_MODULE_V1,
         field,
         move |mut caller: wasmtime::Caller<'_, HostState>, value: i32| {
-            caller
-                .data_mut()
-                .write_line(if value != 0 { "verum" } else { "falsum" });
+            let word = display_bivalens(caller.data(), value);
+            caller.data_mut().write_line(&word);
             Ok(())
         },
     )?;
@@ -3677,6 +3696,43 @@ fn bind_read_line(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error>
         move |mut caller: wasmtime::Caller<'_, HostState>| -> Result<i32, wasmtime::Error> {
             let kind = VALUE_KIND_TEXT as i32;
             Ok(caller.data_mut().alloc_option(kind as u32, None))
+        },
+    )?;
+    Ok(())
+}
+
+/// `set_display_tokens (param i32 i32 i32 i32)`: the module's true, false,
+/// none and tuple words as literal-table text handles, called once at the
+/// start of the entry function by a module whose display locale is not Latin
+/// (need 694b33ce). Never called, the host keeps its built-in words.
+fn bind_set_display_tokens(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    linker.func_wrap(
+        WASM_IMPORT_MODULE_V1,
+        "__faber_rt_v1_set_display_tokens",
+        move |mut caller: wasmtime::Caller<'_, HostState>,
+              true_: i32,
+              false_: i32,
+              none: i32,
+              tuple: i32|
+              -> Result<(), wasmtime::Error> {
+            let mut words = Vec::with_capacity(4);
+            for handle in [true_, false_, none, tuple] {
+                let Some(word) = caller.data().resolve_text(handle).map(str::to_owned) else {
+                    return Err(typed_unsupported(
+                        &mut caller,
+                        format!("set_display_tokens handle {handle}: unknown text handle"),
+                    ));
+                };
+                words.push(word);
+            }
+            let mut words = words.into_iter();
+            caller.data_mut().display_words = Some(DisplayWords {
+                true_: words.next().unwrap_or_default(),
+                false_: words.next().unwrap_or_default(),
+                none: words.next().unwrap_or_default(),
+                tuple: words.next().unwrap_or_default(),
+            });
+            Ok(())
         },
     )?;
     Ok(())
@@ -3989,10 +4045,7 @@ fn bind_tensor_set(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error
                 // (`runner_tensor_ponde_invalid_index`). The checked method
                 // form never reaches this import with a bad index: its helper
                 // branches to `ReturnError` first.
-                return Err(typed_unsupported(
-                    &mut caller,
-                    "tensor ponde invalid index",
-                ));
+                return Err(typed_unsupported(&mut caller, "tensor ponde invalid index"));
             };
             let converted = tensor_value_from_carrier(
                 &TensorValue {
